@@ -40,9 +40,20 @@ try:
 except Exception:
     websocket = None  # type: ignore
 
+class _NullLearningEngine:
+    def get_policy(self):
+        return {}
+
+
 try:
     from meta_filter import MetaFilter as _MetaFilter
-    META_FILTER = _MetaFilter()
+    _learning_engine = globals().get("LEARNING_ENGINE")
+    try:
+        META_FILTER = _MetaFilter(learning_engine=_learning_engine)
+    except TypeError:
+        META_FILTER = _MetaFilter()
+    if getattr(META_FILTER, "learning_engine", None) is None:
+        META_FILTER.learning_engine = _learning_engine or _NullLearningEngine()
 except Exception as _meta_import_exc:
     META_FILTER = None
 
