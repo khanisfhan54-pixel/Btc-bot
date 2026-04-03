@@ -47,9 +47,11 @@ try:
 
     if _learning_engine is None:
         try:
-            _learning_engine = self.learning_engine
+            _self = locals().get("self", None)
+            if _self is not None:
+                _learning_engine = getattr(_self, "learning_engine", None)
         except Exception:
-            pass
+            _learning_engine = None
 
     META_FILTER = _MetaFilter(learning_engine=_learning_engine)
 except Exception as _meta_import_exc:
