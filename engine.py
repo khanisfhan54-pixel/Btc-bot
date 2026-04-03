@@ -42,7 +42,16 @@ except Exception:
 
 try:
     from meta_filter import MetaFilter as _MetaFilter
-    META_FILTER = _MetaFilter()
+
+    _learning_engine = globals().get("LEARNING_ENGINE")
+
+    if _learning_engine is None:
+        try:
+            _learning_engine = self.learning_engine
+        except Exception:
+            pass
+
+    META_FILTER = _MetaFilter(learning_engine=_learning_engine)
 except Exception as _meta_import_exc:
     META_FILTER = None
 
