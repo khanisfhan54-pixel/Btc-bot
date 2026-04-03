@@ -59,6 +59,21 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _enforce_entry_fee_metadata(fees, fee_type, trade_id=None):
+    fees_val = _safe_float(fees, 0.0)
+
+    fee_type_val = str(fee_type).lower().strip() if fee_type is not None else None
+
+    if fee_type_val not in ("quote", "pct"):
+        logger.warning(
+            "Invalid fee_type detected upstream. Defaulting to pct. trade_id=%s",
+            trade_id if trade_id is not None else "unknown",
+        )
+        fee_type_val = "pct"
+
+    return fees_val, fee_type_val
+
+
 def _extract_levels(snapshot: Dict[str, Any]) -> Tuple[List[Level], List[Level]]:
     def to_levels(raw: Any) -> List[Level]:
         out: List[Level] = []
