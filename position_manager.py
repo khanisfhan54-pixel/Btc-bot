@@ -1,0 +1,514 @@
+from __future__ import annotations
+
+import logging
+import math
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional
+import time
+
+from execution_quality import EXECUTION_QUALITY_ENGINE
+
+logger = logging.getLogger(__name__)
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        v = float(value)
+        if math.isnan(v) or math.isinf(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+@dataclass
+class PositionState:
+    side: str
+    entry_price: float
+    size: float
+    sl: float
+    tp: float
+    opened_at: float = field(default_factory=time.time)
+
+    highest_price: float = 0.0
+    lowest_price: float = 0.0
+    partial_taken: bool = False
+    breakeven_moved: bool = False
+    trailing_active: bool = False
+    closed: bool = False
+    exit_reason: Optional[str] = None
+
+    # learning support fields (optional)
+    features_entry: Optional[dict] = None
+    features_exit: Optional[dict] = None
+    trade_id: Optional[str] = None
+    signal: Optional[str] = None
+    confidence: Optional[float] = None
+    regime: Optional[str] = None
+    fees: Optional[float] = None
+    fee_type: Optional[str] = None  # "quote" or "pct"
+
+    def __post_init__(self):
+        if self.fee_type is not None:
+            self.fee_type = str(self.fee_type).lower().strip()
+
+        if self.fees is not None and self.fee_type not in ("quote", "pct"):
+            logger.error(
+                "Invalid fee metadata in PositionState: fees=%s fee_type=%s side=%s entry_price=%s",
+                self.fees,
+                self.fee_type,
+                self.side,
+                self.entry_price,
+            )
+            raise ValueError("PositionState requires fee_type='quote' or 'pct' when fees are provided")
+
+
+class PositionManager:
+    """
+    Institutional-style position management:
+    - break-even move
+    - trailing stop
+    - partial take profit
+    - toxicity / regime kill-switch
+    - liquidity-aware exit decisions
+    """
+
+    def __init__(
+        self,
+        partial_tp_r_multiple: float = 1.0,
+        breakeven_r_multiple: float = 1.0,
+        trailing_start_r_multiple: float = 2.0,
+        trailing_distance_bps: float = 35.0,
+        toxic_vpin_threshold: float = 0.70,
+        toxic_spread_bps_threshold: float = 20.0,
+        min_liquidity_score: float = 0.35,
+        learning_engine: Any = None,
+    ) -> None:
+        self.partial_tp_r_multiple = partial_tp_r_multiple
+        self.breakeven_r_multiple = breakeven_r_multiple
+        self.trailing_start_r_multiple = trailing_start_r_multiple
+        self.trailing_distance_bps = trailing_distance_bps
+        self.toxic_vpin_threshold = toxic_vpin_threshold
+        self.toxic_spread_bps_threshold = toxic_spread_bps_threshold
+        self.min_liquidity_score = min_liquidity_score
+        self.position: Optional[PositionState] = None
+        self.learning_engine = learning_engine
+
+    def reduce_on_cascade(self, position_size: float, cascade_score: float) -> float:
+        try:
+            if _safe_float(cascade_score) > 0.8:
+                return _safe_float(position_size) * 0.5
+            return _safe_float(position_size)
+        except Exception:
+            return _safe_float(position_size)
+
+    def has_position(self) -> bool:
+        return self.position is not None and not self.position.closed
+
+    def get_position(self) -> dict:
+        return dict(vars(self.position)) if getattr(self, "position", None) else {}
+
+    def on_entry(
+        self,
+        side: str,
+        entry_price: float,
+        size: float,
+        sl: float,
+        tp: float,
+        features: Optional[Dict[str, Any]] = None,
+        trade_id: Optional[str] = None,
+        signal: Optional[str] = None,
+        confidence: Optional[float] = None,
+        regime: Optional[str] = None,
+        fees: Optional[float] = None,
+        fee_type: Optional[str] = None,
+    ) -> None:
+        side = str(side).upper().strip()
+        if side not in ("LONG", "SHORT"):
+            raise ValueError("side must be LONG or SHORT")
+
+        if fee_type is not None:
+            fee_type = str(fee_type).lower().strip()
+
+        if fees is not None and fee_type not in ("quote", "pct"):
+            logger.error(
+                "Invalid fee metadata at entry source: fees=%s fee_type=%s side=%s entry_price=%s size=%s",
+                fees,
+                fee_type,
+                side,
+                entry_price,
+                size,
+            )
+            raise ValueError("fee_type must be provided as 'quote' or 'pct' when fees are used")
+
+        self.position = PositionState(
+            side=side,
+            entry_price=_safe_float(entry_price),
+            size=_safe_float(size),
+            sl=_safe_float(sl),
+            tp=_safe_float(tp),
+            highest_price=_safe_float(entry_price),
+            lowest_price=_safe_float(entry_price),
+            features_entry=features if features is not None else None,
+            trade_id=trade_id,
+            signal=signal,
+            confidence=confidence,
+            regime=regime,
+            fees=fees,
+            fee_type=fee_type,
+        )
+
+    def close(self, reason: str = "manual", exit_price: float = 0.0, features_exit: Optional[dict] = None) -> Dict[str, Any]:
+        if not self.position:
+            return {"action": "NO_POSITION"}
+
+        entry_price = self.position.entry_price
+        side        = self.position.side
+        size        = self.position.size
+
+        pnl_pct = 0.0
+        if entry_price > 0 and exit_price > 0:
+            if side == "LONG":
+                pnl_pct = (exit_price - entry_price) / entry_price
+            else:
+                pnl_pct = (entry_price - exit_price) / entry_price
+
+        if abs(size) < 1e-12:
+            logger.warning("Closing position with near-zero size. Forcing pnl_pct=0.")
+            pnl_pct = 0.0
+
+        logger.info(
+            "[POSITION CLOSED] side=%s entry=%.2f exit=%.2f pnl=%.4f%% size=%.6f reason=%s",
+            side, entry_price, exit_price, pnl_pct * 100, size, reason,
+        )
+
+        _tp = self.position.tp
+        _sl = self.position.sl
+
+        reason_lower = str(reason).lower()
+        if reason_lower in ("tp", "take_profit", "target") and _tp > 0:
+            expected_price = _tp
+        elif reason_lower in ("sl", "stop_loss", "stop") and _sl > 0:
+            expected_price = _sl
+        else:
+            expected_price = entry_price
+
+        slippage_bps = 0.0
+        if expected_price > 0 and exit_price > 0:
+            if side == "LONG":
+                slippage_bps = ((exit_price - expected_price) / expected_price) * 10_000.0
+            else:
+                slippage_bps = ((expected_price - exit_price) / expected_price) * 10_000.0
+
+        eq_result = EXECUTION_QUALITY_ENGINE.evaluate(
+            entry_price=entry_price,
+            exit_price=exit_price,
+            expected_price=expected_price,
+            slippage_bps=slippage_bps,
+            latency_ms=0.0,
+            spread_bps=0.0,
+            side=side,
+            reason=reason,
+            price_after_1s=None,
+            price_after_3s=None,
+        )
+
+        self.position.closed = True
+        self.position.exit_reason = reason
+
+        learning_engine = getattr(self, "learning_engine", None)
+        ps = self.position
+
+        features_entry = getattr(ps, "features_entry", None)
+        features_exit_actual = features_exit if features_exit is not None else getattr(ps, "features_exit", None)
+
+        entry_ts = getattr(ps, "opened_at", None)
+        exit_ts = time.time()
+
+        hp = _safe_float(getattr(ps, "highest_price", entry_price), entry_price)
+        lp = _safe_float(getattr(ps, "lowest_price", entry_price), entry_price)
+
+        mfe = 0.0
+        mae = 0.0
+        if entry_price > 0:
+            if side == "LONG":
+                mfe = max(0.0, (hp - entry_price) / entry_price)
+                mae = max(0.0, (entry_price - lp) / entry_price)
+            else:
+                mfe = max(0.0, (entry_price - lp) / entry_price)
+                mae = max(0.0, (hp - entry_price) / entry_price)
+
+        mfe = _safe_float(mfe)
+        mae = _safe_float(mae)
+        mfe = max(0.0, mfe)
+        mae = max(0.0, mae)
+
+        fees = getattr(ps, "fees", 0.0)
+        fee_type = getattr(ps, "fee_type", None)
+
+        fees_val = _safe_float(fees)
+
+        if fees_val <= 0:
+            fee_pct = 0.0
+
+        elif fee_type == "pct":
+            fee_pct = fees_val
+
+        elif fee_type == "quote":
+            notional = max(entry_price * abs(size), 1e-9)
+            fee_pct = fees_val / notional
+
+        else:
+            logger.error(
+                "Missing fee_type detected. Defaulting fee_pct=0.0. This indicates upstream integration issue. "
+                "fees=%s fee_type=%s side=%s entry_price=%s exit_price=%s reason=%s",
+                fees,
+                fee_type,
+                side,
+                entry_price,
+                exit_price,
+                reason,
+            )
+            fee_pct = 0.0
+
+        realized_pnl = pnl_pct - fee_pct
+
+        holding_time = 0.0
+        try:
+            if entry_ts is not None and exit_ts is not None:
+                holding_time = float(exit_ts) - float(entry_ts)
+        except Exception:
+            holding_time = 0.0
+
+        if "tp" in reason_lower:
+            exit_type = "tp"
+        elif "sl" in reason_lower:
+            exit_type = "sl"
+        elif "toxic" in reason_lower:
+            exit_type = "toxicity_exit"
+        else:
+            exit_type = "manual"
+
+        if abs(mfe) < 1e-6:
+            exit_score = realized_pnl
+        else:
+            exit_score = realized_pnl / mfe
+        exit_score = _clamp(exit_score, -10.0, 10.0)
+
+        trade_id = getattr(ps, "trade_id", None)
+        signal = getattr(ps, "signal", None)
+        confidence = getattr(ps, "confidence", None)
+        regime = getattr(ps, "regime", None)
+        stop_loss = getattr(ps, "sl", None)
+
+        if learning_engine and hasattr(learning_engine, "record_closed_trade"):
+            try:
+                learning_engine.record_closed_trade(
+                    signal=signal,
+                    side=side,
+                    entry_price=entry_price,
+                    exit_price=exit_price,
+                    size=size,
+                    entry_ts=entry_ts,
+                    exit_ts=exit_ts,
+                    confidence=confidence,
+                    features_entry=features_entry,
+                    features_exit=features_exit_actual,
+                    reason=reason,
+                    exit_type=exit_type,
+                    fees=fees,
+                    mfe_pct=mfe,
+                    mae_pct=mae,
+                    stop_loss=stop_loss,
+                    trade_id=trade_id,
+                )
+            except Exception as e:
+                logger.warning("[LEARNING] closed trade recording failed: %s", e)
+
+        if learning_engine and hasattr(learning_engine, "record_exit_quality"):
+            try:
+                learning_engine.record_exit_quality(
+                    mfe_pct=mfe,
+                    mae_pct=mae,
+                    exit_quality_score=exit_score,
+                    exit_classification=exit_type,
+                    holding_seconds=holding_time,
+                    reason=reason,
+                    regime=regime,
+                    realized_pnl=realized_pnl,
+                    confidence=confidence,
+                    side=side,
+                )
+            except Exception as e:
+                logger.warning("[LEARNING] exit quality analytics failed: %s", e)
+
+        out = {
+            "action":           "CLOSE",
+            "reason":           reason,
+            "side":             side,
+            "entry_price":      entry_price,
+            "exit_price":       exit_price,
+            "pnl_pct":          pnl_pct,
+            "size":             size,
+            "sl":               _sl,
+            "tp":               _tp,
+            "exec_quality":     eq_result,
+        }
+        self.position = None
+        return out
+
+    def update(self, current_price: float, features: Dict[str, Any]) -> Dict[str, Any]:
+        if not self.position or self.position.closed:
+            return {"action": "NO_POSITION", "reason": "no_open_position"}
+
+        price = _safe_float(current_price)
+        side = self.position.side
+        entry = self.position.entry_price
+        sl = self.position.sl
+        tp = self.position.tp
+
+        liquidity_score = _safe_float(features.get("liquidity_score", 0.0))
+        vpin = _safe_float(features.get("vpin", features.get("toxicity", 0.0)))
+        spread_bps = _safe_float(features.get("spread_bps", 0.0))
+        urgency = _safe_float(features.get("urgency", 0.5))
+        fill_prob = _safe_float(features.get("fill_prob", 1.0))
+        latency_ms = _safe_float(features.get("latency_ms", 0.0))
+        regime = str(features.get("regime", "unknown")).lower()
+        hidden_liquidity = bool(features.get("hidden_liquidity", False))
+
+        if price > self.position.highest_price:
+            self.position.highest_price = price
+        if price < self.position.lowest_price:
+            self.position.lowest_price = price
+
+        risk = abs(entry - sl)
+        if risk <= 0:
+            return {"action": "HOLD", "reason": "invalid_risk"}
+
+        if vpin >= self.toxic_vpin_threshold:
+            self.position.features_exit = features
+            return self.close("toxic_flow", exit_price=price, features_exit=features)
+
+        if spread_bps >= self.toxic_spread_bps_threshold:
+            self.position.features_exit = features
+            return self.close("spread_too_wide", exit_price=price, features_exit=features)
+
+        if liquidity_score < self.min_liquidity_score and regime == "toxic":
+            self.position.features_exit = features
+            return self.close("illiquid_toxic_regime", exit_price=price, features_exit=features)
+
+        if latency_ms > 2500:
+            self.position.features_exit = features
+            return self.close("stale_signal", exit_price=price, features_exit=features)
+
+        if fill_prob < 0.20 and regime in ("range", "toxic"):
+            return {"action": "HOLD", "reason": "low_fill_prob_wait"}
+
+        r_mult = self._current_r_multiple(price)
+
+        if not self.position.partial_taken and r_mult >= self.partial_tp_r_multiple:
+            self.position.partial_taken = True
+            return {
+                "action": "PARTIAL_TAKE_PROFIT",
+                "reason": "hit_1r",
+                "reduce_size_pct": 0.50,
+                "new_sl": self.position.sl,
+                "new_tp": self.position.tp,
+            }
+
+        if not self.position.breakeven_moved and r_mult >= self.breakeven_r_multiple:
+            self.position.breakeven_moved = True
+            new_sl = entry
+
+            cushion_bps = max(2.0, min(8.0, spread_bps * 0.25 + urgency * 3.0))
+            cushion = entry * cushion_bps / 10_000.0
+
+            if side == "LONG":
+                new_sl = max(new_sl, entry + cushion * 0.15)
+            else:
+                new_sl = min(new_sl, entry - cushion * 0.15)
+
+            self.position.sl = new_sl
+            return {
+                "action": "MOVE_SL_TO_BE",
+                "reason": "hit_1r_break_even",
+                "new_sl": new_sl,
+                "new_tp": self.position.tp,
+            }
+
+        if r_mult >= self.trailing_start_r_multiple:
+            self.position.trailing_active = True
+            trailed_sl = self._compute_trailing_sl(price, entry, side, spread_bps)
+            if side == "LONG" and trailed_sl > self.position.sl:
+                self.position.sl = trailed_sl
+                return {
+                    "action": "TRAIL_STOP",
+                    "reason": "trail_after_2r",
+                    "new_sl": trailed_sl,
+                    "new_tp": self.position.tp,
+                }
+            if side == "SHORT" and trailed_sl < self.position.sl:
+                self.position.sl = trailed_sl
+                return {
+                    "action": "TRAIL_STOP",
+                    "reason": "trail_after_2r",
+                    "new_sl": trailed_sl,
+                    "new_tp": self.position.tp,
+                }
+
+        if side == "LONG":
+            if price <= self.position.sl:
+                self.position.features_exit = features
+                return self.close("stop_loss_hit", exit_price=price, features_exit=features)
+            if price >= self.position.tp:
+                self.position.features_exit = features
+                return self.close("take_profit_hit", exit_price=price, features_exit=features)
+        else:
+            if price >= self.position.sl:
+                self.position.features_exit = features
+                return self.close("stop_loss_hit", exit_price=price, features_exit=features)
+            if price <= self.position.tp:
+                self.position.features_exit = features
+                return self.close("take_profit_hit", exit_price=price, features_exit=features)
+
+        return {
+            "action": "HOLD",
+            "reason": "position_managed",
+            "new_sl": self.position.sl,
+            "new_tp": self.position.tp,
+        }
+
+    def _current_r_multiple(self, price: float) -> float:
+        if not self.position:
+            return 0.0
+        entry = self.position.entry_price
+        sl = self.position.sl
+        risk = max(abs(entry - sl), 1e-9)
+        if risk <= 0:
+            return 0.0
+
+        if self.position.side == "LONG":
+            return (price - entry) / risk
+        return (entry - price) / risk
+
+    def _compute_trailing_sl(
+        self,
+        price: float,
+        entry: float,
+        side: str,
+        spread_bps: float,
+    ) -> float:
+        side = side.upper()
+        trail_bps = _clamp(self.trailing_distance_bps + spread_bps * 0.25, 20.0, 120.0)
+        trail_dist = price * trail_bps / 10_000.0
+
+        if side == "LONG":
+            return max(entry, self.position.highest_price - trail_dist)
+        else:
+            return min(entry, self.position.lowest_price + trail_dist)
