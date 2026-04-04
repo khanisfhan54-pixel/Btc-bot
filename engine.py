@@ -47,10 +47,12 @@ try:
 
     if _learning_engine is None:
         try:
-            _self = locals().get("self", None)
-            if _self is not None:
-                _learning_engine = getattr(_self, "learning_engine", None)
-        except Exception:
+            _learning_engine = self.learning_engine
+        except Exception as e:
+            logger.warning(
+                "Failed to access learning_engine. Defaulting to None. error=%s",
+                str(e),
+            )
             _learning_engine = None
 
     META_FILTER = _MetaFilter(learning_engine=_learning_engine)
