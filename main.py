@@ -458,6 +458,21 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _enforce_entry_fee_metadata(fees, fee_type, trade_id=None):
+    fees_val = _safe_float(fees, 0.0)
+
+    fee_type_val = str(fee_type).lower().strip() if fee_type is not None else None
+
+    if fee_type_val not in ("quote", "pct"):
+        logger.warning(
+            "Invalid fee_type in main.py. Defaulting to pct. trade_id=%s",
+            trade_id if trade_id is not None else "unknown",
+        )
+        fee_type_val = "pct"
+
+    return fees_val, fee_type_val
+
+
 def _clamp(value: Any, low: float, high: float) -> float:
     try:
         return max(low, min(high, float(value)))
@@ -1995,8 +2010,10 @@ def run_analysis_cycle(
                 position_size=decision.get("position_size") or None,
             )
 
-            if execution_outcome.get("executed") or execution_outcome.get("paper"):
-                pos_size = _safe_float(execution_outcome.get("position_size", 0.0)) or 0.001
+            eo = execution_outcome or {}
+
+            if eo.get("executed") or eo.get("paper"):
+                pos_size = _safe_float(eo.get("position_size", 0.0)) or 0.001
 
                 impact_tracker.record_entry(
                     entry_price=current_price,
@@ -2006,12 +2023,19 @@ def run_analysis_cycle(
                 )
 
                 try:
+                    fees, fee_type = _enforce_entry_fee_metadata(
+                        eo.get("fees"),
+                        eo.get("fee_type"),
+                        eo.get("trade_id"),
+                    )
                     position_manager.on_entry(
                         side=normalized_signal,
                         entry_price=current_price,
                         size=pos_size,
-                        sl=_safe_float(execution_outcome.get("sl", 0.0)),
-                        tp=_safe_float(execution_outcome.get("tp", 0.0)),
+                        sl=_safe_float(eo.get("sl", 0.0)),
+                        tp=_safe_float(eo.get("tp", 0.0)),
+                        fees=fees,
+                        fee_type=fee_type,
                         features=feat_dict,
                     )
                 except Exception as _pm_err:
