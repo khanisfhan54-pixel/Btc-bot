@@ -288,7 +288,16 @@ class ExecutionLogic:
         expected_cost_bps = self.cfg.fee_bps + expected_slippage_bps + max(0.0, spread_bps * 0.25)
 
         signal_strength = float(signal_payload.get("confidence", confidence))
-        expected_edge_bps = 25.0 * signal_strength * max(0.25, liquidity_score)
+        volatility = _safe_float(features.get("volatility", features.get("atr_pct", 0.0)), 0.0)
+        regime_multiplier = 1.2 if regime == "trend" else 0.9 if regime == "range" else 1.0
+        volatility_multiplier = _clamp(1.0 + volatility, 0.8, 1.5)
+        expected_edge_bps = (
+            25.0
+            * signal_strength
+            * max(0.25, liquidity_score)
+            * regime_multiplier
+            * volatility_multiplier
+        )
         if expected_edge_bps <= expected_cost_bps:
             return {
                 "execute": False,
@@ -352,7 +361,7 @@ class ExecutionLogic:
         combined_meta_scale = _clamp(meta_risk_scale * meta_position_scale, 0.0, 1.5)
         combined_learning_scale = _clamp(combined_meta_scale * learning_risk_scale, 0.0, 1.5)
 
-        risk_budget = account_equity * self.cfg.risk_per_trade * confidence * max(0.25, liquidity_score)
+        risk_budget = account_equity * self.cfg.risk_per_trade * max(0.25, liquidity_score)
         risk_budget *= _clamp(1.0 + (urgency - 0.5) * 0.6, 0.7, 1.3)
         risk_budget *= max(0.0, combined_learning_scale)
         raw_qty = risk_budget / risk_per_unit
@@ -378,12 +387,23 @@ class ExecutionLogic:
             if not (tp < entry < sl):
                 return {"execute": False, "side": side, "sl": 0.0, "tp": 0.0, "position_size": 0.0}
 
+        meta_state = meta_result.get("meta_state", {}) if isinstance(meta_result, dict) else {}
+        order_pref = meta_state.get("order_preference", "MARKET")
+        order_type = self.choose_order_type(
+            cascade_detected=meta_state.get("cascade", {}).get("cascade_detected", False),
+            urgency="high" if urgency > 0.7 else "normal",
+            order_preference=order_pref,
+            queue_fill_probability=_safe_float(features.get("fill_prob", 0.5)),
+            expected_slippage_bps=expected_slippage_bps,
+        )
+
         return {
             "execute": True,
             "side": side,
             "sl": float(sl),
             "tp": float(tp),
             "position_size": float(qty),
+            "order_type": order_type,
             "risk_scale": float(combined_learning_scale),
             "meta_result": meta_result,
             "learning_params": learning_params,
