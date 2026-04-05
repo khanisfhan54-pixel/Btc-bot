@@ -403,7 +403,8 @@ class PositionManager:
             self.position.features_exit = features
             return self.close("illiquid_toxic_regime", exit_price=price, features_exit=features)
 
-        if latency_ms > 2500:
+        adaptive_latency = _safe_float(features.get("execution_latency", 1500.0))
+        if latency_ms > max(1500.0, adaptive_latency):
             self.position.features_exit = features
             return self.close("stale_signal", exit_price=price, features_exit=features)
 
