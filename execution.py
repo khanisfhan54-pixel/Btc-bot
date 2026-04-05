@@ -209,7 +209,8 @@ class ExecutionLogic:
                 )
             )
             urgency          = float(features.get("urgency", 0.5))
-            regime           = str(features.get("regime", "unknown")).lower()
+            regime           = features.get("regime", "unknown")
+            regime           = str(regime).lower()
             hidden_liquidity = bool(features.get("hidden_liquidity", False))
             latency_ms_feat  = float(features.get("latency_ms", 0.0))
         except Exception as exc:
@@ -290,7 +291,7 @@ class ExecutionLogic:
         signal_strength = float(signal_payload.get("confidence", confidence))
         volatility = _safe_float(features.get("volatility", features.get("atr_pct", 0.0)), 0.0)
         regime_multiplier = 1.2 if regime == "trend" else 0.9 if regime == "range" else 1.0
-        volatility_multiplier = _clamp(1.0 + volatility, 0.8, 1.5)
+        volatility_multiplier = _clamp(1.0 + (volatility * 0.5), 0.8, 1.5)
         expected_edge_bps = (
             25.0
             * signal_strength
@@ -387,10 +388,10 @@ class ExecutionLogic:
             if not (tp < entry < sl):
                 return {"execute": False, "side": side, "sl": 0.0, "tp": 0.0, "position_size": 0.0}
 
-        meta_state = meta_result.get("meta_state", {}) if isinstance(meta_result, dict) else {}
-        order_pref = meta_state.get("order_preference", "MARKET")
+        _meta_state = meta_result.get("meta_state") if isinstance(meta_result.get("meta_state"), dict) else {}
+        order_pref = _meta_state.get("order_preference", "MARKET")
         order_type = self.choose_order_type(
-            cascade_detected=meta_state.get("cascade", {}).get("cascade_detected", False),
+            cascade_detected=_meta_state.get("cascade", {}).get("cascade_detected", False),
             urgency="high" if urgency > 0.7 else "normal",
             order_preference=order_pref,
             queue_fill_probability=_safe_float(features.get("fill_prob", 0.5)),
