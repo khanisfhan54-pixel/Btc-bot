@@ -21,6 +21,23 @@ def _clamp(x: float, low: float, high: float) -> float:
     return max(low, min(high, x))
 
 
+def _compute_execution_quality(features: Dict[str, Any]) -> float:
+    raw_quality = _safe_get(features, "execution_quality", None)
+    if raw_quality is not None:
+        return _clamp(_safe_float(raw_quality, 1.0), 0.0, 1.5)
+
+    fill_rate = _safe_float(_safe_get(features, "execution_fill_rate", 1.0), 1.0)
+    slippage = _safe_float(_safe_get(features, "execution_slippage", 0.0), 0.0)
+    latency = _safe_float(_safe_get(features, "execution_latency", 0.0), 0.0)
+
+    fill_component = _clamp(fill_rate, 0.0, 1.5)
+    slippage_penalty = _clamp(slippage, 0.0, 1.0)
+    latency_penalty = _clamp(latency / 1000.0, 0.0, 1.0)
+
+    derived = 1.0 + 0.4 * (fill_component - 1.0) - 0.3 * slippage_penalty - 0.2 * latency_penalty
+    return _clamp(derived, 0.0, 1.5)
+
+
 def _normalize_candle(candle: Any) -> Optional[Dict[str, float]]:
     if isinstance(candle, dict):
         nested = _safe_get(candle, "candle") or _safe_get(candle, "kline")
@@ -107,14 +124,30 @@ class SignalEngine:
     def generate_signal(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         features = kwargs.get("features") or (args[0] if args else {})
         if not isinstance(features, dict):
-            return {"action": "HOLD", "signal": "HOLD", "confidence": 0.0, "score": 0, "reasons": []}
+            return {
+                "action": "HOLD",
+                "signal": "HOLD",
+                "confidence": 0.0,
+                "score": 0,
+                "reasons": [],
+                "execution_quality": 1.0,
+            }
+
+        execution_quality = _compute_execution_quality(features)
 
         liquidity = _safe_get(features, "liquidity", {})
         raw_candles = _safe_get(features, "candles", _safe_get(features, "ohlcv", []))
         candles = _normalize_candles(raw_candles)
 
         if len(candles) < 3:
-            return {"action": "HOLD", "signal": "HOLD", "confidence": 0.0, "score": 0, "reasons": []}
+            return {
+                "action": "HOLD",
+                "signal": "HOLD",
+                "confidence": 0.0,
+                "score": 0,
+                "reasons": [],
+                "execution_quality": execution_quality,
+            }
 
         last = candles[-1]
         prev = candles[-2]
@@ -198,7 +231,14 @@ class SignalEngine:
             reasons += ["trend", "momentum"]
 
         else:
-            return {"action": "HOLD", "signal": "HOLD", "confidence": 0.0, "score": 0, "reasons": []}
+            return {
+                "action": "HOLD",
+                "signal": "HOLD",
+                "confidence": 0.0,
+                "score": 0,
+                "reasons": [],
+                "execution_quality": execution_quality,
+            }
 
         # ── 5. Confidence model ────────────────────────────────────────
         liquidity_score = 1.0 if stop_hunt else 0.4
@@ -231,6 +271,7 @@ class SignalEngine:
             "confidence": confidence,
             "score": int(confidence * 100),
             "reasons": reasons,
+            "execution_quality": execution_quality,
         }
 
     # ------------------------------------------------------------------
