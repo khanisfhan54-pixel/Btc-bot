@@ -1822,6 +1822,39 @@ def _to_rows(candles: Any) -> List[list]:
     return rows
 
 
+def _safe_rows_candidate(value: Any) -> List[list]:
+    if isinstance(value, (list, tuple)):
+        return _to_rows(value)
+    return []
+
+
+def _safe_fallback_rows_from_dict(candles_map: Dict[str, Any]) -> List[list]:
+    if not isinstance(candles_map, dict):
+        return []
+    checked = set()
+    for key in ("candles", "ohlcv", "rows", "data", "klines"):
+        rows = _safe_rows_candidate(candles_map.get(key))
+        if rows:
+            return rows
+        checked.add(key)
+    for key, value in candles_map.items():
+        if key in checked:
+            continue
+        rows = _safe_rows_candidate(value)
+        if rows:
+            return rows
+    return []
+
+
+def _normalize_rows_input(candles: Any) -> List[list]:
+    rows = _to_rows(candles)
+    if rows:
+        return rows
+    if isinstance(candles, dict):
+        return _safe_fallback_rows_from_dict(candles)
+    return []
+
+
 def _aggregate_rows(rows: List[list], factor: int) -> List[list]:
     rows = _to_rows(rows)
     if factor <= 1 or len(rows) < factor:
@@ -2144,132 +2177,6 @@ def score_order_block(ob: dict, volume: float, reaction: float) -> float:
         return 0.0
 
 
-def analyze_orderflow(trades: List[dict], orderbook: dict) -> Dict[str, Any]:
-    """
-    Delta, absorption, aggression, strength.
-    """
-    try:
-        buy_usd, sell_usd = _volume_side(trades or [])
-        total = buy_usd + sell_usd + 1e-9
-        delta = (buy_usd - sell_usd) / total
-        bid_vol, ask_vol = _book_volumes(orderbook, depth=10)
-        book_skew = (bid_vol - ask_vol) / (bid_vol + ask_vol + 1e-9)
-        aggression = "buy" if delta > 0 else "sell" if delta < 0 else "buy"
-        absorption = False
-        if delta < -0.15 and bid_vol > ask_vol * 1.1:
-            absorption = True
-        if delta > 0.15 and ask_vol > bid_vol * 1.1:
-            absorption = True
-        strength = _clamp(abs(delta) * 0.7 + abs(book_skew) * 0.3 + (0.15 if absorption else 0.0), 0.0, 1.0)
-        return {
-            "delta": round(float(delta), 4),
-            "absorption": bool(absorption),
-            "aggression": aggression,
-            "strength": round(float(strength), 4),
-            "buy_usd": round(float(buy_usd), 4),
-            "sell_usd": round(float(sell_usd), 4),
-            "book_skew": round(float(book_skew), 4),
-        }
-    except Exception:
-        return {
-            "delta": 0.0,
-            "absorption": False,
-            "aggression": "buy",
-            "strength": 0.0,
-            "buy_usd": 0.0,
-            "sell_usd": 0.0,
-            "book_skew": 0.0,
-        }
-
-
-def compute_mtf_bias(candles_by_tf: Any) -> Dict[str, Any]:
-    """
-    1H/4H trend + premium/discount, 5m/15m execution structure.
-    """
-    try:
-        if isinstance(candles_by_tf, dict):
-            c1h = _to_rows(candles_by_tf.get("1h") or candles_by_tf.get("1H") or candles_by_tf.get("60m") or [])
-            c4h = _to_rows(candles_by_tf.get("4h") or candles_by_tf.get("4H") or [])
-            c15 = _to_rows(candles_by_tf.get("15m") or [])
-            c5 = _to_rows(candles_by_tf.get("5m") or [])
-            c1 = _to_rows(candles_by_tf.get("1m") or candles_by_tf.get("primary") or [])
-        else:
-            c1 = _to_rows(candles_by_tf)
-            c5 = _aggregate_ohlcv(c1, 5)
-            c15 = _aggregate_ohlcv(c1, 15)
-            c1h = _aggregate_ohlcv(c1, 60)
-            c4h = _aggregate_ohlcv(c1, 240)
-
-        def _trend(rows: List[list]) -> Tuple[str, float]:
-            if len(rows) < 6:
-                return "neutral", 0.0
-            closes = [r[4] for r in rows]
-            e1 = _ema(closes[-10:], min(10, len(closes[-10:])))
-            e2 = _ema(closes[-20:], min(20, len(closes[-20:]))) if len(closes) >= 20 else e1
-            slope = (closes[-1] - closes[-6]) / max(closes[-6], 1e-9)
-            if e1 > e2 and slope > 0:
-                return "bullish", min(1.0, abs(slope) * 25.0)
-            if e1 < e2 and slope < 0:
-                return "bearish", min(1.0, abs(slope) * 25.0)
-            return "neutral", min(1.0, abs(slope) * 10.0)
-
-        h1_trend, h1_conf = _trend(c1h)
-        h4_trend, h4_conf = _trend(c4h if c4h else c1h)
-
-        # premium/discount using 1H/4H range midpoint
-        base_rows = c4h if len(c4h) >= 10 else c1h
-        if not base_rows:
-            base_rows = c15 if c15 else c5
-        if base_rows:
-            hi = max(r[2] for r in base_rows)
-            lo = min(r[3] for r in base_rows)
-            mid = (hi + lo) / 2.0
-            last_price = c1[-1][4] if c1 else (c5[-1][4] if c5 else (c15[-1][4] if c15 else 0.0))
-            htf_zone = "discount" if last_price < mid else "premium"
-        else:
-            htf_zone = "neutral"
-
-        s15 = detect_structure(c15 if c15 else c5)
-        s5 = detect_structure(c5 if c5 else c15)
-
-        if s15.get("bos") == "bullish" or s5.get("bos") == "bullish":
-            ltf_structure = "bos_up"
-        elif s15.get("bos") == "bearish" or s5.get("bos") == "bearish":
-            ltf_structure = "bos_down"
-        else:
-            ltf_structure = "range"
-
-        alignment_score = 0.0
-        if h1_trend != "neutral":
-            alignment_score += 0.25
-        if h4_trend != "neutral":
-            alignment_score += 0.25
-        if h1_trend == h4_trend and h1_trend != "neutral":
-            alignment_score += 0.25
-        if (htf_zone == "discount" and h1_trend == "bullish") or (htf_zone == "premium" and h1_trend == "bearish"):
-            alignment_score += 0.10
-        if (ltf_structure == "bos_up" and h1_trend == "bullish") or (ltf_structure == "bos_down" and h1_trend == "bearish"):
-            alignment_score += 0.15
-
-        return {
-            "htf_trend": h1_trend if h1_trend == h4_trend else ("bullish" if h1_conf >= h4_conf and h1_trend != "neutral" else "bearish" if h4_trend != "neutral" else "neutral"),
-            "htf_zone": htf_zone,
-            "ltf_structure": ltf_structure,
-            "alignment_score": round(_clamp(alignment_score, 0.0, 1.0), 4),
-            "h1": {"trend": h1_trend, "confidence": round(h1_conf, 4)},
-            "h4": {"trend": h4_trend, "confidence": round(h4_conf, 4)},
-        }
-    except Exception:
-        return {
-            "htf_trend": "neutral",
-            "htf_zone": "neutral",
-            "ltf_structure": "range",
-            "alignment_score": 0.0,
-            "h1": {"trend": "neutral", "confidence": 0.0},
-            "h4": {"trend": "neutral", "confidence": 0.0},
-        }
-
-
 def detect_traps(
     orderbook: dict,
     trades: List[dict],
@@ -2408,92 +2315,6 @@ def compute_liquidity_magnet(liquidity_zones: List[dict], price: float) -> Dict[
         return {"target_price": price, "distance": 0.0, "probability": 0.0}
 
 
-def detect_market_regime(candles: Any, volatility: float) -> Dict[str, Any]:
-    """
-    trend | range | expansion | manipulation
-    """
-    try:
-        rows = _to_rows(candles)
-        if len(rows) < 8:
-            return {"type": "range", "confidence": 0.0}
-
-        closes = [r[4] for r in rows]
-        highs = [r[2] for r in rows]
-        lows = [r[3] for r in rows]
-        recent = rows[-20:] if len(rows) >= 20 else rows
-        recent_closes = [r[4] for r in recent]
-        recent_high = max(r[2] for r in recent)
-        recent_low = min(r[3] for r in recent)
-        rng = max(recent_high - recent_low, 1e-9)
-        atr = max(_atr(rows[-30:], 14), 1.0)
-        compression = atr / rng
-        slope = (closes[-1] - closes[-6]) / max(closes[-6], 1e-9) if len(closes) >= 6 else 0.0
-        wickiness = _wick_stats(rows[-1])["upper"] + _wick_stats(rows[-1])["lower"]
-
-        if volatility > 0.02 and abs(slope) > 0.01:
-            rtype = "expansion"
-            conf = min(1.0, 0.55 + volatility * 10.0)
-        elif compression < 0.18 and abs(slope) < 0.006:
-            rtype = "range"
-            conf = min(1.0, 0.55 + (0.18 - compression) * 2.0)
-        elif wickiness > 0.55 and abs(slope) < 0.008:
-            rtype = "manipulation"
-            conf = min(1.0, 0.60 + wickiness * 0.4)
-        else:
-            rtype = "trend"
-            conf = min(1.0, 0.50 + min(abs(slope) * 20.0, 0.35) + min(volatility * 8.0, 0.15))
-
-        return {"type": rtype, "confidence": round(float(_clamp(conf, 0.0, 1.0)), 4)}
-    except Exception:
-        return {"type": "range", "confidence": 0.0}
-
-
-def compute_confluence_score(components: dict) -> float:
-    """
-    0..10 institutional confluence score.
-    """
-    try:
-        smc = components.get("smc_signal")
-        trap = components.get("trap")
-        mtf = components.get("mtf_bias")
-        orderflow = components.get("orderflow")
-        liquidity = components.get("liquidity")
-        volume = components.get("volume")
-        regime = components.get("regime")
-        fvg = components.get("fvg")
-
-        def _norm(x: Any, default: float = 0.0) -> float:
-            if isinstance(x, dict):
-                for k in ("confidence", "strength", "score", "alignment_score", "probability"):
-                    if k in x:
-                        return _clamp(_safe_float(x.get(k), default), 0.0, 1.0)
-                return default
-            return _clamp(_safe_float(x, default), 0.0, 1.0)
-
-        smc_v = _norm(smc)
-        trap_v = _norm(trap)
-        mtf_v = _norm(mtf)
-        of_v = _norm(orderflow)
-        liq_v = _norm(liquidity)
-        vol_v = _norm(volume)
-        reg_v = _norm(regime)
-        fvg_v = _norm(fvg)
-
-        score01 = (
-            smc_v * 0.25
-            + trap_v * 0.20
-            + mtf_v * 0.20
-            + of_v * 0.12
-            + liq_v * 0.10
-            + vol_v * 0.08
-            + fvg_v * 0.03
-            + reg_v * 0.02
-        )
-        return round(float(_clamp(score01 * 10.0, 0.0, 10.0)), 4)
-    except Exception:
-        return 0.0
-
-
 class SMCLearningMemory:
     """
     Lightweight adaptive learning memory.
@@ -2569,55 +2390,6 @@ def update_model_weights(trade_outcome: dict):
 
 def update_learning_memory(trade_result: dict):
     return update_model_weights(trade_result)
-
-
-def score_setup(
-    structure: Dict[str, Any],
-    liquidity: Dict[str, Any],
-    trap: Dict[str, Any],
-    fib_zone: Dict[str, Any],
-    volume_intel: Optional[Dict[str, Any]],
-    market_state: Optional[Dict[str, Any]],
-) -> Dict[str, Any]:
-    features = {
-        "market_state": str((market_state or {}).get("state", "unknown")),
-        "trap_type": trap.get("trap_type") or "none",
-        "fib_in_zone": bool(fib_zone.get("in_zone")),
-        "sweep": bool(trap.get("trap")),
-    }
-
-    base = 0.0
-    reasons = []
-
-    if structure.get("trend") in ("bullish", "bearish"):
-        base += 2.0
-        reasons.append("trend_aligned")
-    if structure.get("bos") or structure.get("choch"):
-        base += 2.0
-        reasons.append("structure_shift")
-    if trap.get("trap"):
-        base += 2.0
-        reasons.append("trap_detected")
-    if fib_zone.get("in_zone") and fib_zone.get("rejected"):
-        base += 2.0
-        reasons.append("fib_rejection")
-    if volume_intel and (volume_intel.get("volume_spike") or volume_intel.get("volume_explosion")):
-        base += 1.0
-        reasons.append("volume_support")
-    if market_state and str(market_state.get("state", "")).upper() not in ("CHOPPY", "RANGING"):
-        base += 1.0
-        reasons.append("market_ok")
-
-    learning_boost = _LEARNING.adjust(features)
-    adjusted = _clamp(base + learning_boost, 0.0, 10.0)
-
-    return {
-        "score": int(round(adjusted)),
-        "raw_score": round(base, 2),
-        "learning_boost": round(learning_boost, 3),
-        "reasons": reasons,
-        "features": features,
-    }
 
 
 def build_risk_plan(
@@ -3384,7 +3156,8 @@ def evaluate_smc_sniper(
 # DEPRECATED (moved to signal_engine) — kept for backward compatibility
 def detect_entry_trigger(price, liquidity_map, engines, ai_score, confidence, volume_intel=None):
     try:
-        smc = (engines or {}).get("smc_signal") or {}
+        engines = engines or {}
+        smc = engines.get("smc_signal") or {}
         if smc.get("signal") in ("LONG", "SHORT") and _safe_float(smc.get("confidence", 0)) >= 8:
             return {
                 "trigger": True,
@@ -3524,32 +3297,41 @@ def run_all_engines(
             trades=trades,
             use_exchange=False,
         )
+        vol_intel = vol_intel or {}
 
         # Candle frames
         if isinstance(ohlcv_data, dict):
-            candles_by_tf = dict(ohlcv_data)
-            candles_by_tf.setdefault("1m", _to_rows(ohlcv_data.get("1m") or ohlcv_data.get("primary") or []))
-            candles_by_tf.setdefault("5m", _to_rows(ohlcv_data.get("5m") or []))
-            candles_by_tf.setdefault("15m", _to_rows(ohlcv_data.get("15m") or []))
-            candles_by_tf.setdefault("1h", _to_rows(ohlcv_data.get("1h") or []))
-        else:
-            base = _to_rows(ohlcv_data)
             candles_by_tf = {
-                "1m": _aggregate_ohlcv(base, 1),
-                "5m": _aggregate_ohlcv(base, 5),
-                "15m": _aggregate_ohlcv(base, 15),
-                "1h": _aggregate_ohlcv(base, 60),
-                "4h": _aggregate_ohlcv(base, 240),
+                "1m": _to_rows(ohlcv_data.get("1m") or ohlcv_data.get("primary") or []),
+                "5m": _to_rows(ohlcv_data.get("5m") or []),
+                "15m": _to_rows(ohlcv_data.get("15m") or []),
+                "1h": _to_rows(ohlcv_data.get("1h") or []),
+                "4h": _to_rows(ohlcv_data.get("4h") or []),
+            }
+            if not candles_by_tf["1m"]:
+                candles_by_tf["1m"] = _normalize_rows_input(ohlcv_data)
+            candles_by_tf["5m"] = candles_by_tf["5m"] or _aggregate_rows(candles_by_tf["1m"], 5)
+            candles_by_tf["15m"] = candles_by_tf["15m"] or _aggregate_rows(candles_by_tf["1m"], 15)
+            candles_by_tf["1h"] = candles_by_tf["1h"] or _aggregate_rows(candles_by_tf["1m"], 60)
+            candles_by_tf["4h"] = candles_by_tf["4h"] or _aggregate_rows(candles_by_tf["1m"], 240)
+        else:
+            base = _normalize_rows_input(ohlcv_data)
+            candles_by_tf = {
+                "1m": _aggregate_rows(base, 1),
+                "5m": _aggregate_rows(base, 5),
+                "15m": _aggregate_rows(base, 15),
+                "1h": _aggregate_rows(base, 60),
+                "4h": _aggregate_rows(base, 240),
             }
 
-        primary_1m = candles_by_tf.get("1m") or candles_by_tf.get("primary") or ohlcv_data or recent_candles
-        primary_15m = candles_by_tf.get("15m") or _aggregate_ohlcv(primary_1m, 15)
+        primary_1m = candles_by_tf.get("1m") or candles_by_tf.get("primary") or _normalize_rows_input(ohlcv_data) or _normalize_rows_input(recent_candles)
+        primary_15m = candles_by_tf.get("15m") or _aggregate_rows(primary_1m, 15)
 
-        liquidity_map = predict_liquidity_map(orderbook, price, depth=10)
-        gravity = liquidity_gravity_engine(orderbook, price, depth=10)
-        sweep = detect_liquidity_sweep(trades, price, threshold_usd=50_000)
-        liq_track = track_liquidations(trades, price, lookback=100)
-        liq_events = liquidation_stream_processor(liquidation_events or [])
+        liquidity_map = predict_liquidity_map(orderbook, price, depth=10) or {}
+        gravity = liquidity_gravity_engine(orderbook, price, depth=10) or {}
+        sweep = detect_liquidity_sweep(trades, price, threshold_usd=50_000) or {}
+        liq_track = track_liquidations(trades, price, lookback=100) or {}
+        liq_events = liquidation_stream_processor(liquidation_events or []) or {}
         liquid_cluster_usd = _safe_float(liq_track.get("total_liq", 0.0)) + _safe_float(liq_events.get("total_liquidations", 0.0))
         oi_value = _safe_float(current_oi if current_oi is not None else open_interest, 1_000_000.0) if (current_oi if current_oi is not None else open_interest) else 1_000_000.0
         liq_clusters = detect_liquidation_clusters(
@@ -3558,18 +3340,18 @@ def run_all_engines(
             funding_rate=fr,
             cascade_prob=_safe_float(cascade_prob, 0.0),
         )
-        stop_hunt = detect_stop_hunt(orderbook, trades, recent_candles=ohlcv_data)
-        absorption = detect_smart_money_absorption(orderbook, trades)
-        smart = smart_money_detection_engine(orderbook, trades, price)
-        smart_abs = smart_money_absorption_engine(orderbook, trades, price)
+        stop_hunt = detect_stop_hunt(orderbook, trades, recent_candles=ohlcv_data) or {}
+        absorption = detect_smart_money_absorption(orderbook, trades) or {}
+        smart = smart_money_detection_engine(orderbook, trades, price) or {}
+        smart_abs = smart_money_absorption_engine(orderbook, trades, price) or {}
         spoof_details = _detect_spoofing_details(orderbook_snapshots if orderbook_snapshots is not None else [orderbook])
         spoof = spoof_details
         best_bid, best_ask = _best_bid_ask(orderbook)
         bid_vol, ask_vol = _book_volumes(orderbook, depth=10)
         ob_imbalance = (bid_vol - ask_vol) / (bid_vol + ask_vol + 1e-9)
-        ofp = order_flow_pressure_engine(orderbook, trades, price)
-        imb = order_imbalance_engine(orderbook)
-        mm = market_maker_position_model(ofp, imb, liquidity_map, price)
+        ofp = order_flow_pressure_engine(orderbook, trades, price) or {}
+        imb = order_imbalance_engine(orderbook) or {}
+        mm = market_maker_position_model(ofp, imb, liquidity_map, price) or {}
         oi_hist = list(oi_history or [])
         if current_oi is None:
             current_oi = _safe_float(open_interest, 0.0)
@@ -3577,7 +3359,7 @@ def run_all_engines(
             current_oi=current_oi,
             oi_history=oi_hist or [current_oi * 0.98, current_oi],
             price=price,
-        )
+        ) or {}
         cprob = _safe_float(cascade_prob, 0.0)
         if cprob <= 0.0:
             cprob = get_cascade_probability(
@@ -3593,11 +3375,11 @@ def run_all_engines(
             )
         spread_pct = _spread_pct(orderbook, price)
         heatmap = liquidation_heatmap_engine(
-            liquidation_cluster=liq_track["total_liq"] + liq_events["total_liquidations"],
+            liquidation_cluster=_safe_float(liq_track.get("total_liq", 0.0)) + _safe_float(liq_events.get("total_liquidations", 0.0)),
             open_interest=oi_value,
             funding_rate=fr,
             spread_pct=spread_pct,
-        )
+        ) or {}
         _msd = market_state_detector if market_state_detector is not None else MarketStateDetector()
         market_state = _msd.detect(
             MarketSnapshot(
@@ -3606,15 +3388,17 @@ def run_all_engines(
                 orderbook=orderbook,
                 trades=trades,
                 candles={
-                    "1m": _aggregate_ohlcv(ohlcv_data, 1),
-                    "3m": _aggregate_ohlcv(ohlcv_data, 3),
-                    "5m": _aggregate_ohlcv(ohlcv_data, 5),
-                    "15m": _aggregate_ohlcv(ohlcv_data, 15),
+                    "1m": primary_1m,
+                    "3m": _aggregate_rows(primary_1m, 3),
+                    "5m": candles_by_tf.get("5m") or _aggregate_rows(primary_1m, 5),
+                    "15m": primary_15m,
                 },
                 open_interest=_safe_float(current_oi if current_oi is not None else open_interest, 0.0),
                 funding_rate=fr,
             )
         )
+        market_state = market_state or {}
+
         strategy = strategy_optimization_engine(
             volatility=_estimate_volatility_from_ohlcv(ohlcv_data),
             recent_performance=performance or {},
@@ -3623,23 +3407,25 @@ def run_all_engines(
             order_imbalance=imb.get("imbalance", 0.0),
         )
 
-        liquidity_intent = analyze_liquidity_intent(orderbook, trades, candles_by_tf)
-        mtf_bias = compute_mtf_bias(candles_by_tf)
-        trap = detect_traps(orderbook, trades, primary_1m, vol_intel)
-        fvg_15 = detect_fvg(primary_15m)
-        fvg_5 = detect_fvg(candles_by_tf.get("5m") or primary_1m)
+        liquidity_intent = analyze_liquidity_intent(orderbook, trades, candles_by_tf) or {}
+        mtf_bias = compute_mtf_bias(candles_by_tf) or {}
+        trap = detect_traps(orderbook, trades, primary_1m, vol_intel) or {}
+        fvg_15 = detect_fvg(primary_15m) or {}
+        fvg_5 = detect_fvg(candles_by_tf.get("5m") or primary_1m) or {}
         fvg = fvg_15 if fvg_15.get("exists") else fvg_5
-        orderflow = analyze_orderflow(trades, orderbook)
-        regime = detect_market_regime(primary_15m if primary_15m else primary_1m, _estimate_volatility_from_ohlcv(ohlcv_data))
-        liquidity_magnet = compute_liquidity_magnet(liquidity_intent.get("liquidity_zones", []), price)
+        orderflow = analyze_orderflow(trades, orderbook) or {}
+        regime = detect_market_regime(primary_15m if primary_15m else primary_1m, _estimate_volatility_from_ohlcv(ohlcv_data)) or {}
+        liquidity_magnet = compute_liquidity_magnet(liquidity_intent.get("liquidity_zones", []), price) or {}
+        nearest_above = liquidity_intent.get("nearest_above") or {}
+        nearest_below = liquidity_intent.get("nearest_below") or {}
 
         # Proxy order block score
         ob_proxy = {
             "freshness": 1.0,
             "imbalance": 1.0 if orderflow.get("delta", 0.0) > 0 else 0.7,
-            "distance_to_liquidity": liquidity_intent.get("nearest_above", {}).get("distance", 0.0)
+            "distance_to_liquidity": nearest_above.get("distance", 0.0)
             if mtf_bias.get("htf_trend") == "bullish"
-            else liquidity_intent.get("nearest_below", {}).get("distance", 0.0),
+            else nearest_below.get("distance", 0.0),
             "atr": _atr(_to_rows(primary_1m)[-30:], 14),
         }
         ob_score = score_order_block(
@@ -3668,13 +3454,14 @@ def run_all_engines(
             price=price,
             orderbook_snapshots=orderbook_snapshots if orderbook_snapshots else [orderbook],
         )
-        liquidity_score = market_data["liquidity_score"]
+        market_data = market_data or {}
+        liquidity_score = market_data.get("liquidity_score", 0.0)
 
         institutional = institutional_score_engine(
             price=price,
             orderbook=orderbook,
             trades=trades,
-            candles={"1m": _aggregate_ohlcv(ohlcv_data, 1)},
+            candles={"1m": primary_1m},
             open_interest=oi_value,
             funding_rate=fr,
             volume_intel=vol_intel,
@@ -3696,6 +3483,8 @@ def run_all_engines(
             market_maker=mm,
         )
 
+        institutional = institutional or {}
+
         smc_signal = evaluate_smc_sniper(
             candles_by_tf=candles_by_tf,
             orderbook=orderbook,
@@ -3706,6 +3495,8 @@ def run_all_engines(
             engines_out={},
             use_learning=True,
         )
+
+        smc_signal = smc_signal or {}
 
         # If SMC is strong, use it to set the composite direction.
         if smc_signal.get("signal") in ("LONG", "SHORT") and _safe_float(smc_signal.get("confidence", 0)) >= 7:
@@ -3762,11 +3553,11 @@ def run_all_engines(
             "funding_trap": funding_trap_detector(fr, price, cprob),
             "spoof": spoof,
             "market_data": market_data,
-            "liquidity_score": market_data["liquidity_score"],
-            "imbalance": market_data["imbalance"],
-            "spread_pct": market_data["spread_pct"],
-            "spoof_detected": market_data["spoof_detected"],
-            "spoof_details": market_data["spoof_details"],
+            "liquidity_score": market_data.get("liquidity_score", 0.0),
+            "imbalance": market_data.get("imbalance", 0.0),
+            "spread_pct": market_data.get("spread_pct", 0.0),
+            "spoof_detected": market_data.get("spoof_detected", False),
+            "spoof_details": market_data.get("spoof_details", {}),
             "volume_intelligence": vol_intel,
             "volume_spike": vol_intel.get("volume_spike", False),
             "volume_explosion": vol_intel.get("volume_explosion", False),
