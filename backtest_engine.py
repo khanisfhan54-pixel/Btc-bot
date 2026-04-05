@@ -11,6 +11,7 @@ try:
     from signal_engine import SignalEngine
     from execution import ExecutionLogic
     from meta_filter import MetaFilter
+    from learning_engine import LEARNING_ENGINE
 except Exception as _be_import_err:
     import logging as _be_log
     _be_log.getLogger(__name__).warning("backtest_engine: module import failed (%s) — BacktestEngine unusable", _be_import_err)
@@ -18,6 +19,7 @@ except Exception as _be_import_err:
     SignalEngine = None  # type: ignore[assignment,misc]
     ExecutionLogic = None  # type: ignore[assignment,misc]
     MetaFilter = None  # type: ignore[assignment,misc]
+    LEARNING_ENGINE = None  # type: ignore[assignment,misc]
 
 logger = logging.getLogger(__name__)
 
@@ -79,8 +81,9 @@ class BacktestConfig:
 
 
 class BacktestEngine:
-    def __init__(self, config: BacktestConfig | None = None) -> None:
+    def __init__(self, config: BacktestConfig | None = None, learning_engine: Any = None) -> None:
         self.cfg = config or BacktestConfig()
+        self.learning_engine = learning_engine if learning_engine is not None else LEARNING_ENGINE
         self.feature_engine = FeatureEngine()
         self.signal_engine = SignalEngine()
         self.execution_logic = ExecutionLogic()
@@ -186,6 +189,26 @@ class BacktestEngine:
                 dd = (peak - balance) / peak if peak > 0 else 0.0
                 max_dd = max(max_dd, dd)
                 returns.append(net_pnl_pct)
+                le = getattr(self, "learning_engine", None)
+                if le and hasattr(le, "record_closed_trade"):
+                    try:
+                        le.record_closed_trade(
+                            trade_id=position.get("trade_id"),
+                            side=position.get("side"),
+                            entry_price=position.get("entry"),
+                            exit_price=current_price,
+                            size=position.get("size"),
+                            pnl=net_pnl_pct,
+                            pnl_abs=pnl,
+                            fees=position.get("fees"),
+                            fee_type=position.get("fee_type"),
+                            hold_time=hold,
+                            signal=position.get("signal"),
+                            features=position.get("entry_features"),
+                            meta=position.get("meta"),
+                        )
+                    except Exception as e:
+                        logger.warning("learning_engine failure: %s", str(e))
                 trade_log.append(
                     {
                         "entry_index": position["entry_index"],
