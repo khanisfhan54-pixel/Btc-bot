@@ -797,44 +797,23 @@ class ExecutionEngine:
                 )
 
                 le = getattr(self, "learning_engine", None)
-                if le and hasattr(le, "record_execution_quality"):
+                if le and hasattr(le, "record_execution_feedback"):
                     try:
                         execution_score = _features.get("execution_score", 0.0)
                         slippage = _safe_float(_features.get("slippage_bps", 0.0))
                         latency = _safe_float(_features.get("latency_ms", 0.0))
-                        spread = _safe_float(_features.get("spread_bps", 0.0))
-                        le.record_execution_quality(
+                        le.record_execution_feedback(
                             score=execution_score,
                             slippage_bps=slippage,
                             latency_ms=latency,
-                            spread_bps=spread,
+                            filled_qty=filled_size,
+                            requested_qty=position_size,
                             side=side,
                             reason="post_trade_execution"
                         )
                     except Exception as exc:
                         logger.warning("[LEARNING] post_exec feedback failed: %s", exc)
 
-                le_fb = getattr(self, "learning_engine", None)
-                if le_fb and hasattr(le_fb, "record_execution_feedback"):
-                    try:
-                        le_fb.record_execution_feedback(
-                            signal=signal,
-                            side=side,
-                            intended_price=price,
-                            executed_price=executed_price,
-                            intended_size=position_size,
-                            filled_size=filled_size,
-                            features=_features,
-                            meta_result=_meta,
-                            status=fill_status,
-                            latency_ms=_safe_float(_features.get("latency_ms", 0.0)),
-                            order_type="market",
-                            pnl=None,
-                            order_id=(result.get("entry_order", {}) or {}).get("id")
-                            if isinstance(result, dict) else None,
-                        )
-                    except Exception as exc:
-                        logger.warning("[LEARNING] live feedback record failed: %s", exc)
             else:
                 result = {"executed": True, "paper": True}
                 simulated_slippage_bps = _safe_float(_features.get("spread_bps", 0.0)) * 0.35
@@ -844,43 +823,22 @@ class ExecutionEngine:
                     else price * (1.0 - simulated_slippage_bps / 10_000.0)
                 )
                 le = getattr(self, "learning_engine", None)
-                if le and hasattr(le, "record_execution_quality"):
+                if le and hasattr(le, "record_execution_feedback"):
                     try:
                         execution_score = _features.get("execution_score", 0.0)
                         slippage = _safe_float(_features.get("slippage_bps", 0.0))
                         latency = _safe_float(_features.get("latency_ms", 0.0))
-                        spread = _safe_float(_features.get("spread_bps", 0.0))
-                        le.record_execution_quality(
+                        le.record_execution_feedback(
                             score=execution_score,
                             slippage_bps=slippage,
                             latency_ms=latency,
-                            spread_bps=spread,
+                            filled_qty=position_size,
+                            requested_qty=position_size,
                             side=side,
-                            reason="post_trade_execution"
+                            reason="paper_execution"
                         )
                     except Exception as exc:
                         logger.warning("[LEARNING] post_exec paper feedback failed: %s", exc)
-
-                le_fb = getattr(self, "learning_engine", None)
-                if le_fb and hasattr(le_fb, "record_execution_feedback"):
-                    try:
-                        le_fb.record_execution_feedback(
-                            signal=signal,
-                            side=side,
-                            intended_price=price,
-                            executed_price=sim_price,
-                            intended_size=position_size,
-                            filled_size=position_size,
-                            features=_features,
-                            meta_result=_meta,
-                            status="paper",
-                            latency_ms=_safe_float(_features.get("latency_ms", 0.0)),
-                            order_type="paper",
-                            pnl=None,
-                            order_id="paper",
-                        )
-                    except Exception as exc:
-                        logger.warning("[LEARNING] paper feedback record failed: %s", exc)
 
             send_telegram_message(
                 f"✅ Liquidity trade placed\n\n"
