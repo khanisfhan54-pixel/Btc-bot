@@ -613,6 +613,7 @@ class MetaFilter:
         elif regime == "trend":
             direction_bonus = -0.05
 
+        direction_bonus *= confidence
         score += direction_bonus
 
         if regime_info["regime"] in ("toxic", "illiquid"):
@@ -623,6 +624,8 @@ class MetaFilter:
             score *= 0.98
 
         score *= _clamp(_safe_float(adaptive.get("meta_strictness", 1.0)), 0.75, 1.35)
+
+        score = min(score, 1.5)
 
         return {
             "score": round(_clamp(score, 0.0, 1.5), 6),
