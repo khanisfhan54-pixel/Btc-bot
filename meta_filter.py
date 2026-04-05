@@ -20,6 +20,7 @@ meta_state always contains `position_scale` for execution.py sizing.
 from __future__ import annotations
 
 import logging
+import random
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
@@ -306,8 +307,7 @@ class MetaFilter:
         # ── RL adaptive score gate ───────────────────────────────────────
         if allow_trade:
             _min_conf = _clamp(_safe_float(adaptive.get("confidence_threshold", 0.60)), 0.45, 0.85)
-            if _safe_float(score_info.get("score", 0.0)) < _min_conf:
-                import random
+            if _safe_float(score_info.get("score", 0.0)) < (_min_conf * 0.9):
                 if trades_seen < 50 and random.random() < 0.08:
                     allow_trade = True
                     risk_scale = max(risk_scale, 0.25)
@@ -588,6 +588,8 @@ class MetaFilter:
         toxicity    = _clamp(max(_safe_float(f.get("toxicity", f.get("vpin", 0.0))), 0.0), 0.0, 2.0)
         fill_prob   = _clamp(_safe_float(f.get("fill_prob", f.get("fill_probability", 0.5))), 0.0, 1.0)
         impact_cost = max(_safe_float(f.get("impact_cost_bps", 0.0)), 0.0)
+        confluence = _clamp(_safe_float(f.get("confluence_score", 0.0)) / 10.0, 0.0, 1.0)
+        institutional = _clamp(_safe_float(f.get("institutional_score", 0.0)) / 10.0, 0.0, 1.0)
 
         score  = 0.0
         score += confidence  * 0.30
@@ -597,6 +599,21 @@ class MetaFilter:
         score += fill_prob   * 0.16
         score += max(0.0, 1.0 - min(1.0, toxicity)) * 0.10
         score += max(0.0, 1.0 - min(1.0, impact_cost / 25.0)) * 0.10
+        score += confluence * 0.12
+        score += institutional * 0.10
+
+        side = str(signal.get("signal", "")).upper()
+        regime = regime_info.get("regime")
+        direction_bonus = 0.0
+
+        if side in ("LONG", "BUY") and regime in ("trend", "accumulation"):
+            direction_bonus = 0.05
+        elif side in ("SHORT", "SELL") and regime in ("distribution"):
+            direction_bonus = 0.05
+        elif regime == "trend":
+            direction_bonus = -0.05
+
+        score += direction_bonus
 
         if regime_info["regime"] in ("toxic", "illiquid"):
             score *= 0.70
@@ -617,6 +634,9 @@ class MetaFilter:
                 "toxicity":        round(toxicity,     6),
                 "fill_prob":       round(fill_prob,    6),
                 "impact_cost_bps": round(impact_cost,  6),
+                "confluence":      round(confluence,   6),
+                "institutional":   round(institutional, 6),
+                "direction_bonus": round(direction_bonus, 6),
             },
             "reason": "ok",
         }
