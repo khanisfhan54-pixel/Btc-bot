@@ -111,6 +111,13 @@ class LearningEngine:
             "total_trades": 0,
             "last_update_reason": "init",
             "valid_r_sample_size": 0,
+            "execution_rolling_stats": {
+                "slippage_bps_avg": 0.0,
+                "latency_ms_avg": 0.0,
+                "fill_rate": 0.0,
+                "execution_score_avg": 0.5,
+                "samples": 0,
+            },
         }
 
         self._load()
@@ -142,6 +149,16 @@ class LearningEngine:
                     # Ensure valid_r_sample_size is present
                     if "valid_r_sample_size" not in self.state or self.state["valid_r_sample_size"] is None:
                         self.state["valid_r_sample_size"] = 0
+                    ers = self.state.get("execution_rolling_stats", {})
+                    if not isinstance(ers, dict):
+                        ers = {}
+                    self.state["execution_rolling_stats"] = {
+                        "slippage_bps_avg": _clamp(_safe_float(ers.get("slippage_bps_avg", 0.0)), 0.0, 10000.0),
+                        "latency_ms_avg": _clamp(_safe_float(ers.get("latency_ms_avg", 0.0)), 0.0, 60000.0),
+                        "fill_rate": _clamp(_safe_float(ers.get("fill_rate", 0.0)), 0.0, 1.0),
+                        "execution_score_avg": _clamp(_safe_float(ers.get("execution_score_avg", 0.5)), 0.0, 1.0),
+                        "samples": int(max(0.0, _safe_float(ers.get("samples", 0)))),
+                    }
 
                     for item in data.get("recent_trades", [])[-self.cfg.window_size:]:
                         if isinstance(item, dict):
@@ -247,6 +264,13 @@ class LearningEngine:
                 "total_trades": 0,
                 "last_update_reason": "reset_safe",
                 "valid_r_sample_size": 0,
+                "execution_rolling_stats": {
+                    "slippage_bps_avg": 0.0,
+                    "latency_ms_avg": 0.0,
+                    "fill_rate": 0.0,
+                    "execution_score_avg": 0.5,
+                    "samples": 0,
+                },
             }
         )
 
@@ -470,6 +494,9 @@ class LearningEngine:
 
     def get_adaptive_params(self) -> Dict[str, Any]:
         self._recompute()
+        execution_stats = self.state.get("execution_rolling_stats", {})
+        if not isinstance(execution_stats, dict):
+            execution_stats = {}
         return {
             "risk_scale": _clamp(_safe_float(self.state.get("risk_scale", 1.0)), self.cfg.min_risk_scale, self.cfg.max_risk_scale),
             "confidence_threshold": _clamp(_safe_float(self.state.get("confidence_threshold", 0.60)), self.cfg.min_confidence_threshold, self.cfg.max_confidence_threshold),
@@ -480,6 +507,10 @@ class LearningEngine:
             "last_avg_slippage_bps": _safe_float(self.state.get("last_avg_slippage_bps", 0.0)),
             "last_avg_fill_quality": _safe_float(self.state.get("last_avg_fill_quality", 0.0)),
             "regime_bias": self.state.get("regime_bias", {}),
+            "execution_quality": _clamp(_safe_float(execution_stats.get("execution_score_avg", 0.5)), 0.0, 1.0),
+            "execution_slippage": _clamp(_safe_float(execution_stats.get("slippage_bps_avg", 0.0)), 0.0, 10000.0),
+            "execution_latency": _clamp(_safe_float(execution_stats.get("latency_ms_avg", 0.0)), 0.0, 60000.0),
+            "execution_fill_rate": _clamp(_safe_float(execution_stats.get("fill_rate", 0.0)), 0.0, 1.0),
         }
 
     def get_policy(self):
@@ -842,8 +873,107 @@ class LearningEngine:
         side: str = "LONG",
         reason: str = "unknown",
     ) -> None:
+        self.record_execution_feedback(
+            score=score,
+            slippage_bps=slippage_bps,
+            latency_ms=latency_ms,
+            fill_rate=1.0,
+            spread_bps=spread_bps,
+            side=side,
+            reason=reason,
+        )
+
+    def record_execution_feedback(
+        self,
+        score: float = 0.5,
+        *,
+        slippage_bps: float = 0.0,
+        latency_ms: float = 0.0,
+        fill_rate: Optional[float] = None,
+        spread_bps: float = 0.0,
+        side: str = "LONG",
+        reason: str = "unknown",
+        filled_qty: Optional[float] = None,
+        requested_qty: Optional[float] = None,
+        fill_quality: Optional[float] = None,
+        filled_ratio: Optional[float] = None,
+        **kwargs: Any,
+    ) -> None:
         score = _clamp(_safe_float(score, 0.5), 0.0, 1.0)
+        slippage_bps = _clamp(abs(_safe_float(slippage_bps, 0.0)), 0.0, 500.0)
+        latency_ms = _clamp(_safe_float(latency_ms, 0.0), 0.0, 10000.0)
+        side = str(side or "LONG").upper()
+        reason = str(reason or "unknown").lower()
+        spread_bps = _clamp(_safe_float(spread_bps, 0.0), 0.0, 500.0)
+
+        computed_fill_rate: Optional[float] = None
+        req = _safe_float(requested_qty, 0.0)
+        if req > 0 and filled_qty is not None:
+            computed_fill_rate = _safe_float(filled_qty, 0.0) / req
+        elif fill_rate is not None:
+            computed_fill_rate = _safe_float(fill_rate, 0.0)
+        elif filled_ratio is not None:
+            computed_fill_rate = _safe_float(filled_ratio, 0.0)
+        fill_rate_clamped = _clamp(_safe_float(computed_fill_rate, 0.0), 0.0, 1.0)
+
+        fill_quality_value = _safe_float(fill_quality, score)
+        fill_quality_value = _clamp(fill_quality_value, 0.0, 1.0)
+
+        feedback = {
+            "score": score,
+            "slippage_bps": slippage_bps,
+            "latency_ms": latency_ms,
+            "fill_rate": fill_rate_clamped,
+            "fill_quality": fill_quality_value,
+            "filled_ratio": fill_rate_clamped,
+            "spread_bps": spread_bps,
+            "side": side,
+            "reason": reason,
+        }
+        self.exec_feedback.append(feedback)
         self.exec_quality_scores.append(score)
+
+        stats = self.state.get("execution_rolling_stats", {})
+        if not isinstance(stats, dict):
+            stats = {}
+        samples = int(max(0.0, _safe_float(stats.get("samples", 0))))
+        prev_slip = _clamp(_safe_float(stats.get("slippage_bps_avg", 0.0)), 0.0, 10000.0)
+        prev_lat = _clamp(_safe_float(stats.get("latency_ms_avg", 0.0)), 0.0, 60000.0)
+        prev_fill = _clamp(_safe_float(stats.get("fill_rate", 0.0)), 0.0, 1.0)
+        prev_score = _clamp(_safe_float(stats.get("execution_score_avg", 0.5)), 0.0, 1.0)
+        new_samples = samples + 1
+
+        if samples <= 0:
+            slippage_avg = slippage_bps
+            latency_avg = latency_ms
+            fill_avg = fill_rate_clamped
+            score_avg = score
+        elif samples < 20:
+            inv_n = 1.0 / max(1, new_samples)
+            slippage_avg = prev_slip + (slippage_bps - prev_slip) * inv_n
+            latency_avg = prev_lat + (latency_ms - prev_lat) * inv_n
+            fill_avg = prev_fill + (fill_rate_clamped - prev_fill) * inv_n
+            score_avg = prev_score + (score - prev_score) * inv_n
+        else:
+            alpha = 0.10
+            slippage_avg = prev_slip + alpha * (slippage_bps - prev_slip)
+            latency_avg = prev_lat + alpha * (latency_ms - prev_lat)
+            fill_avg = prev_fill + alpha * (fill_rate_clamped - prev_fill)
+            score_avg = prev_score + alpha * (score - prev_score)
+
+        self.state["execution_rolling_stats"] = {
+            "slippage_bps_avg": round(_clamp(slippage_avg, 0.0, 10000.0), 6),
+            "latency_ms_avg": round(_clamp(latency_avg, 0.0, 60000.0), 6),
+            "fill_rate": round(_clamp(fill_avg, 0.0, 1.0), 6),
+            "execution_score_avg": round(_clamp(score_avg, 0.0, 1.0), 6),
+            "samples": new_samples,
+        }
+
+        self.side_exec_stats[side]["slippage_bps_sum"] += slippage_bps
+        self.side_exec_stats[side]["fill_quality_sum"] += fill_quality_value
+        self.side_exec_stats[side]["filled_ratio_sum"] += fill_rate_clamped
+        self.side_exec_stats[side]["latency_ms_sum"] += latency_ms
+        self.side_exec_stats[side]["count"] += 1.0
 
         n = len(self.exec_quality_scores)
         if n % self.cfg.save_every_n == 0:
