@@ -234,6 +234,21 @@ except Exception as _ptq_err:
     logger.warning("PRE_TRADE_QUALITY_ENGINE import failed: %s", _ptq_err)
     PRE_TRADE_QUALITY_ENGINE = None
 
+try:
+    from capital_allocator import CapitalAllocator
+except Exception as _ca_err:
+    logger.warning("capital_allocator import failed: %s", _ca_err)
+
+    class CapitalAllocator:
+        def allocate(self, **kwargs):
+            return {
+                "capital_scale": 1.0,
+                "risk_per_trade": 0.0,
+                "max_exposure": _safe_float(kwargs.get("account_equity", 0.0)),
+                "allow_trading": True,
+                "reason": "fallback_allocator",
+            }
+
 engine           = ExecutionEngine()
 feature_engine   = FeatureEngine()
 signal_engine    = SignalEngine()
@@ -244,6 +259,7 @@ order_router     = OrderRouter()
 impact_tracker   = ImpactDecay()
 position_manager = PositionManager()
 trade_lifecycle  = TradeLifecycleManager()
+capital_allocator = CapitalAllocator()
 
 try:
     from engine import (
@@ -1943,6 +1959,43 @@ def run_analysis_cycle(
             _safe_float(decision["position_size"]) / _exec_size_mult,
             _exec_size_mult,
             _safe_float(decision["position_size"]),
+        )
+
+    if decision.get("execute", False) and normalized_signal in ("LONG", "SHORT"):
+        capital_decision = capital_allocator.allocate(
+            learning_params=learning_params,
+            meta_result=meta_result,
+            features=feat_dict,
+            current_drawdown=_safe_float(lifecycle.get("drawdown", 0.0)),
+            account_equity=balance,
+        )
+
+        if not capital_decision.get("allow_trading", True):
+            decision["execute"] = False
+            decision["reason"] = f"{decision.get('reason','')}|capital_blocked:{capital_decision.get('reason')}"
+
+        if decision.get("execute", False) and normalized_signal in ("LONG", "SHORT"):
+            if decision.get("position_size", 0.0) > 0:
+                decision["position_size"] = (
+                    _safe_float(decision["position_size"])
+                    * _safe_float(capital_decision.get("capital_scale", 1.0))
+                )
+
+            max_exposure = _safe_float(capital_decision.get("max_exposure", balance))
+            notional = (
+                _safe_float(decision.get("position_size", 0.0))
+                * _safe_float(current_price)
+            )
+            if notional > max_exposure:
+                decision["position_size"] = max_exposure / max(_safe_float(current_price), 1e-9)
+                decision["reason"] = f"{decision.get('reason','')}|clamped_by_capital_allocator"
+
+        logger.info(
+            "[CAPITAL] scale=%.3f allow=%s max_exp=%.2f reason=%s",
+            capital_decision.get("capital_scale"),
+            capital_decision.get("allow_trading"),
+            capital_decision.get("max_exposure"),
+            capital_decision.get("reason"),
         )
 
     # ── Liquidation engine + pre-trade quality gate ──────────────────
