@@ -191,6 +191,54 @@ class MetaFilter:
                 _safe_float(adaptive.get("meta_strictness", 1.0)) - 0.03, 0.75, 1.35
             )
 
+        # ── Execution-feedback adaptive modifiers (safe / optional) ─────
+        execution_samples = _safe_float(
+            adaptive.get("execution_samples", adaptive.get("execution_feedback_samples", 0))
+        )
+        has_execution_feedback = execution_samples > 0
+        if execution_samples <= 0:
+            has_execution_feedback = (
+                adaptive.get("execution_quality") is not None
+                and adaptive.get("execution_fill_rate") is not None
+                and adaptive.get("execution_slippage") is not None
+                and adaptive.get("execution_latency") is not None
+                and _safe_float(adaptive.get("execution_quality", 0.5)) != 0.5
+            )
+        execution_conf_tighten = 0.0
+        if has_execution_feedback:
+            exec_quality_raw  = adaptive.get("execution_quality", None)
+            exec_slippage_raw = adaptive.get("execution_slippage", None)
+            exec_latency_raw  = adaptive.get("execution_latency", None)
+            exec_fill_raw     = adaptive.get("execution_fill_rate", None)
+
+            risk_mod = 1.0
+
+            if exec_quality_raw is not None:
+                exec_quality = _clamp(_safe_float(exec_quality_raw, 0.5), 0.0, 1.0)
+                risk_mod += (exec_quality - 0.5) * 0.12  # ±6% max
+
+            if exec_fill_raw is not None:
+                exec_fill_rate = _clamp(_safe_float(exec_fill_raw, 0.5), 0.0, 1.0)
+                risk_mod += (exec_fill_rate - 0.5) * 0.06  # ±3% max
+
+            if exec_latency_raw is not None:
+                exec_latency = max(_safe_float(exec_latency_raw, 0.0), 0.0)
+                lat_tighten = _clamp((exec_latency - 700.0) / 5000.0, 0.0, 0.06)
+                execution_conf_tighten += lat_tighten
+                risk_mod -= lat_tighten
+
+            if exec_slippage_raw is not None:
+                exec_slippage = max(_safe_float(exec_slippage_raw, 0.0), 0.0)
+                slip_tighten = _clamp((exec_slippage - 2.0) / 30.0, 0.0, 0.06)
+                execution_conf_tighten += slip_tighten
+                risk_mod -= slip_tighten
+
+            adaptive["risk_scale"] = _clamp(
+                _safe_float(adaptive.get("risk_scale", 1.0)) * _clamp(risk_mod, 0.88, 1.08),
+                0.5,
+                1.5,
+            )
+
         # =========================================================
         # Threshold block (confidence threshold logic, PATCHED)
         # =========================================================
@@ -209,6 +257,7 @@ class MetaFilter:
         win_rate = _clamp(_safe_float(policy.get("win_rate", 0.5)), 0.0, 1.0)
 
         confidence_threshold *= (1 + (0.5 - win_rate) * 0.2)
+        confidence_threshold += _clamp(execution_conf_tighten, 0.0, 0.08)
 
         # 🔥 FINAL SAFETY CLAMP
         confidence_threshold = _clamp(confidence_threshold, 0.40, 0.85)
