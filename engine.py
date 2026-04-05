@@ -40,24 +40,29 @@ try:
 except Exception:
     websocket = None  # type: ignore
 
+_META_FILTER_CLS = None
 try:
     from meta_filter import MetaFilter as _MetaFilter
 
+    _META_FILTER_CLS = _MetaFilter
     _learning_engine = globals().get("LEARNING_ENGINE")
-
-    if _learning_engine is None:
-        try:
-            _learning_engine = self.learning_engine
-        except Exception as e:
-            logger.warning(
-                "Failed to access learning_engine. Defaulting to None. error=%s",
-                str(e),
-            )
-            _learning_engine = None
 
     META_FILTER = _MetaFilter(learning_engine=_learning_engine)
 except Exception as _meta_import_exc:
     META_FILTER = None
+
+
+def _get_meta_filter() -> Any:
+    global META_FILTER
+    if META_FILTER is not None:
+        return META_FILTER
+    if _META_FILTER_CLS is None:
+        return None
+    try:
+        META_FILTER = _META_FILTER_CLS(learning_engine=globals().get("LEARNING_ENGINE"))
+    except Exception:
+        META_FILTER = None
+    return META_FILTER
 
 
 def evaluate_meta_filter(
@@ -74,10 +79,11 @@ def evaluate_meta_filter(
         "reason": "meta_filter_unavailable",
         "meta_state": {},
     }
-    if META_FILTER is None:
+    _meta_filter = _get_meta_filter()
+    if _meta_filter is None:
         return _fallback
     try:
-        return META_FILTER.evaluate(
+        return _meta_filter.evaluate(
             features=features,
             signal=signal,
             decision=decision,

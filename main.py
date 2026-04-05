@@ -237,7 +237,7 @@ except Exception as _ptq_err:
 engine           = ExecutionEngine()
 feature_engine   = FeatureEngine()
 signal_engine    = SignalEngine()
-execution_engine = ExecutionLogic()
+execution_engine = ExecutionLogic(learning_engine=LEARNING_ENGINE)
 fill_model       = QueueFillModel()
 tox_filter       = ToxicityFilter()
 order_router     = OrderRouter()
@@ -1799,8 +1799,22 @@ def run_analysis_cycle(
 
     institutional = engines_out.get("composite", {}) or {}
 
-    signal_output = signal_engine.generate(feat_dict)
+    try:
+        signal_output = signal_engine.generate(feat_dict)
+    except Exception as _signal_exc:
+        logger.warning("[SIGNAL_ENGINE] generate failed, forcing HOLD: %s", _signal_exc)
+        signal_output = {"signal": "HOLD", "confidence": 0.0, "reason": f"signal_error:{_signal_exc}"}
     result["signal_engine_output"] = signal_output
+    logger.info("[SIGNAL] %s", signal_output)
+
+    learning_params: Dict[str, Any] = {}
+    if LEARNING_ENGINE is not None:
+        try:
+            learning_params = LEARNING_ENGINE.get_adaptive_params() or {}
+        except Exception as _lp_exc:
+            logger.warning("[LEARNING] get_adaptive_params failed (non-fatal): %s", _lp_exc)
+            learning_params = {}
+    feat_dict["learning_params"] = learning_params
 
     final_signal = "HOLD"
     execution_direction = "HOLD"
@@ -1824,7 +1838,15 @@ def run_analysis_cycle(
 
     normalized_signal = _normalize_trade_signal(final_signal)
 
-    router_decision = order_router.route(normalized_signal, feat_dict, orderbook)
+    try:
+        router_decision = order_router.route(normalized_signal, feat_dict, orderbook)
+    except Exception as _router_exc:
+        logger.warning("[ROUTER] route failed, forcing no-exec: %s", _router_exc)
+        router_decision = {
+            "execute": False,
+            "reason": f"router_error:{_router_exc}",
+            "order_type": "market",
+        }
     result["router_decision"] = router_decision
 
     try:
@@ -1848,21 +1870,37 @@ def run_analysis_cycle(
         normalized_signal = "HOLD"
 
     balance = _safe_float(engine.get_balance(), 0.0)
-    decision = execution_engine.decide(
-        signal_payload={
-            "signal": normalized_signal,
-            "confidence": float(_safe_float(confidence, 0.0)),
-        },
-        features_payload=feat_dict,
-        snapshot=orderbook,
-        account_equity=balance,
-        meta_result=meta_result,
-    )
+    try:
+        decision = execution_engine.decide(
+            signal_payload={
+                "signal": normalized_signal,
+                "confidence": float(_safe_float(confidence, 0.0)),
+            },
+            features_payload=feat_dict,
+            snapshot=orderbook,
+            account_equity=balance,
+            meta_result=meta_result,
+        )
+    except Exception as _decide_exc:
+        logger.error("[EXECUTION_LOGIC] decide failed (forcing no-exec): %s", _decide_exc, exc_info=True)
+        decision = {
+            "execute": False,
+            "side": "buy" if normalized_signal == "LONG" else "sell",
+            "sl": 0.0,
+            "tp": 0.0,
+            "position_size": 0.0,
+            "reason": f"execution_decide_error:{_decide_exc}",
+            "meta_result": meta_result,
+            "learning_params": learning_params,
+        }
 
     risk_scale = _safe_float(lifecycle.get("risk_scale", 1.0))
     regime_scale = _safe_float(feat_dict.get("position_scale", 1.0))
+    meta_scale = _safe_float(meta_result.get("risk_scale", 1.0))
     if decision.get("position_size", 0.0):
-        decision["position_size"] = _safe_float(decision["position_size"]) * risk_scale * regime_scale
+        decision["position_size"] = (
+            _safe_float(decision["position_size"]) * risk_scale * regime_scale * meta_scale
+        )
 
     # ── Execution-quality position sizing and trade blocking ──────────
     _exec_adj: Dict[str, Any] = {
