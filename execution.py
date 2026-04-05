@@ -221,6 +221,10 @@ class ExecutionLogic:
         learning_risk_scale = _clamp(_safe_float(learning_params.get("risk_scale", 1.0)), 0.5, 1.5)
         learning_conf_thr = _clamp(_safe_float(learning_params.get("confidence_threshold", 0.60)), 0.45, 0.85)
         learning_meta_strictness = _clamp(_safe_float(learning_params.get("meta_strictness", 1.0)), 0.75, 1.35)  # noqa: F841
+        execution_quality = _clamp(_safe_float(learning_params.get("execution_quality", 1.0)), 0.0, 1.0)
+        execution_slippage_bps = max(0.0, _safe_float(learning_params.get("execution_slippage", 0.0)))
+        execution_latency_ms = max(0.0, _safe_float(learning_params.get("execution_latency", 0.0)))
+        execution_fill_rate = _clamp(_safe_float(learning_params.get("execution_fill_rate", 0.5)), 0.0, 1.0)
 
         if confidence < max(self.cfg.min_confidence, learning_conf_thr):
             return {
@@ -286,6 +290,8 @@ class ExecutionLogic:
             return {"execute": False, "side": "buy", "sl": 0.0, "tp": 0.0, "position_size": 0.0}
 
         expected_slippage_bps = self._estimate_slippage_bps(liquidity_score, spread_bps)
+        if execution_slippage_bps > 0.0:
+            expected_slippage_bps = max(expected_slippage_bps, execution_slippage_bps)
         expected_cost_bps = self.cfg.fee_bps + expected_slippage_bps + max(0.0, spread_bps * 0.25)
 
         signal_strength = float(signal_payload.get("confidence", confidence))
@@ -299,6 +305,7 @@ class ExecutionLogic:
             * regime_multiplier
             * volatility_multiplier
         )
+        expected_edge_bps *= _clamp(0.75 + 0.25 * execution_quality, 0.75, 1.0)
         if expected_edge_bps <= expected_cost_bps:
             return {
                 "execute": False,
@@ -364,6 +371,7 @@ class ExecutionLogic:
 
         risk_budget = account_equity * self.cfg.risk_per_trade * max(0.25, liquidity_score)
         risk_budget *= _clamp(1.0 + (urgency - 0.5) * 0.6, 0.7, 1.3)
+        risk_budget *= _clamp(0.85 + 0.15 * execution_quality, 0.85, 1.0)
         risk_budget *= max(0.0, combined_learning_scale)
         raw_qty = risk_budget / risk_per_unit
 
@@ -390,11 +398,18 @@ class ExecutionLogic:
 
         _meta_state = meta_result.get("meta_state") if isinstance(meta_result.get("meta_state"), dict) else {}
         order_pref = _meta_state.get("order_preference", "MARKET")
+        queue_fill_probability = _safe_float(features.get("fill_prob", 0.5))
+        queue_fill_probability = _clamp((queue_fill_probability + execution_fill_rate) / 2.0, 0.0, 1.0)
+        adaptive_order_preference = order_pref
+        if execution_quality <= 0.45 or execution_latency_ms > float(self.cfg.max_age_ms):
+            adaptive_order_preference = "MARKET"
+        elif execution_quality >= 0.80 and queue_fill_probability >= 0.65 and expected_slippage_bps <= 5.0:
+            adaptive_order_preference = "LIMIT"
         order_type = self.choose_order_type(
             cascade_detected=_meta_state.get("cascade", {}).get("cascade_detected", False),
             urgency="high" if urgency > 0.7 else "normal",
-            order_preference=order_pref,
-            queue_fill_probability=_safe_float(features.get("fill_prob", 0.5)),
+            order_preference=adaptive_order_preference,
+            queue_fill_probability=queue_fill_probability,
             expected_slippage_bps=expected_slippage_bps,
         )
 
