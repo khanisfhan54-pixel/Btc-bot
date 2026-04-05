@@ -465,7 +465,7 @@ def _enforce_entry_fee_metadata(fees, fee_type, trade_id=None):
 
     if fee_type_val not in ("quote", "pct"):
         logger.warning(
-            "Invalid fee_type in main.py. Defaulting to pct. trade_id=%s",
+            "Invalid or missing fee_type in main.py. Defaulting to pct. trade_id=%s",
             trade_id if trade_id is not None else "unknown",
         )
         fee_type_val = "pct"
