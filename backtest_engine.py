@@ -132,12 +132,24 @@ class BacktestEngine:
                 size = _safe_float(decision.get("position_size", 0.0))
                 if size <= 0:
                     continue
+                trade_id = f"bt-{i}"
+                fees = _safe_float(self.cfg.fee_bps, 0.0) / 10_000.0
+                fee_type = "pct"
+                if fee_type not in ("quote", "pct"):
+                    logger.warning(
+                        "Missing fee_type in backtest_engine.py. Defaulting to pct. trade_id=%s",
+                        trade_id if trade_id is not None else "unknown",
+                    )
+                    fee_type = "pct"
                 position = {
+                    "trade_id": trade_id,
                     "side": "LONG" if side == "buy" else "SHORT",
                     "entry": entry,
                     "sl": _safe_float(decision.get("sl", 0.0)),
                     "tp": _safe_float(decision.get("tp", 0.0)),
                     "size": size,
+                    "fees": fees,
+                    "fee_type": fee_type,
                     "entry_index": i,
                     "entry_features": features,
                     "signal": signal,
@@ -164,9 +176,10 @@ class BacktestEngine:
 
             if hit_sl or hit_tp or flip or timeout:
                 gross_pnl_pct = ((current_price - entry) / entry) if side == "LONG" else ((entry - current_price) / entry)
-                fee = self.cfg.fee_bps / 10_000.0
+                fees = _safe_float(position.get("fees"), 0.0)
                 slippage = self.cfg.slippage_bps / 10_000.0
-                net_pnl_pct = gross_pnl_pct - fee - slippage
+                total_fee_pct = fees * 2.0
+                net_pnl_pct = gross_pnl_pct - total_fee_pct - slippage
                 pnl = balance * net_pnl_pct * 0.25
                 balance += pnl
                 peak = max(peak, balance)
