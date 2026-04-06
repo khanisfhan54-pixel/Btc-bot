@@ -42,20 +42,30 @@ LIQUIDITY_DEPTH_SCALE  = 25.0
 
 
 def _clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
+    xf = _safe_float(x, lo)
+    if lo > hi:
+        lo, hi = hi, lo
+    return max(lo, min(hi, xf))
 
 
 def _safe_float(x: Any, default: float = 0.0) -> float:
     try:
         if x is None:
             return default
-        return float(x)
+        v = float(x)
+        return v if math.isfinite(v) else default
     except Exception:
         return default
 
 
 def _safe_div(a: float, b: float, default: float = 0.0) -> float:
-    return a / b if abs(b) > 1e-12 else default
+    try:
+        aa = _safe_float(a, default)
+        bb = _safe_float(b, 0.0)
+        out = aa / max(abs(bb), 1e-9)
+        return out if math.isfinite(out) else default
+    except Exception:
+        return default
 
 
 @dataclass
@@ -469,6 +479,8 @@ class FeatureEngine:
             "spoofing_intensity":         spoofing_intensity,
         }
 
+        features = self._sanitize_features(features)
+        confidence = _clamp(confidence, 0.0, 1.0)
         return {"features": features, "confidence": confidence}
 
     # ------------------------------------------------------------------
@@ -518,7 +530,7 @@ class FeatureEngine:
     ) -> Tuple[float, float, float, float]:
         best_bid = bids[0][0]
         best_ask = asks[0][0]
-        mid      = (best_bid + best_ask) / 2.0
+        mid      = max(0.0, (best_bid + best_ask) / 2.0)
         spread   = max(0.0, best_ask - best_bid)
         return best_bid, best_ask, mid, spread
 
@@ -545,8 +557,8 @@ class FeatureEngine:
         bid_vwap = _safe_div(bid_notional, bid_qty, bids[0][0] if bids else 0.0)
         ask_vwap = _safe_div(ask_notional, ask_qty, asks[0][0] if asks else 0.0)
         if bid_vwap > 0 and ask_vwap > 0:
-            return (bid_vwap + ask_vwap) / 2.0
-        return bid_vwap or ask_vwap
+            return max(0.0, (bid_vwap + ask_vwap) / 2.0)
+        return max(0.0, bid_vwap or ask_vwap)
 
     def _ofi_and_mlofi(
         self, bids: List[Level], asks: List[Level]
@@ -688,7 +700,7 @@ class FeatureEngine:
         ]
         if len(prices) < 2 or mid <= 0:
             return False
-        move_bps = abs(prices[0] - prices[-1]) / mid * 10_000.0
+        move_bps = _safe_div(abs(prices[0] - prices[-1]), mid, 0.0) * 10_000.0
         return move_bps <= self.cfg.hidden_liquidity_mid_move_bps
 
     def _liquidity_score(
@@ -783,8 +795,8 @@ class FeatureEngine:
         depth_q   = math.tanh(_safe_div(total_depth, LIQUIDITY_DEPTH_SCALE, 0.0))
         churn_q   = 1.0 - _clamp(queue_churn / 2.0, 0.0, 1.0)
         stale_ms  = self.cfg.toxic_spread_bps * 1000.0  # reuse as staleness threshold (2s proxy)
-        stale_pen = 1.0 if latency_ms <= 2_000.0 else max(
-            0.0, 1.0 - (latency_ms - 2_000.0) / 2_000.0
+        stale_pen = 1.0 if latency_ms <= stale_ms else max(
+            0.0, 1.0 - (latency_ms - stale_ms) / max(stale_ms, 1.0)
         )
         conf = (
             0.35 * spread_q
@@ -841,6 +853,10 @@ class FeatureEngine:
             "queue_churn": 0.0, "resiliency": 0.0, "hidden_liquidity": False,
             "liquidity_score": 0.0, "gap_proxy_bps": 0.0, "largest_gap_bps": 0.0,
             "book_slope_proxy": 0.0, "regime": "unknown", "urgency": 0.5,
+            "regime_confidence": 0.0, "allow_trade": False, "trade_mode": "stand_down",
+            "position_scale": 0.0, "cooldown_bars": 0, "max_hold_bars": 0,
+            "entry_bias": "NEUTRAL", "exit_bias": "hold", "regime_scores": {},
+            "regime_reasons": [],
             "latency_ms": latency, "timestamp_ms": ts,
             # Backward-compat aliases
             "ofi_norm": 0.0, "mlofi_signed": 0.0, "vamp_bias_bps": 0.0,
@@ -848,4 +864,60 @@ class FeatureEngine:
             "bid_depth_n": 0.0, "ask_depth_n": 0.0, "total_depth_n": 0.0,
             "spoofing_intensity": 0.0,
         }
-        return {"features": f, "confidence": 0.0}
+        return {"features": self._sanitize_features(f), "confidence": 0.0}
+
+    def _sanitize_features(self, features: Dict[str, Any]) -> Dict[str, Any]:
+        sanitized: Dict[str, Any] = {}
+        for k, v in features.items():
+            if isinstance(v, bool):
+                sanitized[k] = v
+            elif isinstance(v, (int, float)):
+                sanitized[k] = self._sanitize_numeric_feature(k, v)
+            elif k in ("top_bids", "top_asks") and isinstance(v, list):
+                lvls: List[Level] = []
+                for lvl in v:
+                    if not isinstance(lvl, (list, tuple)) or len(lvl) < 2:
+                        continue
+                    p = _clamp(_safe_float(lvl[0], 0.0), 0.0, 10_000_000.0)
+                    q = _clamp(_safe_float(lvl[1], 0.0), 0.0, 1_000_000_000.0)
+                    if p > 0:
+                        lvls.append((p, q))
+                sanitized[k] = lvls
+            elif k == "mlofi_vector" and isinstance(v, list):
+                sanitized[k] = [_clamp(_safe_float(x, 0.0), -1.0, 1.0) for x in v]
+            elif k == "regime_scores" and isinstance(v, dict):
+                sanitized[k] = {
+                    str(sk): _clamp(_safe_float(sv, 0.0), 0.0, 1.0)
+                    for sk, sv in v.items()
+                }
+            else:
+                sanitized[k] = v
+        return sanitized
+
+    def _sanitize_numeric_feature(self, key: str, value: float) -> float:
+        v = _safe_float(value, 0.0)
+        if key in {"ofi", "ofi_norm", "aggressor_imbalance", "order_imbalance", "trade_imbalance", "mlofi_signed"}:
+            return _clamp(v, -1.0, 1.0)
+        if key in {"trade_burst", "liquidity_score", "urgency", "resiliency", "regime_confidence", "spoofing_intensity"}:
+            return _clamp(v, 0.0, 1.0)
+        if key == "queue_churn":
+            return _clamp(v, 0.0, 2.0)
+        if key in {"spread", "spread_bps", "gap_proxy_bps", "largest_gap_bps", "latency_ms"}:
+            hi = 600_000.0 if key == "latency_ms" else 10_000.0
+            return _clamp(v, 0.0, hi)
+        if key in {"vamp_deviation_bps", "fair_price_deviation_bps", "vamp_bias_bps", "book_slope_proxy"}:
+            return _clamp(v, -10_000.0, 10_000.0)
+        if key in {"ofi_delta", "ofi_velocity", "ofi_acceleration"}:
+            return _clamp(v, -100.0, 100.0)
+        if key in {"position_scale"}:
+            return _clamp(v, 0.0, 2.0)
+        if key in {"cooldown_bars", "max_hold_bars"}:
+            return int(_clamp(v, 0.0, 10_000.0))
+        if key in {"buy_volume", "sell_volume", "trade_volume", "bid_depth", "ask_depth", "total_depth",
+                   "bid_depth_n", "ask_depth_n", "total_depth_n", "top_bid_qty", "top_ask_qty", "avg_level_depth"}:
+            return _clamp(v, 0.0, 1_000_000_000.0)
+        if key in {"best_bid", "best_ask", "mid", "microprice", "vamp", "timestamp_ms"}:
+            return _clamp(v, 0.0, 10_000_000_000_000.0)
+        if key in {"mlofi_strength"}:
+            return _clamp(v, 0.0, 10.0)
+        return _clamp(v, -1_000_000_000.0, 1_000_000_000.0)
