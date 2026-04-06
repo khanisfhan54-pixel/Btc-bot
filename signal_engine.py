@@ -1,6 +1,7 @@
 # signal_engine.py
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, List, Optional
 
 
@@ -12,12 +13,17 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None:
             return default
-        return float(value)
+        result = float(value)
+        if not math.isfinite(result):
+            return default
+        return result
     except Exception:
         return default
 
 
 def _clamp(x: float, low: float, high: float) -> float:
+    if not math.isfinite(x):
+        return low
     return max(low, min(high, x))
 
 
@@ -49,15 +55,24 @@ def _normalize_candle(candle: Any) -> Optional[Dict[str, float]]:
         l = _safe_float(candle.get("low", candle.get("l", candle.get("Low", 0.0))), 0.0)
         c = _safe_float(candle.get("close", candle.get("c", candle.get("Close", 0.0))), 0.0)
         v = _safe_float(candle.get("volume", candle.get("v", candle.get("Volume", 0.0))), 0.0)
+        if h < l or h <= 0 or l <= 0 or c <= 0 or o <= 0:
+            return None
         return {"open": o, "high": h, "low": l, "close": c, "volume": v}
 
     if isinstance(candle, (list, tuple)) and len(candle) >= 6:
+        o = _safe_float(candle[1], 0.0)
+        h = _safe_float(candle[2], 0.0)
+        l = _safe_float(candle[3], 0.0)
+        c = _safe_float(candle[4], 0.0)
+        v = _safe_float(candle[5], 0.0)
+        if h < l or h <= 0 or l <= 0 or c <= 0 or o <= 0:
+            return None
         return {
-            "open": _safe_float(candle[1], 0.0),
-            "high": _safe_float(candle[2], 0.0),
-            "low": _safe_float(candle[3], 0.0),
-            "close": _safe_float(candle[4], 0.0),
-            "volume": _safe_float(candle[5], 0.0),
+            "open": o,
+            "high": h,
+            "low": l,
+            "close": c,
+            "volume": v,
         }
 
     return None
@@ -138,6 +153,53 @@ class SignalEngine:
         liquidity = _safe_get(features, "liquidity", {})
         raw_candles = _safe_get(features, "candles", _safe_get(features, "ohlcv", []))
         candles = _normalize_candles(raw_candles)
+
+        if len(candles) < 3:
+            fallback_source = raw_candles
+            if isinstance(fallback_source, dict):
+                for key in ("candles", "ohlcv", "rows", "data", "klines", "1m", "15m", "primary"):
+                    candidate = fallback_source.get(key)
+                    if isinstance(candidate, (list, tuple)) and candidate:
+                        fallback_source = candidate
+                        break
+                else:
+                    fallback_source = []
+
+            fallback_candles: List[Dict[str, float]] = []
+            if isinstance(fallback_source, (list, tuple)):
+                for raw_candle in fallback_source[-3:]:
+                    parsed: Optional[Dict[str, float]] = None
+
+                    if isinstance(raw_candle, dict):
+                        nested = _safe_get(raw_candle, "candle") or _safe_get(raw_candle, "kline")
+                        if isinstance(nested, dict):
+                            raw_candle = nested
+                        o = _safe_float(raw_candle.get("open", raw_candle.get("o", raw_candle.get("Open", 0.0))), 0.0)
+                        h = _safe_float(raw_candle.get("high", raw_candle.get("h", raw_candle.get("High", 0.0))), 0.0)
+                        l = _safe_float(raw_candle.get("low", raw_candle.get("l", raw_candle.get("Low", 0.0))), 0.0)
+                        c = _safe_float(raw_candle.get("close", raw_candle.get("c", raw_candle.get("Close", 0.0))), 0.0)
+                        v = _safe_float(raw_candle.get("volume", raw_candle.get("v", raw_candle.get("Volume", 0.0))), 0.0)
+                        parsed = {"open": o, "high": h, "low": l, "close": c, "volume": v}
+                    elif isinstance(raw_candle, (list, tuple)) and len(raw_candle) >= 6:
+                        o = _safe_float(raw_candle[1], 0.0)
+                        h = _safe_float(raw_candle[2], 0.0)
+                        l = _safe_float(raw_candle[3], 0.0)
+                        c = _safe_float(raw_candle[4], 0.0)
+                        v = _safe_float(raw_candle[5], 0.0)
+                        parsed = {"open": o, "high": h, "low": l, "close": c, "volume": v}
+
+                    if parsed is not None:
+                        if (
+                            parsed["open"] > 0
+                            and parsed["high"] > 0
+                            and parsed["low"] > 0
+                            and parsed["close"] > 0
+                            and parsed["high"] >= parsed["low"]
+                        ):
+                            fallback_candles.append(parsed)
+
+            if len(fallback_candles) == 3:
+                candles = fallback_candles
 
         if len(candles) < 3:
             return {
@@ -241,10 +303,10 @@ class SignalEngine:
             }
 
         # ── 5. Confidence model ────────────────────────────────────────
-        liquidity_score = 1.0 if stop_hunt else 0.4
-        displacement_score = displacement
-        volume_score_ = vol_score / 2.0
-        regime_score = 1.0 if regime_type == "trend" else 0.7
+        liquidity_score = _safe_float(1.0 if stop_hunt else 0.4, 0.4)
+        displacement_score = _safe_float(displacement, 0.0)
+        volume_score_ = _safe_float(vol_score / 2.0, 0.5)
+        regime_score = _safe_float(1.0 if regime_type == "trend" else 0.7, 0.7)
 
         confidence = (
             0.30 * liquidity_score
