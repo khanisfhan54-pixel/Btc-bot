@@ -20,7 +20,7 @@ meta_state always contains `position_scale` for execution.py sizing.
 from __future__ import annotations
 
 import logging
-import random
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
@@ -31,13 +31,13 @@ logger = logging.getLogger(__name__)
 # otherwise defined locally so this module never crashes on import.
 # ---------------------------------------------------------------------------
 try:
-    from learning_engine import LEARNING_ENGINE, _safe_float, _clamp
+    from learning_engine import LEARNING_ENGINE, _safe_float as _le_safe_float, _clamp as _le_clamp
     _LEARNING_AVAILABLE = True
 except Exception as _le_import_err:
     logger.warning("[META_FILTER] learning_engine unavailable (%s) — using fallbacks", _le_import_err)
     _LEARNING_AVAILABLE = False
 
-    def _safe_float(value: Any, default: float = 0.0) -> float:
+    def _le_safe_float(value: Any, default: float = 0.0) -> float:
         try:
             if value is None:
                 return default
@@ -45,7 +45,7 @@ except Exception as _le_import_err:
         except Exception:
             return default
 
-    def _clamp(x: Any, lo: float, hi: float) -> float:
+    def _le_clamp(x: Any, lo: float, hi: float) -> float:
         try:
             return max(lo, min(hi, float(x)))
         except Exception:
@@ -60,6 +60,29 @@ except Exception as _le_import_err:
             return {}
 
     LEARNING_ENGINE = _FallbackLearningEngine()
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """Finite-safe float conversion wrapper (guards NaN/inf propagation)."""
+    try:
+        v = float(_le_safe_float(value, default))
+    except Exception:
+        return float(default)
+    return v if math.isfinite(v) else float(default)
+
+
+def _clamp(x: Any, lo: float, hi: float) -> float:
+    """Finite-safe clamp wrapper."""
+    lo_f = _safe_float(lo, 0.0)
+    hi_f = _safe_float(hi, lo_f)
+    if hi_f < lo_f:
+        lo_f, hi_f = hi_f, lo_f
+    x_f = _safe_float(x, lo_f)
+    if x_f < lo_f:
+        return lo_f
+    if x_f > hi_f:
+        return hi_f
+    return x_f
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +298,7 @@ class MetaFilter:
         risk_scale  = self.compute_risk_scale(
             features, signal_obj, regime_info, score_info, adaptive, allow_trade,
         )
+        risk_adjustment = 1.0
         reason = hard["reason"] if hard["blocked"] else score_info["reason"]
 
         # Lifecycle and router overrides
@@ -322,7 +346,7 @@ class MetaFilter:
 
                 # ── Hunt confidence boost ──────────────────────────────
                 if _safe_float(hunt.get("confidence", 0.0)) > 0.7 and allow_trade:
-                    risk_scale = min(risk_scale * 1.1, 1.5)
+                    risk_adjustment *= 1.1
 
                 # ── Cascade safety: block unstable cascade without stack ─
                 if cascade.get("cascade_detected") and not stack.get("stack_detected"):
@@ -348,7 +372,7 @@ class MetaFilter:
                 # ── Stack + cascade: boost score and risk ──────────────
                 if stack.get("stack_detected") and cascade.get("cascade_detected") and allow_trade:
                     score_info = {**score_info, "score": min(score_info.get("score", 0.0) * 1.2, 1.5)}
-                    risk_scale = min(risk_scale * 1.2, 1.5)
+                    risk_adjustment *= 1.2
 
             except Exception as _hunt_exc:
                 logger.warning("[META_FILTER] hunt_engine error (non-fatal): %s", _hunt_exc)
@@ -357,12 +381,18 @@ class MetaFilter:
         if allow_trade:
             _min_conf = _clamp(_safe_float(adaptive.get("confidence_threshold", 0.60)), 0.45, 0.85)
             if _safe_float(score_info.get("score", 0.0)) < (_min_conf * 0.9):
-                if trades_seen < 50 and random.random() < 0.08:
+                if trades_seen < 50 and _safe_float(score_info.get("score", 0.0)) >= (_min_conf * 0.82):
                     allow_trade = True
                     risk_scale = max(risk_scale, 0.25)
-                    reason = "exploration"
+                    reason = "exploration_deterministic"
                 else:
                     return self._block("low_adaptive_score", hunt, cascade, stack, features)
+
+        if allow_trade:
+            risk_scale = _clamp(_safe_float(risk_scale, 0.0) * _clamp(risk_adjustment, 0.5, 1.5), 0.0, 2.0)
+
+        if trades_seen < 20 and allow_trade:
+            risk_scale = min(risk_scale, 0.5)
 
         meta_state: Dict[str, Any] = {
             # Required by execution.py
@@ -397,7 +427,7 @@ class MetaFilter:
             "hard_filters": hard,
             # Adaptive
             "adaptive": adaptive,
-            "risk_scale": _clamp(risk_scale, 0.0, 1.5),
+            "risk_scale": _clamp(risk_scale, 0.0, 2.0),
             "reason": reason,
             # Snapshot ts
             "snapshot_ts": snapshot.get("timestamp") if isinstance(snapshot, dict) else None,
@@ -408,9 +438,27 @@ class MetaFilter:
             "order_preference": self._choose_order_preference(hunt, cascade, features),
         }
 
+        allow_trade = bool(allow_trade)
+        if not allow_trade:
+            risk_scale = 0.0
+        risk_scale = float(_clamp(risk_scale, 0.0, 2.0))
+        try:
+            assert risk_scale >= 0.0
+            if allow_trade is False:
+                assert risk_scale == 0.0
+        except AssertionError:
+            logger.error("[META_FILTER] final sanity correction triggered allow=%s risk_scale=%.6f", allow_trade, risk_scale)
+            if not allow_trade:
+                risk_scale = 0.0
+            risk_scale = float(_clamp(risk_scale, 0.0, 2.0))
+
+        meta_state["allow_trade"] = allow_trade
+        meta_state["risk_scale"] = risk_scale
+        meta_state["reason"] = str(reason)
+
         result = {
-            "allow_trade": bool(allow_trade),
-            "risk_scale": float(_clamp(risk_scale, 0.0, 1.5)),
+            "allow_trade": allow_trade,
+            "risk_scale": risk_scale,
             "reason": str(reason),
             "meta_state": meta_state,
         }
@@ -790,7 +838,7 @@ class MetaFilter:
             risk *= 0.90
 
         risk *= _clamp(_safe_float(adaptive.get("risk_scale", 1.0)), 0.5, 1.5)
-        return float(_clamp(risk, 0.0, 1.5))
+        return float(_clamp(risk, 0.0, 2.0))
 
 
 MetaFilterEngine = MetaFilter
