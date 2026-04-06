@@ -168,9 +168,6 @@ class ExecutionLogic:
         account_equity: float,
         meta_result: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        features = features_payload.get("features", features_payload)
-        signal = str(signal_payload.get("signal", "HOLD")).upper()
-        confidence = float(signal_payload.get("confidence", 0.0))
         meta_result = meta_result or {}
         learning_params: Dict[str, Any] = {}
         if self.learning_engine is not None:
@@ -178,6 +175,33 @@ class ExecutionLogic:
                 learning_params = self.learning_engine.get_adaptive_params()
             except Exception:
                 learning_params = {}
+        if not isinstance(signal_payload, dict):
+            return {
+                "execute": False,
+                "side": "buy",
+                "sl": 0.0,
+                "tp": 0.0,
+                "position_size": 0.0,
+                "reason": "invalid_signal_payload",
+                "meta_result": meta_result,
+                "learning_params": learning_params,
+            }
+        signal = str(signal_payload.get("signal", "HOLD")).upper()
+        confidence = _safe_float(signal_payload.get("confidence", 0.0), 0.0)
+        if not isinstance(features_payload, dict):
+            return {
+                "execute": False,
+                "side": "buy" if signal == "LONG" else "sell",
+                "sl": 0.0,
+                "tp": 0.0,
+                "position_size": 0.0,
+                "reason": "invalid_features_payload",
+                "meta_result": meta_result,
+                "learning_params": learning_params,
+            }
+
+        raw_features = features_payload.get("features", features_payload)
+        features = raw_features if isinstance(raw_features, dict) else {}
         if meta_result and not meta_result.get("allow_trade", True):
             return {
                 "execute": False,
@@ -185,13 +209,20 @@ class ExecutionLogic:
                 "sl": 0.0, "tp": 0.0, "position_size": 0.0,
                 "reason": meta_result.get("reason", "meta_blocked"),
                 "meta_result": meta_result,
+                "learning_params": learning_params,
             }
 
         if signal not in ("LONG", "SHORT"):
-            return {"execute": False, "side": "buy", "sl": 0.0, "tp": 0.0, "position_size": 0.0}
+            return {
+                "execute": False, "side": "buy", "sl": 0.0, "tp": 0.0, "position_size": 0.0,
+                "meta_result": meta_result, "learning_params": learning_params,
+            }
 
         if not features:
-            return {"execute": False, "side": "buy", "sl": 0.0, "tp": 0.0, "position_size": 0.0}
+            return {
+                "execute": False, "side": "buy", "sl": 0.0, "tp": 0.0, "position_size": 0.0,
+                "meta_result": meta_result, "learning_params": learning_params,
+            }
 
         try:
             best_bid        = float(features.get("best_bid", 0.0))
@@ -245,6 +276,8 @@ class ExecutionLogic:
                 "sl": 0.0,
                 "tp": 0.0,
                 "position_size": 0.0,
+                "meta_result": meta_result,
+                "learning_params": learning_params,
             }
 
         if spoofing_intensity > self.cfg.max_spoofing_intensity:
@@ -254,6 +287,8 @@ class ExecutionLogic:
                 "sl": 0.0,
                 "tp": 0.0,
                 "position_size": 0.0,
+                "meta_result": meta_result,
+                "learning_params": learning_params,
             }
 
         age_ms = self._snapshot_age_ms(snapshot)
@@ -262,6 +297,7 @@ class ExecutionLogic:
                 "execute": False, "reason": "snapshot_stale",
                 "side": "buy" if signal == "LONG" else "sell",
                 "sl": 0.0, "tp": 0.0, "position_size": 0.0,
+                "meta_result": meta_result, "learning_params": learning_params,
             }
 
         if latency_ms_feat > 0 and age_ms is None and latency_ms_feat > self.cfg.max_age_ms:
@@ -269,6 +305,7 @@ class ExecutionLogic:
                 "execute": False, "reason": "feature_latency_stale",
                 "side": "buy" if signal == "LONG" else "sell",
                 "sl": 0.0, "tp": 0.0, "position_size": 0.0,
+                "meta_result": meta_result, "learning_params": learning_params,
             }
 
         if regime == "toxic":
@@ -276,6 +313,7 @@ class ExecutionLogic:
                 "execute": False, "reason": "regime_toxic",
                 "side": "buy" if signal == "LONG" else "sell",
                 "sl": 0.0, "tp": 0.0, "position_size": 0.0,
+                "meta_result": meta_result, "learning_params": learning_params,
             }
 
         if hidden_liquidity and confidence < self.cfg.min_confidence + 0.10:
@@ -283,11 +321,15 @@ class ExecutionLogic:
                 "execute": False, "reason": "hidden_liquidity_low_confidence",
                 "side": "buy" if signal == "LONG" else "sell",
                 "sl": 0.0, "tp": 0.0, "position_size": 0.0,
+                "meta_result": meta_result, "learning_params": learning_params,
             }
 
         bids, asks = _extract_levels(snapshot)
         if not bids or not asks:
-            return {"execute": False, "side": "buy", "sl": 0.0, "tp": 0.0, "position_size": 0.0}
+            return {
+                "execute": False, "side": "buy", "sl": 0.0, "tp": 0.0, "position_size": 0.0,
+                "meta_result": meta_result, "learning_params": learning_params,
+            }
 
         expected_slippage_bps = self._estimate_slippage_bps(liquidity_score, spread_bps)
         if execution_slippage_bps > 0.0:
@@ -313,13 +355,18 @@ class ExecutionLogic:
                 "sl": 0.0,
                 "tp": 0.0,
                 "position_size": 0.0,
+                "meta_result": meta_result,
+                "learning_params": learning_params,
             }
 
         entry = mid if mid > 0 else ((best_bid + best_ask) / 2.0 if (best_bid > 0 and best_ask > 0) else 0.0)
         if entry <= 0:
             entry = best_ask if signal == "LONG" else best_bid
         if entry <= 0:
-            return {"execute": False, "side": "buy", "sl": 0.0, "tp": 0.0, "position_size": 0.0}
+            return {
+                "execute": False, "side": "buy", "sl": 0.0, "tp": 0.0, "position_size": 0.0,
+                "meta_result": meta_result, "learning_params": learning_params,
+            }
 
         void_buffer = max(
             entry * self.cfg.void_buffer_bps / 10_000.0,
@@ -361,7 +408,10 @@ class ExecutionLogic:
             side = "sell"
 
         if risk_per_unit <= 0:
-            return {"execute": False, "side": side, "sl": 0.0, "tp": 0.0, "position_size": 0.0}
+            return {
+                "execute": False, "side": side, "sl": 0.0, "tp": 0.0, "position_size": 0.0,
+                "meta_result": meta_result, "learning_params": learning_params,
+            }
 
         meta_risk_scale = _clamp(_safe_float(meta_result.get("risk_scale", 1.0)), 0.0, 1.5)
         _meta_state = meta_result.get("meta_state") if isinstance(meta_result.get("meta_state"), dict) else {}
@@ -372,6 +422,7 @@ class ExecutionLogic:
         risk_budget = account_equity * self.cfg.risk_per_trade * max(0.25, liquidity_score)
         risk_budget *= _clamp(1.0 + (urgency - 0.5) * 0.6, 0.7, 1.3)
         risk_budget *= _clamp(0.85 + 0.15 * execution_quality, 0.85, 1.0)
+        # NOTE: Risk scaling is applied both here and in main.py.
         risk_budget *= max(0.0, combined_learning_scale)
         raw_qty = risk_budget / risk_per_unit
 
@@ -384,17 +435,27 @@ class ExecutionLogic:
                 "execute": False, "side": side,
                 "sl": 0.0, "tp": 0.0, "position_size": 0.0,
                 "reason": "meta_risk_zero", "meta_result": meta_result,
+                "learning_params": learning_params,
             }
 
         if qty <= 0:
-            return {"execute": False, "side": side, "sl": 0.0, "tp": 0.0, "position_size": 0.0}
+            return {
+                "execute": False, "side": side, "sl": 0.0, "tp": 0.0, "position_size": 0.0,
+                "meta_result": meta_result, "learning_params": learning_params,
+            }
 
         if signal == "LONG":
             if not (sl < entry < tp):
-                return {"execute": False, "side": side, "sl": 0.0, "tp": 0.0, "position_size": 0.0}
+                return {
+                    "execute": False, "side": side, "sl": 0.0, "tp": 0.0, "position_size": 0.0,
+                    "meta_result": meta_result, "learning_params": learning_params,
+                }
         else:
             if not (tp < entry < sl):
-                return {"execute": False, "side": side, "sl": 0.0, "tp": 0.0, "position_size": 0.0}
+                return {
+                    "execute": False, "side": side, "sl": 0.0, "tp": 0.0, "position_size": 0.0,
+                    "meta_result": meta_result, "learning_params": learning_params,
+                }
 
         _meta_state = meta_result.get("meta_state") if isinstance(meta_result.get("meta_state"), dict) else {}
         order_pref = _meta_state.get("order_preference", "MARKET")
