@@ -19,7 +19,10 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None:
             return default
-        return float(value)
+        out = float(value)
+        if not math.isfinite(out):
+            return default
+        return out
     except Exception:
         return default
 
@@ -332,6 +335,15 @@ class LearningEngine:
             self.pnl_history.append(_safe_float(t.get("pnl", 0.0)))
         win_rate, avg_win, avg_loss, expectancy = self._window_metrics()
         avg_slippage_bps, avg_fill_quality, avg_fill_ratio = self._avg_exec_metrics()
+        exec_samples = int(
+            max(
+                0.0,
+                _safe_float(
+                    (self.state.get("execution_rolling_stats") or {}).get("samples", 0),
+                    0.0,
+                ),
+            )
+        )
 
         recent_closed = trades_list[-self.cfg.window_size:]
         recent_r = [
@@ -367,28 +379,30 @@ class LearningEngine:
         strictness = 1.0
         signal_bias = 0.0
 
-        if win_rate < 0.40:
-            risk_scale *= 0.85
-            conf_thr += 0.06
-            strictness *= 1.15
-        elif win_rate > 0.60:
-            risk_scale *= 1.05
-            conf_thr -= 0.03
-            strictness *= 0.95
+        if len(recent_r) > 0:
+            if win_rate < 0.40:
+                risk_scale *= 0.85
+                conf_thr += 0.06
+                strictness *= 1.15
+            elif win_rate > 0.60:
+                risk_scale *= 1.05
+                conf_thr -= 0.03
+                strictness *= 0.95
 
-        if avg_slippage_bps > self.cfg.slippage_soft_limit_bps:
-            risk_scale *= 0.90
-            strictness *= 1.08
-            conf_thr += 0.03
-        elif avg_slippage_bps < 3.0 and avg_fill_quality > 0.70:
-            risk_scale *= 1.03
+        if exec_samples > 0:
+            if avg_slippage_bps > self.cfg.slippage_soft_limit_bps:
+                risk_scale *= 0.90
+                strictness *= 1.08
+                conf_thr += 0.03
+            elif avg_slippage_bps < 3.0 and avg_fill_quality > 0.70:
+                risk_scale *= 1.03
 
-        if avg_fill_quality < self.cfg.fill_quality_soft_limit:
-            risk_scale *= 0.92
-            strictness *= 1.06
-            conf_thr += 0.02
-        elif avg_fill_quality > 0.75 and win_rate > 0.55:
-            risk_scale *= 1.02
+            if avg_fill_quality < self.cfg.fill_quality_soft_limit:
+                risk_scale *= 0.92
+                strictness *= 1.06
+                conf_thr += 0.02
+            elif avg_fill_quality > 0.75 and win_rate > 0.55:
+                risk_scale *= 1.02
 
         if len(recent_r) >= 3:
             if avg_r < 0:
@@ -497,6 +511,7 @@ class LearningEngine:
         execution_stats = self.state.get("execution_rolling_stats", {})
         if not isinstance(execution_stats, dict):
             execution_stats = {}
+        execution_samples = int(max(0.0, _safe_float(execution_stats.get("samples", 0))))
         return {
             "risk_scale": _clamp(_safe_float(self.state.get("risk_scale", 1.0)), self.cfg.min_risk_scale, self.cfg.max_risk_scale),
             "confidence_threshold": _clamp(_safe_float(self.state.get("confidence_threshold", 0.60)), self.cfg.min_confidence_threshold, self.cfg.max_confidence_threshold),
@@ -511,6 +526,8 @@ class LearningEngine:
             "execution_slippage": _clamp(_safe_float(execution_stats.get("slippage_bps_avg", 0.0)), 0.0, 10000.0),
             "execution_latency": _clamp(_safe_float(execution_stats.get("latency_ms_avg", 0.0)), 0.0, 60000.0),
             "execution_fill_rate": _clamp(_safe_float(execution_stats.get("fill_rate", 0.0)), 0.0, 1.0),
+            "execution_samples": execution_samples,
+            "execution_feedback_samples": execution_samples,
         }
 
     def get_policy(self):
@@ -933,15 +950,18 @@ class LearningEngine:
         self.exec_feedback.append(feedback)
         self.exec_quality_scores.append(score)
 
-        stats = self.state.get("execution_rolling_stats", {})
+        stats = self.state.setdefault("execution_rolling_stats", {})
         if not isinstance(stats, dict):
             stats = {}
-        samples = int(max(0.0, _safe_float(stats.get("samples", 0))))
+            self.state["execution_rolling_stats"] = stats
+        prev_samples = int(max(0.0, _safe_float(stats.get("samples", 0))))
+        stats["samples"] = prev_samples + 1
+        samples = prev_samples
         prev_slip = _clamp(_safe_float(stats.get("slippage_bps_avg", 0.0)), 0.0, 10000.0)
         prev_lat = _clamp(_safe_float(stats.get("latency_ms_avg", 0.0)), 0.0, 60000.0)
         prev_fill = _clamp(_safe_float(stats.get("fill_rate", 0.0)), 0.0, 1.0)
         prev_score = _clamp(_safe_float(stats.get("execution_score_avg", 0.5)), 0.0, 1.0)
-        new_samples = samples + 1
+        new_samples = int(stats["samples"])
 
         if samples <= 0:
             slippage_avg = slippage_bps
