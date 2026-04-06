@@ -194,7 +194,7 @@ class SignalEngine:
                             and parsed["high"] > 0
                             and parsed["low"] > 0
                             and parsed["close"] > 0
-                            and parsed["high"] >= parsed["low"]
+                            and parsed["high"] > parsed["low"]
                         ):
                             fallback_candles.append(parsed)
 
