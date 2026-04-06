@@ -519,18 +519,19 @@ def _extract_fill_info(
     status = "filled"
     try:
         if isinstance(result, dict):
+            entry_result = result.get("entry_order") if isinstance(result.get("entry_order"), dict) else result
             executed_price = _safe_float(
-                result.get("average")
-                or result.get("avgPrice")
-                or result.get("price")
+                entry_result.get("average")
+                or entry_result.get("avgPrice")
+                or entry_result.get("price")
                 or fallback_price
             )
             filled_size = _safe_float(
-                result.get("filled")
-                or result.get("amount")
+                entry_result.get("filled")
+                or entry_result.get("amount")
                 or fallback_size
             )
-            status = str(result.get("status", "filled"))
+            status = str(entry_result.get("status", "filled"))
         else:
             executed_price = _safe_float(
                 getattr(result, "average", None)
@@ -819,7 +820,34 @@ class ExecutionEngine:
         meta_result: Optional[Dict[str, Any]] = None,
         features: Optional[Dict[str, Any]] = None,
     ) -> dict:
+        fees, fee_type = _enforce_entry_fee_metadata(
+            fees=_safe_float(features.get("fees", 0.0), 0.0) if isinstance(features, dict) else 0.0,
+            fee_type=(features.get("fee_type") if isinstance(features, dict) else "pct"),
+            trade_id=None,
+        )
         try:
+            def _is_finite_positive(x: Any) -> bool:
+                v = _safe_float(x, float("nan"))
+                return math.isfinite(v) and v > 0.0
+
+            def _normalize_amount(symbol_name: str, requested: float) -> Tuple[float, Optional[str]]:
+                req = _safe_float(requested, 0.0)
+                if not math.isfinite(req) or req <= 0.0:
+                    return 0.0, "invalid_requested_size"
+                try:
+                    precision_qty = _safe_float(self.exchange.amount_to_precision(symbol_name, req), req)
+                    amount = max(0.0, precision_qty)
+                except Exception:
+                    amount = max(0.0, req)
+                try:
+                    market = self.exchange.market(symbol_name)
+                    amount_min = _safe_float((market.get("limits") or {}).get("amount", {}).get("min"), 0.0)
+                except Exception:
+                    amount_min = 0.0
+                if amount_min > 0.0 and amount < amount_min:
+                    return 0.0, f"size_below_exchange_min:{amount}<{amount_min}"
+                return amount, None
+
             if getattr(self, "learning_engine", None):
                 try:
                     params = self.learning_engine.get_adaptive_params()
@@ -830,47 +858,71 @@ class ExecutionEngine:
 
                 if not exec_adj or not exec_adj.get("allow_trading", True):
                     reason = exec_adj.get("reason", "blocked") if exec_adj else "blocked"
-                    return {"status": "blocked", "reason": reason}
-
-                size_multiplier = _safe_float(params.get("risk_scale", 1.0)) * _safe_float(exec_adj.get("size_multiplier", 1.0))
-                position_size = max(0.0, position_size * size_multiplier)
+                    return {"status": "blocked", "executed": False, "reason": reason, "fees": fees, "fee_type": fee_type}
 
                 conf_thr = _safe_float(params.get("confidence_threshold", 0.0))
                 if conf_thr > 0 and confidence < conf_thr:
-                    return {"status": "filtered", "reason": "low_confidence"}
+                    return {"status": "filtered", "executed": False, "reason": "low_confidence", "fees": fees, "fee_type": fee_type}
 
             if meta_result and not meta_result.get("allow_trade", True):
                 return {
                     "executed": False,
                     "reason": meta_result.get("reason", "meta_blocked"),
                     "meta_result": meta_result,
+                    "fees": fees,
+                    "fee_type": fee_type,
                 }
             trade_symbol = symbol or self.current_symbol
             if not trade_symbol:
-                raise ValueError("symbol is required for execution")
+                return {"executed": False, "reason": "symbol_required", "fees": fees, "fee_type": fee_type}
 
             signal = str(execution_signal).upper().strip()
             if signal not in {"LONG", "SHORT"}:
-                raise ValueError("execution_signal must be LONG or SHORT")
+                return {"executed": False, "reason": "invalid_signal", "fees": fees, "fee_type": fee_type}
 
-            if position_size <= 0:
-                raise ValueError("position_size must be greater than zero")
+            if not _is_finite_positive(price):
+                return {"executed": False, "reason": "invalid_price", "fees": fees, "fee_type": fee_type}
+            if not _is_finite_positive(position_size):
+                return {"executed": False, "reason": "invalid_position_size", "fees": fees, "fee_type": fee_type}
+            if not _is_finite_positive(sl_price) or not _is_finite_positive(tp_price):
+                return {"executed": False, "reason": "invalid_sl_tp", "fees": fees, "fee_type": fee_type}
+            if not math.isfinite(_safe_float(confidence, float("nan"))):
+                return {"executed": False, "reason": "invalid_confidence", "fees": fees, "fee_type": fee_type}
 
             side = "buy" if signal == "LONG" else "sell"
             _features = features if isinstance(features, dict) else {}
-            _meta = meta_result if isinstance(meta_result, dict) else {}
+            normalized_size, size_err = _normalize_amount(trade_symbol, position_size)
+            if size_err is not None or normalized_size <= 0.0:
+                return {"executed": False, "reason": size_err or "size_normalization_failed", "fees": fees, "fee_type": fee_type}
 
             if LIVE_TRADING:
-                result = self.place_order_with_sl_tp(
-                    symbol=trade_symbol,
-                    side=side,
-                    amount=position_size,
-                    sl=sl_price,
-                    tp=tp_price,
-                )
+                try:
+                    result = self.place_order_with_sl_tp(
+                        symbol=trade_symbol,
+                        side=side,
+                        amount=normalized_size,
+                        sl=sl_price,
+                        tp=tp_price,
+                    )
+                except Exception as exc:
+                    return {
+                        "executed": False,
+                        "reason": "exchange_order_failed",
+                        "error": str(exc),
+                        "fees": fees,
+                        "fee_type": fee_type,
+                    }
                 executed_price, filled_size, fill_status = _extract_fill_info(
-                    result, fallback_price=price, fallback_size=position_size,
+                    result, fallback_price=price, fallback_size=normalized_size,
                 )
+                if not math.isfinite(filled_size) or filled_size <= 0.0:
+                    return {
+                        "executed": False,
+                        "reason": "no_fill",
+                        "fill_status": fill_status,
+                        "fees": fees,
+                        "fee_type": fee_type,
+                    }
 
                 le = getattr(self, "learning_engine", None)
                 if le and hasattr(le, "record_execution_feedback"):
@@ -883,21 +935,46 @@ class ExecutionEngine:
                             slippage_bps=slippage,
                             latency_ms=latency,
                             filled_qty=filled_size,
-                            requested_qty=position_size,
+                            requested_qty=normalized_size,
                             side=side,
                             reason="post_trade_execution"
                         )
                     except Exception as exc:
                         logger.warning("[LEARNING] post_exec feedback failed: %s", exc)
+                result = {
+                    "executed": True,
+                    "paper": False,
+                    "symbol": trade_symbol,
+                    "side": side,
+                    "requested_size": normalized_size,
+                    "filled_size": float(filled_size),
+                    "executed_price": float(executed_price),
+                    "fill_status": fill_status,
+                    "raw_result": result,
+                    "fees": fees,
+                    "fee_type": fee_type,
+                }
 
             else:
-                result = {"executed": True, "paper": True}
+                simulated_size = normalized_size
                 simulated_slippage_bps = _safe_float(_features.get("spread_bps", 0.0)) * 0.35
                 sim_price = (
                     price * (1.0 + simulated_slippage_bps / 10_000.0)
                     if side == "buy"
                     else price * (1.0 - simulated_slippage_bps / 10_000.0)
                 )
+                result = {
+                    "executed": True,
+                    "paper": True,
+                    "symbol": trade_symbol,
+                    "side": side,
+                    "requested_size": normalized_size,
+                    "filled_size": float(simulated_size),
+                    "executed_price": float(sim_price),
+                    "fill_status": "filled",
+                    "fees": fees,
+                    "fee_type": fee_type,
+                }
                 le = getattr(self, "learning_engine", None)
                 if le and hasattr(le, "record_execution_feedback"):
                     try:
@@ -908,8 +985,8 @@ class ExecutionEngine:
                             score=execution_score,
                             slippage_bps=slippage,
                             latency_ms=latency,
-                            filled_qty=position_size,
-                            requested_qty=position_size,
+                            filled_qty=simulated_size,
+                            requested_qty=normalized_size,
                             side=side,
                             reason="paper_execution"
                         )
@@ -922,7 +999,7 @@ class ExecutionEngine:
                 f"Signal: {signal}\n"
                 f"Entry Price: {price}\n"
                 f"Confidence: {confidence}\n"
-                f"Size: {position_size}\n"
+                f"Size: {normalized_size}\n"
                 f"SL: {sl_price}\n"
                 f"TP: {tp_price}"
             )
@@ -938,7 +1015,13 @@ class ExecutionEngine:
                 f"Size: {position_size}\n"
                 f"Error: {exc}"
             )
-            raise
+            return {
+                "executed": False,
+                "reason": "execution_exception",
+                "error": str(exc),
+                "fees": fees,
+                "fee_type": fee_type,
+            }
 
     def execute_decision(
         self,
@@ -959,15 +1042,65 @@ class ExecutionEngine:
             account_equity=account_equity,
             meta_result=meta_result,
         )
+        final_decision = dict(decision)
+        final_decision["position_size"] = _safe_float(final_decision.get("position_size", 0.0), 0.0)
+        try:
+            assert final_decision["position_size"] >= 0.0, "position_size must be >= 0"
+            if not bool(final_decision.get("execute")):
+                assert final_decision["position_size"] == 0.0, "execute=False requires position_size=0"
+        except AssertionError as assert_exc:
+            logger.warning("[EXECUTION VALIDATION] %s", assert_exc)
 
-        if decision.get("execute"):
+        if not bool(final_decision.get("execute")):
+            final_decision["position_size"] = 0.0
+            final_decision["execution_status"] = "skipped"
+            logger.info(
+                "[EXECUTION] skipped symbol=%s execute=%s final_position_size=%.8f reason=%s",
+                symbol,
+                final_decision.get("execute"),
+                final_decision["position_size"],
+                final_decision.get("reason", "not_executable"),
+            )
+            return final_decision
+
+        # Execute exactly once for this cycle.
+        execution_attempted = False
+        if not execution_attempted:
+            execution_attempted = True
+            signal_name = str(signal_payload.get("signal", "")).upper().strip()
+            if signal_name not in {"LONG", "SHORT"}:
+                return {
+                    **final_decision,
+                    "execute": False,
+                    "position_size": 0.0,
+                    "execution_status": "failed",
+                    "reason": "invalid_signal_for_execution",
+                }
+            if signal_name == "LONG":
+                if not (final_decision.get("sl", 0.0) < current_price < final_decision.get("tp", 0.0)):
+                    return {
+                        **final_decision,
+                        "execute": False,
+                        "position_size": 0.0,
+                        "execution_status": "failed",
+                        "reason": "invalid_sl_tp_long",
+                    }
+            if signal_name == "SHORT":
+                if not (final_decision.get("tp", 0.0) < current_price < final_decision.get("sl", 0.0)):
+                    return {
+                        **final_decision,
+                        "execute": False,
+                        "position_size": 0.0,
+                        "execution_status": "failed",
+                        "reason": "invalid_sl_tp_short",
+                    }
             execution_result = self._execute_liquidity_trade(
-                execution_signal=str(signal_payload.get("signal", "")),
+                execution_signal=signal_name,
                 price=current_price,
                 confidence=confidence,
-                sl_price=float(decision["sl"]),
-                tp_price=float(decision["tp"]),
-                position_size=float(decision["position_size"]),
+                sl_price=float(final_decision["sl"]),
+                tp_price=float(final_decision["tp"]),
+                position_size=float(final_decision["position_size"]),
                 symbol=symbol,
                 meta_result=meta_result,
                 features=features_payload.get("features", features_payload)
@@ -976,26 +1109,28 @@ class ExecutionEngine:
             if isinstance(execution_result, dict):
                 if execution_result.get("status") == "blocked":
                     return {
-                        **decision,
+                        **final_decision,
                         "execute": False,
+                        "position_size": 0.0,
                         "execution_status": "blocked",
                         "reason": execution_result.get("reason", "blocked")
                     }
 
                 if execution_result.get("executed") is False:
                     return {
-                        **decision,
+                        **final_decision,
                         "execute": False,
+                        "position_size": 0.0,
                         "execution_status": "failed",
-                        "reason": execution_result.get("reason", "execution_failed")
+                        "reason": execution_result.get("reason", "execution_failed"),
+                        "execution_result": execution_result,
                     }
-
                 return {
-                    **decision,
+                    **final_decision,
                     "execution_status": "success",
                     "execution_result": execution_result
                 }
-        return decision
+        return final_decision
 
     def get_open_position(self, symbol: str) -> Dict[str, Any]:
         try:
