@@ -1961,43 +1961,6 @@ def run_analysis_cycle(
             _safe_float(decision["position_size"]),
         )
 
-    if decision.get("execute", False) and normalized_signal in ("LONG", "SHORT"):
-        capital_decision = capital_allocator.allocate(
-            learning_params=learning_params,
-            meta_result=meta_result,
-            features=feat_dict,
-            current_drawdown=_safe_float(lifecycle.get("drawdown", 0.0)),
-            account_equity=balance,
-        )
-
-        if not capital_decision.get("allow_trading", True):
-            decision["execute"] = False
-            decision["reason"] = f"{decision.get('reason','')}|capital_blocked:{capital_decision.get('reason')}"
-
-        if decision.get("execute", False) and normalized_signal in ("LONG", "SHORT"):
-            if decision.get("position_size", 0.0) > 0:
-                decision["position_size"] = (
-                    _safe_float(decision["position_size"])
-                    * _safe_float(capital_decision.get("capital_scale", 1.0))
-                )
-
-            max_exposure = _safe_float(capital_decision.get("max_exposure", balance))
-            notional = (
-                _safe_float(decision.get("position_size", 0.0))
-                * _safe_float(current_price)
-            )
-            if notional > max_exposure:
-                decision["position_size"] = max_exposure / max(_safe_float(current_price), 1e-9)
-                decision["reason"] = f"{decision.get('reason','')}|clamped_by_capital_allocator"
-
-        logger.info(
-            "[CAPITAL] scale=%.3f allow=%s max_exp=%.2f reason=%s",
-            capital_decision.get("capital_scale"),
-            capital_decision.get("allow_trading"),
-            capital_decision.get("max_exposure"),
-            capital_decision.get("reason"),
-        )
-
     # ── Liquidation engine + pre-trade quality gate ──────────────────
     _liq_plan: list = []
     _liq_style  = "PASSIVE"
@@ -2068,6 +2031,71 @@ def run_analysis_cycle(
         except Exception as _ptq_exc:
             logger.warning("[PRE_TRADE_QUALITY] non-fatal: %s", _ptq_exc)
 
+    capital_decision: Dict[str, Any] = {
+        "capital_scale": 1.0,
+        "allow_trading": True,
+        "max_exposure": balance,
+        "reason": "not_applied",
+    }
+    if decision.get("execute", False) and normalized_signal in ("LONG", "SHORT"):
+        capital_decision = capital_allocator.allocate(
+            learning_params=learning_params,
+            meta_result=meta_result,
+            features=feat_dict,
+            current_drawdown=_safe_float(lifecycle.get("drawdown", 0.0)),
+            account_equity=balance,
+        )
+
+        if not capital_decision.get("allow_trading", True):
+            decision["execute"] = False
+            decision["reason"] = f"{decision.get('reason','')}|capital_blocked:{capital_decision.get('reason')}"
+            normalized_signal = "HOLD"
+        elif decision.get("position_size", 0.0) > 0:
+            decision["position_size"] = (
+                _safe_float(decision["position_size"])
+                * _safe_float(capital_decision.get("capital_scale", 1.0))
+            )
+
+            max_exposure = _safe_float(capital_decision.get("max_exposure", balance))
+            notional = (
+                _safe_float(decision.get("position_size", 0.0))
+                * _safe_float(current_price)
+            )
+            if notional > max_exposure:
+                decision["position_size"] = max_exposure / max(_safe_float(current_price), 1e-9)
+                decision["reason"] = f"{decision.get('reason','')}|clamped_by_capital_allocator"
+
+        if not decision.get("execute", False):
+            normalized_signal = "HOLD"
+
+    final_position_size = _safe_float(decision.get("position_size", 0.0))
+    if final_position_size < 0:
+        logger.warning("[SAFETY] negative position_size corrected: %.6f", final_position_size)
+        decision["position_size"] = 0.0
+        final_position_size = 0.0
+
+    if not decision.get("execute", False) and normalized_signal != "HOLD":
+        logger.warning("[SAFETY] forcing HOLD because execute=False after finalization")
+        normalized_signal = "HOLD"
+
+    try:
+        assert final_position_size >= 0
+        if decision.get("execute") is False:
+            assert normalized_signal == "HOLD"
+    except AssertionError as _assert_err:
+        logger.warning("[SAFETY] finalization assertion failed: %s", _assert_err)
+
+    final_decision = decision.copy()
+    final_decision["position_size"] = final_position_size
+
+    logger.info(
+        "[CAPITAL] scale=%.3f allow=%s max_exp=%.2f reason=%s",
+        capital_decision.get("capital_scale"),
+        capital_decision.get("allow_trading"),
+        capital_decision.get("max_exposure"),
+        capital_decision.get("reason"),
+    )
+
     logger.info(
         "[META_FILTER] allow=%s scale=%.2f reason=%s",
         meta_result.get("allow_trade", True),
@@ -2075,7 +2103,7 @@ def run_analysis_cycle(
         meta_result.get("reason", ""),
     )
     logger.info("[ROUTER] %s", router_decision)
-    logger.info("[DECISION] %s", decision)
+    logger.info("[DECISION] %s", final_decision)
 
     execution_outcome = {
         "executed": False,
@@ -2085,7 +2113,7 @@ def run_analysis_cycle(
 
     if (
         normalized_signal in ("LONG", "SHORT")
-        and decision.get("execute")
+        and final_decision.get("execute")
         and router_decision.get("execute")
         and not position_manager.has_position()
     ):
@@ -2096,9 +2124,9 @@ def run_analysis_cycle(
                 confidence=_safe_float(confidence, 0.0),
                 candles_by_tf=candles_by_tf,
                 engines_out=engines_out,
-                sl_price=decision.get("sl") or None,
-                tp_price=decision.get("tp") or None,
-                position_size=decision.get("position_size") or None,
+                sl_price=final_decision.get("sl") or None,
+                tp_price=final_decision.get("tp") or None,
+                position_size=final_decision.get("position_size") or None,
             )
 
             eo = execution_outcome or {}
@@ -2157,8 +2185,8 @@ def run_analysis_cycle(
         except Exception as exc:
             logger.error("Execution block failed: %s", exc, exc_info=True)
             execution_outcome = {"executed": False, "reason": str(exc)}
-    elif not decision.get("execute"):
-        execution_outcome["reason"] = decision.get("reason", "execution_engine_blocked")
+    elif not final_decision.get("execute"):
+        execution_outcome["reason"] = final_decision.get("reason", "execution_engine_blocked")
     elif not router_decision.get("execute"):
         execution_outcome["reason"] = f"router_blocked:{router_decision.get('reason', 'unknown')}"
 
