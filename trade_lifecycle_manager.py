@@ -117,6 +117,7 @@ class TradeLifecycleManager:
         self._last_cycle_ts_ms = 0.0
         self._last_state_version = -1
         self._last_execution_id = ""
+        self._current_correlation_id = ""
         self._last_execution_ts_ms = 0.0
         self._pending_execution = False
         self._state_version = 0
@@ -130,10 +131,27 @@ class TradeLifecycleManager:
             self._pending_execution = new_value
             self._bump_state_version()
 
+    def _generate_correlation_id(self) -> str:
+        return hashlib.sha256(
+            f"{time.time_ns()}_{id(self)}_{self._state_version}".encode()
+        ).hexdigest()
+
+    def _clear_correlation_id(self) -> None:
+        if self._current_correlation_id:
+            LOGGER.info("lifecycle_cid_cleared cid=%s", self._current_correlation_id[:12])
+        self._current_correlation_id = ""
+
+    def _clear_execution_tracking(self) -> None:
+        if self._last_execution_id:
+            LOGGER.info("lifecycle_execution_id_cleared execution_id=%s", self._last_execution_id[:12])
+        self._last_execution_id = ""
+        self._clear_correlation_id()
+
     def _transition(self, new_state: str, reason: str) -> None:
         curr = self._fsm_state
+        cid = self._current_correlation_id[:12] if self._current_correlation_id else ""
         if new_state not in self._VALID_STATES:
-            LOGGER.warning("lifecycle_invalid_state state=%s reason=%s", new_state, reason)
+            LOGGER.warning("lifecycle_invalid_state cid=%s state=%s reason=%s", cid, new_state, reason)
             self._fsm_state = "IDLE"
             return
         allowed = self._VALID_TRANSITIONS.get(curr, set())
@@ -148,7 +166,8 @@ class TradeLifecycleManager:
                 self.state.cooldown_bars_remaining,
             )
             LOGGER.warning(
-                "lifecycle_illegal_transition from=%s to=%s reason=%s resetting=IDLE",
+                "lifecycle_illegal_transition cid=%s from=%s to=%s reason=%s resetting=IDLE",
+                cid,
                 curr,
                 new_state,
                 reason,
@@ -156,7 +175,7 @@ class TradeLifecycleManager:
             self._fsm_state = "IDLE"
             return
         if curr != new_state:
-            LOGGER.info("lifecycle_transition from=%s to=%s reason=%s", curr, new_state, reason)
+            LOGGER.info("lifecycle_transition cid=%s from=%s to=%s reason=%s", cid, curr, new_state, reason)
         self._fsm_state = new_state
 
     def _build_cycle_id(self, current_price: float, features: Dict[str, Any]) -> str:
@@ -199,9 +218,29 @@ class TradeLifecycleManager:
         features: Dict[str, Any],
     ) -> None:
         try:
-            execution_id = self._build_cycle_id(entry_price, features)
-            if self._last_execution_id == execution_id:
-                LOGGER.info("lifecycle_on_entry_duplicate_blocked execution_id=%s", execution_id[:12])
+            correlation_id = self.get_correlation_id()
+            if not correlation_id:
+                self._set_pending_execution(False)
+                self._clear_execution_tracking()
+                self._transition("IDLE", "on_entry_rejected")
+                LOGGER.warning("lifecycle_on_entry_rejected cid=%s reason=%s", "", "missing_cid")
+                LOGGER.error("lifecycle_on_entry_rejected_missing_cid")
+                return
+            if self._last_execution_id and correlation_id != self._last_execution_id:
+                self._set_pending_execution(False)
+                self._clear_execution_tracking()
+                self._transition("IDLE", "on_entry_rejected")
+                LOGGER.warning("lifecycle_on_entry_rejected cid=%s reason=%s", correlation_id[:12], "stale_cid")
+                LOGGER.warning(
+                    "lifecycle_on_entry_rejected_stale cid=%s expected_execution_id=%s",
+                    correlation_id[:12],
+                    self._last_execution_id[:12],
+                )
+                return
+            cid = correlation_id[:12]
+            execution_id = self._last_execution_id or correlation_id
+            if self.state.active and self._last_execution_id == execution_id:
+                LOGGER.info("lifecycle_on_entry_duplicate_blocked cid=%s execution_id=%s", cid, execution_id[:12])
                 return
 
             if self._fsm_state != "EXECUTING":
@@ -225,28 +264,37 @@ class TradeLifecycleManager:
 
             self._set_pending_execution(False)
             self._last_execution_id = execution_id
+            self._current_correlation_id = correlation_id
             self._last_execution_ts_ms = _safe_timestamp_ms(self.state.entry_time)
             self._bump_state_version()
             self._transition("IN_POSITION", "entry_confirmed")
-            LOGGER.info("lifecycle_execution_lock released=entry_confirmed")
+            LOGGER.info("lifecycle_execution_lock cid=%s released=entry_confirmed", cid)
             LOGGER.info(
-                "lifecycle_entry side=%s size=%.6f entry_price=%.6f execution_id=%s",
+                "lifecycle_entry cid=%s side=%s size=%.6f entry_price=%.6f execution_id=%s",
+                cid,
                 self.state.side,
                 self.state.size,
                 self.state.entry_price,
                 execution_id[:12],
             )
         except Exception:
-            LOGGER.exception("lifecycle_on_entry_error")
+            LOGGER.exception("lifecycle_on_entry_error cid=%s", self.get_correlation_id()[:12])
             self._set_pending_execution(False)
-            LOGGER.info("lifecycle_execution_lock released=entry_failed")
+            self._clear_execution_tracking()
+            self.state.active = False
+            self.state.size = 0.0
+            self.state.bars_held = 0
+            self.state.flattened = True
             self._transition("IDLE", "on_entry_exception")
+            LOGGER.info("lifecycle_execution_lock released=entry_failed")
 
     def on_exit(self, pnl_pct: float, reason: str) -> None:
         try:
+            cid = self.get_correlation_id()[:12]
             if not self.state.active:
                 self._set_pending_execution(False)
-                LOGGER.debug("lifecycle_on_exit_noop reason=already_flat")
+                self._clear_execution_tracking()
+                LOGGER.debug("lifecycle_on_exit_noop cid=%s reason=already_flat", cid)
                 return
             self._transition("EXITING", f"on_exit:{reason}")
             pnl = _safe_float(pnl_pct, 0.0)
@@ -269,12 +317,15 @@ class TradeLifecycleManager:
             self.state.flattened = True
             self._set_pending_execution(False)
             self._bump_state_version()
-            LOGGER.info("lifecycle_execution_lock released=exit_complete")
+            LOGGER.info("lifecycle_execution_lock cid=%s released=exit_complete", cid)
             self._transition("COOLDOWN", "exit_complete")
-            LOGGER.info("lifecycle_exit pnl_pct=%.6f reason=%s", pnl, reason)
+            LOGGER.info("lifecycle_exit cid=%s pnl_pct=%.6f reason=%s", cid, pnl, reason)
+            self._clear_execution_tracking()
         except Exception:
-            LOGGER.exception("lifecycle_on_exit_error")
+            LOGGER.exception("lifecycle_on_exit_error cid=%s", self.get_correlation_id()[:12])
             self._set_pending_execution(False)
+            if not self.state.active:
+                self._clear_execution_tracking()
             LOGGER.info("lifecycle_execution_lock released=exit_failed")
             self._transition("IDLE", "on_exit_exception")
 
@@ -303,37 +354,48 @@ class TradeLifecycleManager:
 
             if regime in ("toxic", "illiquid"):
                 self._set_pending_execution(False)
+                self._clear_execution_tracking()
                 return False
             if regime_conf < self.cfg.min_regime_confidence:
                 self._set_pending_execution(False)
+                self._clear_execution_tracking()
                 return False
             if vpin >= self.cfg.toxic_vpin:
                 self._set_pending_execution(False)
+                self._clear_execution_tracking()
                 return False
             if spread_bps >= self.cfg.toxic_spread_bps:
                 self._set_pending_execution(False)
+                self._clear_execution_tracking()
                 return False
             if liquidity_score < self.cfg.min_liquidity_score:
                 self._set_pending_execution(False)
+                self._clear_execution_tracking()
                 return False
             if latency_ms >= self.cfg.stale_latency_ms:
                 self._set_pending_execution(False)
+                self._clear_execution_tracking()
                 return False
             if self.state.consecutive_losses >= self.cfg.max_consecutive_losses:
                 self._set_pending_execution(False)
+                self._clear_execution_tracking()
                 return False
 
             self._set_pending_execution(True)
+            correlation_id = self._generate_correlation_id()
+            self._current_correlation_id = correlation_id
+            self._last_execution_id = correlation_id
             self._last_execution_ts_ms = _safe_timestamp_ms(
                 features.get("timestamp_ms", features.get("timestamp", features.get("ts", features.get("time")))),
                 default=(time.time() * 1000.0),
             )
             self._transition("EXECUTING", "can_open_new_trade_true")
-            LOGGER.info("lifecycle_execution_lock engaged=trade_approved")
+            LOGGER.info("lifecycle_execution_lock cid=%s engaged=trade_approved", correlation_id[:12])
             return True
         except Exception:
             LOGGER.exception("lifecycle_can_open_new_trade_error")
             self._set_pending_execution(False)
+            self._clear_execution_tracking()
             LOGGER.info("lifecycle_execution_lock released=approval_error")
             return False
 
@@ -357,6 +419,7 @@ class TradeLifecycleManager:
             lock_age_ms = max(0.0, current_time_ms - _safe_timestamp_ms(self._last_execution_ts_ms, current_time_ms))
             if self._pending_execution and lock_age_ms > adaptive_timeout_ms and not self.state.active:
                 self._set_pending_execution(False)
+                self._clear_execution_tracking()
                 LOGGER.info("lifecycle_execution_lock released=timeout")
                 if self._fsm_state == "EXECUTING":
                     self._transition("READY", "execution_lock_timeout")
@@ -405,6 +468,7 @@ class TradeLifecycleManager:
                 }
                 if self._pending_execution and not self.state.active:
                     self._set_pending_execution(False)
+                    self._clear_execution_tracking()
                     LOGGER.info("lifecycle_execution_lock released=hard_stop_toxic")
                 self._transition("EXITING", "hard_stop_toxic")
             elif latency_ms >= self.cfg.stale_latency_ms:
@@ -416,6 +480,7 @@ class TradeLifecycleManager:
                 }
                 if self._pending_execution and not self.state.active:
                     self._set_pending_execution(False)
+                    self._clear_execution_tracking()
                     LOGGER.info("lifecycle_execution_lock released=hard_stop_stale")
                 self._transition("EXITING", "hard_stop_stale")
             elif regime in ("toxic", "illiquid"):
@@ -427,6 +492,7 @@ class TradeLifecycleManager:
                 }
                 if self._pending_execution and not self.state.active:
                     self._set_pending_execution(False)
+                    self._clear_execution_tracking()
                     LOGGER.info("lifecycle_execution_lock released=regime_block")
                 self._transition("COOLDOWN", "regime_block")
             elif self.state.consecutive_losses >= self.cfg.max_consecutive_losses:
@@ -439,6 +505,7 @@ class TradeLifecycleManager:
                 }
                 if self._pending_execution and not self.state.active:
                     self._set_pending_execution(False)
+                    self._clear_execution_tracking()
                     LOGGER.info("lifecycle_execution_lock released=max_losses")
                 self._transition("EXITING", "max_consecutive_losses")
             else:
@@ -526,6 +593,7 @@ class TradeLifecycleManager:
             LOGGER.exception("lifecycle_update_error")
             self._fsm_state = "IDLE"
             self._set_pending_execution(False)
+            self._clear_execution_tracking()
             LOGGER.info("lifecycle_execution_lock released=update_exception")
             fallback = {
                 "action": "HOLD",
@@ -561,3 +629,6 @@ class TradeLifecycleManager:
                 "reason": "lifecycle_safe_fallback",
                 "block_new_entries": True,
             }
+
+    def get_correlation_id(self) -> str:
+        return self._current_correlation_id or ""

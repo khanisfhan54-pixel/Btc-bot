@@ -91,6 +91,7 @@ class PositionState:
     regime: Optional[str] = None
     fees: Optional[float] = None
     fee_type: Optional[str] = None  # "quote" or "pct"
+    correlation_id: str = ""
 
     def __post_init__(self):
         if self.fee_type is not None:
@@ -243,7 +244,9 @@ class PositionManager:
         regime: Optional[str] = None,
         fees: Optional[float] = None,
         fee_type: Optional[str] = None,
+        correlation_id: str = "",
     ) -> None:
+        cid = (correlation_id or "")[:12]
         self._sanitize_internal_state()
         side = str(side).upper().strip()
         if side not in ("LONG", "SHORT"):
@@ -255,14 +258,14 @@ class PositionManager:
         clean_tp = _safe_float(tp, 0.0)
         if clean_entry <= 0 or clean_size <= 0 or clean_sl <= 0 or clean_tp <= 0:
             logger.error(
-                "Rejected invalid entry payload: side=%s entry=%s size=%s sl=%s tp=%s",
-                side, entry_price, size, sl, tp,
+                "Rejected invalid entry payload cid=%s side=%s entry=%s size=%s sl=%s tp=%s",
+                cid, side, entry_price, size, sl, tp,
             )
             return
         if self.has_position():
             logger.warning(
-                "Duplicate entry blocked. Existing position side=%s size=%.8f; requested side=%s size=%s",
-                self.position.side, self.position.size, side, size,
+                "Duplicate entry blocked cid=%s existing_side=%s existing_size=%.8f requested_side=%s requested_size=%s",
+                cid, self.position.side, self.position.size, side, size,
             )
             return
 
@@ -295,6 +298,11 @@ class PositionManager:
             regime=regime,
             fees=fees,
             fee_type=fee_type,
+            correlation_id=correlation_id or "",
+        )
+        logger.info(
+            "position_open cid=%s side=%s entry=%.8f size=%.8f sl=%.8f tp=%.8f",
+            cid, side, clean_entry, clean_size, clean_sl, clean_tp,
         )
         self._sanitize_internal_state()
 
@@ -303,6 +311,8 @@ class PositionManager:
         if not self.position:
             return {"action": "NO_POSITION"}
         entry_price = _safe_float(getattr(self.position, "entry_price", 0.0), 0.0)
+        correlation_id = str(getattr(self.position, "correlation_id", "") or "")
+        cid = correlation_id[:12]
         side = str(getattr(self.position, "side", "LONG")).upper().strip()
         if side not in ("LONG", "SHORT"):
             side = "LONG"
@@ -334,8 +344,8 @@ class PositionManager:
                 pnl_pct = 0.0
 
             logger.info(
-                "[POSITION CLOSED] side=%s entry=%.2f exit=%.2f pnl=%.4f%% size=%.6f reason=%s",
-                side, entry_price, exit_price, pnl_pct * 100, size, reason,
+                "[POSITION CLOSED] cid=%s side=%s entry=%.2f exit=%.2f pnl=%.4f%% size=%.6f reason=%s",
+                cid, side, entry_price, exit_price, pnl_pct * 100, size, reason,
             )
 
             reason_lower = str(reason).lower()
@@ -503,6 +513,7 @@ class PositionManager:
             out = {
                 "action":           "CLOSE",
                 "reason":           reason,
+                "correlation_id":   correlation_id,
                 "side":             side,
                 "entry_price":      entry_price,
                 "exit_price":       exit_price,
@@ -518,6 +529,7 @@ class PositionManager:
             return {
                 "action": "CLOSE",
                 "reason": reason,
+                "correlation_id": correlation_id,
                 "side": side,
                 "entry_price": entry_price,
                 "exit_price": entry_price,
