@@ -694,55 +694,87 @@ class ExecutionEngine:
             return "LIMIT"
         return "MARKET"
 
-    def place_market_order(self, symbol: str, side: str, amount: float) -> dict:
+    def place_market_order(self, symbol: str, side: str, amount: float, correlation_id: str = "") -> dict:
+        cid = (correlation_id or "")[:12]
         try:
+            logger.info("order_send_market cid=%s symbol=%s side=%s amount=%.8f", cid, symbol, side, amount)
+            params: Dict[str, Any] = {}
+            if cid:
+                params["clientOrderId"] = f"{cid}_ENTRY"
             order = self.exchange.create_order(
                 symbol=symbol,
                 type="market",
                 side=side.lower(),
                 amount=amount,
+                params=params,
             )
+            if isinstance(order, dict):
+                order["correlation_id"] = correlation_id or ""
+            else:
+                try:
+                    setattr(order, "correlation_id", correlation_id or "")
+                except Exception:
+                    logger.warning("Failed to attach correlation_id to order object type=%s", type(order))
 
             order_id = order.get("id", "N/A")
             message = (
                 f"🚀 TRADE EXECUTED\n\n"
+                f"CID: {cid}\n"
                 f"Symbol: {symbol}  \n"
                 f"Side: {side.upper()}  \n"
                 f"Size: {amount}  \n\n"
                 f"Order ID: {order_id}"
             )
             send_telegram_message(message)
+            logger.info("order_sent_market cid=%s symbol=%s side=%s amount=%.8f order_id=%s", cid, symbol, side, amount, order_id)
             return order
         except Exception as exc:
             send_telegram_message(
                 f"⚠️ Trade execution failed\n\n"
+                f"CID: {cid}\n"
                 f"Symbol: {symbol}\n"
                 f"Side: {side.upper()}\n"
                 f"Size: {amount}\n"
                 f"Error: {exc}"
             )
+            logger.error("order_failed_market cid=%s symbol=%s side=%s amount=%.8f error=%s", cid, symbol, side, amount, exc)
             raise
 
-    def place_limit_order(self, symbol: str, side: str, amount: float, price: float) -> dict:
+    def place_limit_order(self, symbol: str, side: str, amount: float, price: float, correlation_id: str = "") -> dict:
+        cid = (correlation_id or "")[:12]
         try:
+            logger.info("order_send_limit cid=%s symbol=%s side=%s amount=%.8f price=%.8f", cid, symbol, side, amount, price)
+            params: Dict[str, Any] = {"timeInForce": "GTC"}
+            if cid:
+                params["clientOrderId"] = f"{cid}_ENTRY"
             order = self.exchange.create_order(
                 symbol=symbol,
                 type="limit",
                 side=side.lower(),
                 amount=amount,
                 price=price,
-                params={"timeInForce": "GTC"},
+                params=params,
             )
+            if isinstance(order, dict):
+                order["correlation_id"] = correlation_id or ""
+            else:
+                try:
+                    setattr(order, "correlation_id", correlation_id or "")
+                except Exception:
+                    logger.warning("Failed to attach correlation_id to order object type=%s", type(order))
+            logger.info("order_sent_limit cid=%s symbol=%s side=%s amount=%.8f price=%.8f", cid, symbol, side, amount, price)
             return order
         except Exception as exc:
             send_telegram_message(
                 f"⚠️ Limit order failed\n\n"
+                f"CID: {cid}\n"
                 f"Symbol: {symbol}\n"
                 f"Side: {side.upper()}\n"
                 f"Size: {amount}\n"
                 f"Price: {price}\n"
                 f"Error: {exc}"
             )
+            logger.error("order_failed_limit cid=%s symbol=%s side=%s amount=%.8f price=%.8f error=%s", cid, symbol, side, amount, price, exc)
             raise
 
     def place_order_with_sl_tp(
@@ -752,7 +784,9 @@ class ExecutionEngine:
         amount: float,
         sl: float,
         tp: float,
+        correlation_id: str = "",
     ) -> dict:
+        cid = (correlation_id or "")[:12]
         try:
             if side.lower() not in {"buy", "sell"}:
                 raise ValueError("side must be 'buy' or 'sell'")
@@ -763,7 +797,7 @@ class ExecutionEngine:
             if sl <= 0 or tp <= 0:
                 raise ValueError("sl and tp must be greater than zero")
 
-            entry_order = self.place_market_order(symbol, side, amount)
+            entry_order = self.place_market_order(symbol, side, amount, correlation_id=correlation_id)
             exit_side = "sell" if side.lower() == "buy" else "buy"
 
             sl_order = self.exchange.create_order(
@@ -775,6 +809,7 @@ class ExecutionEngine:
                     "stopPrice": sl,
                     "reduceOnly": True,
                     "workingType": "MARK_PRICE",
+                    "clientOrderId": f"{cid}_SL",
                 },
             )
 
@@ -787,9 +822,15 @@ class ExecutionEngine:
                     "stopPrice": tp,
                     "reduceOnly": True,
                     "workingType": "MARK_PRICE",
+                    "clientOrderId": f"{cid}_TP",
                 },
             )
+            if isinstance(sl_order, dict):
+                sl_order["correlation_id"] = correlation_id or ""
+            if isinstance(tp_order, dict):
+                tp_order["correlation_id"] = correlation_id or ""
 
+            logger.info("order_sent_bracket cid=%s symbol=%s side=%s amount=%.8f sl=%.8f tp=%.8f", cid, symbol, side, amount, sl, tp)
             return {
                 "entry_order": entry_order,
                 "sl_order": sl_order,
@@ -799,6 +840,7 @@ class ExecutionEngine:
         except Exception as exc:
             send_telegram_message(
                 f"⚠️ Bracket order failed\n\n"
+                f"CID: {cid}\n"
                 f"Symbol: {symbol}\n"
                 f"Side: {side.upper()}\n"
                 f"Size: {amount}\n"
@@ -806,6 +848,7 @@ class ExecutionEngine:
                 f"TP: {tp}\n"
                 f"Error: {exc}"
             )
+            logger.error("order_failed_bracket cid=%s symbol=%s side=%s amount=%.8f error=%s", cid, symbol, side, amount, exc)
             raise
 
     def _execute_liquidity_trade(
@@ -819,7 +862,9 @@ class ExecutionEngine:
         symbol: Optional[str] = None,
         meta_result: Optional[Dict[str, Any]] = None,
         features: Optional[Dict[str, Any]] = None,
+        correlation_id: str = "",
     ) -> dict:
+        cid = (correlation_id or "")[:12]
         fees, fee_type = _enforce_entry_fee_metadata(
             fees=_safe_float(features.get("fees", 0.0), 0.0) if isinstance(features, dict) else 0.0,
             fee_type=(features.get("fee_type") if isinstance(features, dict) else "pct"),
@@ -903,8 +948,10 @@ class ExecutionEngine:
                         amount=normalized_size,
                         sl=sl_price,
                         tp=tp_price,
+                        correlation_id=correlation_id,
                     )
                 except Exception as exc:
+                    logger.error("execution_live_failed cid=%s symbol=%s reason=exchange_order_failed error=%s", cid, trade_symbol, exc)
                     return {
                         "executed": False,
                         "reason": "exchange_order_failed",
@@ -953,6 +1000,7 @@ class ExecutionEngine:
                     "raw_result": result,
                     "fees": fees,
                     "fee_type": fee_type,
+                    "correlation_id": correlation_id or "",
                 }
 
             else:
@@ -974,6 +1022,7 @@ class ExecutionEngine:
                     "fill_status": "filled",
                     "fees": fees,
                     "fee_type": fee_type,
+                    "correlation_id": correlation_id or "",
                 }
                 le = getattr(self, "learning_engine", None)
                 if le and hasattr(le, "record_execution_feedback"):
@@ -995,6 +1044,7 @@ class ExecutionEngine:
 
             send_telegram_message(
                 f"✅ Liquidity trade placed\n\n"
+                f"CID: {cid}\n"
                 f"Symbol: {trade_symbol}\n"
                 f"Signal: {signal}\n"
                 f"Entry Price: {price}\n"
@@ -1003,10 +1053,15 @@ class ExecutionEngine:
                 f"SL: {sl_price}\n"
                 f"TP: {tp_price}"
             )
+            logger.info(
+                "execution_trade_result cid=%s symbol=%s signal=%s side=%s requested_size=%.8f executed=%s",
+                cid, trade_symbol, signal, side, normalized_size, result.get("executed")
+            )
             return result
         except Exception as exc:
             send_telegram_message(
                 f"⚠️ Liquidity trade execution failed\n\n"
+                f"CID: {cid}\n"
                 f"Signal: {execution_signal}\n"
                 f"Price: {price}\n"
                 f"Confidence: {confidence}\n"
@@ -1015,12 +1070,14 @@ class ExecutionEngine:
                 f"Size: {position_size}\n"
                 f"Error: {exc}"
             )
+            logger.error("execution_trade_exception cid=%s signal=%s size=%.8f error=%s", cid, execution_signal, position_size, exc)
             return {
                 "executed": False,
                 "reason": "execution_exception",
                 "error": str(exc),
                 "fees": fees,
                 "fee_type": fee_type,
+                "correlation_id": correlation_id or "",
             }
 
     def execute_decision(
@@ -1033,7 +1090,9 @@ class ExecutionEngine:
         current_price: float,
         confidence: float,
         meta_result: Optional[Dict[str, Any]] = None,
+        correlation_id: str = "",
     ) -> Dict[str, Any]:
+        cid = (correlation_id or "")[:12]
         self.set_symbol(symbol)
         decision = self.decide(
             signal_payload=signal_payload,
@@ -1055,7 +1114,8 @@ class ExecutionEngine:
             final_decision["position_size"] = 0.0
             final_decision["execution_status"] = "skipped"
             logger.info(
-                "[EXECUTION] skipped symbol=%s execute=%s final_position_size=%.8f reason=%s",
+                "[EXECUTION] skipped cid=%s symbol=%s execute=%s final_position_size=%.8f reason=%s",
+                cid,
                 symbol,
                 final_decision.get("execute"),
                 final_decision["position_size"],
@@ -1105,6 +1165,7 @@ class ExecutionEngine:
                 meta_result=meta_result,
                 features=features_payload.get("features", features_payload)
                 if isinstance(features_payload, dict) else {},
+                correlation_id=correlation_id,
             )
             if isinstance(execution_result, dict):
                 if execution_result.get("status") == "blocked":

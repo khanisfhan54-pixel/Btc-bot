@@ -204,6 +204,9 @@ except Exception as _new_module_import_err:
         def session_guard(self) -> dict:
             return {"action": "ALLOW", "block_new_entries": False}
 
+        def get_correlation_id(self) -> str:
+            return ""
+
 try:
     from learning_engine import LEARNING_ENGINE
 except Exception:
@@ -1267,8 +1270,11 @@ def _format_execution_message(
     sl_price: Optional[float] = None,
     tp_price: Optional[float] = None,
     order_id: Optional[str] = None,
+    correlation_id: str = "",
 ) -> str:
+    cid = (correlation_id or "")[:12]
     lines = [title]
+    lines.append(f"CID: {cid or 'n/a'}")
     lines.append(f"Side: {signal}")
     lines.append(f"Confidence: {confidence:.2f}")
     lines.append(f"Price: {price:,.2f}")
@@ -1290,6 +1296,7 @@ def _execute_liquidity_trade(
     sl_price: Optional[float] = None,
     tp_price: Optional[float] = None,
     position_size: Optional[float] = None,
+    correlation_id: str = "",
 ) -> Dict[str, Any]:
     """
     Execute a trade signal.
@@ -1298,6 +1305,7 @@ def _execute_liquidity_trade(
     Falls back to computing them from market data when not provided (e.g. legacy path).
     """
     market_data: Optional[Dict[str, Any]] = None
+    cid = (correlation_id or "")[:12]
 
     # --- Resolve SL / TP ---
     if sl_price is None or tp_price is None or _safe_float(sl_price) <= 0 or _safe_float(tp_price) <= 0:
@@ -1331,6 +1339,7 @@ def _execute_liquidity_trade(
             signal=execution_signal,
             confidence=confidence,
             price=price,
+            correlation_id=correlation_id,
         )
         send_telegram_message(pre_msg)
 
@@ -1339,7 +1348,7 @@ def _execute_liquidity_trade(
 
         if not LIVE_TRADING:
             print(
-                f"🧪 Paper Trade: {execution_signal} @ {price:.2f}"
+                f"🧪 Paper Trade[{cid}]: {execution_signal} @ {price:.2f}"
                 f" | SL={_safe_float(sl_price):.2f} | TP={_safe_float(tp_price):.2f}"
                 f" | Size={_safe_float(position_size):.6f}"
             )
@@ -1351,11 +1360,13 @@ def _execute_liquidity_trade(
                 sl_price=_safe_float(sl_price),
                 tp_price=_safe_float(tp_price),
                 order_id="paper",
+                correlation_id=correlation_id,
             )
             send_telegram_message(paper_msg)
             return {
                 "executed": False,
                 "paper": True,
+                "correlation_id": correlation_id or "",
                 "sl": sl_price,
                 "tp": tp_price,
                 "position_size": _safe_float(position_size),
@@ -1369,6 +1380,7 @@ def _execute_liquidity_trade(
             position_size,
             sl_price,
             tp_price,
+            correlation_id=correlation_id,
         )
 
         order_id = None
@@ -1389,12 +1401,14 @@ def _execute_liquidity_trade(
             sl_price=_safe_float(sl_price),
             tp_price=_safe_float(tp_price),
             order_id=str(order_id) if order_id is not None else "unknown",
+            correlation_id=correlation_id,
         )
         send_telegram_message(post_msg)
 
         return {
             "executed": True,
             "paper": False,
+            "correlation_id": correlation_id or "",
             "order_id": order_id,
             "sl": sl_price,
             "tp": tp_price,
@@ -1408,8 +1422,8 @@ def _execute_liquidity_trade(
             send_telegram_message(err_msg)
         except Exception:
             pass
-        logger.error("Execution failed: %s", exc, exc_info=True)
-        return {"executed": False, "reason": str(exc)}
+        logger.error("Execution failed cid=%s: %s", cid, exc, exc_info=True)
+        return {"executed": False, "reason": str(exc), "correlation_id": correlation_id or ""}
 
 
 def run_analysis_cycle(
@@ -1530,9 +1544,11 @@ def run_analysis_cycle(
         pos_action.get("size")
         or (position_manager.position.size if position_manager.has_position() else 0.0)
     )
+    _pa_correlation_id = str(pos_action.get("correlation_id") or "")
+    _pa_cid = _pa_correlation_id[:12]
     logger.info(
-        "[POSITION ACTION] action=%s price=%.2f new_sl=%.2f size=%.4f reason=%s",
-        _pa_action, current_price, _pa_new_sl, _pa_size, _pa_reason,
+        "[POSITION ACTION] cid=%s action=%s price=%.2f new_sl=%.2f size=%.4f reason=%s",
+        _pa_cid, _pa_action, current_price, _pa_new_sl, _pa_size, _pa_reason,
     )
 
     if _pa_action == "CLOSE":
@@ -1546,8 +1562,8 @@ def run_analysis_cycle(
         _real_pnl_pct      = _safe_float(pos_action.get("pnl_pct", 0.0))
 
         logger.info(
-            "[EXIT] side=%s entry=%.2f exit=%.2f pnl=%.4f%% size=%.4f reason=%s",
-            _close_side, _close_entry_price, _close_exit_price,
+            "[EXIT] cid=%s side=%s entry=%.2f exit=%.2f pnl=%.4f%% size=%.4f reason=%s",
+            _pa_cid, _close_side, _close_entry_price, _close_exit_price,
             _real_pnl_pct * 100, _close_size, _pa_reason,
         )
 
@@ -2110,6 +2126,8 @@ def run_analysis_cycle(
         "paper": False,
         "reason": "not_attempted",
     }
+    active_correlation_id = trade_lifecycle.get_correlation_id() if hasattr(trade_lifecycle, "get_correlation_id") else ""
+    active_cid = active_correlation_id[:12]
 
     if (
         normalized_signal in ("LONG", "SHORT")
@@ -2127,6 +2145,15 @@ def run_analysis_cycle(
                 sl_price=final_decision.get("sl") or None,
                 tp_price=final_decision.get("tp") or None,
                 position_size=final_decision.get("position_size") or None,
+                correlation_id=active_correlation_id,
+            )
+            logger.info(
+                "[EXECUTION TRACE] cid=%s signal=%s executed=%s paper=%s reason=%s",
+                active_cid,
+                normalized_signal,
+                execution_outcome.get("executed"),
+                execution_outcome.get("paper"),
+                execution_outcome.get("reason", ""),
             )
 
             eo = execution_outcome or {}
@@ -2156,6 +2183,7 @@ def run_analysis_cycle(
                         fees=fees,
                         fee_type=fee_type,
                         features=feat_dict,
+                        correlation_id=active_correlation_id,
                     )
                 except Exception as _pm_err:
                     logger.warning("[POSITION_MANAGER] on_entry failed: %s", _pm_err)
