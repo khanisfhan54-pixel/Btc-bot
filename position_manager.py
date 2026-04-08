@@ -161,6 +161,7 @@ class PositionManager:
         self.min_liquidity_score = min_liquidity_score
         self.position: Optional[PositionState] = None
         self.learning_engine = learning_engine
+        self._already_closed = False
 
     def _reset_to_safe_state(self, reason: str) -> None:
         logger.error("Forcing safe flat state due to invalid/corrupt position state: %s", reason)
@@ -269,6 +270,7 @@ class PositionManager:
         fee_type: Optional[str] = None,
         correlation_id: str = "",
     ) -> None:
+        self._already_closed = False
         cid = (correlation_id or "")[:12]
         self._sanitize_internal_state()
         side = str(side).upper().strip()
@@ -334,6 +336,7 @@ class PositionManager:
             fee_type=fee_type,
             correlation_id=correlation_id or "",
         )
+        self._already_closed = False
         logger.info(
             "position_open cid=%s side=%s entry=%.8f size=%.8f sl=%.8f tp=%.8f",
             cid, side, clean_entry, clean_size, clean_sl, clean_tp,
@@ -342,6 +345,8 @@ class PositionManager:
 
     def close(self, reason: str = "manual", exit_price: float = 0.0, features_exit: Optional[dict] = None) -> Dict[str, Any]:
         self._sanitize_internal_state()
+        if self._already_closed:
+            return {"action": "NO_POSITION", "reason": "already_closed"}
         if not self.position:
             return {"action": "NO_POSITION"}
         entry_price = _safe_float(getattr(self.position, "entry_price", 0.0), 0.0)
@@ -551,6 +556,11 @@ class PositionManager:
                         correlation_id=correlation_id,
                     )
                     learning_recorded = True
+                    logger.info(
+                        "learning_trade_emitted trade_id=%s pnl=%.4f",
+                        trade_id,
+                        realized_pnl,
+                    )
                 except Exception as e:
                     logger.warning("[LEARNING] closed trade recording failed: %s", e)
                     try:
@@ -671,6 +681,7 @@ class PositionManager:
                 "fallback_error": True,
             }
         finally:
+            self._already_closed = True
             self.position = None
 
     def update(self, current_price: float, features: Dict[str, Any]) -> Dict[str, Any]:
