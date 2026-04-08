@@ -59,6 +59,16 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _get_order_id(order: Any) -> str:
+    if isinstance(order, dict):
+        return str(order.get("id") or order.get("orderId") or "N/A")
+    return str(
+        getattr(order, "id", None)
+        or getattr(order, "orderId", None)
+        or "N/A"
+    )
+
+
 def _enforce_entry_fee_metadata(fees, fee_type, trade_id=None):
     fees_val = _safe_float(fees, 0.0)
 
@@ -217,37 +227,40 @@ class ExecutionLogic:
         if signal not in ("LONG", "SHORT"):
             return {
                 "execute": False, "side": "buy", "sl": 0.0, "tp": 0.0, "position_size": 0.0,
+                "reason": "unsupported_signal",
                 "meta_result": meta_result, "learning_params": learning_params,
             }
 
         if not features:
             return {
                 "execute": False, "side": "buy", "sl": 0.0, "tp": 0.0, "position_size": 0.0,
+                "reason": "missing_features",
                 "meta_result": meta_result, "learning_params": learning_params,
             }
 
         try:
-            best_bid        = float(features.get("best_bid", 0.0))
-            best_ask        = float(features.get("best_ask", 0.0))
-            mid             = float(features.get("mid", 0.0))
-            spread          = float(features.get("spread", 0.0))
-            spread_bps      = float(features.get("spread_bps", 999.0))
-            gap_proxy_bps   = float(features.get("gap_proxy_bps", 0.0))
-            largest_gap_bps = float(features.get("largest_gap_bps", 0.0))
-            liquidity_score = float(features.get("liquidity_score", 0.0))
-            spoofing_intensity = float(
+            best_bid        = _safe_float(features.get("best_bid", 0.0), 0.0)
+            best_ask        = _safe_float(features.get("best_ask", 0.0), 0.0)
+            mid             = _safe_float(features.get("mid", 0.0), 0.0)
+            spread          = _safe_float(features.get("spread", 0.0), 0.0)
+            spread_bps      = _safe_float(features.get("spread_bps", 999.0), 999.0)
+            gap_proxy_bps   = _safe_float(features.get("gap_proxy_bps", 0.0), 0.0)
+            largest_gap_bps = _safe_float(features.get("largest_gap_bps", 0.0), 0.0)
+            liquidity_score = _safe_float(features.get("liquidity_score", 0.0), 0.0)
+            spoofing_intensity = _safe_float(
                 features.get(
                     "spoofing_intensity",
                     features.get("spoof_score", features.get("spoof", 0.0)),
-                )
+                ),
+                0.0,
             )
-            urgency          = float(features.get("urgency", 0.5))
+            urgency          = _safe_float(features.get("urgency", 0.5), 0.5)
             regime           = features.get("regime", "unknown")
             regime           = str(regime).lower().strip()
             if regime not in ("trend", "range", "toxic"):
                 regime = "unknown"
             hidden_liquidity = bool(features.get("hidden_liquidity", False))
-            latency_ms_feat  = float(features.get("latency_ms", 0.0))
+            latency_ms_feat  = _safe_float(features.get("latency_ms", 0.0), 0.0)
         except Exception as exc:
             raise ValueError(f"invalid features payload: {exc}") from exc
 
@@ -321,6 +334,7 @@ class ExecutionLogic:
                 "sl": 0.0,
                 "tp": 0.0,
                 "position_size": 0.0,
+                "reason": "spoofing_detected",
                 "meta_result": meta_result,
                 "learning_params": learning_params,
             }
@@ -362,6 +376,7 @@ class ExecutionLogic:
         if not bids or not asks:
             return {
                 "execute": False, "side": "buy", "sl": 0.0, "tp": 0.0, "position_size": 0.0,
+                "reason": "invalid_order_book",
                 "meta_result": meta_result, "learning_params": learning_params,
             }
 
@@ -370,7 +385,7 @@ class ExecutionLogic:
             expected_slippage_bps = max(expected_slippage_bps, execution_slippage_bps)
         expected_cost_bps = self.cfg.fee_bps + expected_slippage_bps + max(0.0, spread_bps * 0.25)
 
-        signal_strength = float(signal_payload.get("confidence", confidence))
+        signal_strength = _safe_float(signal_payload.get("confidence", confidence), confidence)
         volatility = _safe_float(features.get("volatility", features.get("atr_pct", 0.0)), 0.0)
         regime_multiplier = 1.2 if regime == "trend" else 0.9 if regime == "range" else 1.0
         volatility_multiplier = _clamp(1.0 + (volatility * 0.5), 0.8, 1.5)
@@ -389,6 +404,7 @@ class ExecutionLogic:
                 "sl": 0.0,
                 "tp": 0.0,
                 "position_size": 0.0,
+                "reason": "edge_below_cost",
                 "meta_result": meta_result,
                 "learning_params": learning_params,
             }
@@ -399,6 +415,7 @@ class ExecutionLogic:
         if entry <= 0:
             return {
                 "execute": False, "side": "buy", "sl": 0.0, "tp": 0.0, "position_size": 0.0,
+                "reason": "invalid_entry_price",
                 "meta_result": meta_result, "learning_params": learning_params,
             }
 
@@ -444,6 +461,7 @@ class ExecutionLogic:
         if risk_per_unit <= 0:
             return {
                 "execute": False, "side": side, "sl": 0.0, "tp": 0.0, "position_size": 0.0,
+                "reason": "invalid_risk_per_unit",
                 "meta_result": meta_result, "learning_params": learning_params,
             }
 
@@ -475,6 +493,7 @@ class ExecutionLogic:
         if qty <= 0:
             return {
                 "execute": False, "side": side, "sl": 0.0, "tp": 0.0, "position_size": 0.0,
+                "reason": "position_size_zero",
                 "meta_result": meta_result, "learning_params": learning_params,
             }
 
@@ -482,12 +501,14 @@ class ExecutionLogic:
             if not (sl < entry < tp):
                 return {
                     "execute": False, "side": side, "sl": 0.0, "tp": 0.0, "position_size": 0.0,
+                    "reason": "invalid_bracket_long",
                     "meta_result": meta_result, "learning_params": learning_params,
                 }
         else:
             if not (tp < entry < sl):
                 return {
                     "execute": False, "side": side, "sl": 0.0, "tp": 0.0, "position_size": 0.0,
+                    "reason": "invalid_bracket_short",
                     "meta_result": meta_result, "learning_params": learning_params,
                 }
 
@@ -750,7 +771,7 @@ class ExecutionEngine:
                 except Exception:
                     logger.warning("Failed to attach correlation_id to order object type=%s", type(order))
 
-            order_id = order.get("id", "N/A")
+            order_id = _get_order_id(order)
             message = (
                 f"🚀 TRADE EXECUTED\n\n"
                 f"CID: {cid}\n"
@@ -796,7 +817,8 @@ class ExecutionEngine:
                     setattr(order, "correlation_id", correlation_id or "")
                 except Exception:
                     logger.warning("Failed to attach correlation_id to order object type=%s", type(order))
-            logger.info("order_sent_limit cid=%s symbol=%s side=%s amount=%.8f price=%.8f", cid, symbol, side, amount, price)
+            order_id = _get_order_id(order)
+            logger.info("order_sent_limit cid=%s symbol=%s side=%s amount=%.8f price=%.8f order_id=%s", cid, symbol, side, amount, price, order_id)
             return order
         except Exception as exc:
             send_telegram_message(
@@ -833,32 +855,68 @@ class ExecutionEngine:
 
             entry_order = self.place_market_order(symbol, side, amount, correlation_id=correlation_id)
             exit_side = "sell" if side.lower() == "buy" else "buy"
+            sl_order = None
+            tp_order = None
+            try:
+                sl_order = self.exchange.create_order(
+                    symbol=symbol,
+                    type="STOP_MARKET",
+                    side=exit_side,
+                    amount=amount,
+                    params={
+                        "stopPrice": sl,
+                        "reduceOnly": True,
+                        "workingType": "MARK_PRICE",
+                        "clientOrderId": f"{cid}_SL",
+                    },
+                )
 
-            sl_order = self.exchange.create_order(
-                symbol=symbol,
-                type="STOP_MARKET",
-                side=exit_side,
-                amount=amount,
-                params={
-                    "stopPrice": sl,
-                    "reduceOnly": True,
-                    "workingType": "MARK_PRICE",
-                    "clientOrderId": f"{cid}_SL",
-                },
-            )
-
-            tp_order = self.exchange.create_order(
-                symbol=symbol,
-                type="TAKE_PROFIT_MARKET",
-                side=exit_side,
-                amount=amount,
-                params={
-                    "stopPrice": tp,
-                    "reduceOnly": True,
-                    "workingType": "MARK_PRICE",
-                    "clientOrderId": f"{cid}_TP",
-                },
-            )
+                tp_order = self.exchange.create_order(
+                    symbol=symbol,
+                    type="TAKE_PROFIT_MARKET",
+                    side=exit_side,
+                    amount=amount,
+                    params={
+                        "stopPrice": tp,
+                        "reduceOnly": True,
+                        "workingType": "MARK_PRICE",
+                        "clientOrderId": f"{cid}_TP",
+                    },
+                )
+            except Exception as exc:
+                logger.error("bracket_partial_failure cid=%s error=%s", cid, exc)
+                # FUTURE: compensation hook (disabled for safety)
+                # try:
+                #     entry_id = _get_order_id(entry_order)
+                #     if entry_id and entry_id != "N/A":
+                #         self.exchange.cancel_order(entry_id, symbol=symbol)
+                # except Exception as cancel_exc:
+                #     logger.warning("compensation_cancel_failed cid=%s error=%s", cid, cancel_exc)
+                # TODO (future): centralize all execution feedback in _execute_liquidity_trade()
+                # Current placement is intentional to capture bracket-level failures early.
+                le = getattr(self, "learning_engine", None)
+                if le and hasattr(le, "record_execution_feedback"):
+                    try:
+                        le.record_execution_feedback(
+                            score=0.0,
+                            slippage_bps=0.0,
+                            latency_ms=0.0,
+                            filled_qty=0.0,
+                            requested_qty=amount,
+                            side=side,
+                            reason="bracket_partial_failure",
+                            trade_id=correlation_id or "",
+                        )
+                    except Exception:
+                        pass
+                return {
+                    "entry_order": entry_order,
+                    "sl_order": sl_order,
+                    "tp_order": tp_order,
+                    "partial_failure": True,
+                    "error": str(exc),
+                    "correlation_id": correlation_id or "",
+                }
             if isinstance(sl_order, dict):
                 sl_order["correlation_id"] = correlation_id or ""
             if isinstance(tp_order, dict):
@@ -869,6 +927,7 @@ class ExecutionEngine:
                 "entry_order": entry_order,
                 "sl_order": sl_order,
                 "tp_order": tp_order,
+                "correlation_id": correlation_id or "",
             }
 
         except Exception as exc:
@@ -1018,7 +1077,8 @@ class ExecutionEngine:
                             filled_qty=filled_size,
                             requested_qty=normalized_size,
                             side=side,
-                            reason="post_trade_execution"
+                            reason="post_trade_execution",
+                            trade_id=correlation_id or "",
                         )
                     except Exception as exc:
                         logger.warning("[LEARNING] post_exec feedback failed: %s", exc)
@@ -1071,7 +1131,8 @@ class ExecutionEngine:
                             filled_qty=simulated_size,
                             requested_qty=normalized_size,
                             side=side,
-                            reason="paper_execution"
+                            reason="paper_execution",
+                            trade_id=correlation_id or "",
                         )
                     except Exception as exc:
                         logger.warning("[LEARNING] post_exec paper feedback failed: %s", exc)
@@ -1209,6 +1270,15 @@ class ExecutionEngine:
                         "position_size": 0.0,
                         "execution_status": "blocked",
                         "reason": execution_result.get("reason", "blocked")
+                    }
+                if execution_result.get("partial_failure"):
+                    return {
+                        **final_decision,
+                        "execute": False,
+                        "position_size": 0.0,
+                        "execution_status": "failed",
+                        "reason": "bracket_partial_failure",
+                        "execution_result": execution_result,
                     }
 
                 if execution_result.get("executed") is False:
