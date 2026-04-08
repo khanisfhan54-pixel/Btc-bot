@@ -175,6 +175,8 @@ class ExecutionLogic:
                 learning_params = self.learning_engine.get_adaptive_params()
             except Exception:
                 learning_params = {}
+        if not isinstance(learning_params, dict):
+            learning_params = {}
         if not isinstance(signal_payload, dict):
             return {
                 "execute": False,
@@ -241,7 +243,9 @@ class ExecutionLogic:
             )
             urgency          = float(features.get("urgency", 0.5))
             regime           = features.get("regime", "unknown")
-            regime           = str(regime).lower()
+            regime           = str(regime).lower().strip()
+            if regime not in ("trend", "range", "toxic"):
+                regime = "unknown"
             hidden_liquidity = bool(features.get("hidden_liquidity", False))
             latency_ms_feat  = float(features.get("latency_ms", 0.0))
         except Exception as exc:
@@ -249,13 +253,33 @@ class ExecutionLogic:
 
         _ = (best_bid, best_ask)
 
-        learning_risk_scale = _clamp(_safe_float(learning_params.get("risk_scale", 1.0)), 0.5, 1.5)
-        learning_conf_thr = _clamp(_safe_float(learning_params.get("confidence_threshold", 0.60)), 0.45, 0.85)
+        regime_risk_map = learning_params.get("regime_risk_map", {}) if isinstance(learning_params, dict) else {}
+        if not isinstance(regime_risk_map, dict):
+            regime_risk_map = {}
+        regime_risk = _clamp(
+            _safe_float(regime_risk_map.get(regime, regime_risk_map.get("unknown", 0.8)), 0.8),
+            0.0,
+            1.5,
+        )
+        base_risk = _clamp(
+            _safe_float(
+                learning_params.get("risk_multiplier", learning_params.get("risk_scale", 1.0))
+            ),
+            0.0,
+            2.0,
+        )
+        learning_risk_scale = _clamp(base_risk * regime_risk, 0.0, 2.0)
+        learning_conf_thr = _clamp(_safe_float(learning_params.get("min_confidence_threshold", learning_params.get("confidence_threshold", 0.60))), 0.3, 0.9)
         learning_meta_strictness = _clamp(_safe_float(learning_params.get("meta_strictness", 1.0)), 0.75, 1.35)  # noqa: F841
         execution_quality = _clamp(_safe_float(learning_params.get("execution_quality", 1.0)), 0.0, 1.0)
         execution_slippage_bps = max(0.0, _safe_float(learning_params.get("execution_slippage", 0.0)))
         execution_latency_ms = max(0.0, _safe_float(learning_params.get("execution_latency", 0.0)))
         execution_fill_rate = _clamp(_safe_float(learning_params.get("execution_fill_rate", 0.5)), 0.0, 1.0)
+        slippage_tolerance_bps = _clamp(
+            _safe_float(learning_params.get("slippage_tolerance_bps", self.cfg.max_spread_bps)),
+            2.0,
+            20.0,
+        )
 
         if confidence < max(self.cfg.min_confidence, learning_conf_thr):
             return {
@@ -269,13 +293,23 @@ class ExecutionLogic:
                 "learning_params": learning_params,
             }
 
-        if liquidity_score < self.cfg.min_liquidity_score or spread_bps > self.cfg.max_spread_bps:
+        effective_spread_limit = max(min(self.cfg.max_spread_bps, slippage_tolerance_bps), 2.0)
+        if liquidity_score < self.cfg.min_liquidity_score or spread_bps > effective_spread_limit:
+            reasons = []
+            if "liquidity_score" not in features:
+                reasons.append("missing_liquidity_data")
+            if liquidity_score < self.cfg.min_liquidity_score:
+                reasons.append("low_liquidity")
+            if spread_bps > effective_spread_limit:
+                reasons.append("spread_too_wide")
+            _reason = "|".join(reasons) if reasons else "execution_filtered"
             return {
                 "execute": False,
                 "side": "buy" if signal == "LONG" else "sell",
                 "sl": 0.0,
                 "tp": 0.0,
                 "position_size": 0.0,
+                "reason": _reason,
                 "meta_result": meta_result,
                 "learning_params": learning_params,
             }

@@ -12,6 +12,7 @@ import random
 import logging
 import statistics
 import threading
+import uuid
 from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Deque, Dict, List, Optional, Tuple
@@ -1232,6 +1233,11 @@ def _normalize_trade_signal(signal: str) -> str:
     return "NONE"
 
 
+def _normalize_trade_id(value: Any) -> str:
+    v = str(value or "").strip()
+    return v if v else ""
+
+
 def _build_execution_market_data(candles_by_tf: Dict[str, Any], engines_out: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     try:
         candle_rows = candles_by_tf.get("1m") or candles_by_tf.get("15m") or candles_by_tf.get("primary") or []
@@ -1306,6 +1312,18 @@ def _execute_liquidity_trade(
     """
     market_data: Optional[Dict[str, Any]] = None
     cid = (correlation_id or "")[:12]
+    _trade_seed = "|".join(
+        [
+            str(correlation_id or ""),
+            str(execution_signal or ""),
+            f"{_safe_float(price):.8f}",
+            f"{_safe_float(sl_price):.8f}",
+            f"{_safe_float(tp_price):.8f}",
+            f"{_safe_float(position_size):.8f}",
+            str(int(time.time() * 1000)),
+        ]
+    )
+    deterministic_trade_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, _trade_seed))
 
     # --- Resolve SL / TP ---
     if sl_price is None or tp_price is None or _safe_float(sl_price) <= 0 or _safe_float(tp_price) <= 0:
@@ -1366,6 +1384,7 @@ def _execute_liquidity_trade(
             return {
                 "executed": False,
                 "paper": True,
+                "trade_id": deterministic_trade_id,
                 "correlation_id": correlation_id or "",
                 "sl": sl_price,
                 "tp": tp_price,
@@ -1405,9 +1424,12 @@ def _execute_liquidity_trade(
         )
         send_telegram_message(post_msg)
 
+        normalized_order_id = _normalize_trade_id(order_id)
+        trade_id = normalized_order_id if normalized_order_id else deterministic_trade_id
         return {
             "executed": True,
             "paper": False,
+            "trade_id": trade_id,
             "correlation_id": correlation_id or "",
             "order_id": order_id,
             "sl": sl_price,
@@ -1603,24 +1625,7 @@ def run_analysis_cycle(
             except Exception as _eq_exit_err:
                 logger.warning("[EXIT_QUALITY] on_exit failed (non-fatal): %s", _eq_exit_err)
 
-        if LEARNING_ENGINE is not None and _eq_metrics:
-            try:
-                LEARNING_ENGINE.record_exit_quality(
-                    mfe_pct=_safe_float(_eq_metrics.get("mfe_pct", 0.0)),
-                    mae_pct=_safe_float(_eq_metrics.get("mae_pct", 0.0)),
-                    exit_quality_score=_safe_float(_eq_metrics.get("exit_quality_score", 0.5)),
-                    exit_classification=str(_eq_metrics.get("exit_classification", "unknown")),
-                    holding_seconds=_safe_float(_eq_metrics.get("holding_seconds", 0.0)),
-                    reason=_pa_reason,
-                    regime=str(feat_dict.get("regime", "unknown")),
-                    exit_efficiency=_safe_float(_eq_metrics.get("exit_efficiency", 0.0)),
-                    realized_pnl=_safe_float(_eq_metrics.get("realized_pnl", 0.0)),
-                    peak_pnl=_safe_float(_eq_metrics.get("peak_pnl", 0.0)),
-                    confidence=_safe_float(_eq_metrics.get("confidence", 0.0)),
-                    side=_close_side,
-                )
-            except Exception as _eq_le_err:
-                logger.warning("[EXIT_QUALITY] record_exit_quality failed (non-fatal): %s", _eq_le_err)
+        # LearningEngine trade + exit-quality updates are executed once in PositionManager.close().
 
         # ── Execution quality → learning engine ──────────────────────────
         if LEARNING_ENGINE is not None:
@@ -1645,33 +1650,7 @@ def run_analysis_cycle(
             except Exception as _exec_q_err:
                 logger.warning("[EXEC_QUALITY] record_execution_quality failed (non-fatal): %s", _exec_q_err)
 
-        if LEARNING_ENGINE is not None:
-            try:
-                LEARNING_ENGINE.record_closed_trade(
-                    signal=_close_side,
-                    side=_close_side,
-                    entry_price=_close_entry_price,
-                    exit_price=_close_exit_price,
-                    size=_close_size,
-                    entry_ts=None,
-                    exit_ts=datetime.now(timezone.utc).isoformat(),
-                    confidence=_close_confidence,
-                    features_entry=feat_dict,
-                    features_exit=feat_dict,
-                    reason=_pa_reason,
-                    exit_type="forced_close",
-                    fees=0.0,
-                    pnl_override=_real_pnl_pct,
-                    mfe_pct=_safe_float(_eq_metrics.get("mfe_pct")) if _eq_metrics else None,
-                    mae_pct=_safe_float(_eq_metrics.get("mae_pct")) if _eq_metrics else None,
-                )
-                logger.info(
-                    "[LEARNING] trade recorded side=%s entry=%.2f exit=%.2f pnl=%.4f size=%.4f reason=%s",
-                    _close_side, _close_entry_price, _close_exit_price,
-                    _real_pnl_pct, _close_size, _pa_reason,
-                )
-            except Exception as _le_close_err:
-                logger.warning("[LEARNING] record_closed_trade failed (non-fatal): %s", _le_close_err)
+        # Closed-trade learning must be emitted exactly once from PositionManager.close().
 
         try:
             trade_lifecycle.on_exit(pnl_pct=_real_pnl_pct, reason=_pa_reason)
@@ -2180,6 +2159,10 @@ def run_analysis_cycle(
                         size=pos_size,
                         sl=_safe_float(eo.get("sl", 0.0)),
                         tp=_safe_float(eo.get("tp", 0.0)),
+                        trade_id=str(eo.get("trade_id") or ""),
+                        signal=normalized_signal,
+                        confidence=_clamp(_safe_float(confidence, 0.0), 0.0, 1.0),
+                        regime=str(feat_dict.get("regime", "unknown")),
                         fees=fees,
                         fee_type=fee_type,
                         features=feat_dict,
