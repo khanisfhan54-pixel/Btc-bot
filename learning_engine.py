@@ -131,6 +131,7 @@ class LearningEngine:
         self._save_thread: Optional[threading.Thread] = None
         self._recompute_thread: Optional[threading.Thread] = None
         self._pending_adaptive_update = False
+        self._stale_save_skips = 0
 
         self.state: Dict[str, Any] = {
             "risk_scale": 1.0,
@@ -174,22 +175,60 @@ class LearningEngine:
         if pending_recompute:
             self._pending_recompute = True
 
-    def _build_save_payload(self) -> Dict[str, Any]:
-        payload = dict(self.state)
-        payload["recent_trades"] = list(self.trades)
-        payload["execution_feedback"] = list(self.exec_feedback)
-        payload["win_rate_history"] = list(self.win_rate_history)
-        payload["pnl_history"] = list(self.pnl_history)
-        payload["signal_stats"] = dict(self.signal_stats)
-        payload["regime_stats"] = dict(self.regime_stats)
-        payload["side_exec_stats"] = dict(self.side_exec_stats)
-        payload["closed_trades"] = list(self.closed_trades)
-        payload["exit_reason_stats"] = dict(self.exit_reason_stats)
-        payload["holding_time_history"] = list(self.holding_time_history)
-        payload["exit_regime_stats"] = dict(self.exit_regime_stats)
-        payload["exit_quality_history"] = list(self.exit_quality_history)
-        payload["exec_quality_scores"] = list(self.exec_quality_scores)
-        payload["open_trades"] = list(self._open_trades.values())
+
+    def _snapshot_for_save(self) -> Dict[str, Any]:
+        def _clone_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            return [dict(item) if isinstance(item, dict) else item for item in records]
+
+        def _clone_trades_with_features(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            out: List[Dict[str, Any]] = []
+            for item in records:
+                if not isinstance(item, dict):
+                    out.append(item)
+                    continue
+                cloned = dict(item)
+                features = cloned.get("features")
+                if isinstance(features, dict):
+                    cloned["features"] = dict(features)
+                out.append(cloned)
+            return out
+
+        return {
+            "version": self._state_version,
+            "state": dict(self.state),
+            "trades": _clone_trades_with_features(list(self.trades)),
+            "exec_feedback": _clone_records(list(self.exec_feedback)),
+            "win_rate_history": list(self.win_rate_history),
+            "pnl_history": list(self.pnl_history),
+            "signal_stats": {k: dict(v) for k, v in self.signal_stats.items()},
+            "regime_stats": {k: dict(v) for k, v in self.regime_stats.items()},
+            "side_exec_stats": {k: dict(v) for k, v in self.side_exec_stats.items()},
+            "closed_trades": _clone_records(list(self.closed_trades)),
+            "exit_reason_stats": dict(self.exit_reason_stats),
+            "holding_time_history": list(self.holding_time_history),
+            "exit_regime_stats": {k: dict(v) for k, v in self.exit_regime_stats.items()},
+            "exit_quality_history": _clone_records(list(self.exit_quality_history)),
+            "exec_quality_scores": list(self.exec_quality_scores),
+            "open_trades": _clone_trades_with_features(list(self._open_trades.values())),
+        }
+
+    def _build_save_payload(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        payload = dict(snapshot.get("state", {}))
+        payload["state_version"] = int(max(0, _safe_float(snapshot.get("version", 0), 0.0)))
+        payload["recent_trades"] = snapshot.get("trades", [])
+        payload["execution_feedback"] = snapshot.get("exec_feedback", [])
+        payload["win_rate_history"] = snapshot.get("win_rate_history", [])
+        payload["pnl_history"] = snapshot.get("pnl_history", [])
+        payload["signal_stats"] = snapshot.get("signal_stats", {})
+        payload["regime_stats"] = snapshot.get("regime_stats", {})
+        payload["side_exec_stats"] = snapshot.get("side_exec_stats", {})
+        payload["closed_trades"] = snapshot.get("closed_trades", [])
+        payload["exit_reason_stats"] = snapshot.get("exit_reason_stats", {})
+        payload["holding_time_history"] = snapshot.get("holding_time_history", [])
+        payload["exit_regime_stats"] = snapshot.get("exit_regime_stats", {})
+        payload["exit_quality_history"] = snapshot.get("exit_quality_history", [])
+        payload["exec_quality_scores"] = snapshot.get("exec_quality_scores", [])
+        payload["open_trades"] = snapshot.get("open_trades", [])
         return payload
 
     def _schedule_save(self, force: bool = False) -> None:
@@ -256,19 +295,31 @@ class LearningEngine:
                     self._save_pending = False
                     self._save_force = False
                     self._last_save_ts = now
-                    payload = self._build_save_payload()
+                    snapshot = self._snapshot_for_save()
                 else:
-                    payload = None
+                    snapshot = None
 
-            if payload is None:
+            if snapshot is None:
                 time.sleep(delay)
                 continue
+
+            snapshot_version = int(_safe_float(snapshot.get("version", 0), 0.0))
+            with self._lock:
+                if snapshot_version < self._state_version:
+                    self._stale_save_skips = min(self._stale_save_skips + 1, 1000)
+                    if self._stale_save_skips < 3:
+                        self._save_pending = True
+                        continue
+
+            payload = self._build_save_payload(snapshot)
 
             try:
                 tmp_path = self.state_path + ".tmp"
                 with open(tmp_path, "w", encoding="utf-8") as f:
                     json.dump(payload, f, indent=2, default=str)
                 os.replace(tmp_path, self.state_path)
+                with self._lock:
+                    self._stale_save_skips = 0
             except Exception as exc:
                 logger.warning("learning state save failed: %s", exc)
 
@@ -515,11 +566,13 @@ class LearningEngine:
                     cloned = dict(item)
                     cloned["trade_id"] = trade_id
                     cloned["created_at"] = str(cloned.get("created_at", "") or "")
-                    cloned["entry_ts"] = cloned.get("entry_ts")
+                    cloned["entry_ts"] = self._parse_ts(cloned.get("entry_ts"))
                     cloned["signal"] = str(cloned.get("signal", "HOLD") or "HOLD").upper()
                     cloned["confidence"] = _clamp(_safe_float(cloned.get("confidence", 0.0)), 0.0, 1.0)
                     cloned["features"] = dict(cloned.get("features", {})) if isinstance(cloned.get("features", {}), dict) else {}
                     cloned["regime"] = str(cloned.get("regime", "unknown") or "unknown").lower()
+                    if cloned["entry_ts"] is None and not cloned["created_at"]:
+                        continue
                     sanitized_trades.append(cloned)
         self.trades = sanitized_trades
 
@@ -537,6 +590,8 @@ class LearningEngine:
                 cloned["pnl"] = _safe_float(cloned.get("pnl", 0.0))
                 cloned["pnl_pct"] = _safe_float(cloned.get("pnl_pct", 0.0))
                 cloned["r_multiple"] = _safe_float(cloned.get("r_multiple", 0.0)) if _is_valid_r(cloned.get("r_multiple")) else None
+                cloned["holding_seconds"] = max(0.0, _safe_float(cloned.get("holding_seconds", 0.0)))
+                cloned["confidence"] = _clamp(_safe_float(cloned.get("confidence", 0.0)), 0.0, 1.0)
                 sanitized_closed.append(cloned)
         self.closed_trades = sanitized_closed
 
@@ -575,7 +630,7 @@ class LearningEngine:
                     "exit_efficiency": _safe_float(item.get("exit_efficiency", 0.0)),
                     "realized_pnl": _safe_float(item.get("realized_pnl", 0.0)),
                     "peak_pnl": _safe_float(item.get("peak_pnl", 0.0)),
-                    "confidence": _safe_float(item.get("confidence", 0.0)),
+                    "confidence": _clamp(_safe_float(item.get("confidence", 0.0)), 0.0, 1.0),
                     "side": str(item.get("side", "LONG")).upper(),
                 }
             )
@@ -659,33 +714,37 @@ class LearningEngine:
         self._recompute()
 
     def _load(self) -> None:
-        with self._lock:
-            backup_path = self.state_path + ".bak"
-            try:
-                if os.path.exists(self.state_path):
-                    with open(self.state_path, "r", encoding="utf-8") as f:
-                        raw_data = f.read()
-                    data = json.loads(raw_data)
-                    if isinstance(data, dict):
+        backup_path = self.state_path + ".bak"
+        try:
+            if os.path.exists(self.state_path):
+                with open(self.state_path, "r", encoding="utf-8") as f:
+                    raw_data = f.read()
+                data = json.loads(raw_data)
+                if isinstance(data, dict):
+                    with self._lock:
                         self._restore_from_data(data)
-                        try:
-                            with open(backup_path, "w", encoding="utf-8") as dst:
-                                dst.write(raw_data)
-                        except Exception as backup_exc:
-                            logger.warning("learning state backup failed: %s", backup_exc)
-            except Exception as exc:
-                logger.error("CRITICAL: state load failed, attempting backup recovery")
-                logger.warning("learning state load failed: %s", exc)
-                try:
-                    if os.path.exists(backup_path):
-                        with open(backup_path, "r", encoding="utf-8") as f:
-                            data = json.load(f)
-                        if isinstance(data, dict):
-                            self._restore_from_data(data)
-                            return
-                except Exception as backup_exc:
-                    logger.warning("learning state backup recovery failed: %s", backup_exc)
-                self._reset_safe()
+                    try:
+                        with open(backup_path, "w", encoding="utf-8") as dst:
+                            dst.write(raw_data)
+                    except Exception as backup_exc:
+                        logger.warning("learning state backup failed: %s", backup_exc)
+                    return
+        except Exception as exc:
+            logger.error("CRITICAL: state load failed, attempting backup recovery")
+            logger.warning("learning state load failed: %s", exc)
+
+        try:
+            if os.path.exists(backup_path):
+                with open(backup_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    with self._lock:
+                        self._restore_from_data(data)
+                    return
+        except Exception as backup_exc:
+            logger.warning("learning state backup recovery failed: %s", backup_exc)
+
+        self._reset_safe()
 
 
     def _reset_safe(self) -> None:
@@ -1422,25 +1481,25 @@ class LearningEngine:
 
             if self._adaptive_update_counter % 5 == 0:
                 self._pending_adaptive_update = True
-            self._sync_legacy_state_from_adaptive()
-            logger.info(
-                "[LEARNING_SCORE] %s",
-                json.dumps(
-                    {
-                        "trade_id": resolved_trade_id,
-                        "correlation_id": trade_record["correlation_id"],
-                        "execution_score": trade["execution_score"],
-                        "trade_score": trade["trade_score"],
-                        "confidence_error": trade["confidence_error"],
-                        "slippage_bps": trade_record["slippage_bps"],
-                        "latency_ms": trade_record["latency_ms"],
-                        "fill_ratio": trade_record["fill_ratio"],
-                        "regime": trade_record["regime"],
-                    },
-                    sort_keys=True,
-                    default=str,
-                ),
-            )
+            if logger.isEnabledFor(logging.INFO):
+                logger.info(
+                    "[LEARNING_SCORE] %s",
+                    json.dumps(
+                        {
+                            "trade_id": resolved_trade_id,
+                            "correlation_id": trade_record["correlation_id"],
+                            "execution_score": trade["execution_score"],
+                            "trade_score": trade["trade_score"],
+                            "confidence_error": trade["confidence_error"],
+                            "slippage_bps": trade_record["slippage_bps"],
+                            "latency_ms": trade_record["latency_ms"],
+                            "fill_ratio": trade_record["fill_ratio"],
+                            "regime": trade_record["regime"],
+                        },
+                        sort_keys=True,
+                        default=str,
+                    ),
+                )
             self.win_rate_history.append(self.state.get("last_win_rate", 0.0))
             if self._trade_counter % self.cfg.save_every_n == 0:
                 self._schedule_save()
