@@ -1312,15 +1312,20 @@ def _execute_liquidity_trade(
     """
     market_data: Optional[Dict[str, Any]] = None
     cid = (correlation_id or "")[:12]
+    def _seed_val(v):
+        if v is None:
+            return "NA"
+        return f"{round(_safe_float(v), 8):.8f}"
+
     _trade_seed = "|".join(
         [
-            str(correlation_id or ""),
+            str(correlation_id or "NO_CID"),
             str(execution_signal or ""),
             f"{_safe_float(price):.8f}",
-            f"{_safe_float(sl_price):.8f}",
-            f"{_safe_float(tp_price):.8f}",
-            f"{_safe_float(position_size):.8f}",
-            str(int(time.time() * 1000)),
+            _seed_val(sl_price),
+            _seed_val(tp_price),
+            _seed_val(position_size),
+            str(correlation_id or "NO_CID"),
         ]
     )
     deterministic_trade_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, _trade_seed))
@@ -1330,20 +1335,20 @@ def _execute_liquidity_trade(
         market_data = _build_execution_market_data(candles_by_tf, engines_out)
         if not market_data:
             logger.info("Skipping execution: liquidity market data missing or sweep not confirmed.")
-            return {"executed": False, "reason": "missing_liquidity_data"}
+            return {"executed": False, "reason": "missing_liquidity_data", "trade_id": deterministic_trade_id, "correlation_id": correlation_id or ""}
         try:
             sl_price, tp_price = calculate_liquidity_sl_tp(execution_signal, price, market_data)
         except Exception as exc:
             logger.warning("calculate_liquidity_sl_tp failed: %s", exc)
-            return {"executed": False, "reason": f"sl_tp_error:{exc}"}
+            return {"executed": False, "reason": f"sl_tp_error:{exc}", "trade_id": deterministic_trade_id, "correlation_id": correlation_id or ""}
 
     try:
         if sl_price is None or tp_price is None:
-            return {"executed": False, "reason": "invalid_sl_tp"}
+            return {"executed": False, "reason": "invalid_sl_tp", "trade_id": deterministic_trade_id, "correlation_id": correlation_id or ""}
 
         stop_loss_distance = abs(price - _safe_float(sl_price))
         if stop_loss_distance <= 0:
-            return {"executed": False, "reason": "invalid_stop_loss_distance"}
+            return {"executed": False, "reason": "invalid_stop_loss_distance", "trade_id": deterministic_trade_id, "correlation_id": correlation_id or ""}
 
         # --- Resolve position size ---
         if position_size is None or _safe_float(position_size) <= 0:
@@ -1362,7 +1367,7 @@ def _execute_liquidity_trade(
         send_telegram_message(pre_msg)
 
         if position_size is None or _safe_float(position_size) <= 0:
-            return {"executed": False, "reason": "invalid_position_size"}
+            return {"executed": False, "reason": "invalid_position_size", "trade_id": deterministic_trade_id, "correlation_id": correlation_id or ""}
 
         if not LIVE_TRADING:
             print(
@@ -1424,12 +1429,10 @@ def _execute_liquidity_trade(
         )
         send_telegram_message(post_msg)
 
-        normalized_order_id = _normalize_trade_id(order_id)
-        trade_id = normalized_order_id if normalized_order_id else deterministic_trade_id
         return {
             "executed": True,
             "paper": False,
-            "trade_id": trade_id,
+            "trade_id": deterministic_trade_id,
             "correlation_id": correlation_id or "",
             "order_id": order_id,
             "sl": sl_price,
@@ -1445,7 +1448,12 @@ def _execute_liquidity_trade(
         except Exception:
             pass
         logger.error("Execution failed cid=%s: %s", cid, exc, exc_info=True)
-        return {"executed": False, "reason": str(exc), "correlation_id": correlation_id or ""}
+        return {
+            "executed": False,
+            "reason": str(exc),
+            "correlation_id": correlation_id or "",
+            "trade_id": deterministic_trade_id,
+        }
 
 
 def run_analysis_cycle(
