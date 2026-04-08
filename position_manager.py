@@ -53,12 +53,11 @@ def _deterministic_trade_id(
     seed = "|".join(
         [
             str(side or "").upper().strip(),
-            f"{_safe_float(entry_price):.8f}",
-            f"{_safe_float(size):.8f}",
-            f"{_safe_float(sl):.8f}",
-            f"{_safe_float(tp):.8f}",
-            str(correlation_id or "").strip(),
-            str(int(time.time() * 1000)),
+            f"{round(_safe_float(entry_price), 8):.8f}",
+            f"{round(_safe_float(size), 8):.8f}",
+            f"{round(_safe_float(sl), 8):.8f}",
+            f"{round(_safe_float(tp), 8):.8f}",
+            str(correlation_id or "NO_CID").strip(),
         ]
     )
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, seed))
@@ -310,6 +309,10 @@ class PositionManager:
 
         normalized_trade_id = str(trade_id or "").strip()
         if not normalized_trade_id:
+            logger.warning(
+                "trade_id_missing_at_entry cid=%s generating_deterministic_id",
+                correlation_id[:12] if correlation_id else "",
+            )
             normalized_trade_id = _deterministic_trade_id(
                 side=side,
                 entry_price=clean_entry,
