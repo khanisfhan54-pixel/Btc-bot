@@ -82,6 +82,8 @@ class LearningConfig:
 
 
 class LearningEngine:
+    MAX_TRADES = 5000
+
     def __init__(self, state_path: str = LEARNING_STATE_PATH, config: LearningConfig | None = None) -> None:
         self.state_path = state_path
         self.cfg = config or LearningConfig()
@@ -117,6 +119,7 @@ class LearningEngine:
         )
 
         self._open_trades: Dict[str, Dict] = {}
+        self._seen_trade_ids = set()
 
         self._trade_counter = 0
         self._dirty = True
@@ -594,6 +597,7 @@ class LearningEngine:
                 cloned["confidence"] = _clamp(_safe_float(cloned.get("confidence", 0.0)), 0.0, 1.0)
                 sanitized_closed.append(cloned)
         self.closed_trades = sanitized_closed
+        self._seen_trade_ids = {str(t.get("trade_id")).strip() for t in self.closed_trades if isinstance(t, dict) and str(t.get("trade_id", "")).strip()}
 
         sanitized_feedback = deque(maxlen=250)
         for item in list(self.exec_feedback):
@@ -1255,10 +1259,6 @@ class LearningEngine:
         **kwargs: Any,
     ) -> Dict[str, Any]:
         with self._lock:
-            def _normalize_trade_id(value: Any) -> Optional[str]:
-                v = str(value or "").strip()
-                return v if v else None
-
             signal = str(signal or "HOLD").upper()
             side = str(side or "LONG").upper()
             reason = str(reason or "unknown").lower()
@@ -1271,57 +1271,26 @@ class LearningEngine:
             features_entry = features_entry if isinstance(features_entry, dict) else {}
             features_exit = features_exit if isinstance(features_exit, dict) else {}
             now_iso = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
-            orphan = False
-            normalized_trade_id = _normalize_trade_id(trade_id)
+            trade_id = str(trade_id or "").strip()
+            if not trade_id:
+                logger.error("learning_missing_trade_id — skipping record")
+                return {}
+            if trade_id in self._seen_trade_ids:
+                logger.warning("learning_duplicate_trade_skipped trade_id=%s", trade_id)
+                return {}
+            resolved_trade_id = trade_id
             normalized_correlation_id = str(correlation_id or features_entry.get("correlation_id") or features_exit.get("correlation_id") or "").strip()
 
-            resolved_trade_id = None
-            open_trades_count = len(self._open_trades)
-            if normalized_trade_id:
-                resolved_trade_id = normalized_trade_id
-            elif _normalize_trade_id(features_entry.get("trade_id")):
-                resolved_trade_id = _normalize_trade_id(features_entry.get("trade_id"))
-            elif _normalize_trade_id(features_exit.get("trade_id")):
-                resolved_trade_id = _normalize_trade_id(features_exit.get("trade_id"))
-            elif open_trades_count > 0:
-                possible_times = []
-                if entry_ts is not None:
-                    parsed_entry_ts = self._parse_ts(entry_ts)
-                    if parsed_entry_ts is not None:
-                        possible_times.append(parsed_entry_ts)
-                for k in ["entry_ts", "timestamp", "ts"]:
-                    t = features_entry.get(k)
-                    if t is not None:
-                        pt = self._parse_ts(t)
-                        if pt is not None:
-                            possible_times.append(pt)
-                best_id = None
-                best_diff = float("inf")
-                for otid, otrade in self._open_trades.items():
-                    if not isinstance(otrade, dict):
-                        continue
-                    if str(otrade.get("signal", "")).upper() != signal:
-                        continue
-                    oentry_ts_parsed = self._parse_ts(otrade.get("entry_ts") or otrade.get("created_at"))
-                    for t in possible_times:
-                        if oentry_ts_parsed is not None:
-                            diff = abs(oentry_ts_parsed - t)
-                            if diff < best_diff:
-                                best_diff = diff
-                                best_id = otid
-                if best_id:
-                    resolved_trade_id = best_id
-                elif open_trades_count == 1:
-                    resolved_trade_id = next(iter(self._open_trades))
-
-            if not resolved_trade_id:
-                deterministic_seed = f"{signal}|{side}|{entry_price:.8f}|{exit_price:.8f}|{size:.8f}|{normalized_correlation_id}"
-                resolved_trade_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, deterministic_seed))
-                orphan = True
-
-            existing = next((t for t in reversed(self.closed_trades) if t.get("trade_id") == resolved_trade_id), None)
-            if existing is not None:
-                return dict(existing)
+            if entry_price <= 0 or exit_price <= 0:
+                logger.warning("learning_invalid_price — skipping trade_id=%s", trade_id)
+                return {}
+            if size <= 0:
+                logger.warning("learning_invalid_size — skipping trade_id=%s", trade_id)
+                return {}
+            self._seen_trade_ids.add(trade_id)
+            if len(self._seen_trade_ids) > 100_000:
+                logger.warning("learning_seen_trade_ids_reset")
+                self._seen_trade_ids.clear()
 
             is_long = side in ("LONG", "BUY")
             notional = abs(entry_price * size)
@@ -1330,7 +1299,8 @@ class LearningEngine:
             else:
                 gross_pnl = ((exit_price - entry_price) * size) if is_long else ((entry_price - exit_price) * size)
                 pnl = gross_pnl - fees
-            pnl_pct = (pnl / notional) if notional > 0 else 0.0
+            pnl = _safe_float(pnl, 0.0)
+            pnl_pct = _safe_float((pnl / notional), 0.0) if notional > 0 else 0.0
 
             risk_per_trade = None
             r_method = None
@@ -1386,6 +1356,10 @@ class LearningEngine:
             latency_ms = max(0.0, _safe_float(features_exit.get("latency_ms", features_entry.get("latency_ms", 0.0)), 0.0))
             mfe_val = max(0.0, _safe_float(mfe_pct, 0.0))
             mae_val = max(0.0, _safe_float(mae_pct, 0.0))
+            if abs(mfe_val) < 1e-9:
+                exit_efficiency = _safe_float(pnl, 0.0)
+            else:
+                exit_efficiency = _safe_float(pnl / mfe_val, 0.0)
             actual_outcome = 1.0 if pnl > 0 else 0.0
             confidence_error = _clamp(abs(confidence - actual_outcome), 0.0, 1.0)
             execution_score = self._normalize_execution_score(slippage_bps, latency_ms, fill_ratio)
@@ -1447,10 +1421,9 @@ class LearningEngine:
                 "execution_score": round(execution_score, 6),
                 "trade_score": round(trade_score, 6),
                 "confidence_error": round(confidence_error, 6),
+                "exit_efficiency": round(exit_efficiency, 6),
                 "trade_record": trade_record,
             }
-            if orphan:
-                trade["orphan_trade"] = True
 
             self.closed_trades.append(trade)
             self.holding_time_history.append(holding_seconds)
@@ -1481,6 +1454,13 @@ class LearningEngine:
 
             if self._adaptive_update_counter % 5 == 0:
                 self._pending_adaptive_update = True
+            logger.info(
+                "learning_trade_recorded trade_id=%s pnl=%.6f mfe=%.6f mae=%.6f",
+                resolved_trade_id,
+                _safe_float(pnl, 0.0),
+                _safe_float(mfe_val, 0.0),
+                _safe_float(mae_val, 0.0),
+            )
             if logger.isEnabledFor(logging.INFO):
                 logger.info(
                     "[LEARNING_SCORE] %s",
@@ -1521,6 +1501,10 @@ class LearningEngine:
         side: str = "LONG",
     ) -> None:
         with self._lock:
+            trade_id = str(self.state.get("last_closed_trade_id", "") or "").strip()
+            if not trade_id:
+                logger.warning("exit_quality_missing_trade_id — skipping")
+                return
             entry = {
             "mfe_pct": _safe_float(mfe_pct),
             "mae_pct": _safe_float(mae_pct),
@@ -1534,6 +1518,7 @@ class LearningEngine:
             "peak_pnl": _safe_float(peak_pnl),
             "confidence": _safe_float(confidence),
             "side": str(side or "LONG").upper(),
+            "trade_id": trade_id,
         }
             self.exit_quality_history.append(entry)
             self._mark_mutated(dirty=True, pending_recompute=True)
@@ -1637,6 +1622,9 @@ class LearningEngine:
             fill_rate_clamped = _clamp(_safe_float(computed_fill_rate, 0.0), 0.0, 1.0)
 
             fill_quality_value = _clamp(_safe_float(fill_quality, score), 0.0, 1.0)
+            trade_id = str(kwargs.get("trade_id") or self.state.get("last_closed_trade_id", "") or "").strip()
+            if not trade_id:
+                logger.warning("execution_quality_missing_trade_id")
             feedback = {
                 "score": score,
                 "slippage_bps": slippage_bps,
@@ -1647,6 +1635,7 @@ class LearningEngine:
                 "spread_bps": spread_bps,
                 "side": side,
                 "reason": reason,
+                "trade_id": trade_id,
             }
             self.exec_feedback.append(feedback)
             self.exec_quality_scores.append(score)
