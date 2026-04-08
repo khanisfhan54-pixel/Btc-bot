@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 import time
@@ -39,6 +40,28 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
+
+
+def _deterministic_trade_id(
+    side: str,
+    entry_price: float,
+    size: float,
+    sl: float,
+    tp: float,
+    correlation_id: str = "",
+) -> str:
+    seed = "|".join(
+        [
+            str(side or "").upper().strip(),
+            f"{_safe_float(entry_price):.8f}",
+            f"{_safe_float(size):.8f}",
+            f"{_safe_float(sl):.8f}",
+            f"{_safe_float(tp):.8f}",
+            str(correlation_id or "").strip(),
+            str(int(time.time() * 1000)),
+        ]
+    )
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, seed))
 
 
 def _is_valid_position(position: Any) -> bool:
@@ -283,6 +306,17 @@ class PositionManager:
             )
             raise ValueError("fee_type must be provided as 'quote' or 'pct' when fees are used")
 
+        normalized_trade_id = str(trade_id or "").strip()
+        if not normalized_trade_id:
+            normalized_trade_id = _deterministic_trade_id(
+                side=side,
+                entry_price=clean_entry,
+                size=clean_size,
+                sl=clean_sl,
+                tp=clean_tp,
+                correlation_id=correlation_id or "",
+            )
+
         self.position = PositionState(
             side=side,
             entry_price=clean_entry,
@@ -292,7 +326,7 @@ class PositionManager:
             highest_price=clean_entry,
             lowest_price=clean_entry,
             features_entry=features if features is not None else None,
-            trade_id=trade_id,
+            trade_id=normalized_trade_id,
             signal=signal,
             confidence=confidence,
             regime=regime,
@@ -325,6 +359,32 @@ class PositionManager:
             "latency_ms": 0.0,
             "fallback": True,
         }
+        learning_recorded = False
+        learning_engine = getattr(self, "learning_engine", None)
+        features_entry = getattr(self.position, "features_entry", None)
+        features_entry_safe = features_entry if isinstance(features_entry, dict) else {}
+        features_exit_safe = features_exit if isinstance(features_exit, dict) else {}
+        signal = str(getattr(self.position, "signal", side) or side)
+        confidence = _safe_float(getattr(self.position, "confidence", 0.0), 0.0)
+        regime = str(getattr(self.position, "regime", "unknown") or "unknown")
+        if "correlation_id" not in features_entry_safe:
+            features_entry_safe = {**features_entry_safe, "correlation_id": correlation_id}
+        if "regime" not in features_entry_safe:
+            features_entry_safe = {**features_entry_safe, "regime": regime}
+        mfe = 0.0
+        mae = 0.0
+        entry_ts = getattr(self.position, "opened_at", None)
+        exit_ts = time.time()
+        resolved_trade_id = str(getattr(self.position, "trade_id", "") or "").strip()
+        if not resolved_trade_id:
+            resolved_trade_id = _deterministic_trade_id(
+                side=side,
+                entry_price=entry_price,
+                size=size,
+                sl=_sl,
+                tp=_tp,
+                correlation_id=correlation_id,
+            )
 
         try:
             exit_price = _safe_float(exit_price, 0.0)
@@ -383,13 +443,12 @@ class PositionManager:
             self.position.closed = True
             self.position.exit_reason = reason
 
-            learning_engine = getattr(self, "learning_engine", None)
             ps = self.position
 
-            features_entry = getattr(ps, "features_entry", None)
             features_exit_actual = features_exit if features_exit is not None else getattr(ps, "features_exit", None)
+            features_exit_safe = features_exit_actual if isinstance(features_exit_actual, dict) else {}
 
-            entry_ts = getattr(ps, "opened_at", None)
+            entry_ts = getattr(ps, "opened_at", entry_ts)
             exit_ts = time.time()
 
             hp = _safe_float(getattr(ps, "highest_price", entry_price), entry_price)
@@ -463,10 +522,10 @@ class PositionManager:
                 exit_score = realized_pnl / mfe
             exit_score = _clamp(exit_score, -10.0, 10.0)
 
-            trade_id = getattr(ps, "trade_id", None)
-            signal = getattr(ps, "signal", None)
-            confidence = getattr(ps, "confidence", None)
-            regime = getattr(ps, "regime", None)
+            trade_id = resolved_trade_id
+            signal = getattr(ps, "signal", signal)
+            confidence = _safe_float(getattr(ps, "confidence", confidence), confidence)
+            regime = str(getattr(ps, "regime", regime) or regime)
             stop_loss = getattr(ps, "sl", None)
 
             if learning_engine and hasattr(learning_engine, "record_closed_trade"):
@@ -489,9 +548,32 @@ class PositionManager:
                         mae_pct=mae,
                         stop_loss=stop_loss,
                         trade_id=trade_id,
+                        correlation_id=correlation_id,
                     )
+                    learning_recorded = True
                 except Exception as e:
                     logger.warning("[LEARNING] closed trade recording failed: %s", e)
+                    try:
+                        learning_engine.record_closed_trade(
+                            signal=signal or side,
+                            side=side,
+                            entry_price=entry_price,
+                            exit_price=exit_price,
+                            size=size,
+                            confidence=_safe_float(confidence, 0.0),
+                            features_entry=features_entry_safe,
+                            features_exit=features_exit_safe,
+                            reason="fallback_exception_close",
+                            exit_type="fallback",
+                            pnl_override=None,
+                            mfe_pct=mfe,
+                            mae_pct=mae,
+                            trade_id=resolved_trade_id,
+                            correlation_id=correlation_id,
+                        )
+                        learning_recorded = True
+                    except Exception as fallback_err:
+                        logger.error("FATAL: fallback learning also failed: %s", fallback_err)
 
             if learning_engine and hasattr(learning_engine, "record_exit_quality"):
                 try:
@@ -514,6 +596,7 @@ class PositionManager:
                 "action":           "CLOSE",
                 "reason":           reason,
                 "correlation_id":   correlation_id,
+                "trade_id":         resolved_trade_id,
                 "side":             side,
                 "entry_price":      entry_price,
                 "exit_price":       exit_price,
@@ -522,22 +605,70 @@ class PositionManager:
                 "sl":               _sl,
                 "tp":               _tp,
                 "exec_quality":     eq_result,
+                "learning_recorded": learning_recorded,
             }
             return out
         except Exception as exc:
             logger.error("[POSITION CLOSE] unexpected failure, returning safe close payload: %s", exc)
+            if not learning_recorded and learning_engine and hasattr(learning_engine, "record_closed_trade"):
+                try:
+                    learning_engine.record_closed_trade(
+                        signal=signal or side,
+                        side=side,
+                        entry_price=entry_price,
+                        exit_price=max(_safe_float(exit_price, entry_price), entry_price),
+                        size=size,
+                        confidence=_safe_float(confidence, 0.0),
+                        features_entry=features_entry_safe,
+                        features_exit=features_exit_safe,
+                        reason="fallback_exception_close",
+                        exit_type="fallback",
+                        pnl_override=None,
+                        mfe_pct=mfe,
+                        mae_pct=mae,
+                        trade_id=resolved_trade_id,
+                        correlation_id=correlation_id,
+                    )
+                    learning_recorded = True
+                except Exception as fallback_exc:
+                    logger.error("FATAL: fallback learning also failed: %s", fallback_exc)
+            exit_price_safe = entry_price
+            try:
+                _candidate_exit = _safe_float(exit_price, entry_price)
+                if _candidate_exit > 0:
+                    exit_price_safe = _candidate_exit
+            except Exception:
+                exit_price_safe = entry_price
+
+            pnl_pct_safe = 0.0
+            try:
+                pnl_candidate = None
+                if "pnl_pct" in locals():
+                    pnl_candidate = _safe_float(locals().get("pnl_pct"), 0.0)
+                if pnl_candidate is not None and math.isfinite(pnl_candidate):
+                    pnl_pct_safe = pnl_candidate
+                elif entry_price > 0 and exit_price_safe > 0:
+                    if side == "LONG":
+                        pnl_pct_safe = (exit_price_safe - entry_price) / entry_price
+                    else:
+                        pnl_pct_safe = (entry_price - exit_price_safe) / entry_price
+            except Exception:
+                pnl_pct_safe = 0.0
             return {
                 "action": "CLOSE",
                 "reason": reason,
                 "correlation_id": correlation_id,
+                "trade_id": resolved_trade_id,
                 "side": side,
                 "entry_price": entry_price,
-                "exit_price": entry_price,
-                "pnl_pct": 0.0,
+                "exit_price": exit_price_safe,
+                "pnl_pct": pnl_pct_safe,
                 "size": size,
                 "sl": _sl,
                 "tp": _tp,
                 "exec_quality": safe_eq_fallback,
+                "learning_recorded": learning_recorded,
+                "fallback_error": True,
             }
         finally:
             self.position = None
