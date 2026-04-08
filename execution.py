@@ -1218,83 +1218,114 @@ class ExecutionEngine:
             )
             return final_decision
 
+        if not isinstance(features_payload, dict):
+            return {
+                **final_decision,
+                "execute": False,
+                "position_size": 0.0,
+                "execution_status": "blocked",
+                "reason": "invalid_features_payload",
+            }
+
+        try:
+            confidence = float(confidence)
+        except Exception:
+            confidence = 0.0
+        confidence = max(0.0, min(1.0, confidence))
+
         # Execute exactly once for this cycle.
-        execution_attempted = False
-        if not execution_attempted:
-            execution_attempted = True
-            signal_name = str(signal_payload.get("signal", "")).upper().strip()
-            if signal_name not in {"LONG", "SHORT"}:
+        signal = signal_payload.get("signal", "")
+        signal_name = str(signal).strip().upper()
+        if signal_name not in ("LONG", "SHORT"):
+            return {
+                **final_decision,
+                "execute": False,
+                "position_size": 0.0,
+                "execution_status": "blocked",
+                "reason": "invalid_signal",
+            }
+        price_val = _safe_float(current_price, 0.0)
+        size_val = _safe_float(final_decision.get("position_size", 0.0), 0.0)
+        sl_val = _safe_float(final_decision.get("sl", 0.0), 0.0)
+        tp_val = _safe_float(final_decision.get("tp", 0.0), 0.0)
+        if (
+            price_val <= 0.0
+            or size_val <= 0.0
+            or sl_val <= 0.0
+            or tp_val <= 0.0
+        ):
+            return {
+                **final_decision,
+                "execute": False,
+                "position_size": 0.0,
+                "execution_status": "failed",
+                "reason": "invalid_execution_inputs",
+            }
+        if signal_name == "LONG":
+            if not (final_decision.get("sl", 0.0) < current_price < final_decision.get("tp", 0.0)):
                 return {
                     **final_decision,
                     "execute": False,
                     "position_size": 0.0,
                     "execution_status": "failed",
-                    "reason": "invalid_signal_for_execution",
+                    "reason": "invalid_sl_tp_long",
                 }
-            if signal_name == "LONG":
-                if not (final_decision.get("sl", 0.0) < current_price < final_decision.get("tp", 0.0)):
-                    return {
-                        **final_decision,
-                        "execute": False,
-                        "position_size": 0.0,
-                        "execution_status": "failed",
-                        "reason": "invalid_sl_tp_long",
-                    }
-            if signal_name == "SHORT":
-                if not (final_decision.get("tp", 0.0) < current_price < final_decision.get("sl", 0.0)):
-                    return {
-                        **final_decision,
-                        "execute": False,
-                        "position_size": 0.0,
-                        "execution_status": "failed",
-                        "reason": "invalid_sl_tp_short",
-                    }
-            execution_result = self._execute_liquidity_trade(
-                execution_signal=signal_name,
-                price=current_price,
-                confidence=confidence,
-                sl_price=float(final_decision["sl"]),
-                tp_price=float(final_decision["tp"]),
-                position_size=float(final_decision["position_size"]),
-                symbol=symbol,
-                meta_result=meta_result,
-                features=features_payload.get("features", features_payload)
-                if isinstance(features_payload, dict) else {},
-                correlation_id=correlation_id,
-            )
-            if isinstance(execution_result, dict):
-                if execution_result.get("status") == "blocked":
-                    return {
-                        **final_decision,
-                        "execute": False,
-                        "position_size": 0.0,
-                        "execution_status": "blocked",
-                        "reason": execution_result.get("reason", "blocked")
-                    }
-                if execution_result.get("partial_failure"):
-                    return {
-                        **final_decision,
-                        "execute": False,
-                        "position_size": 0.0,
-                        "execution_status": "failed",
-                        "reason": "bracket_partial_failure",
-                        "execution_result": execution_result,
-                    }
-
-                if execution_result.get("executed") is False:
-                    return {
-                        **final_decision,
-                        "execute": False,
-                        "position_size": 0.0,
-                        "execution_status": "failed",
-                        "reason": execution_result.get("reason", "execution_failed"),
-                        "execution_result": execution_result,
-                    }
+        if signal_name == "SHORT":
+            if not (final_decision.get("tp", 0.0) < current_price < final_decision.get("sl", 0.0)):
                 return {
                     **final_decision,
-                    "execution_status": "success",
-                    "execution_result": execution_result
+                    "execute": False,
+                    "position_size": 0.0,
+                    "execution_status": "failed",
+                    "reason": "invalid_sl_tp_short",
                 }
+        features = features_payload.get("features", features_payload)
+        execution_result = self._execute_liquidity_trade(
+            execution_signal=signal_name,
+            price=current_price,
+            confidence=confidence,
+            sl_price=float(final_decision["sl"]),
+            tp_price=float(final_decision["tp"]),
+            position_size=float(final_decision["position_size"]),
+            symbol=symbol,
+            meta_result=meta_result,
+            features=features,
+            correlation_id=correlation_id,
+        )
+        if isinstance(execution_result, dict):
+            if execution_result.get("status") == "blocked":
+                return {
+                    **final_decision,
+                    "execute": False,
+                    "position_size": 0.0,
+                    "execution_status": "blocked",
+                    "reason": execution_result.get("reason", "blocked"),
+                    "execution_result": execution_result,
+                }
+            if execution_result.get("partial_failure"):
+                return {
+                    **final_decision,
+                    "execute": False,
+                    "position_size": 0.0,
+                    "execution_status": "failed",
+                    "reason": "bracket_partial_failure",
+                    "execution_result": execution_result,
+                }
+
+            if execution_result.get("executed") is False:
+                return {
+                    **final_decision,
+                    "execute": False,
+                    "position_size": 0.0,
+                    "execution_status": "failed",
+                    "reason": execution_result.get("reason", "execution_failed"),
+                    "execution_result": execution_result,
+                }
+            return {
+                **final_decision,
+                "execution_status": "success",
+                "execution_result": execution_result
+            }
         return final_decision
 
     def get_open_position(self, symbol: str) -> Dict[str, Any]:
