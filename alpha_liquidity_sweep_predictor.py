@@ -587,7 +587,7 @@ class LiquiditySweepAlpha:
         # Progressive Confidence Gating: Replaces hard threshold with continuous scaler based on deque warmth.
         warmup_factor = min(1.0, len(self.ofi_history) / 20.0, len(self.hawkes_history) / 5.0)
         time_decay = math.exp(-0.01 * max(0.0, (time.time() - self.last_trade_time)))
-        warmup_factor = _clamp(0.5 * warmup_factor + 0.5 * _clamp(time_decay, 0.3, 1.0), 0.0, 1.0)
+        warmup_factor = _clamp(0.6 * warmup_factor + 0.4 * _clamp(time_decay, 0.3, 1.0), 0.0, 1.0)
 
         if state == "PRE_SWEEP_BUILDUP":
             # --- Early Anticipation Logic ---
@@ -610,7 +610,7 @@ class LiquiditySweepAlpha:
                 0.0,
                 1.0,
             )
-            macro_weight = max(0.1 * macro_reliability, 0.4 * (1.0 - corr_proxy) * macro_reliability)
+            macro_weight = max(0.15 * macro_reliability, 0.4 * (1.0 - corr_proxy) * macro_reliability)
             micro_weight = 1.0 - macro_weight
 
             # Logit Ensemble: Ensures proper probabilistic aggregation rather than linear weighting.
@@ -697,7 +697,7 @@ class LiquiditySweepAlpha:
                 0.0,
                 1.0,
             )
-            macro_weight = max(0.1 * macro_reliability, 0.4 * (1.0 - corr_proxy) * macro_reliability)
+            macro_weight = max(0.15 * macro_reliability, 0.4 * (1.0 - corr_proxy) * macro_reliability)
             micro_weight = 1.0 - macro_weight
 
             # Predictors subset ensemble

@@ -333,7 +333,7 @@ class ExecutionLogic:
         confidence_delta = confidence - base_confidence
         confidence = base_confidence + _clamp(confidence_delta, -max_alpha_impact, max_alpha_impact)
         prev_conf = getattr(self, "_last_exec_conf", confidence)
-        confidence = 0.7 * prev_conf + 0.3 * confidence
+        confidence = 0.6 * prev_conf + 0.4 * confidence
         self._last_exec_conf = confidence
         confidence = _clamp(confidence, 0.01, 0.99)
 
