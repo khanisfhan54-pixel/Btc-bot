@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import time
 from dataclasses import dataclass
 from statistics import median
 from typing import Any, Dict, List, Optional, Tuple
@@ -238,6 +239,16 @@ class ExecutionLogic:
                 "meta_result": meta_result, "learning_params": learning_params,
             }
 
+        alpha = features.get("alpha", {})
+        if not isinstance(alpha, dict):
+            alpha = {}
+        alpha_direction = alpha.get("direction")
+        alpha_confidence = _clamp(_safe_float(alpha.get("confidence", 0.5), 0.5), 0.0, 1.0)
+        if isinstance(alpha_direction, str):
+            alpha_direction = alpha_direction.upper().strip()
+        else:
+            alpha_direction = None
+
         try:
             best_bid        = _safe_float(features.get("best_bid", 0.0), 0.0)
             best_ask        = _safe_float(features.get("best_ask", 0.0), 0.0)
@@ -247,6 +258,7 @@ class ExecutionLogic:
             gap_proxy_bps   = _safe_float(features.get("gap_proxy_bps", 0.0), 0.0)
             largest_gap_bps = _safe_float(features.get("largest_gap_bps", 0.0), 0.0)
             liquidity_score = _safe_float(features.get("liquidity_score", 0.0), 0.0)
+            liquidity_score = _clamp(liquidity_score, 0.0, 1.0)
             spoofing_intensity = _safe_float(
                 features.get(
                     "spoofing_intensity",
@@ -293,6 +305,37 @@ class ExecutionLogic:
             2.0,
             20.0,
         )
+        alpha_ts = _safe_float(alpha.get("timestamp", 0.0), 0.0)
+        now_ts = time.time()
+        if alpha_ts > 0.0 and math.isfinite(alpha_ts) and alpha_ts <= now_ts:
+            latency_ms = max(0.0, (now_ts - alpha_ts) * 1000.0)
+        else:
+            latency_ms = max(0.0, _safe_float(features.get("latency_ms", 0.0), 0.0))
+        alpha_decay = max(0.6, 1.0 - (latency_ms / 3000.0))
+        alpha_confidence = _clamp(alpha_confidence * alpha_decay, 0.0, 1.0)
+        alpha_strength = _clamp(abs(alpha_confidence - 0.5) * 2.0, 0.0, 1.0)
+        base_confidence = confidence
+
+        if alpha_direction == signal:
+            boost = 1.0 + (0.1 * alpha_strength)
+            alpha_weight = 0.5 * _clamp(1.0 - confidence, 0.0, 1.0)
+            confidence *= 1.0 + ((boost - 1.0) * alpha_weight)
+        elif (alpha_direction == "LONG" and signal == "SHORT") or (alpha_direction == "SHORT" and signal == "LONG"):
+            penalty = 0.1 * alpha_strength
+            alpha_weight = _clamp(confidence, 0.0, 1.0)
+            confidence *= 1.0 - (penalty * alpha_weight)
+        if alpha_strength > 0.8 and (
+            (alpha_direction == "LONG" and signal == "SHORT")
+            or (alpha_direction == "SHORT" and signal == "LONG")
+        ):
+            confidence *= 0.6
+        max_alpha_impact = 0.15
+        confidence_delta = confidence - base_confidence
+        confidence = base_confidence + _clamp(confidence_delta, -max_alpha_impact, max_alpha_impact)
+        prev_conf = getattr(self, "_last_exec_conf", confidence)
+        confidence = 0.7 * prev_conf + 0.3 * confidence
+        self._last_exec_conf = confidence
+        confidence = _clamp(confidence, 0.01, 0.99)
 
         if confidence < max(self.cfg.min_confidence, learning_conf_thr):
             return {

@@ -1732,6 +1732,8 @@ def run_analysis_cycle(
     engines_out["volume_explosion"] = volume_intel.get("volume_explosion", False)
     engines_out["volume_strength"] = volume_intel.get("volume_strength", 0.0)
     engines_out["mtf_confirmation"] = volume_intel.get("mtf_confirmation", False)
+    alpha_payload = engines_out.get("alpha", {})
+    feat_dict["alpha"] = alpha_payload if isinstance(alpha_payload, dict) else {}
     smc_signal = engines_out.get("smc_signal", {}) or {}
 
     sma_signal, sma_fast, sma_slow = sma_crossover_signal(ohlcv)

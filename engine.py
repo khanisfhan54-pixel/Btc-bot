@@ -22,13 +22,23 @@ import logging
 import math
 import os
 import statistics
+import sys
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
+from alpha_liquidity_sweep_predictor import LiquiditySweepAlpha, predict_sweep
+
 logger = logging.getLogger(__name__)
+_LIQUIDITY_SWEEP_ALPHA = LiquiditySweepAlpha()
+
+
+def _debug_import_integrity() -> None:
+    modules = set(sys.modules.keys())
+    if "alpha_liquidity_sweep_predictor" not in modules:
+        logger.warning("alpha_liquidity_sweep_predictor not loaded yet")
 
 try:
     import requests
@@ -3283,6 +3293,10 @@ def run_all_engines(
     current_oi: Optional[float] = None,
     market_state_detector: Optional[Any] = None,
 ) -> Dict[str, Any]:
+    if not getattr(run_all_engines, "_import_checked", False):
+        _debug_import_integrity()
+        run_all_engines._import_checked = True
+
     orderbook = orderbook or {}
     trades = trades or []
     price = _safe_float(price, 0.0)
@@ -3461,6 +3475,126 @@ def run_all_engines(
             orderbook_snapshots=orderbook_snapshots if orderbook_snapshots else [orderbook],
         )
         market_data = market_data or {}
+        alpha_source = "stateful"
+        try:
+            alpha_raw = _LIQUIDITY_SWEEP_ALPHA.get_signal(
+                {
+                    "price": price,
+                    "close_price": _safe_float(primary_1m[-1][4], price) if primary_1m else price,
+                    "prev_book": orderbook_snapshots[-2] if orderbook_snapshots and len(orderbook_snapshots) >= 2 else orderbook,
+                    "curr_book": orderbook,
+                    "timestamp": time.time(),
+                    "trades_count": len(trades),
+                    "curr_depth": bid_vol + ask_vol,
+                    "atr": max(_atr(_to_rows(primary_1m)[-30:], 14), 1e-8),
+                    "ema_fast": compute_sma([_safe_float(r[4]) for r in _to_rows(primary_1m)[-12:]], 9),
+                    "ema_slow": compute_sma([_safe_float(r[4]) for r in _to_rows(primary_1m)[-26:]], 21),
+                    "macro_liquidity": liquidity_intent,
+                    "macro_market_state": market_state,
+                    "macro_volume_intel": vol_intel,
+                }
+            ) or {}
+        except Exception:
+            alpha_source = "fallback_predict_sweep"
+            logger.exception("[ALPHA] stateful source failed, using fallback")
+            alpha_raw = predict_sweep(
+                liquidity=liquidity_intent,
+                market_state=market_state,
+                volume_intel=vol_intel,
+            ) or {}
+
+        alpha_confidence = _clamp(_safe_float(alpha_raw.get("confidence", alpha_raw.get("probability", 0.5)), 0.5), 0.0, 1.0)
+        alpha_prob_above = _clamp(_safe_float(alpha_raw.get("prob_above", 0.5), 0.5), 0.0, 1.0)
+        alpha_prob_below = _clamp(_safe_float(alpha_raw.get("prob_below", 0.5), 0.5), 0.0, 1.0)
+        if alpha_prob_above <= 0.0 and alpha_prob_below <= 0.0:
+            action = str(alpha_raw.get("action", "")).upper()
+            if action == "BUY":
+                alpha_prob_above = alpha_confidence
+                alpha_prob_below = 1.0 - alpha_confidence
+            elif action == "SELL":
+                alpha_prob_below = alpha_confidence
+                alpha_prob_above = 1.0 - alpha_confidence
+            else:
+                alpha_prob_above = 0.5
+                alpha_prob_below = 0.5
+        alpha_total = alpha_prob_above + alpha_prob_below
+        if alpha_total > 0.0:
+            alpha_prob_above /= alpha_total
+            alpha_prob_below /= alpha_total
+        else:
+            alpha_prob_above = 0.5
+            alpha_prob_below = 0.5
+
+        alpha_confidence = max(alpha_prob_above, alpha_prob_below)
+        deadband = 0.03 + 0.03 * (1.0 - alpha_confidence)
+        if abs(alpha_prob_above - alpha_prob_below) < deadband:
+            alpha_direction = "NEUTRAL"
+        elif alpha_prob_above > alpha_prob_below:
+            alpha_direction = "LONG"
+            alpha_confidence = max(alpha_prob_above, alpha_prob_below)
+        else:
+            alpha_direction = "SHORT"
+            alpha_confidence = max(alpha_prob_above, alpha_prob_below)
+        entropy = -(
+            (alpha_prob_above * math.log(alpha_prob_above + 1e-6)) +
+            (alpha_prob_below * math.log(alpha_prob_below + 1e-6))
+        ) / math.log(2.0)
+        entropy_factor = _clamp(1.0 - 0.2 * entropy, 0.6, 1.0)
+        alpha_confidence *= entropy_factor
+        depth = _safe_float(bid_vol + ask_vol, 0.0)
+        depth_norm = depth / ((_safe_float(price, 0.0) * 0.01) + 1e-8)
+        if depth_norm < 1e-4:
+            alpha_direction = "NEUTRAL"
+            alpha_confidence = 0.5
+        _alpha_symbol = (symbol or "BTC/USDT").replace("/", "").upper()
+        _alpha_key = f"_last_alpha_direction_{_alpha_symbol}"
+        _alpha_ts_key = f"_last_alpha_flip_ts_{_alpha_symbol}"
+        _alpha_conf_key = f"_last_alpha_conf_{_alpha_symbol}"
+        prev_alpha_direction = getattr(run_all_engines, _alpha_key, "NEUTRAL")
+        prev_alpha_conf = _clamp(_safe_float(getattr(run_all_engines, _alpha_conf_key, 0.5), 0.5), 0.0, 1.0)
+        flip_threshold = 0.55 if prev_alpha_direction == "NEUTRAL" else 0.65
+        now_ts = time.time()
+        prev_flip_ts = _safe_float(getattr(run_all_engines, _alpha_ts_key, 0.0), 0.0)
+        if (
+            alpha_direction != prev_alpha_direction
+            and alpha_confidence < flip_threshold
+            and alpha_confidence < prev_alpha_conf
+            and abs(alpha_prob_above - alpha_prob_below) < 0.15
+        ):
+            alpha_direction = prev_alpha_direction
+        if alpha_direction != prev_alpha_direction and (now_ts - prev_flip_ts) < 1.0 and alpha_confidence < 0.7:
+            alpha_direction = prev_alpha_direction
+        liq_bias = str((liquidity_intent or {}).get("direction", "")).upper()
+        if liq_bias in ("LONG", "SHORT") and alpha_direction in ("LONG", "SHORT"):
+            if liq_bias == alpha_direction:
+                alpha_confidence = _clamp(alpha_confidence + 0.02, 0.0, 1.0)
+            else:
+                alpha_confidence = _clamp(alpha_confidence - 0.02, 0.0, 1.0)
+        setattr(run_all_engines, _alpha_key, alpha_direction)
+        if alpha_direction == "NEUTRAL":
+            setattr(run_all_engines, _alpha_ts_key, 0.0)
+            setattr(run_all_engines, _alpha_conf_key, 0.5)
+        elif alpha_direction != prev_alpha_direction:
+            setattr(run_all_engines, _alpha_ts_key, now_ts)
+        setattr(run_all_engines, _alpha_conf_key, alpha_confidence)
+        alpha_confidence = _clamp(_safe_float(alpha_confidence, 0.5), 0.01, 0.99)
+        market_data["alpha"] = {
+            "direction": alpha_direction,
+            "confidence": alpha_confidence,
+            "raw": alpha_raw,
+            "source": alpha_source,
+            "timestamp": now_ts,
+            "prob_above": alpha_prob_above,
+            "prob_below": alpha_prob_below,
+            "micro_prob": _clamp(_safe_float(alpha_raw.get("micro_prob", 0.5), 0.5), 0.0, 1.0),
+            "macro_prob": _clamp(_safe_float(alpha_raw.get("macro_prob", 0.5), 0.5), 0.0, 1.0),
+        }
+        logger.debug(
+            "[ALPHA] source=%s direction=%s confidence=%.4f",
+            alpha_source,
+            alpha_direction,
+            _safe_float(alpha_confidence, 0.5),
+        )
         liquidity_score = market_data.get("liquidity_score", 0.0)
 
         institutional = institutional_score_engine(
@@ -3564,6 +3698,7 @@ def run_all_engines(
             "spread_pct": market_data.get("spread_pct", 0.0),
             "spoof_detected": market_data.get("spoof_detected", False),
             "spoof_details": market_data.get("spoof_details", {}),
+            "alpha": market_data.get("alpha", {}),
             "volume_intelligence": vol_intel,
             "volume_spike": vol_intel.get("volume_spike", False),
             "volume_explosion": vol_intel.get("volume_explosion", False),

@@ -146,7 +146,11 @@ class SignalEngine:
                 "score": 0,
                 "reasons": [],
                 "execution_quality": 1.0,
+                "alpha": {},
             }
+        alpha = _safe_get(features, "alpha", {})
+        if not isinstance(alpha, dict):
+            alpha = {}
 
         execution_quality = _compute_execution_quality(features)
 
@@ -209,6 +213,7 @@ class SignalEngine:
                 "score": 0,
                 "reasons": [],
                 "execution_quality": execution_quality,
+                "alpha": alpha,
             }
 
         last = candles[-1]
@@ -261,6 +266,19 @@ class SignalEngine:
 
         # ── 4. Regime ──────────────────────────────────────────────────
         regime_type = _extract_regime_type(features)
+        atr_val = _safe_float(_safe_get(features, "atr", 0.0), 0.0)
+        price_ref = _safe_float(_safe_get(features, "price", _safe_get(features, "close", 0.0)), 0.0)
+        volatility_guard = (atr_val / price_ref) if (atr_val > 0.0 and price_ref > 0.0) else None
+        if volatility_guard is not None and volatility_guard > 0.05:
+            return {
+                "action": "HOLD",
+                "signal": "HOLD",
+                "confidence": 0.0,
+                "score": 0,
+                "reasons": ["volatility_circuit_breaker"],
+                "execution_quality": execution_quality,
+                "alpha": alpha,
+            }
 
         # ── Signal logic ───────────────────────────────────────────────
         reasons: List[str] = []
@@ -300,6 +318,7 @@ class SignalEngine:
                 "score": 0,
                 "reasons": [],
                 "execution_quality": execution_quality,
+                "alpha": alpha,
             }
 
         # ── 5. Confidence model ────────────────────────────────────────
@@ -322,10 +341,22 @@ class SignalEngine:
         institutional_mod = 0.90 + 0.20 * (institutional_score / 10.0)
         confidence *= confluence_mod * institutional_mod
 
-        confidence = _clamp(confidence, 0.05, 0.95)
+        confidence = _clamp(confidence, 0.01, 0.99)
+        alpha_direction = str(_safe_get(alpha, "direction", "NEUTRAL")).upper()
+        alpha_confidence = _clamp(_safe_float(_safe_get(alpha, "confidence", 0.5), 0.5), 0.0, 1.0)
+        latency_ms = max(0.0, _safe_float(_safe_get(features, "latency_ms", 0.0), 0.0))
+        alpha_decay = max(0.6, 1.0 - (latency_ms / 3000.0))
+        alpha_confidence = _clamp(alpha_confidence * alpha_decay, 0.0, 1.0)
+        signal_str = "LONG" if base.get("side") == "buy" else "SHORT"
+        alpha_strength = _clamp(abs(alpha_confidence - 0.5) * 2.0, 0.0, 1.0)
+        alpha_delta = 0.05 * alpha_strength
+        if alpha_direction == signal_str:
+            confidence += alpha_delta
+        elif (alpha_direction == "LONG" and signal_str == "SHORT") or (alpha_direction == "SHORT" and signal_str == "LONG"):
+            confidence -= alpha_delta
+        confidence = _clamp(confidence, 0.01, 0.99)
 
         # ── Final return ───────────────────────────────────────────────
-        signal_str = "LONG" if base.get("side") == "buy" else "SHORT"
         return {
             **base,
             "action": signal_str,
@@ -334,6 +365,7 @@ class SignalEngine:
             "score": int(confidence * 100),
             "reasons": reasons,
             "execution_quality": execution_quality,
+            "alpha": alpha,
         }
 
     # ------------------------------------------------------------------
