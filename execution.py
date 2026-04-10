@@ -305,6 +305,32 @@ class ExecutionLogic:
             alpha_direction = alpha_direction.upper().strip()
         else:
             alpha_direction = None
+        liquidity_score = _safe_float(features.get("liquidity_score", 0.0), 0.0)
+        liquidity_score = _clamp(liquidity_score, 0.0, 1.0)
+        alpha_threshold = 0.5 + 0.1 * (1.0 - liquidity_score)
+        alpha_active = alpha_direction in ("LONG", "SHORT") and alpha_confidence >= alpha_threshold
+        if alpha_active and signal == "LONG" and alpha_direction != "LONG":
+            return {
+                "execute": False,
+                "side": "buy",
+                "sl": 0.0,
+                "tp": 0.0,
+                "position_size": 0.0,
+                "reason": "alpha_misaligned",
+                "meta_result": meta_result,
+                "learning_params": learning_params,
+            }
+        if alpha_active and signal == "SHORT" and alpha_direction != "SHORT":
+            return {
+                "execute": False,
+                "side": "sell",
+                "sl": 0.0,
+                "tp": 0.0,
+                "position_size": 0.0,
+                "reason": "alpha_misaligned",
+                "meta_result": meta_result,
+                "learning_params": learning_params,
+            }
 
         try:
             best_bid        = _safe_float(features.get("best_bid", 0.0), 0.0)

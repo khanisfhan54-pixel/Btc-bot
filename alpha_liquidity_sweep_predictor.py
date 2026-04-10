@@ -527,7 +527,11 @@ class LiquiditySweepAlpha:
                 "regime": "RANGING",
                 "ofi_zscore": 0.0,
                 "hawkes_intensity": 0.0,
-                "logic": "Invalid price"
+                "logic": "Invalid price",
+                "micro_prob": 0.5,
+                "macro_prob": 0.5,
+                "prob_above": 0.5,
+                "prob_below": 0.5,
             }
         close_price = _safe_float(md.get('close_price', price))
         atr = _safe_float(md.get('atr', price * 0.01)) + 1e-8

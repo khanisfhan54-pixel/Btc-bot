@@ -277,9 +277,20 @@ try:
         evaluate_smc_sniper,
         evaluate_meta_filter,
         apply_meta_to_decision,
+        _default_alpha,
     )
 except Exception as _e:
     logger.warning("Engines import failed: %s", _e)
+
+    def _default_alpha() -> dict:
+        return {
+            "direction": "NEUTRAL",
+            "confidence": 0.5,
+            "prob_above": 0.5,
+            "prob_below": 0.5,
+            "micro_prob": 0.5,
+            "macro_prob": 0.5,
+        }
 
     def run_all_engines(*args, **kwargs):
         return {
@@ -389,6 +400,7 @@ except Exception as _e:
                 "invalidations": [],
                 "features": {},
             },
+            "alpha": _default_alpha(),
         }
 
     def analyze_volume_intelligence(*args, **kwargs):
