@@ -60,6 +60,65 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _default_alpha():
+    return {
+        "direction": "NEUTRAL",
+        "confidence": 0.5,
+        "prob_above": 0.5,
+        "prob_below": 0.5,
+        "micro_prob": 0.5,
+        "macro_prob": 0.5,
+    }
+
+
+def _validate_alpha(alpha: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        if not isinstance(alpha, dict):
+            logger.warning("Alpha validation adjusted: %s", alpha)
+            return _default_alpha()
+
+        conf = float(alpha.get("confidence", 0.5))
+        p_up = float(alpha.get("prob_above", 0.5))
+        p_dn = float(alpha.get("prob_below", 0.5))
+        direction = alpha.get("direction")
+        adjusted = False
+
+        if not math.isfinite(conf):
+            conf = 0.5
+            adjusted = True
+        conf = max(0.0, min(1.0, conf))
+        if not math.isfinite(p_up):
+            p_up = 0.5
+            adjusted = True
+        if not math.isfinite(p_dn):
+            p_dn = 0.5
+            adjusted = True
+
+        if abs((p_up + p_dn) - 1.0) > 1e-6:
+            total = max(1e-8, p_up + p_dn)
+            p_up /= total
+            p_dn /= total
+            adjusted = True
+
+        if direction not in ("LONG", "SHORT", "NEUTRAL"):
+            direction = "NEUTRAL"
+            adjusted = True
+
+        validated = {
+            **alpha,
+            "confidence": max(0.0, min(1.0, conf)),
+            "prob_above": max(0.0, min(1.0, p_up)),
+            "prob_below": max(0.0, min(1.0, p_dn)),
+            "direction": direction,
+        }
+        if adjusted:
+            logger.warning("Alpha validation adjusted: %s", alpha)
+        return validated
+    except Exception:
+        logger.warning("Alpha validation adjusted: %s", alpha)
+        return _default_alpha()
+
+
 def _get_order_id(order: Any) -> str:
     if isinstance(order, dict):
         return str(order.get("id") or order.get("orderId") or "N/A")
@@ -239,9 +298,7 @@ class ExecutionLogic:
                 "meta_result": meta_result, "learning_params": learning_params,
             }
 
-        alpha = features.get("alpha", {})
-        if not isinstance(alpha, dict):
-            alpha = {}
+        alpha = _validate_alpha(features.get("alpha", {}))
         alpha_direction = alpha.get("direction")
         alpha_confidence = _clamp(_safe_float(alpha.get("confidence", 0.5), 0.5), 0.0, 1.0)
         if isinstance(alpha_direction, str):

@@ -165,6 +165,65 @@ def _clamp(value: Any, low: float, high: float) -> float:
         return low
 
 
+def _default_alpha() -> Dict[str, Any]:
+    return {
+        "direction": "NEUTRAL",
+        "confidence": 0.5,
+        "prob_above": 0.5,
+        "prob_below": 0.5,
+        "micro_prob": 0.5,
+        "macro_prob": 0.5,
+    }
+
+
+def _validate_alpha(alpha: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        if not isinstance(alpha, dict):
+            logger.warning("Alpha validation adjusted: %s", alpha)
+            return _default_alpha()
+
+        conf = float(alpha.get("confidence", 0.5))
+        p_up = float(alpha.get("prob_above", 0.5))
+        p_dn = float(alpha.get("prob_below", 0.5))
+        direction = alpha.get("direction")
+        adjusted = False
+
+        if not math.isfinite(conf):
+            conf = 0.5
+            adjusted = True
+        conf = max(0.0, min(1.0, conf))
+        if not math.isfinite(p_up):
+            p_up = 0.5
+            adjusted = True
+        if not math.isfinite(p_dn):
+            p_dn = 0.5
+            adjusted = True
+
+        if abs((p_up + p_dn) - 1.0) > 1e-6:
+            total = max(1e-8, p_up + p_dn)
+            p_up /= total
+            p_dn /= total
+            adjusted = True
+
+        if direction not in ("LONG", "SHORT", "NEUTRAL"):
+            direction = "NEUTRAL"
+            adjusted = True
+
+        validated = {
+            **alpha,
+            "confidence": max(0.0, min(1.0, conf)),
+            "prob_above": max(0.0, min(1.0, p_up)),
+            "prob_below": max(0.0, min(1.0, p_dn)),
+            "direction": direction,
+        }
+        if adjusted:
+            logger.warning("Alpha validation adjusted: %s", alpha)
+        return validated
+    except Exception:
+        logger.warning("Alpha validation adjusted: %s", alpha)
+        return _default_alpha()
+
+
 def _mean(values: List[float], default: float = 0.0) -> float:
     try:
         vals = [float(v) for v in values if v is not None]
@@ -3578,7 +3637,7 @@ def run_all_engines(
             setattr(run_all_engines, _alpha_ts_key, now_ts)
         setattr(run_all_engines, _alpha_conf_key, alpha_confidence)
         alpha_confidence = _clamp(_safe_float(alpha_confidence, 0.5), 0.01, 0.99)
-        market_data["alpha"] = {
+        alpha_payload = {
             "direction": alpha_direction,
             "confidence": alpha_confidence,
             "raw": alpha_raw,
@@ -3589,6 +3648,8 @@ def run_all_engines(
             "micro_prob": _clamp(_safe_float(alpha_raw.get("micro_prob", 0.5), 0.5), 0.0, 1.0),
             "macro_prob": _clamp(_safe_float(alpha_raw.get("macro_prob", 0.5), 0.5), 0.0, 1.0),
         }
+        alpha_payload = _validate_alpha(alpha_payload)
+        market_data["alpha"] = alpha_payload
         logger.debug(
             "[ALPHA] source=%s direction=%s confidence=%.4f",
             alpha_source,
