@@ -311,7 +311,7 @@ class ExecutionLogic:
             latency_ms = max(0.0, (now_ts - alpha_ts) * 1000.0)
         else:
             latency_ms = max(0.0, _safe_float(features.get("latency_ms", 0.0), 0.0))
-        alpha_decay = max(0.5, 1.0 - (latency_ms / 2000.0))
+        alpha_decay = max(0.6, 1.0 - (latency_ms / 3000.0))
         alpha_confidence = _clamp(alpha_confidence * alpha_decay, 0.0, 1.0)
         alpha_strength = _clamp(abs(alpha_confidence - 0.5) * 2.0, 0.0, 1.0)
         base_confidence = confidence
@@ -333,7 +333,7 @@ class ExecutionLogic:
         confidence_delta = confidence - base_confidence
         confidence = base_confidence + _clamp(confidence_delta, -max_alpha_impact, max_alpha_impact)
         prev_conf = getattr(self, "_last_exec_conf", confidence)
-        confidence = 0.7 * prev_conf + 0.3 * confidence
+        confidence = 0.6 * prev_conf + 0.4 * confidence
         self._last_exec_conf = confidence
         confidence = _clamp(confidence, 0.01, 0.99)
 

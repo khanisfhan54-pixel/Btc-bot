@@ -345,7 +345,7 @@ class SignalEngine:
         alpha_direction = str(_safe_get(alpha, "direction", "NEUTRAL")).upper()
         alpha_confidence = _clamp(_safe_float(_safe_get(alpha, "confidence", 0.5), 0.5), 0.0, 1.0)
         latency_ms = max(0.0, _safe_float(_safe_get(features, "latency_ms", 0.0), 0.0))
-        alpha_decay = max(0.5, 1.0 - (latency_ms / 2000.0))
+        alpha_decay = max(0.6, 1.0 - (latency_ms / 3000.0))
         alpha_confidence = _clamp(alpha_confidence * alpha_decay, 0.0, 1.0)
         signal_str = "LONG" if base.get("side") == "buy" else "SHORT"
         alpha_strength = _clamp(abs(alpha_confidence - 0.5) * 2.0, 0.0, 1.0)

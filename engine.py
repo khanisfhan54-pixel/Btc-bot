@@ -3539,7 +3539,7 @@ def run_all_engines(
             (alpha_prob_above * math.log(alpha_prob_above + 1e-6)) +
             (alpha_prob_below * math.log(alpha_prob_below + 1e-6))
         ) / math.log(2.0)
-        entropy_factor = _clamp(1.0 - 0.3 * entropy, 0.5, 1.0)
+        entropy_factor = _clamp(1.0 - 0.2 * entropy, 0.6, 1.0)
         alpha_confidence *= entropy_factor
         depth = _safe_float(bid_vol + ask_vol, 0.0)
         depth_norm = depth / ((_safe_float(price, 0.0) * 0.01) + 1e-8)
@@ -3562,7 +3562,7 @@ def run_all_engines(
             and abs(alpha_prob_above - alpha_prob_below) < 0.15
         ):
             alpha_direction = prev_alpha_direction
-        if alpha_direction != prev_alpha_direction and (now_ts - prev_flip_ts) < 0.5 and alpha_confidence < 0.7:
+        if alpha_direction != prev_alpha_direction and (now_ts - prev_flip_ts) < 1.0 and alpha_confidence < 0.7:
             alpha_direction = prev_alpha_direction
         liq_bias = str((liquidity_intent or {}).get("direction", "")).upper()
         if liq_bias in ("LONG", "SHORT") and alpha_direction in ("LONG", "SHORT"):
