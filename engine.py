@@ -3671,6 +3671,14 @@ def run_all_engines(
         age = now_ts - alpha_payload.get("timestamp", now_ts)
         decay = math.exp(-age / 3.0)
         alpha_payload["confidence"] *= decay
+
+        p_up = alpha_payload.get("prob_above", 0.5)
+        p_dn = alpha_payload.get("prob_below", 0.5)
+        entropy_raw = -(
+            p_up * math.log(p_up + 1e-8) +
+            p_dn * math.log(p_dn + 1e-8)
+        )
+        entropy_norm = entropy_raw / math.log(2.0)
         alpha_payload["confidence"] = _clamp(alpha_payload["confidence"], 0.0, 1.0)
 
         p_up = alpha_payload.get("prob_above", 0.5)
@@ -3690,11 +3698,14 @@ def run_all_engines(
         alpha_payload["confidence"] = _clamp(alpha_payload["confidence"], 0.0, 1.0)
 
         prev_conf = _safe_float(getattr(run_all_engines, _alpha_conf_key, 0.5), 0.5)
+        prev_conf = _clamp(prev_conf, 0.0, 1.0)
         delta = alpha_payload["confidence"] - prev_conf
         if delta > 0:
             alpha_payload["confidence"] *= 1.05
         else:
             alpha_payload["confidence"] *= 0.95
+
+        vol_factor = _clamp(atr_for_alpha / max(price, 1e-8), 0.5, 2.0)
         alpha_payload["confidence"] = _clamp(alpha_payload["confidence"], 0.0, 1.0)
 
         vol_factor = _clamp(atr_for_alpha / max(price, 1e-8), 0.5, 2.0)
@@ -3728,12 +3739,9 @@ def run_all_engines(
             assert alpha_payload["direction"] in ("LONG", "SHORT", "NEUTRAL")
             assert 0.0 <= alpha_payload["confidence"] <= 1.0
 
-        conf = alpha_payload.get("confidence", 0.5)
-
-        if not math.isfinite(conf):
-            conf = 0.5
-
-        alpha_payload["confidence"] = max(0.0, min(1.0, conf))
+        if not math.isfinite(alpha_payload["confidence"]):
+            alpha_payload["confidence"] = 0.5
+        alpha_payload["confidence"] = _clamp(alpha_payload["confidence"], 0.0, 1.0)
         market_data["alpha"] = alpha_payload
         logger.debug(
             "[ALPHA] source=%s direction=%s confidence=%.4f",
