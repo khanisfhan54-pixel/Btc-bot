@@ -3679,16 +3679,7 @@ def run_all_engines(
             p_dn * math.log(p_dn + 1e-8)
         )
         entropy_norm = entropy_raw / math.log(2.0)
-        alpha_payload["confidence"] = _clamp(alpha_payload["confidence"], 0.0, 1.0)
-
-        p_up = alpha_payload.get("prob_above", 0.5)
-        p_dn = alpha_payload.get("prob_below", 0.5)
-        entropy = -(
-            p_up * math.log(p_up + 1e-8) +
-            p_dn * math.log(p_dn + 1e-8)
-        )
-        entropy_norm = entropy / math.log(2.0)
-        alpha_payload["confidence"] *= (1.0 - 0.5 * entropy_norm)
+        alpha_payload["confidence"] *= (1.0 - 0.4 * entropy_norm)
         alpha_payload["confidence"] = _clamp(alpha_payload["confidence"], 0.0, 1.0)
 
         micro = alpha_payload.get("micro_prob", 0.5)
@@ -3706,20 +3697,16 @@ def run_all_engines(
             alpha_payload["confidence"] *= 0.95
 
         vol_factor = _clamp(atr_for_alpha / max(price, 1e-8), 0.5, 2.0)
-        alpha_payload["confidence"] = _clamp(alpha_payload["confidence"], 0.0, 1.0)
-
-        vol_factor = _clamp(atr_for_alpha / max(price, 1e-8), 0.5, 2.0)
-        alpha_payload["confidence"] *= vol_factor
         alpha_payload["confidence"] *= (0.75 + 0.25 * vol_factor)
         alpha_payload["confidence"] = _clamp(alpha_payload["confidence"], 0.0, 1.0)
 
         # Keep weak-but-valid signals alive after stacked penalties.
         alpha_payload["confidence"] = max(alpha_payload["confidence"], 0.05)
-        alpha_payload["confidence"] = _clamp(alpha_payload["confidence"], 0.0, 1.0)
 
         # Final temporal smoothing for stable downstream consumption.
         alpha_payload["confidence"] = 0.7 * prev_conf + 0.3 * alpha_payload["confidence"]
         alpha_payload["confidence"] = _clamp(alpha_payload["confidence"], 0.0, 1.0)
+
         alpha_prob_above = _clamp(_safe_float(alpha_payload.get("prob_above", 0.5), 0.5), 0.0, 1.0)
         alpha_prob_below = _clamp(_safe_float(alpha_payload.get("prob_below", 0.5), 0.5), 0.0, 1.0)
         alpha_prob_total = alpha_prob_above + alpha_prob_below
