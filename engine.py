@@ -3535,7 +3535,23 @@ def run_all_engines(
         )
         market_data = market_data or {}
         alpha_source = "stateful"
+        atr_for_alpha = max(_atr(_to_rows(primary_1m)[-30:], 14), 1e-8)
         try:
+            recent_highs = [
+                v
+                for r in primary_1m[-20:]
+                if r and len(r) > 2
+                for v in [_safe_float(r[2], float("nan"))]
+                if math.isfinite(v)
+            ]
+            recent_lows  = [
+                v
+                for r in primary_1m[-20:]
+                if r and len(r) > 3
+                for v in [_safe_float(r[3], float("nan"))]
+                if math.isfinite(v)
+            ]
+            _LIQUIDITY_SWEEP_ALPHA.update_liquidity_pools(recent_highs, recent_lows)
             alpha_raw = _LIQUIDITY_SWEEP_ALPHA.get_signal(
                 {
                     "price": price,
@@ -3545,7 +3561,7 @@ def run_all_engines(
                     "timestamp": time.time(),
                     "trades_count": len(trades),
                     "curr_depth": bid_vol + ask_vol,
-                    "atr": max(_atr(_to_rows(primary_1m)[-30:], 14), 1e-8),
+                    "atr": atr_for_alpha,
                     "ema_fast": compute_sma([_safe_float(r[4]) for r in _to_rows(primary_1m)[-12:]], 9),
                     "ema_slow": compute_sma([_safe_float(r[4]) for r in _to_rows(primary_1m)[-26:]], 21),
                     "macro_liquidity": liquidity_intent,
@@ -3614,6 +3630,9 @@ def run_all_engines(
         flip_threshold = 0.55 if prev_alpha_direction == "NEUTRAL" else 0.65
         now_ts = time.time()
         prev_flip_ts = _safe_float(getattr(run_all_engines, _alpha_ts_key, 0.0), 0.0)
+        if alpha_direction != prev_alpha_direction:
+            if abs(alpha_prob_above - alpha_prob_below) < 0.2:
+                alpha_direction = prev_alpha_direction
         if (
             alpha_direction != prev_alpha_direction
             and alpha_confidence < flip_threshold
@@ -3649,6 +3668,65 @@ def run_all_engines(
             "macro_prob": _clamp(_safe_float(alpha_raw.get("macro_prob", 0.5), 0.5), 0.0, 1.0),
         }
         alpha_payload = _validate_alpha(alpha_payload)
+        age = now_ts - alpha_payload.get("timestamp", now_ts)
+        decay = math.exp(-age / 3.0)
+        alpha_payload["confidence"] *= decay
+
+        p_up = alpha_payload.get("prob_above", 0.5)
+        p_dn = alpha_payload.get("prob_below", 0.5)
+        entropy_raw = -(
+            p_up * math.log(p_up + 1e-8) +
+            p_dn * math.log(p_dn + 1e-8)
+        )
+        entropy_norm = entropy_raw / math.log(2.0)
+        alpha_payload["confidence"] *= (1.0 - 0.5 * entropy_norm)
+        alpha_payload["confidence"] = _clamp(alpha_payload["confidence"], 0.0, 1.0)
+
+        micro = alpha_payload.get("micro_prob", 0.5)
+        macro = alpha_payload.get("macro_prob", 0.5)
+        if abs(micro - macro) > 0.4:
+            alpha_payload["confidence"] *= 0.7
+        alpha_payload["confidence"] = _clamp(alpha_payload["confidence"], 0.0, 1.0)
+
+        prev_conf = _safe_float(getattr(run_all_engines, _alpha_conf_key, 0.5), 0.5)
+        prev_conf = _clamp(prev_conf, 0.0, 1.0)
+        delta = alpha_payload["confidence"] - prev_conf
+        if delta > 0:
+            alpha_payload["confidence"] *= 1.05
+        else:
+            alpha_payload["confidence"] *= 0.95
+
+        vol_factor = _clamp(atr_for_alpha / max(price, 1e-8), 0.5, 2.0)
+        alpha_payload["confidence"] *= (0.75 + 0.25 * vol_factor)
+        alpha_payload["confidence"] = _clamp(alpha_payload["confidence"], 0.0, 1.0)
+
+        # Keep weak-but-valid signals alive after stacked penalties.
+        alpha_payload["confidence"] = max(alpha_payload["confidence"], 0.05)
+
+        # Final temporal smoothing for stable downstream consumption.
+        alpha_payload["confidence"] = 0.7 * prev_conf + 0.3 * alpha_payload["confidence"]
+        alpha_prob_above = _clamp(_safe_float(alpha_payload.get("prob_above", 0.5), 0.5), 0.0, 1.0)
+        alpha_prob_below = _clamp(_safe_float(alpha_payload.get("prob_below", 0.5), 0.5), 0.0, 1.0)
+        alpha_prob_total = alpha_prob_above + alpha_prob_below
+        if alpha_prob_total > 0.0:
+            alpha_prob_above /= alpha_prob_total
+            alpha_prob_below /= alpha_prob_total
+        else:
+            alpha_prob_above = 0.5
+            alpha_prob_below = 0.5
+        alpha_payload["prob_above"] = alpha_prob_above
+        alpha_payload["prob_below"] = alpha_prob_below
+
+        debug = bool(getattr(run_all_engines, "_debug_alpha", False))
+        if debug:
+            assert 0.0 <= alpha_payload["confidence"] <= 1.0
+            assert abs(alpha_payload["prob_above"] + alpha_payload["prob_below"] - 1.0) < 1e-6
+            assert alpha_payload["direction"] in ("LONG", "SHORT", "NEUTRAL")
+            assert 0.0 <= alpha_payload["confidence"] <= 1.0
+
+        if not math.isfinite(alpha_payload["confidence"]):
+            alpha_payload["confidence"] = 0.5
+        alpha_payload["confidence"] = _clamp(alpha_payload["confidence"], 0.0, 1.0)
         market_data["alpha"] = alpha_payload
         logger.debug(
             "[ALPHA] source=%s direction=%s confidence=%.4f",
@@ -3940,6 +4018,7 @@ def run_all_engines(
                 "risk_scale": 1.0,
                 "components": {},
             },
+            "alpha": _default_alpha(),
         }
 
 
