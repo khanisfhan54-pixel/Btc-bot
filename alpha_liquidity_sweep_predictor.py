@@ -132,7 +132,7 @@ def predict_sweep(
 
     if dist_above is not None and dist_below is not None:
         total = dist_above + dist_below
-        if total > 1e-12:
+        if total >= 1e-12:
             prob_above += (dist_below / total - 0.5)
             prob_below += (dist_above / total - 0.5)
     elif dist_above is not None:
@@ -159,7 +159,7 @@ def predict_sweep(
             prob_below += 0.15
             prob_above -= 0.10
 
-    if vol_spike or vol_strength > 0.7:
+    if vol_spike or vol_strength >= 0.7:
         if bias > 0:
             prob_above += 0.1
         elif bias < 0:
@@ -392,11 +392,11 @@ class LiquiditySweepAlpha:
         dist_to_high = abs(self.liquidity_pools['high'] - price)
         dist_to_low = abs(price - self.liquidity_pools['low'])
 
-        is_high_sweep = price > self.liquidity_pools['high']
-        is_low_sweep = price < self.liquidity_pools['low']
+        is_high_sweep = price >= self.liquidity_pools['high']
+        is_low_sweep = price <= self.liquidity_pools['low']
 
-        baseline = (self.hawkes_sum / len(self.hawkes_history)) if len(self.hawkes_history) > 5 else 1.0
-        intensity_spike = hawkes_intensity > baseline * 2.0
+        baseline = (self.hawkes_sum / max(1, len(self.hawkes_history))) if len(self.hawkes_history) > 5 else 1.0
+        intensity_spike = hawkes_intensity >= baseline * 2.0
 
         thresholds = self._normalize_thresholds(atr, price)
 
@@ -575,7 +575,7 @@ class LiquiditySweepAlpha:
                  pre_sweep_depth, curr_depth, sweep_time_elapsed, atr, ema_fast, ema_slow,
                  macro_liquidity (optional), macro_market_state (optional), macro_volume_intel (optional)
         """
-        md = market_data  # local alias (latency)
+        md = market_data if isinstance(market_data, dict) else {}  # local alias (latency)
         price = _safe_float(md.get('price'))
         if price <= 0.0:
             return _safe_output({
@@ -684,7 +684,7 @@ class LiquiditySweepAlpha:
             # Execution threshold dynamically tightens when the system is cold
             threshold = 0.55 + 0.1 * (1.0 - warmup_factor)
 
-            if combined_prob > threshold:
+            if combined_prob >= threshold:
                 action = "BUY" if sweep_side == "high" else "SELL"
                 # Calibrated Confidence: Confidence explicitly maps to normalized probability space.
                 confidence = combined_prob
@@ -697,7 +697,7 @@ class LiquiditySweepAlpha:
                 action = "HOLD"
                 confidence = 0.0
                 logic_path = "Active sweep detected but system not warmed up"
-                return {
+                return _safe_output({
                     "action": action,
                     "confidence": round(confidence, 4),
                     "state": state,
@@ -709,7 +709,7 @@ class LiquiditySweepAlpha:
                     "macro_prob": 0.5,
                     "prob_above": 0.5,
                     "prob_below": 0.5,
-                }
+                })
             close_price = _safe_float(md.get("close_price", price))
             is_fake, rej_score = self._detect_fake_breakout(sweep_side, close_price, ofi_z)
             res_score = self.check_resiliency(
@@ -774,7 +774,7 @@ class LiquiditySweepAlpha:
             )
             ensemble_score = _standard_sigmoid(ensemble_logit)
 
-            if ensemble_score > 0.65 and is_fake:
+            if ensemble_score >= 0.65 and is_fake:
                 action = "SELL" if sweep_side == "high" else "BUY"
                 confidence = ensemble_score * warmup_factor
                 logic_path = f"Fake {sweep_side} sweep confirmed via logit ensemble."
