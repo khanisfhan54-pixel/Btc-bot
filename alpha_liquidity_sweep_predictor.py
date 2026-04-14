@@ -5,6 +5,7 @@ import time
 
 __all__ = ["predict_sweep", "LiquiditySweepAlpha"]
 LOGIT_TEMP = 1.2
+EPS = 1e-12
 
 def _safe_float(x: Any, default: float = 0.0) -> float:
     try:
@@ -46,6 +47,44 @@ def _standard_sigmoid(x: float) -> float:
         ez = math.exp(x)
         return ez / (1.0 + ez)
 
+
+def _safe_output(result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Institutional output contract:
+    - No None values
+    - Stable schema
+    - Normalized probabilities
+    """
+    prob_above = _clamp(_safe_float(result.get("prob_above"), 0.5), 0.0, 1.0)
+    prob_below = _clamp(_safe_float(result.get("prob_below"), 0.5), 0.0, 1.0)
+    total = prob_above + prob_below
+    if total <= EPS:
+        prob_above, prob_below = 0.5, 0.5
+    else:
+        prob_above /= total
+        prob_below /= total
+
+    action = str(result.get("action", "HOLD")).upper()
+    if action not in {"BUY", "SELL", "HOLD"}:
+        action = "HOLD"
+
+    # ✅ FIX 5: Ensure strict numeric casting (institutional safety)
+    confidence = float(_safe_float(result.get("confidence"), 0.0))
+
+    return {
+        "action": action,
+        "confidence": round(_clamp(confidence, 0.0, 1.0), 4),
+        "state": str(result.get("state", "NORMAL")),
+        "regime": str(result.get("regime", "RANGING")),
+        "ofi_zscore": round(_safe_float(result.get("ofi_zscore"), 0.0), 4),
+        "hawkes_intensity": round(_safe_float(result.get("hawkes_intensity"), 0.0), 4),
+        "logic": str(result.get("logic", "No immediate edge")),
+        "micro_prob": round(_clamp(_safe_float(result.get("micro_prob"), 0.5), 0.0, 1.0), 4),
+        "macro_prob": round(_clamp(_safe_float(result.get("macro_prob"), 0.5), 0.0, 1.0), 4),
+        "prob_above": round(prob_above, 4),
+        "prob_below": round(prob_below, 4),
+    }
+
 def predict_sweep(
     liquidity: Dict[str, Any],
     market_state: Dict[str, Any],
@@ -54,8 +93,25 @@ def predict_sweep(
     """
     Predict which side liquidity will be swept first based on structural context.
     """
+    # ✅ FIX 1: Harden liquidity input
+    if not isinstance(liquidity, dict):
+        liquidity = {}
+
+    # ✅ FIX 2: Harden market_state input (prevents None crash)
+    if not isinstance(market_state, dict):
+        market_state = {}
+
+    # ✅ FIX 3: Harden volume_intel input
+    vol_intel = volume_intel if isinstance(volume_intel, dict) else {}
+
     nearest_above = liquidity.get("nearest_above")
     nearest_below = liquidity.get("nearest_below")
+
+    # Ensure pools are valid dicts
+    if not isinstance(nearest_above, dict):
+        nearest_above = None
+    if not isinstance(nearest_below, dict):
+        nearest_below = None
 
     dist_above = _safe_float(nearest_above.get("distance_points")) if nearest_above else None
     dist_below = _safe_float(nearest_below.get("distance_points")) if nearest_below else None
@@ -69,7 +125,6 @@ def predict_sweep(
     volatility = _safe_float(market_state.get("volatility", 0.0))
     bias = _safe_float(market_state.get("bias", 0.0))
 
-    vol_intel = volume_intel or {}
     vol_spike = bool(vol_intel.get("volume_spike", False))
     vol_strength = _safe_float(vol_intel.get("volume_strength", 0.0))
 
@@ -128,23 +183,26 @@ def predict_sweep(
     prob_below = _clamp(prob_below)
 
     total_prob = prob_above + prob_below
-    if total_prob > 0:
+    # ✅ FIX 4: Safe probability normalization
+    if total_prob <= EPS:
+        prob_above, prob_below = 0.5, 0.5
+    else:
         prob_above /= total_prob
         prob_below /= total_prob
 
-    if prob_above > prob_below:
+    if prob_above >= prob_below:
         side = "above"
         probability = prob_above
-        target = _safe_float(nearest_above.get("price")) if nearest_above else None
+        target = _safe_float(nearest_above.get("price")) if nearest_above else 0.0
     else:
         side = "below"
         probability = prob_below
-        target = _safe_float(nearest_below.get("price")) if nearest_below else None
+        target = _safe_float(nearest_below.get("price")) if nearest_below else 0.0
 
     return {
         "side": side,
         "probability": round(probability, 4),
-        "target_price": target,
+        "target_price": round(_safe_float(target, 0.0), 8),
         "prob_above": round(prob_above, 4),
         "prob_below": round(prob_below, 4),
         "state": state,
@@ -520,7 +578,7 @@ class LiquiditySweepAlpha:
         md = market_data  # local alias (latency)
         price = _safe_float(md.get('price'))
         if price <= 0.0:
-            return {
+            return _safe_output({
                 "action": "HOLD",
                 "confidence": 0.0,
                 "state": "NORMAL",
@@ -532,7 +590,7 @@ class LiquiditySweepAlpha:
                 "macro_prob": 0.5,
                 "prob_above": 0.5,
                 "prob_below": 0.5,
-            }
+            })
         close_price = _safe_float(md.get('close_price', price))
         atr = _safe_float(md.get('atr', price * 0.01)) + 1e-8
         if atr < 1e-8:
@@ -747,16 +805,16 @@ class LiquiditySweepAlpha:
         final_prob_up = _clamp(_safe_float(final_prob_up, 0.5), 0.0, 1.0)
         final_prob_down = 1.0 - final_prob_up
 
-        return {
+        return _safe_output({
             "action": action,
-            "confidence": round(confidence, 4),
+            "confidence": confidence,
             "state": state,
             "regime": regime,
-            "ofi_zscore": round(ofi_z, 4),
-            "hawkes_intensity": round(hawkes, 4),
+            "ofi_zscore": ofi_z,
+            "hawkes_intensity": hawkes,
             "logic": logic_path,
             "micro_prob": micro_prob if micro_prob is not None else 0.5,
             "macro_prob": macro_prob if macro_prob is not None else 0.5,
             "prob_above": final_prob_up,
             "prob_below": final_prob_down,
-        }
+        })
