@@ -427,6 +427,8 @@ class LiquiditySweepAlpha:
         is_fake = False
 
         if sweep_side == "high":
+            if self.liquidity_pools.get('high') is None:
+                return False, 0.0
             if close_price < self.liquidity_pools['high']: 
                 rejection_score += 0.5
             if ofi_z < -1.0: 
@@ -434,6 +436,8 @@ class LiquiditySweepAlpha:
             is_fake = rejection_score >= 0.5
 
         elif sweep_side == "low":
+            if self.liquidity_pools.get('low') is None:
+                return False, 0.0
             if close_price > self.liquidity_pools['low']:
                 rejection_score += 0.5
             if ofi_z > 1.0:
@@ -595,6 +599,7 @@ class LiquiditySweepAlpha:
         atr = _safe_float(md.get('atr', price * 0.01)) + 1e-8
         if atr < 1e-8:
             atr = 1e-8
+        vol_ratio = atr / (price + 1e-8)
 
         thresholds = self._normalize_thresholds(atr, price)
 
@@ -637,14 +642,17 @@ class LiquiditySweepAlpha:
         confidence = 0.0
         logic_path = "No immediate edge"
 
-        # Dynamically define sweep side contextually based on state proximity
-        sweep_side = "high" if price > (self.liquidity_pools['high'] or price) else "low"
-        if state == "PRE_SWEEP_BUILDUP":
-            high_pool = self.liquidity_pools.get('high')
-            low_pool = self.liquidity_pools.get('low')
-            dist_to_high = abs(high_pool - price) if high_pool else float('inf')
-            dist_to_low = abs(price - low_pool) if low_pool else float('inf')
-            sweep_side = "high" if dist_to_high < dist_to_low else "low"
+        # Dynamically define sweep side contextually based on proximity to nearest pool
+        high_pool = self.liquidity_pools.get('high')
+        low_pool = self.liquidity_pools.get('low')
+        if high_pool is not None and low_pool is not None:
+            sweep_side = "high" if abs(high_pool - price) <= abs(price - low_pool) else "low"
+        elif high_pool is not None:
+            sweep_side = "high"
+        elif low_pool is not None:
+            sweep_side = "low"
+        else:
+            sweep_side = "high"
 
         # Progressive Confidence Gating: Replaces hard threshold with continuous scaler based on deque warmth.
         warmup_factor = min(1.0, len(self.ofi_history) / 20.0, len(self.hawkes_history) / 5.0)
@@ -676,7 +684,7 @@ class LiquiditySweepAlpha:
             micro_weight = 1.0 - macro_weight
 
             # Logit Ensemble: Ensures proper probabilistic aggregation rather than linear weighting.
-            final_logit = (micro_weight * _safe_logit(pred_micro, atr)) + (macro_weight * _safe_logit(pred_macro, atr))
+            final_logit = (micro_weight * _safe_logit(pred_micro, vol_ratio)) + (macro_weight * _safe_logit(pred_macro, vol_ratio))
             combined_prob = _standard_sigmoid(final_logit)
             min_history_factor = min(1.0, len(self.ofi_history) / 20.0)
             combined_prob *= (0.7 * min_history_factor + 0.3 * warmup_factor)
@@ -763,13 +771,13 @@ class LiquiditySweepAlpha:
             micro_weight = 1.0 - macro_weight
 
             # Predictors subset ensemble
-            pred_logit = (micro_weight * _safe_logit(pred_micro, atr)) + (macro_weight * _safe_logit(pred_macro, atr))
+            pred_logit = (micro_weight * _safe_logit(pred_micro, vol_ratio)) + (macro_weight * _safe_logit(pred_macro, vol_ratio))
 
             # Logit Ensemble: Full statistical mapping across all primary system variables.
             ensemble_logit = (
-                0.40 * _safe_logit(reaction_confidence, atr) +
-                0.25 * _safe_logit(ml_prob, atr) +
-                0.15 * _safe_logit(liq_prob, atr) + 
+                0.40 * _safe_logit(reaction_confidence, vol_ratio) +
+                0.25 * _safe_logit(ml_prob, vol_ratio) +
+                0.15 * _safe_logit(liq_prob, vol_ratio) + 
                 0.20 * pred_logit
             )
             ensemble_score = _standard_sigmoid(ensemble_logit)
