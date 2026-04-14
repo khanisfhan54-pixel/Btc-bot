@@ -55,11 +55,10 @@ try:
     from meta_filter import MetaFilter as _MetaFilter
 
     _META_FILTER_CLS = _MetaFilter
-    _learning_engine = globals().get("LEARNING_ENGINE")
-
-    META_FILTER = _MetaFilter(learning_engine=_learning_engine)
 except Exception as _meta_import_exc:
-    META_FILTER = None
+    pass
+
+META_FILTER = None
 
 
 def _get_meta_filter() -> Any:
@@ -138,7 +137,10 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
     try:
         if x is None:
             return default
-        return float(x)
+        v = float(x)
+        if not math.isfinite(v):
+            return default
+        return v
     except Exception:
         return default
 
@@ -1789,7 +1791,6 @@ def institutional_score_engine(
         oispike = bool((oi_spike or {}).get("oi_spike", False))
         disp = _displacement_score((candles or {}).get("1m", []) if isinstance(candles, dict) else candles)
 
-        trap_conf = _safe_float((trap := (liquidity_sweep or {})).get("strength", 0.0))
         fvg = detect_fvg((candles or {}).get("15m", []) if isinstance(candles, dict) else candles)
         mtf = compute_mtf_bias(candles)
         structure = detect_structure((candles or {}).get("15m", []) if isinstance(candles, dict) else candles)
@@ -2215,7 +2216,7 @@ def detect_fvg(candles: Any) -> Dict[str, Any]:
 
     filled = False
     if exists and low is not None and high is not None:
-        filled = c2[3] <= high and c2[2] >= low or (rows[-1][3] <= high and rows[-1][2] >= low)
+        filled = (c2[3] <= high and c2[2] >= low)
 
     size = abs((high or 0.0) - (low or 0.0))
     strength = _clamp((size / atr) * 0.6 + (_body_ratio(c3) * 0.4), 0.0, 1.0) if exists else 0.0
@@ -2398,19 +2399,24 @@ class SMCLearningMemory:
 
     def __init__(self, path: str = SMC_LEARNING_PATH):
         self.path = path
+        self._file_lock = threading.Lock()
         self.data = self._load()
 
     def _load(self) -> Dict[str, Any]:
         try:
-            with open(self.path, "r") as f:
-                return json.load(f)
+            with self._file_lock:
+                with open(self.path, "r") as f:
+                    return json.load(f)
         except Exception:
             return {"total": 0, "feature_stats": {}, "regime_stats": {}}
 
     def _save(self) -> None:
         try:
-            with open(self.path, "w") as f:
-                json.dump(self.data, f, indent=2)
+            tmp = self.path + ".tmp"
+            with self._file_lock:
+                with open(tmp, "w") as f:
+                    json.dump(self.data, f, indent=2)
+                os.replace(tmp, self.path)
         except Exception:
             pass
 
@@ -3022,7 +3028,6 @@ def evaluate_smc_sniper(
         direction = trap["direction"]
 
     fib = detect_fibonacci_zone(c15m, price, direction if direction != "NONE" else ("LONG" if structure_15.get("trend") == "bullish" else "SHORT"))
-    trap = detect_traps(orderbook, trades, c1m, volume_intel)
 
     fvg_15 = detect_fvg(c15m)
     fvg_5 = detect_fvg(c5m)
@@ -3622,14 +3627,14 @@ def run_all_engines(
             alpha_direction = "NEUTRAL"
             alpha_confidence = 0.5
         _alpha_symbol = (symbol or "BTC/USDT").replace("/", "").upper()
-        _alpha_key = f"_last_alpha_direction_{_alpha_symbol}"
-        _alpha_ts_key = f"_last_alpha_flip_ts_{_alpha_symbol}"
-        _alpha_conf_key = f"_last_alpha_conf_{_alpha_symbol}"
-        prev_alpha_direction = getattr(run_all_engines, _alpha_key, "NEUTRAL")
-        prev_alpha_conf = _clamp(_safe_float(getattr(run_all_engines, _alpha_conf_key, 0.5), 0.5), 0.0, 1.0)
+        if not hasattr(run_all_engines, "_alpha_state"):
+            run_all_engines._alpha_state = {}
+        _alpha_st = run_all_engines._alpha_state.setdefault(_alpha_symbol, {})
+        prev_alpha_direction = _alpha_st.get("direction", "NEUTRAL")
+        prev_alpha_conf = _clamp(_safe_float(_alpha_st.get("confidence", 0.5), 0.5), 0.0, 1.0)
         flip_threshold = 0.55 if prev_alpha_direction == "NEUTRAL" else 0.65
         now_ts = time.time()
-        prev_flip_ts = _safe_float(getattr(run_all_engines, _alpha_ts_key, 0.0), 0.0)
+        prev_flip_ts = _safe_float(_alpha_st.get("flip_ts", 0.0), 0.0)
         if alpha_direction != prev_alpha_direction:
             if abs(alpha_prob_above - alpha_prob_below) < 0.2:
                 alpha_direction = prev_alpha_direction
@@ -3648,13 +3653,13 @@ def run_all_engines(
                 alpha_confidence = _clamp(alpha_confidence + 0.02, 0.0, 1.0)
             else:
                 alpha_confidence = _clamp(alpha_confidence - 0.02, 0.0, 1.0)
-        setattr(run_all_engines, _alpha_key, alpha_direction)
+        _alpha_st["direction"] = alpha_direction
         if alpha_direction == "NEUTRAL":
-            setattr(run_all_engines, _alpha_ts_key, 0.0)
-            setattr(run_all_engines, _alpha_conf_key, 0.5)
+            _alpha_st["flip_ts"] = 0.0
+            _alpha_st["confidence"] = 0.5
         elif alpha_direction != prev_alpha_direction:
-            setattr(run_all_engines, _alpha_ts_key, now_ts)
-        setattr(run_all_engines, _alpha_conf_key, alpha_confidence)
+            _alpha_st["flip_ts"] = now_ts
+        _alpha_st["confidence"] = alpha_confidence
         alpha_confidence = _clamp(_safe_float(alpha_confidence, 0.5), 0.01, 0.99)
         alpha_payload = {
             "direction": alpha_direction,
@@ -3668,7 +3673,8 @@ def run_all_engines(
             "macro_prob": _clamp(_safe_float(alpha_raw.get("macro_prob", 0.5), 0.5), 0.0, 1.0),
         }
         alpha_payload = _validate_alpha(alpha_payload)
-        age = now_ts - alpha_payload.get("timestamp", now_ts)
+        _raw_signal_ts = _safe_float(alpha_raw.get("timestamp", now_ts), now_ts)
+        age = max(0.0, now_ts - _raw_signal_ts)
         decay = math.exp(-age / 3.0)
         alpha_payload["confidence"] *= decay
 
@@ -3688,7 +3694,7 @@ def run_all_engines(
             alpha_payload["confidence"] *= 0.7
         alpha_payload["confidence"] = _clamp(alpha_payload["confidence"], 0.0, 1.0)
 
-        prev_conf = _safe_float(getattr(run_all_engines, _alpha_conf_key, 0.5), 0.5)
+        prev_conf = prev_alpha_conf
         prev_conf = _clamp(prev_conf, 0.0, 1.0)
         delta = alpha_payload["confidence"] - prev_conf
         if delta > 0:
@@ -4717,7 +4723,7 @@ class BinanceFuturesStreamClient:
             timestamp=now,
             orderbook=self.orderbook,
             trades=list(self.trades),
-            candles=self.candles,
+            candles={k: list(v) for k, v in self.candles.items()},
             open_interest=self.open_interest,
             funding_rate=self.funding_rate,
             whale_walls=self.whale_walls,
@@ -4742,12 +4748,8 @@ class BinanceFuturesStreamClient:
             bid = _safe_float(data.get("b"))
             ask = _safe_float(data.get("a"))
             if bid > 0 and ask > 0:
-                self.price = (bid + ask) / 2.0
                 with self._lock:
-                    self.orderbook = {
-                        "bids": [[bid, _safe_float(data.get("B"), 0.0)]],
-                        "asks": [[ask, _safe_float(data.get("A"), 0.0)]],
-                    }
+                    self.price = (bid + ask) / 2.0
         except Exception:
             pass
 
@@ -5077,12 +5079,13 @@ class SniperExecutionEngine:
                 "breakout_valid": breakout_valid,
                 "trap": trap,
                 "volume_intel": volume_intel,
-                "open_interest": snapshot.open_interest or self.rest.open_interest(),
-                "funding_rate": snapshot.funding_rate or self.rest.funding_rate(),
+                "open_interest": snapshot.open_interest if snapshot.open_interest is not None else self.rest.open_interest(),
+                "funding_rate": snapshot.funding_rate if snapshot.funding_rate is not None else self.rest.funding_rate(),
                 "strategy_bias": strategy_bias,
             }
         )
-        self.latest_decision = signal
+        with self._lock:
+            self.latest_decision = signal
         if self.on_signal:
             try:
                 self.on_signal(signal)
