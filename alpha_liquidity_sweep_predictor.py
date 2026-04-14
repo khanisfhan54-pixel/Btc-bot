@@ -1,4 +1,5 @@
 import math
+import threading
 from typing import Dict, Any, Optional, List, Tuple
 from collections import deque
 import time
@@ -231,9 +232,10 @@ class LiquiditySweepAlpha:
 
         # Hawkes Process State
         self.hawkes_lambda = 0.0
-        self.last_trade_time = time.time()
+        self.last_trade_time = 0.0
         self.hawkes_decay = 0.5 
         self.hawkes_alpha = 0.1 
+        self._lock = threading.RLock()
 
     def _normalize_thresholds(self, atr: float, price: float) -> Dict[str, float]:
         """
@@ -253,10 +255,11 @@ class LiquiditySweepAlpha:
         return 0.5 * (y + 1.0) # [0, 1]
 
     def update_liquidity_pools(self, recent_highs: List[float], recent_lows: List[float]):
-        if recent_highs is not None and len(recent_highs) > 0:
-            self.liquidity_pools['high'] = max(recent_highs[-20:])
-        if recent_lows is not None and len(recent_lows) > 0:
-            self.liquidity_pools['low'] = min(recent_lows[-20:])
+        with self._lock:
+            if recent_highs is not None and len(recent_highs) > 0:
+                self.liquidity_pools['high'] = max(recent_highs[-20:])
+            if recent_lows is not None and len(recent_lows) > 0:
+                self.liquidity_pools['low'] = min(recent_lows[-20:])
 
     def _update_hawkes(self, timestamp: float, trade_count: int) -> float:
         # sanitize inputs + protect against timestamp unit mismatches (s vs ms/ns)
@@ -579,250 +582,254 @@ class LiquiditySweepAlpha:
                  pre_sweep_depth, curr_depth, sweep_time_elapsed, atr, ema_fast, ema_slow,
                  macro_liquidity (optional), macro_market_state (optional), macro_volume_intel (optional)
         """
-        md = market_data if isinstance(market_data, dict) else {}  # local alias (latency)
-        price = _safe_float(md.get('price'))
-        if price <= 0.0:
-            return _safe_output({
-                "action": "HOLD",
-                "confidence": 0.0,
-                "state": "NORMAL",
-                "regime": "RANGING",
-                "ofi_zscore": 0.0,
-                "hawkes_intensity": 0.0,
-                "logic": "Invalid price",
-                "micro_prob": 0.5,
-                "macro_prob": 0.5,
-                "prob_above": 0.5,
-                "prob_below": 0.5,
-            })
-        close_price = _safe_float(md.get('close_price', price))
-        atr = _safe_float(md.get('atr', price * 0.01)) + 1e-8
-        if atr < 1e-8:
-            atr = 1e-8
-        vol_ratio = atr / (price + 1e-8)
-
-        thresholds = self._normalize_thresholds(atr, price)
-
-        # Calculate core signals and cache previous state for deltas
-        prev_lambda = self.hawkes_lambda
-        ofi_z = self.calculate_ofi_zscore(md.get('prev_book', {}), md.get('curr_book', {}))
-        hawkes = self._update_hawkes(md.get('timestamp', time.time()), md.get('trades_count', 0))
-        hawkes_delta = hawkes - prev_lambda
-
-        regime = self._detect_regime(
-            md.get('ema_fast', price),
-            md.get('ema_slow', price),
-            buffer=thresholds["trend_buffer"]
-        )
-
-        state = self.detect_sweep_state(price, atr, hawkes)
-
-        # Microstructure Predictor
-        micro_prediction = self._predict_next_sweep(md, ofi_z, hawkes, hawkes_delta)
-
-        # Macro Structural Predictor
-        macro_liquidity = md.get('macro_liquidity', {})
-        macro_market_state = md.get('macro_market_state', {'state': regime, 'volatility': atr})
-        macro_volume_intel = md.get('macro_volume_intel', {})
-        macro_reliability = 1.0
-        if not macro_liquidity or not isinstance(macro_liquidity, dict):
-            macro_reliability = 0.5
-        if not macro_market_state or not isinstance(macro_market_state, dict):
-            macro_reliability *= 0.7
-
-        macro_prediction = predict_sweep(macro_liquidity, macro_market_state, macro_volume_intel)
-
-        # Handle macro fallback gracefully if pools are undefined
-        macro_prob_up = macro_prediction.get("prob_above", 0.5)
-        macro_prob_down = macro_prediction.get("prob_below", 0.5)
-        micro_prob = None
-        macro_prob = None
-
-        action = "HOLD"
-        confidence = 0.0
-        logic_path = "No immediate edge"
-
-        # Dynamically define sweep side contextually based on proximity to nearest pool
-        high_pool = self.liquidity_pools.get('high')
-        low_pool = self.liquidity_pools.get('low')
-        if high_pool is not None and low_pool is not None:
-            sweep_side = "high" if abs(high_pool - price) <= abs(price - low_pool) else "low"
-        elif high_pool is not None:
-            sweep_side = "high"
-        elif low_pool is not None:
-            sweep_side = "low"
-        else:
-            sweep_side = "high"
-
-        # Progressive Confidence Gating: Replaces hard threshold with continuous scaler based on deque warmth.
-        warmup_factor = min(1.0, len(self.ofi_history) / 20.0, len(self.hawkes_history) / 5.0)
-        time_decay = math.exp(-0.01 * max(0.0, (time.time() - self.last_trade_time)))
-        warmup_factor = _clamp(0.6 * warmup_factor + 0.4 * _clamp(time_decay, 0.3, 1.0), 0.0, 1.0)
-
-        if state == "PRE_SWEEP_BUILDUP":
-            # --- Early Anticipation Logic ---
-            # For a breakout (anticipation), we want high probability that it continues *through* the level.
-            # If approaching 'high', we want prob_up. If 'low', we want prob_down.
-            pred_micro = micro_prediction["prob_up"] if sweep_side == "high" else micro_prediction["prob_down"]
-            pred_macro = macro_prob_up if sweep_side == "high" else macro_prob_down
-            pred_micro = _calibrate_prob(pred_micro)
-            pred_macro = _calibrate_prob(pred_macro)
-            pred_macro = _clamp(0.5 + (pred_macro - 0.5) * macro_reliability, 0.0, 1.0)
-            micro_prob = _clamp(pred_micro, 0.0, 1.0)
-            macro_prob = _clamp(pred_macro, 0.0, 1.0)
-
-            # Feature Decorrelation: Softly reduce macro weight when microstructure z-score is highly active
-            # This mathematically decorrelates structurally repetitive features mapped in both predictive sets.
-            hawkes_term = math.tanh(hawkes / 5.0)
-            corr_proxy = _clamp(
-                0.6 * abs(ofi_z) / 3.0 +
-                0.4 * hawkes_term,
-                0.0,
-                1.0,
-            )
-            macro_weight = max(0.15 * macro_reliability, 0.4 * (1.0 - corr_proxy) * macro_reliability)
-            micro_weight = 1.0 - macro_weight
-
-            # Logit Ensemble: Ensures proper probabilistic aggregation rather than linear weighting.
-            final_logit = (micro_weight * _safe_logit(pred_micro, vol_ratio)) + (macro_weight * _safe_logit(pred_macro, vol_ratio))
-            combined_prob = _standard_sigmoid(final_logit)
-            min_history_factor = min(1.0, len(self.ofi_history) / 20.0)
-            combined_prob *= (0.7 * min_history_factor + 0.3 * warmup_factor)
-
-            # Execution threshold dynamically tightens when the system is cold
-            threshold = 0.55 + 0.1 * (1.0 - warmup_factor)
-
-            if combined_prob >= threshold:
-                action = "BUY" if sweep_side == "high" else "SELL"
-                # Calibrated Confidence: Confidence explicitly maps to normalized probability space.
-                confidence = combined_prob
-                logic_path = f"Anticipatory early entry on {sweep_side} buildup. Prob: {combined_prob:.2f}"
-            else:
-                logic_path = "Buildup detected, awaiting breach or stronger confirmation"
-
-        elif state == "ACTIVE_SWEEP":
-            if warmup_factor < 0.5:
-                action = "HOLD"
-                confidence = 0.0
-                logic_path = "Active sweep detected but system not warmed up"
+        with self._lock:
+            md = market_data if isinstance(market_data, dict) else {}  # local alias (latency)
+            price = _safe_float(md.get('price'))
+            if price <= 0.0:
                 return _safe_output({
-                    "action": action,
-                    "confidence": round(confidence, 4),
-                    "state": state,
-                    "regime": regime,
-                    "ofi_zscore": round(ofi_z, 4),
-                    "hawkes_intensity": round(hawkes, 4),
-                    "logic": logic_path,
+                    "action": "HOLD",
+                    "confidence": 0.0,
+                    "state": "NORMAL",
+                    "regime": "RANGING",
+                    "ofi_zscore": 0.0,
+                    "hawkes_intensity": 0.0,
+                    "logic": "Invalid price",
                     "micro_prob": 0.5,
                     "macro_prob": 0.5,
                     "prob_above": 0.5,
                     "prob_below": 0.5,
                 })
-            close_price = _safe_float(md.get("close_price", price))
-            is_fake, rej_score = self._detect_fake_breakout(sweep_side, close_price, ofi_z)
-            res_score = self.check_resiliency(
-                md.get('pre_sweep_depth', 1.0), 
-                md.get('curr_depth', 1.0), 
-                md.get('sweep_time_elapsed', 0.0)
+            close_price = _safe_float(md.get('close_price', price))
+            atr = _safe_float(md.get('atr', price * 0.01)) + 1e-8
+            if atr < 1e-8:
+                atr = 1e-8
+            vol_ratio = atr / (price + 1e-8)
+    
+            thresholds = self._normalize_thresholds(atr, price)
+    
+            # Calculate core signals and cache previous state for deltas
+            prev_lambda = self.hawkes_lambda
+            prev_trade_time = self.last_trade_time
+            ofi_z = self.calculate_ofi_zscore(md.get('prev_book', {}), md.get('curr_book', {}))
+            hawkes = self._update_hawkes(md.get('timestamp', time.time()), md.get('trades_count', 0))
+            hawkes_delta = hawkes - prev_lambda
+    
+            regime = self._detect_regime(
+                md.get('ema_fast', price),
+                md.get('ema_slow', price),
+                buffer=thresholds["trend_buffer"]
             )
-
-            w_ofi, w_res, w_rej = 0.3, 0.4, 0.3
-            ofi_component = _clamp(abs(ofi_z) / 3.0) 
-            res_component = _clamp(res_score)
-
-            raw_logit = (w_ofi * ofi_component) + (w_res * res_component) + (w_rej * rej_score)
-            reaction_confidence = self._fast_sigmoid(raw_logit)
-
-            trend_penalty = 0.0
-            if (sweep_side == "high" and regime == "UPTREND") or (sweep_side == "low" and regime == "DOWNTREND"):
-                trend_penalty = 0.2 
-
-            reaction_confidence = _clamp(reaction_confidence - trend_penalty)
-
-            ml_prob = self._ml_sweep_probability({
-                "ofi": ofi_z,
-                "hawkes": hawkes,
-                "volatility": atr,
-                "depth": md.get("curr_depth", 1.0)
-            })
-
-            liquidity_bias = self._liquidity_forecast()
-            liq_prob = (liquidity_bias + 1.0) / 2.0
-
-            # --- Mean Reversion (Fade) Logic ---
-            # In an active sweep, we are looking for the fake-out / reversion.
-            # If sweeping 'high', we want high prob_down. If 'low', we want prob_up.
-            pred_micro = micro_prediction["prob_down"] if sweep_side == "high" else micro_prediction["prob_up"]
-            pred_macro = macro_prob_down if sweep_side == "high" else macro_prob_up
-            pred_micro = _calibrate_prob(pred_micro)
-            pred_macro = _calibrate_prob(pred_macro)
-            pred_macro = _clamp(0.5 + (pred_macro - 0.5) * macro_reliability, 0.0, 1.0)
-            micro_prob = _clamp(pred_micro, 0.0, 1.0)
-            macro_prob = _clamp(pred_macro, 0.0, 1.0)
-
-            hawkes_term = math.tanh(hawkes / 5.0)
-            corr_proxy = _clamp(
-                0.6 * abs(ofi_z) / 3.0 +
-                0.4 * hawkes_term,
-                0.0,
-                1.0,
-            )
-            macro_weight = max(0.15 * macro_reliability, 0.4 * (1.0 - corr_proxy) * macro_reliability)
-            micro_weight = 1.0 - macro_weight
-
-            # Predictors subset ensemble
-            pred_logit = (micro_weight * _safe_logit(pred_micro, vol_ratio)) + (macro_weight * _safe_logit(pred_macro, vol_ratio))
-
-            # Logit Ensemble: Full statistical mapping across all primary system variables.
-            ensemble_logit = (
-                0.40 * _safe_logit(reaction_confidence, vol_ratio) +
-                0.25 * _safe_logit(ml_prob, vol_ratio) +
-                0.15 * _safe_logit(liq_prob, vol_ratio) + 
-                0.20 * pred_logit
-            )
-            ensemble_score = _standard_sigmoid(ensemble_logit)
-
-            if ensemble_score >= 0.65 and is_fake:
-                action = "SELL" if sweep_side == "high" else "BUY"
-                confidence = ensemble_score * warmup_factor
-                logic_path = f"Fake {sweep_side} sweep confirmed via logit ensemble."
+    
+            state = self.detect_sweep_state(price, atr, hawkes)
+    
+            # Microstructure Predictor
+            micro_prediction = self._predict_next_sweep(md, ofi_z, hawkes, hawkes_delta)
+    
+            # Macro Structural Predictor
+            macro_liquidity = md.get('macro_liquidity', {})
+            macro_market_state = md.get('macro_market_state', {'state': regime, 'volatility': atr})
+            macro_volume_intel = md.get('macro_volume_intel', {})
+            macro_reliability = 1.0
+            if not macro_liquidity or not isinstance(macro_liquidity, dict):
+                macro_reliability = 0.5
+            if not macro_market_state or not isinstance(macro_market_state, dict):
+                macro_reliability *= 0.7
+    
+            macro_prediction = predict_sweep(macro_liquidity, macro_market_state, macro_volume_intel)
+    
+            # Handle macro fallback gracefully if pools are undefined
+            macro_prob_up = macro_prediction.get("prob_above", 0.5)
+            macro_prob_down = macro_prediction.get("prob_below", 0.5)
+            micro_prob = None
+            macro_prob = None
+    
+            action = "HOLD"
+            confidence = 0.0
+            logic_path = "No immediate edge"
+    
+            # Dynamically define sweep side contextually based on proximity to nearest pool
+            high_pool = self.liquidity_pools.get('high')
+            low_pool = self.liquidity_pools.get('low')
+            if high_pool is not None and low_pool is not None:
+                sweep_side = "high" if abs(high_pool - price) <= abs(price - low_pool) else "low"
+            elif high_pool is not None:
+                sweep_side = "high"
+            elif low_pool is not None:
+                sweep_side = "low"
             else:
-                logic_path = f"True breakout / lack of reversion edge on {sweep_side} sweep."
-
-        if regime == "RANGING":
-            confidence *= 0.9
-        if regime == "UPTREND" and action == "SELL":
-            confidence *= 0.9
-        if regime == "DOWNTREND" and action == "BUY":
-            confidence *= 0.9
-
-        # unify probability schema for engine compatibility
-        if micro_prob is None:
-            final_prob_up = 0.5
-        else:
-            if action == "BUY":
-                final_prob_up = micro_prob
-            elif action == "SELL":
-                final_prob_up = 1.0 - micro_prob
-            elif sweep_side == "high":
-                final_prob_up = micro_prob
-            elif sweep_side == "low":
-                final_prob_up = 1.0 - micro_prob
-            else:
+                sweep_side = "high"
+    
+            # Progressive Confidence Gating: Replaces hard threshold with continuous scaler based on deque warmth.
+            warmup_factor = min(1.0, len(self.ofi_history) / 20.0, len(self.hawkes_history) / 5.0)
+            # Use data-timestamp inter-tick gap (not wall clock) for backtest fidelity
+            data_gap = max(0.0, self.last_trade_time - prev_trade_time) if prev_trade_time > 0.0 else 0.0
+            time_decay = math.exp(-0.01 * data_gap)
+            warmup_factor = _clamp(0.6 * warmup_factor + 0.4 * _clamp(time_decay, 0.3, 1.0), 0.0, 1.0)
+    
+            if state == "PRE_SWEEP_BUILDUP":
+                # --- Early Anticipation Logic ---
+                # For a breakout (anticipation), we want high probability that it continues *through* the level.
+                # If approaching 'high', we want prob_up. If 'low', we want prob_down.
+                pred_micro = micro_prediction["prob_up"] if sweep_side == "high" else micro_prediction["prob_down"]
+                pred_macro = macro_prob_up if sweep_side == "high" else macro_prob_down
+                pred_micro = _calibrate_prob(pred_micro)
+                pred_macro = _calibrate_prob(pred_macro)
+                pred_macro = _clamp(0.5 + (pred_macro - 0.5) * macro_reliability, 0.0, 1.0)
+                micro_prob = _clamp(pred_micro, 0.0, 1.0)
+                macro_prob = _clamp(pred_macro, 0.0, 1.0)
+    
+                # Feature Decorrelation: Softly reduce macro weight when microstructure z-score is highly active
+                # This mathematically decorrelates structurally repetitive features mapped in both predictive sets.
+                hawkes_term = math.tanh(hawkes / 5.0)
+                corr_proxy = _clamp(
+                    0.6 * abs(ofi_z) / 3.0 +
+                    0.4 * hawkes_term,
+                    0.0,
+                    1.0,
+                )
+                macro_weight = max(0.15 * macro_reliability, 0.4 * (1.0 - corr_proxy) * macro_reliability)
+                micro_weight = 1.0 - macro_weight
+    
+                # Logit Ensemble: Ensures proper probabilistic aggregation rather than linear weighting.
+                final_logit = (micro_weight * _safe_logit(pred_micro, vol_ratio)) + (macro_weight * _safe_logit(pred_macro, vol_ratio))
+                combined_prob = _standard_sigmoid(final_logit)
+                min_history_factor = min(1.0, len(self.ofi_history) / 20.0)
+    
+                # Execution threshold dynamically tightens when the system is cold
+                # Absorbs both warmup and history gating without destroying probability calibration
+                threshold = 0.55 + 0.10 * (1.0 - warmup_factor) + 0.10 * (1.0 - min_history_factor)
+    
+                if combined_prob >= threshold:
+                    action = "BUY" if sweep_side == "high" else "SELL"
+                    # Calibrated Confidence: Confidence explicitly maps to normalized probability space.
+                    confidence = combined_prob
+                    logic_path = f"Anticipatory early entry on {sweep_side} buildup. Prob: {combined_prob:.2f}"
+                else:
+                    logic_path = "Buildup detected, awaiting breach or stronger confirmation"
+    
+            elif state == "ACTIVE_SWEEP":
+                if warmup_factor < 0.5:
+                    action = "HOLD"
+                    confidence = 0.0
+                    logic_path = "Active sweep detected but system not warmed up"
+                    return _safe_output({
+                        "action": action,
+                        "confidence": round(confidence, 4),
+                        "state": state,
+                        "regime": regime,
+                        "ofi_zscore": round(ofi_z, 4),
+                        "hawkes_intensity": round(hawkes, 4),
+                        "logic": logic_path,
+                        "micro_prob": 0.5,
+                        "macro_prob": 0.5,
+                        "prob_above": 0.5,
+                        "prob_below": 0.5,
+                    })
+                close_price = _safe_float(md.get("close_price", price))
+                is_fake, rej_score = self._detect_fake_breakout(sweep_side, close_price, ofi_z)
+                res_score = self.check_resiliency(
+                    md.get('pre_sweep_depth', 1.0), 
+                    md.get('curr_depth', 1.0), 
+                    md.get('sweep_time_elapsed', 0.0)
+                )
+    
+                w_ofi, w_res, w_rej = 0.3, 0.4, 0.3
+                ofi_component = _clamp(abs(ofi_z) / 3.0) 
+                res_component = _clamp(res_score)
+    
+                raw_logit = (w_ofi * ofi_component) + (w_res * res_component) + (w_rej * rej_score)
+                reaction_confidence = self._fast_sigmoid(raw_logit)
+    
+                trend_penalty = 0.0
+                if (sweep_side == "high" and regime == "UPTREND") or (sweep_side == "low" and regime == "DOWNTREND"):
+                    trend_penalty = 0.2 
+    
+                reaction_confidence = _clamp(reaction_confidence - trend_penalty)
+    
+                ml_prob = self._ml_sweep_probability({
+                    "ofi": ofi_z,
+                    "hawkes": hawkes,
+                    "volatility": atr,
+                    "depth": md.get("curr_depth", 1.0)
+                })
+    
+                liquidity_bias = self._liquidity_forecast()
+                liq_prob = (liquidity_bias + 1.0) / 2.0
+    
+                # --- Mean Reversion (Fade) Logic ---
+                # In an active sweep, we are looking for the fake-out / reversion.
+                # If sweeping 'high', we want high prob_down. If 'low', we want prob_up.
+                pred_micro = micro_prediction["prob_down"] if sweep_side == "high" else micro_prediction["prob_up"]
+                pred_macro = macro_prob_down if sweep_side == "high" else macro_prob_up
+                pred_micro = _calibrate_prob(pred_micro)
+                pred_macro = _calibrate_prob(pred_macro)
+                pred_macro = _clamp(0.5 + (pred_macro - 0.5) * macro_reliability, 0.0, 1.0)
+                micro_prob = _clamp(pred_micro, 0.0, 1.0)
+                macro_prob = _clamp(pred_macro, 0.0, 1.0)
+    
+                hawkes_term = math.tanh(hawkes / 5.0)
+                corr_proxy = _clamp(
+                    0.6 * abs(ofi_z) / 3.0 +
+                    0.4 * hawkes_term,
+                    0.0,
+                    1.0,
+                )
+                macro_weight = max(0.15 * macro_reliability, 0.4 * (1.0 - corr_proxy) * macro_reliability)
+                micro_weight = 1.0 - macro_weight
+    
+                # Predictors subset ensemble
+                pred_logit = (micro_weight * _safe_logit(pred_micro, vol_ratio)) + (macro_weight * _safe_logit(pred_macro, vol_ratio))
+    
+                # Logit Ensemble: Full statistical mapping across all primary system variables.
+                ensemble_logit = (
+                    0.40 * _safe_logit(reaction_confidence, vol_ratio) +
+                    0.25 * _safe_logit(ml_prob, vol_ratio) +
+                    0.15 * _safe_logit(liq_prob, vol_ratio) + 
+                    0.20 * pred_logit
+                )
+                ensemble_score = _standard_sigmoid(ensemble_logit)
+    
+                if ensemble_score >= 0.65 and is_fake:
+                    action = "SELL" if sweep_side == "high" else "BUY"
+                    confidence = ensemble_score * warmup_factor
+                    logic_path = f"Fake {sweep_side} sweep confirmed via logit ensemble."
+                else:
+                    logic_path = f"True breakout / lack of reversion edge on {sweep_side} sweep."
+    
+            if regime == "RANGING":
+                confidence *= 0.9
+            if regime == "UPTREND" and action == "SELL":
+                confidence *= 0.9
+            if regime == "DOWNTREND" and action == "BUY":
+                confidence *= 0.9
+    
+            # unify probability schema for engine compatibility
+            if micro_prob is None:
                 final_prob_up = 0.5
-        final_prob_up = _clamp(_safe_float(final_prob_up, 0.5), 0.0, 1.0)
-        final_prob_down = 1.0 - final_prob_up
-
-        return _safe_output({
-            "action": action,
-            "confidence": confidence,
-            "state": state,
-            "regime": regime,
-            "ofi_zscore": ofi_z,
-            "hawkes_intensity": hawkes,
-            "logic": logic_path,
-            "micro_prob": micro_prob if micro_prob is not None else 0.5,
-            "macro_prob": macro_prob if macro_prob is not None else 0.5,
-            "prob_above": final_prob_up,
-            "prob_below": final_prob_down,
-        })
+            else:
+                if action == "BUY":
+                    final_prob_up = micro_prob
+                elif action == "SELL":
+                    final_prob_up = 1.0 - micro_prob
+                elif sweep_side == "high":
+                    final_prob_up = micro_prob
+                elif sweep_side == "low":
+                    final_prob_up = 1.0 - micro_prob
+                else:
+                    final_prob_up = 0.5
+            final_prob_up = _clamp(_safe_float(final_prob_up, 0.5), 0.0, 1.0)
+            final_prob_down = 1.0 - final_prob_up
+    
+            return _safe_output({
+                "action": action,
+                "confidence": confidence,
+                "state": state,
+                "regime": regime,
+                "ofi_zscore": ofi_z,
+                "hawkes_intensity": hawkes,
+                "logic": logic_path,
+                "micro_prob": micro_prob if micro_prob is not None else 0.5,
+                "macro_prob": macro_prob if macro_prob is not None else 0.5,
+                "prob_above": final_prob_up,
+                "prob_below": final_prob_down,
+            })
