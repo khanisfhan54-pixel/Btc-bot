@@ -215,10 +215,10 @@ def _map_execution_mode(regime_label: str) -> str:
 # ==========================================
 def compute_hmm_regime(alpha: np.ndarray) -> Dict[str, Any]:
     """
-    Converts real-time filtered probabilities (alpha) into a continuous scoring system
-    and strict regime classification. No backward pass (gamma) to prevent future leakage.
+    Converts real-time filtered probabilities (alpha) into bounded regime scores.
 
-    Critical constraint: probabilities must be STRICTLY forward-looking.
+    Classification is purely probabilistic (argmax over TREND/BEAR, RANGE, TOXIC)
+    with no hard RANGE override to avoid regime collapse.
     """
     alpha_safe = np.asarray(alpha, dtype=float)
     if not np.all(np.isfinite(alpha_safe)):
@@ -238,26 +238,45 @@ def compute_hmm_regime(alpha: np.ndarray) -> Dict[str, Any]:
     bull = float(alpha_safe[0])
     bear = float(alpha_safe[1])
     crisis = float(alpha_safe[2])
+
+    directional_strength = float(np.clip(abs(bull - bear), 0.0, 1.0))
+    low_directionality = 1.0 - directional_strength
+    directional_confidence = float(np.clip(max(bull, bear), 0.0, 1.0))
+
+    # Soft range evidence (bounded; no hard overrides).
+    range_from_balance = low_directionality
+    range_from_low_vol = float(np.clip(1.0 - crisis, 0.0, 1.0))
+    range_from_low_drift = float(np.clip(1.0 - directional_confidence, 0.0, 1.0))
+
+    range_score_raw = (
+        0.40 * range_from_balance
+        + 0.35 * range_from_low_vol
+        + 0.25 * range_from_low_drift
+    )
+    trend_pressure = 0.40 * directional_strength + 0.25 * float(
+        np.clip((directional_confidence - 0.55) / 0.45, 0.0, 1.0)
+    )
+    range_score = float(np.clip(min(range_score_raw, 0.78) - trend_pressure, 0.0, 1.0))
+
+    trend_score = float(np.clip(
+        (1.0 - crisis) * (0.70 * directional_confidence + 0.30 * directional_strength),
+        0.0,
+        1.0,
+    ))
+    toxic_score = float(np.clip(crisis * (1.0 + 0.40 * crisis), 0.0, 1.0))
+
+    directional_label = "TREND" if bull >= bear else "BEAR"
+    score_map = {
+        directional_label: trend_score,
+        "RANGE": range_score,
+        "TOXIC": toxic_score,
+    }
+    regime = max(score_map, key=score_map.get)
+
     dominant = max(bull, bear)
-    separation = abs(bull - bear)
+    separation = directional_strength
     edge_score = float(np.clip((dominant - crisis) + 0.25 * separation, 0.0, 1.0))
 
-    # Regime Classification: precedence order is TOXIC > TREND > BEAR > RANGE.
-    # Bear-dominant states must not collapse into RANGE — that label is reserved
-    # for genuinely ambiguous, low-conviction environments only.
-    if crisis > 0.55:
-        regime = "TOXIC"
-    elif bull > 0.55:
-        regime = "TREND"
-    elif bear > 0.55:
-        regime = "BEAR"
-    else:
-        regime = "RANGE"
-
-    if regime in ("TREND", "BEAR") and separation < 0.15 and crisis < 0.30:
-        regime = "RANGE"
-        
-    # 4. Continuous Scoring
     return {
         "regime": regime,
         "bull": bull,
@@ -267,6 +286,9 @@ def compute_hmm_regime(alpha: np.ndarray) -> Dict[str, Any]:
         "risk_level": crisis,
         "confidence": max(bull, bear, crisis),
         "edge_score": edge_score,
+        "trend_score": trend_score,
+        "range_score": range_score,
+        "toxic_score": toxic_score,
     }
 
 # ==========================================
@@ -2031,19 +2053,11 @@ class AdvancedRegimeEngine:
             and self._abs_return_ema < 2.5e-3
             and regime_scores["risk_level"] < 0.35
         )
+        low_vol_regime_soft_penalty = 0.0
         if low_vol_range_gate and confirmed_regime in ("TREND", "BEAR"):
-            confirmed_regime = "RANGE"
-            confirmed_regime_idx = self.current_regime_idx
-            self._confirmed_regime = confirmed_regime
-            self._confirmed_regime_idx = confirmed_regime_idx
-            self._prev_regime = confirmed_regime
-            self._range_anchor_size = abs(self.last_signed_position_size)
-            self._in_range = True
-            self.range_ticks += time_delta
-            self.range_ticks = min(self.range_ticks, 1000.0)
-            self.range_ticks_int = int(self.range_ticks)
-            execution_mode = _map_execution_mode(confirmed_regime)
-            execution_side = "range_mean_revert"
+            # Soft discourage directional conviction in low-vol/drift environments
+            # without force-switching the regime label.
+            low_vol_regime_soft_penalty = 0.18
 
         # ==========================================
         # EDGE-ADJUSTED VOL TARGETING
@@ -2054,7 +2068,9 @@ class AdvancedRegimeEngine:
         # Edge score adjustment after volatility is known.
         vol_ratio = expected_vol / max(self.garch.target_vol, 1e-8)
         edge_score = float(np.clip(
-            regime_edge - self._EDGE_VOL_PENALTY * max(vol_ratio - 1.0, 0.0),
+            regime_edge
+            - self._EDGE_VOL_PENALTY * max(vol_ratio - 1.0, 0.0)
+            - low_vol_regime_soft_penalty,
             0.0,
             1.0,
         ))
