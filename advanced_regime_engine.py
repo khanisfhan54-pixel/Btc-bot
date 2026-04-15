@@ -245,13 +245,16 @@ def compute_hmm_regime(alpha: np.ndarray) -> Dict[str, Any]:
     # Regime Classification: precedence order is TOXIC > TREND > BEAR > RANGE.
     # Bear-dominant states must not collapse into RANGE — that label is reserved
     # for genuinely ambiguous, low-conviction environments only.
-    if crisis > 0.5:
+    if crisis > 0.55:
         regime = "TOXIC"
-    elif bull > 0.6:
+    elif bull > 0.55:
         regime = "TREND"
-    elif bear > 0.6:
+    elif bear > 0.55:
         regime = "BEAR"
     else:
+        regime = "RANGE"
+
+    if regime in ("TREND", "BEAR") and separation < 0.15 and crisis < 0.30:
         regime = "RANGE"
         
     # 4. Continuous Scoring
@@ -273,9 +276,10 @@ class NHHMM_Engine:
     def __init__(self, n_states=3, n_features=3):
         self.K = n_states
         self.n_features = n_features
-        self.beta = np.random.randn(self.K, self.K, n_features) * 0.01
-        self.mu = np.zeros(self.K)
-        self.sigma = np.ones(self.K)
+        init_rng = np.random.default_rng(7)
+        self.beta = init_rng.normal(0.0, 0.01, size=(self.K, self.K, n_features))
+        self.mu = np.array([0.001, -0.001, 0.0], dtype=float)
+        self.sigma = np.array([0.004, 0.004, 0.010], dtype=float)
         
     def load_weights(self, beta: np.ndarray, mu: np.ndarray, sigma: np.ndarray):
         """Inject pre-trained parameters for live inference."""
@@ -330,6 +334,7 @@ class SparseJumpModel:
         self.lambda_pen = jump_penalty
         self.kappa = sparsity_kappa
         self.max_iter = max_iter
+        self._score_scale = 2.5
         self.weights = None
         self.means = None
         
@@ -358,7 +363,14 @@ class SparseJumpModel:
 
         # --- Dimension guard (resolves CRITICAL-6) ---
         if self.means is None:
-            self.means = np.random.randn(self.K, n_feat)
+            self.means = np.zeros((self.K, n_feat), dtype=float)
+            if n_feat > 0:
+                self.means[0, 0] = 0.0030
+                if self.K > 1:
+                    self.means[1, 0] = -0.0030
+                if self.K > 2:
+                    crisis_idx = min(2, n_feat - 1)
+                    self.means[2, crisis_idx] = 0.05
             self.weights = np.ones(n_feat) / np.sqrt(n_feat)
         elif self.means.shape[1] != n_feat:
             raise ValueError(
@@ -378,7 +390,7 @@ class SparseJumpModel:
             switch_mask = np.ones(self.K, dtype=bool)
             switch_mask[prev_state] = False
             # lambda_pen + additional damping combined into single penalty term
-            costs[switch_mask] -= (self.lambda_pen + 0.3)
+            costs[switch_mask] -= (0.25 * self.lambda_pen + 0.05)
 
         # NHHMM bias: symmetric clamp [0, 1] allows caller to reduce influence
         # below 1.0 during low-confidence or risk-off conditions.
@@ -390,7 +402,7 @@ class SparseJumpModel:
         best_state = int(np.argmax(biased_scores))
 
         # Numerically stable softmax for output probabilities
-        shifted = biased_scores - np.max(biased_scores)
+        shifted = (biased_scores - np.max(biased_scores)) * self._score_scale
         probs = np.exp(shifted)
         total = float(probs.sum())
         if not np.isfinite(total) or total <= 0.0:
@@ -467,7 +479,7 @@ class AdvancedRegimeEngine:
     # 🚨 CIRCUIT BREAKER CONFIG
     # ==========================================
     _MAX_DRAWDOWN = 0.12
-    _MAX_CONSECUTIVE_LOSSES = 5
+    _MAX_CONSECUTIVE_LOSSES = 7
     _VOL_SHOCK_MULTIPLIER = 3.5
     _CONFIDENCE_COLLAPSE_THRESHOLD = 0.35
     _HEALING_COOLDOWN_TICKS = 20
@@ -602,6 +614,9 @@ class AdvancedRegimeEngine:
         self._equity = 1.0
         self._drawdown = 0.0
         self._loss_streak = 0
+        self._shock_memory = 0.0
+        self._return_ema = 0.0
+        self._abs_return_ema = 0.0
 
         self._circuit_breaker_active = False
         self._circuit_breaker_reason = None
@@ -623,7 +638,7 @@ class AdvancedRegimeEngine:
         self._warning_stop_event = threading.Event()
         self._warning_worker = threading.Thread(
             target=self._warning_emitter_loop,
-            daemon=False,
+            daemon=True,
             name=f"{self.engine_id}_warning_worker"
         )
         try:
@@ -652,18 +667,14 @@ class AdvancedRegimeEngine:
         except Exception:
             self._BASE_TRACEBACK_JSON_SIZE = 200  # safe fallback
 
-        self.garch_var = (
-            self.garch.omega
-            / np.clip(1.0 - self.garch.alpha - self.garch.beta_garch, 1e-8, None)
-        )
+        target_var = float(self.garch.target_vol ** 2)
+        self.garch_var = np.full(2, target_var, dtype=float)
         self.garch_prob = np.ones(2) / 2.0
         self._smoothed_garch_prob = self.garch_prob.copy()
 
     def _stationary_garch_var(self) -> np.ndarray:
-        return (
-            self.garch.omega
-            / np.clip(1.0 - self.garch.alpha - self.garch.beta_garch, 1e-8, None)
-        )
+        target_var = float(self.garch.target_vol ** 2)
+        return np.full(2, target_var, dtype=float)
 
     def _obs_should_sample(self) -> bool:
         """
@@ -707,6 +718,17 @@ class AdvancedRegimeEngine:
         self._confirmed_regime = None
         self._prev_regime = None
         self._regime_persistence = 0
+        self.last_signed_position_size = 0.0
+
+        # Reset PnL / breaker memory
+        self._equity = 1.0
+        self._equity_peak = 1.0
+        self._drawdown = 0.0
+        self._loss_streak = 0
+        self._last_price = None
+        self._shock_memory = 0.0
+        self._return_ema = 0.0
+        self._abs_return_ema = 0.0
 
         # Reset breaker
         self._circuit_breaker_active = False
@@ -1131,6 +1153,9 @@ class AdvancedRegimeEngine:
             "equity_peak": float(self._equity_peak),
             "drawdown": float(self._drawdown),
             "loss_streak": int(self._loss_streak),
+            "shock_memory": float(self._shock_memory),
+            "return_ema": float(self._return_ema),
+            "abs_return_ema": float(self._abs_return_ema),
             # Explicitly mark deprecated field as False to avoid confusion in external systems
             "emit_extended_schema": False,
         }
@@ -1162,6 +1187,9 @@ class AdvancedRegimeEngine:
         self._last_valid_sjm_probs = None
         self._smoothed_garch_prob = self.garch_prob.copy()
         self.garch_var = self._stationary_garch_var()
+        self._shock_memory = 0.0
+        self._return_ema = 0.0
+        self._abs_return_ema = 0.0
 
     @_synchronized
     def load_state(self, state: Dict[str, Any]) -> None:
@@ -1317,6 +1345,15 @@ class AdvancedRegimeEngine:
         self._equity_peak = float(state.get("equity_peak", 1.0))
         self._drawdown = float(state.get("drawdown", 0.0))
         self._loss_streak = int(state.get("loss_streak", 0))
+        self._shock_memory = float(state.get("shock_memory", 0.0))
+        if not np.isfinite(self._shock_memory):
+            self._shock_memory = 0.0
+        self._return_ema = float(state.get("return_ema", 0.0))
+        if not np.isfinite(self._return_ema):
+            self._return_ema = 0.0
+        self._abs_return_ema = float(state.get("abs_return_ema", 0.0))
+        if not np.isfinite(self._abs_return_ema) or self._abs_return_ema < 0.0:
+            self._abs_return_ema = 0.0
 
     @_synchronized
     def update(self, market_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -1332,25 +1369,29 @@ class AdvancedRegimeEngine:
         if price is not None:
             try:
                 price = float(price)
-                if self._last_price is not None:
-                    pnl = (price - self._last_price) * self.last_signed_position_size
-                    self._equity += pnl
+                if np.isfinite(price):
+                    if not self._circuit_breaker_active and self._last_price is not None:
+                        prev_price = float(self._last_price)
+                        if np.isfinite(prev_price) and abs(prev_price) > 1e-12:
+                            frac_ret = (price - prev_price) / prev_price
+                            pnl = frac_ret * self.last_signed_position_size
+                            if np.isfinite(pnl):
+                                self._equity += pnl
 
-                    if pnl < 0:
-                        self._loss_streak += 1
-                    else:
-                        self._loss_streak = 0
+                                if pnl < -1e-6:
+                                    self._loss_streak += 1
+                                elif pnl > 1e-6:
+                                    self._loss_streak = 0
 
-                    self._equity_peak = max(self._equity_peak, self._equity)
-                    self._drawdown = (self._equity_peak - self._equity) / max(self._equity_peak, 1e-8)
+                                self._equity_peak = max(self._equity_peak, self._equity)
+                                self._drawdown = (self._equity_peak - self._equity) / max(self._equity_peak, 1e-8)
 
-                    if self._drawdown > self._MAX_DRAWDOWN:
-                        self._trigger_circuit_breaker("MAX_DRAWDOWN")
+                                if self._drawdown > self._MAX_DRAWDOWN:
+                                    self._trigger_circuit_breaker("MAX_DRAWDOWN")
 
-                    if self._loss_streak >= self._MAX_CONSECUTIVE_LOSSES:
-                        self._trigger_circuit_breaker("LOSS_STREAK")
-
-                self._last_price = price
+                                if self._loss_streak >= self._MAX_CONSECUTIVE_LOSSES:
+                                    self._trigger_circuit_breaker("LOSS_STREAK")
+                    self._last_price = price
             except Exception:
                 pass
 
@@ -1363,6 +1404,7 @@ class AdvancedRegimeEngine:
             if self._healing_counter > self._HEALING_COOLDOWN_TICKS:
                 self._self_heal()
             else:
+                self.last_signed_position_size = 0.0
                 return _build_output(
                     regime_idx=-1,
                     regime_label="HALTED",
@@ -1697,8 +1739,14 @@ class AdvancedRegimeEngine:
 
         nhhmm_confidence = float(np.max(nhhmm_posterior))
         effective_bias_weight = float(np.clip(nhhmm_confidence, 0.0, 1.0))
+        sjm_x_t = np.asarray(x_t, dtype=float).copy()
+        if sjm_x_t.size > 0 and np.isfinite(y_t):
+            sjm_x_t[0] = float(y_t)
+            vol_idx = 2 if sjm_x_t.size > 2 else sjm_x_t.size - 1
+            if vol_idx >= 0:
+                sjm_x_t[vol_idx] = abs(float(y_t))
         sjm_state, sjm_probs = self.sjm.online_predict(
-            x_t=x_t,
+            x_t=sjm_x_t,
             expected_n_features=self.n_features,
             prev_state=self.current_regime_idx,
             nhhmm_probs=nhhmm_posterior,
@@ -1729,6 +1777,18 @@ class AdvancedRegimeEngine:
 
         else:
             self._last_valid_sjm_probs = sjm_probs.copy()
+
+        if np.isfinite(y_t):
+            self._shock_memory = max(abs(float(y_t)), 0.90 * float(getattr(self, "_shock_memory", 0.0)))
+            shock_intensity = float(np.clip(self._shock_memory / 0.02, 0.0, 1.0))
+            if self.K >= 3:
+                sjm_probs = np.asarray(sjm_probs, dtype=float).copy()
+                non_crisis_scale = max(1.0 - 0.8 * shock_intensity, 0.1)
+                sjm_probs[0] *= non_crisis_scale
+                sjm_probs[1] *= non_crisis_scale
+                sjm_probs[2] *= (0.2 + 1.8 * shock_intensity)
+                sjm_probs = _normalize_prob_vector(sjm_probs)
+                sjm_state = int(np.argmax(sjm_probs))
             
         self.current_regime_idx = sjm_state
         regime_scores = compute_hmm_regime(sjm_probs)
@@ -1961,6 +2021,29 @@ class AdvancedRegimeEngine:
         else:
             expected_vol = float(max(self._last_valid_vol, self._LAST_VALID_VOL_FLOOR))
             self._last_valid_vol = float(expected_vol)
+
+        self._return_ema = 0.92 * float(getattr(self, "_return_ema", 0.0)) + 0.08 * float(y_t)
+        self._abs_return_ema = 0.92 * float(getattr(self, "_abs_return_ema", 0.0)) + 0.08 * abs(float(y_t))
+
+        low_vol_range_gate = (
+            expected_vol < (0.75 * self.garch.target_vol)
+            and abs(self._return_ema) < 4.5e-4
+            and self._abs_return_ema < 2.5e-3
+            and regime_scores["risk_level"] < 0.35
+        )
+        if low_vol_range_gate and confirmed_regime in ("TREND", "BEAR"):
+            confirmed_regime = "RANGE"
+            confirmed_regime_idx = self.current_regime_idx
+            self._confirmed_regime = confirmed_regime
+            self._confirmed_regime_idx = confirmed_regime_idx
+            self._prev_regime = confirmed_regime
+            self._range_anchor_size = abs(self.last_signed_position_size)
+            self._in_range = True
+            self.range_ticks += time_delta
+            self.range_ticks = min(self.range_ticks, 1000.0)
+            self.range_ticks_int = int(self.range_ticks)
+            execution_mode = _map_execution_mode(confirmed_regime)
+            execution_side = "range_mean_revert"
 
         # ==========================================
         # EDGE-ADJUSTED VOL TARGETING
@@ -2210,6 +2293,17 @@ class AdvancedRegimeEngine:
         self._confirmed_regime = None
         self._prev_regime = None
         self._regime_persistence = 0
+        self.last_signed_position_size = 0.0
+
+        # Reset PnL / breaker memory
+        self._equity = 1.0
+        self._equity_peak = 1.0
+        self._drawdown = 0.0
+        self._loss_streak = 0
+        self._last_price = None
+        self._shock_memory = 0.0
+        self._return_ema = 0.0
+        self._abs_return_ema = 0.0
 
         # Reset breaker
         self._circuit_breaker_active = False
