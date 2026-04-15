@@ -9,29 +9,40 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # 1. Checkout repo
       - name: Checkout code
         uses: actions/checkout@v3
 
+      # 2. Setup Python
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: "3.11"
 
+      # 3. Install dependencies (from requirements.txt ✅)
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install numpy scipy pytest pytest-cov
+          pip install -r requirements.txt
 
+      # 4. Set PYTHONPATH (important for imports)
       - name: Set PYTHONPATH
         run: echo "PYTHONPATH=$PYTHONPATH:$(pwd)" >> $GITHUB_ENV
 
+      # 5. Debug (optional but useful)
       - name: Debug path
         run: |
           pwd
           ls -R
 
+      # 6. Run tests
       - name: Run tests
-        run: pytest --cov=. --cov-report=xml
+        run: pytest -v --maxfail=1 --disable-warnings
 
+      # 7. Run calibration (NEW ✅)
+      - name: Run calibration
+        run: python calibrate_regime.py
+
+      # 8. Upload coverage (optional)
       - name: Upload coverage
         uses: codecov/codecov-action@v3
