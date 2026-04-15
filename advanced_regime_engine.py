@@ -248,22 +248,39 @@ def compute_hmm_regime(alpha: np.ndarray) -> Dict[str, Any]:
     range_from_low_vol = float(np.clip(1.0 - crisis, 0.0, 1.0))
     range_from_low_drift = float(np.clip(1.0 - directional_confidence, 0.0, 1.0))
 
-    range_score_raw = (
-        0.40 * range_from_balance
-        + 0.35 * range_from_low_vol
-        + 0.25 * range_from_low_drift
-    )
-    trend_pressure = 0.40 * directional_strength + 0.25 * float(
-        np.clip((directional_confidence - 0.55) / 0.45, 0.0, 1.0)
-    )
-    range_score = float(np.clip(min(range_score_raw, 0.78) - trend_pressure, 0.0, 1.0))
-
+    # --- TREND SCORE (BOOSTED) ---
     trend_score = float(np.clip(
-        (1.0 - crisis) * (0.70 * directional_confidence + 0.30 * directional_strength),
+        (1.0 - 0.6 * crisis) * (0.75 * directional_confidence + 0.35 * directional_strength),
         0.0,
         1.0,
     ))
-    toxic_score = float(np.clip(crisis * (1.0 + 0.40 * crisis), 0.0, 1.0))
+
+    # --- TOXIC SCORE (REDUCED AGGRESSION) ---
+    toxic_score = float(np.clip(
+        crisis * (0.85 + 0.15 * crisis),
+        0.0,
+        1.0,
+    ))
+
+    # --- RANGE SCORE (SLIGHTLY WEAKENED) ---
+    range_score_raw = (
+        0.35 * range_from_balance
+        + 0.30 * range_from_low_vol
+        + 0.20 * range_from_low_drift
+    )
+    trend_pressure = 0.50 * directional_strength + 0.30 * float(
+        np.clip((directional_confidence - 0.5) / 0.5, 0.0, 1.0)
+    )
+
+    range_score = float(np.clip(
+        min(range_score_raw, 0.70) - trend_pressure,
+        0.0,
+        1.0
+    ))
+
+    dominant = max(bull, bear)
+    separation = directional_strength
+    edge_score = float(np.clip((dominant - crisis) + 0.25 * separation, 0.0, 1.0))
 
     directional_label = "TREND" if bull >= bear else "BEAR"
     score_map = {
@@ -272,10 +289,6 @@ def compute_hmm_regime(alpha: np.ndarray) -> Dict[str, Any]:
         "TOXIC": toxic_score,
     }
     regime = max(score_map, key=score_map.get)
-
-    dominant = max(bull, bear)
-    separation = directional_strength
-    edge_score = float(np.clip((dominant - crisis) + 0.25 * separation, 0.0, 1.0))
 
     return {
         "regime": regime,
