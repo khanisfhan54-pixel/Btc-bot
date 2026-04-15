@@ -250,14 +250,14 @@ def compute_hmm_regime(alpha: np.ndarray) -> Dict[str, Any]:
 
     # --- TREND SCORE (BOOSTED) ---
     trend_score = float(np.clip(
-        (1.0 - 0.6 * crisis) * (0.75 * directional_confidence + 0.35 * directional_strength),
+        (1.0 - 0.45 * crisis) * (0.85 * directional_confidence + 0.45 * directional_strength),
         0.0,
         1.0,
     ))
 
     # --- TOXIC SCORE (REDUCED AGGRESSION) ---
     toxic_score = float(np.clip(
-        crisis * (0.85 + 0.15 * crisis),
+        crisis * (0.70 + 0.10 * crisis),
         0.0,
         1.0,
     ))
@@ -268,7 +268,7 @@ def compute_hmm_regime(alpha: np.ndarray) -> Dict[str, Any]:
         + 0.30 * range_from_low_vol
         + 0.20 * range_from_low_drift
     )
-    trend_pressure = 0.50 * directional_strength + 0.30 * float(
+    trend_pressure = 0.55 * directional_strength + 0.35 * float(
         np.clip((directional_confidence - 0.5) / 0.5, 0.0, 1.0)
     )
 
