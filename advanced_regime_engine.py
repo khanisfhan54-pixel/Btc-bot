@@ -283,6 +283,13 @@ def compute_hmm_regime(alpha: np.ndarray) -> Dict[str, Any]:
     edge_score = float(np.clip((dominant - crisis) + 0.25 * separation, 0.0, 1.0))
 
     directional_label = "TREND" if bull >= bear else "BEAR"
+
+    # Small directional bias toward TREND (alpha capture preference)
+    if directional_label == "TREND":
+        trend_score *= 1.10
+    else:
+        trend_score *= 0.95
+
     score_map = {
         directional_label: trend_score,
         "RANGE": range_score,
