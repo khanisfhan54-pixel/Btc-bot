@@ -1,6 +1,7 @@
 import numpy as np
 from scipy.special import softmax
 import atexit
+from dataclasses import dataclass
 from typing import Dict, Any, List
 from collections import Counter, OrderedDict
 import logging
@@ -209,6 +210,75 @@ def _map_execution_mode(regime_label: str) -> str:
     if regime_label == "TOXIC":
         return "flat_or_hedge"
     return "range_mean_revert"
+
+# ==========================================
+# Markov Regime Smoother (soft, no hard override)
+# ==========================================
+@dataclass
+class RegimeMarkovSmoother:
+    blend: float = 0.35
+    weak_lead_gap: float = 0.08
+
+    def __post_init__(self) -> None:
+        self.states = ("TREND", "RANGE", "BEAR", "TOXIC")
+        self.state_to_idx = {name: i for i, name in enumerate(self.states)}
+        self.transition = np.array(
+            [
+                [0.86, 0.08, 0.03, 0.03],  # TREND ->
+                [0.10, 0.78, 0.08, 0.04],  # RANGE ->
+                [0.03, 0.08, 0.86, 0.03],  # BEAR  ->
+                [0.04, 0.06, 0.05, 0.85],  # TOXIC ->
+            ],
+            dtype=float,
+        )
+        self.prev_probs = np.ones(4, dtype=float) / 4.0
+
+    def reset(self) -> None:
+        self.prev_probs = np.ones(4, dtype=float) / 4.0
+
+    def set_prev_probs(self, probs: np.ndarray) -> None:
+        self.prev_probs = self._normalize(probs)
+
+    def _normalize(self, probs: np.ndarray) -> np.ndarray:
+        probs = np.asarray(probs, dtype=float)
+        probs = np.ravel(probs)
+        if probs.size != 4:
+            return np.ones(4, dtype=float) / 4.0
+        probs = np.clip(probs, 1e-12, None)
+        total = float(np.sum(probs))
+        if (not np.isfinite(total)) or total <= 0.0:
+            return np.ones(4, dtype=float) / 4.0
+        return probs / total
+
+    def _scores_to_evidence(self, scores: Dict[str, Any]) -> np.ndarray:
+        bull = float(np.clip(scores.get("bull", 0.5), 0.0, 1.0))
+        bear = float(np.clip(scores.get("bear", 0.5), 0.0, 1.0))
+        trend_mass = float(np.clip(scores.get("trend_score", 0.0), 0.0, 1.0))
+        range_mass = float(np.clip(scores.get("range_score", 0.0), 0.0, 1.0))
+        toxic_mass = float(np.clip(scores.get("toxic_score", 0.0), 0.0, 1.0))
+
+        directional_total = max(bull + bear, 1e-12)
+        trend_prob = trend_mass * (bull / directional_total)
+        bear_prob = trend_mass * (bear / directional_total)
+        return self._normalize(np.array([trend_prob, range_mass, bear_prob, toxic_mass], dtype=float))
+
+    def update(self, scores: Dict[str, Any], prev_regime: str | None) -> tuple[str, np.ndarray]:
+        evidence = self._scores_to_evidence(scores)
+        markov_pred = self._normalize(np.dot(self.prev_probs, self.transition))
+        smoothed = self._normalize(self.blend * evidence + (1.0 - self.blend) * markov_pred)
+
+        winner_idx = int(np.argmax(smoothed))
+        winner = self.states[winner_idx]
+
+        # Tiny hysteresis gate only when the new winner is weakly ahead.
+        if prev_regime in self.state_to_idx and winner != prev_regime and winner != "TOXIC":
+            prev_idx = self.state_to_idx[prev_regime]
+            if (smoothed[winner_idx] - smoothed[prev_idx]) < self.weak_lead_gap:
+                winner_idx = prev_idx
+                winner = prev_regime
+
+        self.prev_probs = smoothed
+        return winner, smoothed
 
 # ==========================================
 # NEW: Real-Time Continuous Scoring Layer
@@ -648,6 +718,8 @@ class AdvancedRegimeEngine:
         self._regime_persistence = 0
         self._REGIME_CONFIRMATION_TICKS = 2
         self._lock = threading.RLock()
+        self._regime_smoother = RegimeMarkovSmoother()
+        self._regime_state_probs = np.ones(4, dtype=float) / 4.0
 
         # ==========================================
         # 🚨 RISK STATE TRACKING
@@ -1188,6 +1260,7 @@ class AdvancedRegimeEngine:
             "nhhmm_prior": self.nhhmm_prior.astype(float).tolist(),
             "garch_prob": self.garch_prob.astype(float).tolist(),
             "smoothed_garch_prob": self._smoothed_garch_prob.astype(float).tolist(),
+            "regime_state_probs": self._regime_state_probs.astype(float).tolist(),
             "garch_var": self.garch_var.astype(float).tolist(),
             "circuit_breaker_active": bool(self._circuit_breaker_active),
             "circuit_breaker_reason": self._circuit_breaker_reason,
@@ -1228,6 +1301,9 @@ class AdvancedRegimeEngine:
         # --- NEW: reset SJM fallback memory ---
         self._last_valid_sjm_probs = None
         self._smoothed_garch_prob = self.garch_prob.copy()
+        self._regime_state_probs = np.ones(4, dtype=float) / 4.0
+        if getattr(self, "_regime_smoother", None) is not None:
+            self._regime_smoother.reset()
         self.garch_var = self._stationary_garch_var()
         self._shock_memory = 0.0
         self._return_ema = 0.0
@@ -1371,6 +1447,18 @@ class AdvancedRegimeEngine:
             )
         else:
             self._smoothed_garch_prob = _normalize_prob_vector(self._smoothed_garch_prob)
+
+        if "regime_state_probs" in state and state["regime_state_probs"] is not None:
+            try:
+                self._regime_state_probs = _normalize_prob_vector(
+                    self._coerce_vector("regime_state_probs", state["regime_state_probs"], 4)
+                )
+            except Exception:
+                self._regime_state_probs = np.ones(4, dtype=float) / 4.0
+        else:
+            self._regime_state_probs = np.ones(4, dtype=float) / 4.0
+        if getattr(self, "_regime_smoother", None) is not None:
+            self._regime_smoother.set_prev_probs(self._regime_state_probs)
 
         self.garch_var = self._coerce_vector("garch_var", state.get("garch_var", self.garch_var), 2)
         # HARD SAFETY: prevent NaN/Inf contamination from snapshots
@@ -1835,6 +1923,11 @@ class AdvancedRegimeEngine:
         self.current_regime_idx = sjm_state
         regime_scores = compute_hmm_regime(sjm_probs)
         regime = regime_scores["regime"]
+        if getattr(self, "_regime_smoother", None) is not None:
+            regime, self._regime_state_probs = self._regime_smoother.update(
+                regime_scores,
+                self._confirmed_regime,
+            )
 
         # Capture base trend strength before any execution-level overrides (fixes Issue 1)
         base_trend_strength = float(regime_scores["trend_strength"])
