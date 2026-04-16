@@ -19,6 +19,18 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
     except Exception:
         return default
 
+def _try_float(x: Any) -> Optional[float]:
+    """Convert to float if valid, else return None. Unlike _safe_float, does NOT substitute a default."""
+    if x is None:
+        return None
+    try:
+        v = float(x)
+        if math.isnan(v) or math.isinf(v):
+            return None
+        return v
+    except Exception:
+        return None
+
 def _is_finite(x: float) -> bool:
     return not (math.isnan(x) or math.isinf(x))
 
@@ -114,8 +126,8 @@ def predict_sweep(
     if not isinstance(nearest_below, dict):
         nearest_below = None
 
-    dist_above = _safe_float(nearest_above.get("distance_points")) if nearest_above else None
-    dist_below = _safe_float(nearest_below.get("distance_points")) if nearest_below else None
+    dist_above = _try_float(nearest_above.get("distance_points")) if nearest_above else None
+    dist_below = _try_float(nearest_below.get("distance_points")) if nearest_below else None
     if dist_above is not None and dist_above < 0.0:
         dist_above = 0.0
     if dist_below is not None and dist_below < 0.0:
@@ -180,8 +192,8 @@ def predict_sweep(
         prob_above += 0.1 * compression_bias * compression
         prob_below -= 0.1 * compression_bias * compression
 
-    prob_above = _clamp(prob_above)
-    prob_below = _clamp(prob_below)
+    prob_above = _clamp(prob_above, EPS, 1.0 - EPS)
+    prob_below = _clamp(prob_below, EPS, 1.0 - EPS)
 
     total_prob = prob_above + prob_below
     # ✅ FIX 4: Safe probability normalization
@@ -190,6 +202,9 @@ def predict_sweep(
     else:
         prob_above /= total_prob
         prob_below /= total_prob
+    _FLOOR = 1e-4
+    prob_above = _clamp(prob_above, _FLOOR, 1.0 - _FLOOR)
+    prob_below = _clamp(prob_below, _FLOOR, 1.0 - _FLOOR)
 
     if prob_above >= prob_below:
         side = "above"
@@ -258,9 +273,13 @@ class LiquiditySweepAlpha:
     def update_liquidity_pools(self, recent_highs: List[float], recent_lows: List[float]):
         with self._lock:
             if recent_highs is not None and len(recent_highs) > 0:
-                self.liquidity_pools['high'] = max(recent_highs[-20:])
+                valid_highs = [v for v in recent_highs[-20:] if isinstance(v, (int, float)) and _is_finite(v)]
+                if valid_highs:
+                    self.liquidity_pools['high'] = max(valid_highs)
             if recent_lows is not None and len(recent_lows) > 0:
-                self.liquidity_pools['low'] = min(recent_lows[-20:])
+                valid_lows = [v for v in recent_lows[-20:] if isinstance(v, (int, float)) and _is_finite(v)]
+                if valid_lows:
+                    self.liquidity_pools['low'] = min(valid_lows)
 
     def _update_hawkes(self, timestamp: float, trade_count: int) -> float:
         # sanitize inputs + protect against timestamp unit mismatches (s vs ms/ns)
@@ -473,7 +492,7 @@ class LiquiditySweepAlpha:
         depth = features.get("depth", 1.0)
 
         # basic normalization
-        vol = vol / (1 + vol)
+        vol = _clamp(math.log1p(100.0 * max(0.0, vol)) / 5.0, 0.0, 1.0)
         depth = depth / (1 + depth)
 
         # normalize inputs to avoid dominance
@@ -536,7 +555,8 @@ class LiquiditySweepAlpha:
 
         # --- Feature 4: Compression ---
         atr = _safe_float(market_data.get("atr", price * 0.01))
-        compression = 1.0 - (atr / (price + 1e-6))
+        vol_ratio = atr / (price + 1e-6)
+        compression = math.exp(-100.0 * _clamp(vol_ratio, 0.0, 1.0))
         compression = _clamp(compression, 0.0, 1.0)
 
         # --- Feature 5: Liquidity void ---
@@ -628,7 +648,7 @@ class LiquiditySweepAlpha:
     
             # Macro Structural Predictor
             macro_liquidity = md.get('macro_liquidity', {})
-            macro_market_state = md.get('macro_market_state', {'state': regime, 'volatility': atr})
+            macro_market_state = md.get('macro_market_state', {'state': regime, 'volatility': vol_ratio})
             macro_volume_intel = md.get('macro_volume_intel', {})
             macro_reliability = 1.0
             if not macro_liquidity or not isinstance(macro_liquidity, dict):
@@ -739,18 +759,19 @@ class LiquiditySweepAlpha:
                 res_component = _clamp(res_score)
     
                 raw_logit = (w_ofi * ofi_component) + (w_res * res_component) + (w_rej * rej_score)
-                reaction_confidence = _standard_sigmoid(raw_logit)
+                centered_logit = (raw_logit - 0.5) * 4.0
+                reaction_score = _standard_sigmoid(centered_logit)
     
                 trend_penalty = 0.0
                 if (sweep_side == "high" and regime == "UPTREND") or (sweep_side == "low" and regime == "DOWNTREND"):
                     trend_penalty = 0.2 
     
-                reaction_confidence = _clamp(reaction_confidence - trend_penalty)
+                reaction_score = _clamp(reaction_score - trend_penalty)
     
                 ml_prob = self._ml_sweep_probability({
                     "ofi": ofi_z,
                     "hawkes": hawkes,
-                    "volatility": atr,
+                    "volatility": vol_ratio,
                     "depth": md.get("curr_depth", 1.0)
                 })
     
@@ -783,7 +804,7 @@ class LiquiditySweepAlpha:
     
                 # Logit Ensemble: Full statistical mapping across all primary system variables.
                 ensemble_logit = (
-                    0.40 * _safe_logit(reaction_confidence, vol_ratio) +
+                    0.40 * _safe_logit(reaction_score, vol_ratio) +
                     0.25 * _safe_logit(ml_prob, vol_ratio) +
                     0.15 * _safe_logit(liq_prob, vol_ratio) + 
                     0.20 * pred_logit
@@ -792,7 +813,7 @@ class LiquiditySweepAlpha:
     
                 if ensemble_score >= 0.65 and is_fake:
                     action = "SELL" if sweep_side == "high" else "BUY"
-                    confidence = ensemble_score * warmup_factor
+                    confidence = max(0.0, ensemble_score - 0.15 * (1.0 - warmup_factor))
                     logic_path = f"Fake {sweep_side} sweep confirmed via logit ensemble."
                 else:
                     logic_path = f"True breakout / lack of reversion edge on {sweep_side} sweep."
