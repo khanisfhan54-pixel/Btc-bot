@@ -56,8 +56,8 @@ def _safe_output(result: Dict[str, Any]) -> Dict[str, Any]:
     - Stable schema
     - Normalized probabilities
     """
-    prob_above = _clamp(_safe_float(result.get("prob_above"), 0.5), 0.0, 1.0)
-    prob_below = _clamp(_safe_float(result.get("prob_below"), 0.5), 0.0, 1.0)
+    prob_above = _clamp(_safe_float(result.get("prob_above"), 0.5), EPS, 1.0 - EPS)
+    prob_below = _clamp(_safe_float(result.get("prob_below"), 0.5), EPS, 1.0 - EPS)
     total = prob_above + prob_below
     if total <= EPS:
         prob_above, prob_below = 0.5, 0.5
@@ -176,7 +176,7 @@ def predict_sweep(
     # dynamic compression threshold
     comp_threshold = max(vol_adj * 5, 0.05)
 
-    if volatility > 0 and vol_adj < 0.01 and compression < comp_threshold:
+    if volatility > 0 and vol_adj < 0.5 and compression < comp_threshold:
         prob_above += 0.1 * compression_bias * compression
         prob_below -= 0.1 * compression_bias * compression
 
@@ -203,6 +203,7 @@ def predict_sweep(
     return {
         "side": side,
         "probability": round(probability, 4),
+        "confidence": round(probability, 4),
         "target_price": round(_safe_float(target, 0.0), 8),
         "prob_above": round(prob_above, 4),
         "prob_below": round(prob_below, 4),
@@ -611,7 +612,7 @@ class LiquiditySweepAlpha:
             prev_lambda = self.hawkes_lambda
             prev_trade_time = self.last_trade_time
             ofi_z = self.calculate_ofi_zscore(md.get('prev_book', {}), md.get('curr_book', {}))
-            hawkes = self._update_hawkes(md.get('timestamp', time.time()), md.get('trades_count', 0))
+            hawkes = self._update_hawkes(md.get('timestamp', 0.0), md.get('trades_count', 0))
             hawkes_delta = hawkes - prev_lambda
     
             regime = self._detect_regime(
@@ -738,7 +739,7 @@ class LiquiditySweepAlpha:
                 res_component = _clamp(res_score)
     
                 raw_logit = (w_ofi * ofi_component) + (w_res * res_component) + (w_rej * rej_score)
-                reaction_confidence = self._fast_sigmoid(raw_logit)
+                reaction_confidence = _standard_sigmoid(raw_logit)
     
                 trend_penalty = 0.0
                 if (sweep_side == "high" and regime == "UPTREND") or (sweep_side == "low" and regime == "DOWNTREND"):
