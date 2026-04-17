@@ -32,7 +32,21 @@ class ReplayEngine:
         self._dropped_events = 0
         self._fsm_error = None
         self._strict_replay = True
+        self._unsafe_no_copy = False
+        self._unsafe_warning_emitted = False
         self._HASH_NAMESPACE = "ADV_REGIME_REPLAY"
+
+    def _emit_unsafe_mode_warning(self) -> None:
+        if not self._unsafe_no_copy or self._unsafe_warning_emitted:
+            return
+        try:
+            LOGGER.critical(
+                "ReplayEngine running in UNSAFE mode (_unsafe_no_copy=True). "
+                "Determinism is NOT guaranteed."
+            )
+        except Exception:
+            pass
+        self._unsafe_warning_emitted = True
 
     def _canonicalize(self, obj: Any):
         if isinstance(obj, dict):
@@ -153,13 +167,15 @@ class ReplayEngine:
             event = {
                 "id": self._event_id,
                 "type": event_type,
-                "payload": payload if isinstance(payload, dict) else {},
+                # Defensive copy prevents post-record mutation from corrupting replay history.
+                "payload": copy.deepcopy(payload) if isinstance(payload, dict) else {},
             }
             self._event_id += 1
             self._events.append(event)
 
     def snapshot(self, state: Dict[str, Any]) -> None:
         with self._lock:
+            # Snapshot correctness must never depend on unsafe replay mode.
             snapshot_state = copy.deepcopy(state) if isinstance(state, dict) else {}
             snapshot_state.setdefault("schema_version", "1.0")
             # unified checksum (single domain)
@@ -179,14 +195,24 @@ class ReplayEngine:
         Generator: yields events in original order
         """
         with self._lock:
-            for e in list(self._events):
-                yield e
+            self._emit_unsafe_mode_warning()
+            if self._unsafe_no_copy:
+                events = list(self._events)
+            else:
+                events = copy.deepcopy(list(self._events))
+        for e in events:
+            yield e
 
     def replay_from(self, event_id: int):
         with self._lock:
-            for e in list(self._events):
-                if e.get("id", 0) >= int(event_id):
-                    yield e
+            self._emit_unsafe_mode_warning()
+            if self._unsafe_no_copy:
+                events = list(self._events)
+            else:
+                events = copy.deepcopy(list(self._events))
+        for e in events:
+            if e.get("id", 0) >= int(event_id):
+                yield e
 
     def dropped_events(self) -> int:
         with self._lock:
@@ -195,14 +221,14 @@ class ReplayEngine:
     def rewind(self, steps: int = 100):
         with self._lock:
             idx = max(len(self._events) - steps, 0)
-            return list(self._events)[idx:]
+            return copy.deepcopy(list(self._events)[idx:])
 
     # ==========================================
     # DEBUG UTILITIES
     # ==========================================
     def last_events(self, n: int = 50) -> List[Dict[str, Any]]:
         with self._lock:
-            return list(self._events)[-n:]
+            return copy.deepcopy(list(self._events)[-n:])
 
     def clear(self):
         with self._lock:
@@ -263,7 +289,17 @@ class ReplayEngine:
                         LOGGER.debug("Replay error for event_type=%s payload=%s err=%s", etype, payload, exc)
                     except Exception:
                         pass
-                    continue
+                    err = {
+                        "last_event": last_event,
+                        "event": etype,
+                        "reason": "EVENT_HANDLER_ERROR",
+                        "error_type": type(exc).__name__,
+                    }
+                    self._fsm_error = err
+                    setattr(engine, "_fsm_error", err)
+                    if getattr(engine, "_strict_replay", True):
+                        raise RuntimeError(f"Replay handler error: {etype}") from exc
+                    return
         finally:
             try:
                 setattr(engine, "_is_replay", False)
@@ -289,33 +325,61 @@ class ReplayEngine:
                         pass
                     snapshot = None
                 else:
-                    snapshot = dict(self._snapshots[snap_idx])
+                    snapshot = copy.deepcopy(self._snapshots[snap_idx])
 
         if snapshot is None:
             self.apply_events(engine, start_id=0)
             return
 
         try:
+            state = snapshot.get("state", {}) if isinstance(snapshot, dict) else {}
+            if isinstance(state, dict):
+                expected_checksum = state.get("_checksum")
+                if expected_checksum:
+                    check_blob = copy.deepcopy(state)
+                    check_blob.pop("_checksum", None)
+                    actual_checksum = self._state_hash(check_blob)
+                    if actual_checksum != expected_checksum:
+                        err = {"snapshot_index": snapshot_index, "reason": "SNAPSHOT_CHECKSUM_MISMATCH"}
+                        self._fsm_error = err
+                        setattr(engine, "_fsm_error", err)
+                        if getattr(engine, "_strict_replay", True):
+                            raise RuntimeError("Replay corruption: snapshot checksum mismatch")
+                        return
             if hasattr(engine, "load_snapshot"):
                 engine.load_snapshot(snapshot)
             elif hasattr(engine, "load_state"):
-                state = snapshot.get("state", {})
                 if isinstance(state, dict):
                     engine.load_state(state)
             # RNG restore handled ONLY in engine.load_snapshot()
             start_id = int(snapshot.get("id", 0))
             self.apply_events(engine, start_id=start_id)
-        except Exception:
+        except Exception as exc:
+            if getattr(engine, "_strict_replay", True):
+                raise
+            err = {
+                "snapshot_index": snapshot_index,
+                "reason": "SNAPSHOT_RESTORE_FAILED",
+                "error_type": type(exc).__name__,
+            }
+            self._fsm_error = err
             try:
-                LOGGER.debug("Replay from snapshot failed at index=%s", snapshot_index)
+                setattr(engine, "_fsm_error", err)
             except Exception:
                 pass
+            try:
+                LOGGER.debug("Replay from snapshot failed at index=%s err=%s", snapshot_index, exc)
+            except Exception:
+                pass
+            return
 
     # ==========================================
     # REPLAY VALIDATION ENGINE
     # ==========================================
     def validate_replay(self, engine_factory, snapshot_index: int = -1) -> Dict[str, Any]:
         with self._lock:
+            if self._unsafe_no_copy:
+                raise RuntimeError("validate_replay cannot run with _unsafe_no_copy=True")
             result = {
                 "diverged": False,
                 "reason": None,
