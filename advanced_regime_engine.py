@@ -17,6 +17,14 @@ from functools import wraps
 import json
 import queue
 import threading
+try:
+    from traceback_engine import TracebackEngine
+except Exception:
+    TracebackEngine = None
+try:
+    from replay_engine import ReplayEngine
+except Exception:
+    ReplayEngine = None
 
 try:
     from prometheus_client import Counter as PromCounter, Gauge, Histogram
@@ -773,6 +781,15 @@ class AdvancedRegimeEngine:
 
         self._obs_counter = 0
         self._OBS_SAMPLE_RATE = 5  # update metrics every N ticks
+        self._tick_id = 0
+        try:
+            self._trace_engine = TracebackEngine() if TracebackEngine is not None else None
+        except Exception:
+            self._trace_engine = None
+        try:
+            self._replay_engine = ReplayEngine() if ReplayEngine is not None else None
+        except Exception:
+            self._replay_engine = None
 
         # --- FIX: Precompute static JSON overhead for traceback logging ---
         try:
@@ -843,122 +860,24 @@ class AdvancedRegimeEngine:
         except Exception:
             pass
 
-    # ==========================================
-    # 🚨 CIRCUIT BREAKER TRIGGER
-    # ==========================================
-    def _trigger_circuit_breaker(self, reason: str):
-        self._circuit_breaker_active = True
-        self._circuit_breaker_reason = reason
-        self._healing_counter = 0
-
+    def _replay_record(self, event_type: str, payload: Dict[str, Any] | None = None) -> None:
+        replay_engine = getattr(self, "_replay_engine", None)
+        if replay_engine is None:
+            return
+        safe_payload = {}
+        if isinstance(payload, dict):
+            for k, v in payload.items():
+                try:
+                    if isinstance(v, (int, float, str, bool, type(None))):
+                        safe_payload[k] = v
+                    else:
+                        safe_payload[k] = str(v)[:200]
+                except Exception:
+                    safe_payload[k] = "UNSERIALIZABLE"
         try:
-            LOGGER.critical(f"[CIRCUIT BREAKER TRIGGERED] Reason={reason}")
+            replay_engine.record_event(event_type, safe_payload)
         except Exception:
             pass
-
-    # ==========================================
-    # 🔄 SELF HEALING SYSTEM
-    # ==========================================
-    def _self_heal(self, error_code: str | None = None, context: Dict[str, Any] | None = None) -> str:
-        """
-        Best-effort healing.
-
-        - Called without an error_code: preserves existing circuit-breaker recovery behavior.
-        - Called with an error_code: applies category-aware recovery action.
-        """
-        self._healing_count = int(getattr(self, "_healing_count", 0)) + 1
-        self._last_healing_error = error_code
-        self._last_healing_context = dict(context or {})
-
-        try:
-            LOGGER.warning("[SELF HEALING INITIATED]")
-        except Exception:
-            pass
-
-        # Legacy breaker recovery path: keep existing behavior intact.
-        if error_code is None:
-            # Reset critical states
-            self.nhhmm_prior = np.ones(self.K) / self.K
-            self.garch_prob = np.ones(2) / 2.0
-            self._smoothed_garch_prob = self.garch_prob.copy()
-
-            # Reset volatility memory
-            self.garch_var = self._stationary_garch_var()
-            self._last_valid_vol = self.garch.target_vol
-
-            # Reset regime memory
-            self.current_regime_idx = None
-            self._confirmed_regime = None
-            self._prev_regime = None
-            self._regime_persistence = 0
-            self.last_signed_position_size = 0.0
-
-            # Reset PnL / breaker memory
-            self._equity = 1.0
-            self._equity_peak = 1.0
-            self._drawdown = 0.0
-            self._loss_streak = 0
-            self._last_price = None
-            self._shock_memory = 0.0
-            self._return_ema = 0.0
-            self._abs_return_ema = 0.0
-
-            # Reset breaker
-            self._circuit_breaker_active = False
-            self._circuit_breaker_reason = None
-            self._healing_counter = 0
-            self._last_healing_action = "RESET_BREAKER"
-            return self._last_healing_action
-
-        action = "NO_ACTION"
-        try:
-            from errors import get_error
-            err = get_error(error_code)
-            category = getattr(err, "category", "")
-            err_code = getattr(err, "code", error_code)
-        except Exception:
-            category = ""
-            err_code = error_code
-
-        if category == "numerical":
-            self._last_valid_sjm_probs = np.ones(self.K, dtype=float) / self.K
-            smooth_len = int(np.size(self._smoothed_garch_prob))
-            if smooth_len <= 0:
-                self._smoothed_garch_prob = np.ones(2, dtype=float) / 2.0
-            else:
-                self._smoothed_garch_prob = np.ones(smooth_len, dtype=float) / smooth_len
-            self._shock_memory = 0.0
-            if getattr(self, "_regime_smoother", None) is not None:
-                self._regime_smoother.reset()
-            self._regime_state_probs = np.ones(4, dtype=float) / 4.0
-            action = "RESET_NUMERICAL"
-
-        elif category == "state":
-            self.reset_state()
-            action = "RESET_STATE"
-
-        elif category == "smoothing":
-            if getattr(self, "_regime_smoother", None) is not None:
-                self._regime_smoother.reset()
-            self._regime_state_probs = np.ones(4, dtype=float) / 4.0
-            self._confirmed_regime = None
-            self._confirmed_regime_idx = None
-            self._regime_persistence = 0
-            action = "RESET_SMOOTHER"
-
-        elif category == "classification":
-            self._regime_persistence = max(0, int(getattr(self, "_regime_persistence", 0)) - 1)
-            action = "SOFT_REBALANCE"
-
-        elif category == "input":
-            action = "SKIP_AND_DEGRADE"
-
-        elif category == "risk":
-            self._trigger_circuit_breaker(str(err_code))
-            action = "CIRCUIT_BREAK"
-
-        self._last_healing_action = action
-        return action
 
     def _shutdown_warning_worker(self) -> None:
         """
@@ -1094,8 +1013,60 @@ class AdvancedRegimeEngine:
         Keep per-timeframe failures isolated while preserving enough traceback
         context to debug the exact failure site from the warning text.
         """
-        tb = self._summarize_traceback(exc)
-        tb_struct = self._summarize_traceback_structured(exc)
+        trace_engine = getattr(self, "_trace_engine", None)
+        tb = None
+        tb_struct = None
+        if trace_engine is not None:
+            try:
+                frame_budget = self._obs_traceback_budget()
+                captured = trace_engine.capture(
+                    exc=exc,
+                    context={"timeframe": tf, "component": "mtf_forward_pass"},
+                    frame_budget=frame_budget,
+                )
+                captured_frames = captured.get("frames", [])
+                tb_struct = {
+                    "type": captured.get("type", type(exc).__name__),
+                    "message": captured.get("message", str(exc)),
+                    "frames": captured_frames,
+                    "dropped_frames": max(
+                        int(captured.get("frame_count", len(captured_frames))) - len(captured_frames),
+                        0,
+                    ),
+                    "annotations": [],
+                    # Backward-compatible extension fields:
+                    "trace_id": captured.get("trace_id"),
+                    "fingerprint": captured.get("fingerprint"),
+                    "context": captured.get("context", {}),
+                    "timestamp": captured.get("timestamp"),
+                }
+                rendered_frames = []
+                for frame in captured_frames:
+                    rendered_frames.append(
+                        f'  File "{frame.get("file")}", line {frame.get("line")}, in {frame.get("func")}'
+                    )
+                    code_line = frame.get("code")
+                    if isinstance(code_line, str) and code_line:
+                        rendered_frames.append(f"    {code_line}")
+                tb_parts = [
+                    f'{tb_struct.get("type", type(exc).__name__)}: {tb_struct.get("message", str(exc))}'
+                ]
+                if rendered_frames:
+                    tb_parts = rendered_frames + tb_parts
+                tb = "\n".join(tb_parts)
+                if len(tb) > self._TRACEBACK_MAX_CHARS:
+                    tb = tb[: self._TRACEBACK_MAX_CHARS - 3] + "..."
+            except Exception:
+                # Preserve existing traceback fallback behavior.
+                pass
+        if tb is None or tb_struct is None:
+            tb = self._summarize_traceback(exc)
+            tb_struct = self._summarize_traceback_structured(exc)
+
+        self._replay_record(
+            "error",
+            {"type": "mtf_failure", "timeframe": tf, "error": type(exc).__name__},
+        )
 
         # --- FIX: ASCII-safe JSON encoding (prevents ingestion issues in strict pipelines) ---
         try:
@@ -1616,9 +1587,16 @@ class AdvancedRegimeEngine:
     @_synchronized
     def update(self, market_data: Dict[str, Any]) -> Dict[str, Any]:
         start_time = time.perf_counter()
-        
-        # CONSISTENT OBS SAMPLING (avoid inconsistent metrics)
+        self._tick_id = int(getattr(self, "_tick_id", 0)) + 1
         obs_sample = self._obs_should_sample()
+        if obs_sample:
+            self._replay_record(
+                "update_start",
+                {
+                    "price": market_data.get("price"),
+                    "has_mtf": "mtf" in market_data,
+                },
+            )
 
         # ==========================================
         # 🚨 STEP -1: PnL TRACKING (NEW)
@@ -1664,7 +1642,7 @@ class AdvancedRegimeEngine:
             else:
                 self._obs_observe("circuit_breaker", "critical", {"reason": self._circuit_breaker_reason})
                 self.last_signed_position_size = 0.0
-                return _build_output(
+                output = _build_output(
                     regime_idx=-1,
                     regime_label="HALTED",
                     execution_mode="circuit_breaker",
@@ -1685,6 +1663,9 @@ class AdvancedRegimeEngine:
                     switch_stability_ema=self._switch_stability_ema,
                     execution_side="flat",
                 )
+                if obs_sample:
+                    self._replay_record("update_end", {"regime": "HALTED"})
+                return output
         
         # ==========================================
         # FIXED: Explicit base timeframe + safe MTF fusion
@@ -1952,7 +1933,7 @@ class AdvancedRegimeEngine:
             self._obs_observe("data_failure", "high", {"feed_status": feed_status})
             self._obs_counter += 1  # PRODUCTION HARDENING: prevent rate-limit bypass on outage
 
-            return _build_output(
+            output = _build_output(
                 # expose MTF degradation state without changing schema shape
                 # via risk_metrics.feed_status + comment trail in warnings
                 regime_idx=int(self.current_regime_idx) if self.current_regime_idx is not None else -1,
@@ -1978,6 +1959,9 @@ class AdvancedRegimeEngine:
                 include_signal_valid=True,
                 signal_valid=False,
             )
+            if obs_sample:
+                self._replay_record("update_end", {"regime": "UNKNOWN"})
+            return output
 
         feed_status = 'OK'
         if mtf_partial_survival:
@@ -2505,7 +2489,7 @@ class AdvancedRegimeEngine:
         if confirmed_regime in ("TREND", "BEAR"):
             final_regime_idx = int(self.current_regime_idx) if self.current_regime_idx is not None else -1
 
-        return _build_output(
+        output = _build_output(
             regime_idx=final_regime_idx,
             regime_label=confirmed_regime,
             execution_mode=execution_mode,
@@ -2534,6 +2518,27 @@ class AdvancedRegimeEngine:
             include_signal_valid=True,
             signal_valid=True,
         )
+        if obs_sample:
+            self._replay_record("update_end", {"regime": confirmed_regime})
+        if self._replay_engine is not None and (self._tick_id % 100 == 0):
+            try:
+                self._replay_engine.snapshot({
+                    "regime": confirmed_regime,
+                    "equity": self._equity,
+                    "drawdown": self._drawdown,
+                    "loss_streak": self._loss_streak,
+                    "garch_prob": self.garch_prob.tolist(),
+                    "nhhmm_prior": self.nhhmm_prior.tolist(),
+                    "smoothed_garch_prob": self._smoothed_garch_prob.tolist(),
+                    "regime_state_probs": self._regime_state_probs.tolist(),
+                    "shock_memory": self._shock_memory,
+                    "return_ema": self._return_ema,
+                    "abs_return_ema": self._abs_return_ema,
+                    "last_price": self._last_price,
+                })
+            except Exception:
+                pass
+        return output
 
     # ==========================================
     # 🚨 CIRCUIT BREAKER TRIGGER
@@ -2542,6 +2547,7 @@ class AdvancedRegimeEngine:
         self._circuit_breaker_active = True
         self._circuit_breaker_reason = reason
         self._healing_counter = 0
+        self._replay_record("circuit_breaker", {"reason": reason})
 
         try:
             LOGGER.critical(f"[CIRCUIT BREAKER TRIGGERED] Reason={reason}")
@@ -2569,37 +2575,54 @@ class AdvancedRegimeEngine:
 
         # Legacy breaker recovery path: keep existing behavior intact.
         if error_code is None:
-            # Reset critical states
+            # Reset probabilities
             self.nhhmm_prior = np.ones(self.K) / self.K
             self.garch_prob = np.ones(2) / 2.0
             self._smoothed_garch_prob = self.garch_prob.copy()
+            self._regime_state_probs = np.ones(4, dtype=float) / 4.0
+            if getattr(self, "_regime_smoother", None) is not None:
+                self._regime_smoother.reset()
 
-            # Reset volatility memory
+            # Reset volatility
             self.garch_var = self._stationary_garch_var()
             self._last_valid_vol = self.garch.target_vol
 
-            # Reset regime memory
+            # Reset regime state
             self.current_regime_idx = None
             self._confirmed_regime = None
+            self._confirmed_regime_idx = None
             self._prev_regime = None
+            self._prev_raw_regime = None
             self._regime_persistence = 0
             self.last_signed_position_size = 0.0
+            self._last_effective_trend_strength = 0.0
+            self._last_edge_score = 0.0
+            self._last_regime_change_ts = None
+            self._range_anchor_size = 0.0
+            self._in_range = False
+            self.range_ticks = 0.0
+            self.range_ticks_int = 0
 
-            # Reset PnL / breaker memory
+            # Reset PnL state
             self._equity = 1.0
             self._equity_peak = 1.0
             self._drawdown = 0.0
             self._loss_streak = 0
             self._last_price = None
+
+            # Reset memory variables
             self._shock_memory = 0.0
             self._return_ema = 0.0
             self._abs_return_ema = 0.0
+            self._last_timestamp = None
+            self._last_valid_dt = 1.0
+            self._last_valid_sjm_probs = None
 
             # Reset breaker
             self._circuit_breaker_active = False
             self._circuit_breaker_reason = None
             self._healing_counter = 0
-            self._last_healing_action = "RESET_BREAKER"
+            self._last_healing_action = "RESET_FULL"
             return self._last_healing_action
 
         action = "NO_ACTION"
@@ -2648,6 +2671,14 @@ class AdvancedRegimeEngine:
         elif category == "risk":
             self._trigger_circuit_breaker(str(err_code))
             action = "CIRCUIT_BREAK"
+
+        self._replay_record(
+            "self_heal",
+            {
+                "error": error_code,
+                "action": action,
+            },
+        )
 
         self._last_healing_action = action
         return action
