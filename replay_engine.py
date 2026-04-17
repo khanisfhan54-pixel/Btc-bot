@@ -43,131 +43,55 @@ class ReplayEngine:
         """
         Deterministic, depth-limited structural copy.
 
-        Guarantees:
-        - No mutation leaks up to depth boundary
+        Properties:
+        - No mutation leaks at shallow levels
         - No deepcopy performance cliffs
-        - Consistent behavior across container types
+        - Minimal branching for speed
         """
 
-        # At depth boundary → enforce shallow structural freeze
+        container_types = (dict, list, tuple, set, frozenset)
+
+        def shallow_structural_copy(value):
+            if isinstance(value, dict):
+                return dict(value)
+            if isinstance(value, list):
+                return list(value)
+            if isinstance(value, tuple):
+                return tuple(value)
+            if isinstance(value, (set, frozenset)):
+                return type(value)(value)
+            return value
+
+        # Depth boundary -> shallow structural freeze.
         if depth <= 0:
             if isinstance(p, dict):
-                out = {}
-                for k, v in p.items():
-                    if isinstance(v, dict):
-                        out[k] = dict(v)
-                    elif isinstance(v, list):
-                        out[k] = list(v)
-                    elif isinstance(v, tuple):
-                        out[k] = tuple(v)
-                    elif isinstance(v, (set, frozenset)):
-                        out[k] = type(v)(v)
-                    else:
-                        out[k] = v
-                return out
+                return {k: shallow_structural_copy(v) for k, v in p.items()}
             if isinstance(p, list):
-                out = []
-                for v in p:
-                    if isinstance(v, dict):
-                        out.append(dict(v))
-                    elif isinstance(v, list):
-                        out.append(list(v))
-                    elif isinstance(v, tuple):
-                        out.append(tuple(v))
-                    elif isinstance(v, (set, frozenset)):
-                        out.append(type(v)(v))
-                    else:
-                        out.append(v)
-                return out
+                return [shallow_structural_copy(v) for v in p]
             if isinstance(p, tuple):
-                out = []
-                for v in p:
-                    if isinstance(v, dict):
-                        out.append(dict(v))
-                    elif isinstance(v, list):
-                        out.append(list(v))
-                    elif isinstance(v, tuple):
-                        out.append(tuple(v))
-                    elif isinstance(v, (set, frozenset)):
-                        out.append(type(v)(v))
-                    else:
-                        out.append(v)
-                return tuple(out)
+                return tuple(shallow_structural_copy(v) for v in p)
             if isinstance(p, (set, frozenset)):
-                out = []
-                for v in p:
-                    if isinstance(v, dict):
-                        out.append(dict(v))
-                    elif isinstance(v, list):
-                        out.append(list(v))
-                    elif isinstance(v, tuple):
-                        out.append(tuple(v))
-                    elif isinstance(v, (set, frozenset)):
-                        out.append(type(v)(v))
-                    else:
-                        out.append(v)
-                return type(p)(out)
+                return type(p)(shallow_structural_copy(v) for v in p)
             return p
 
         if isinstance(p, dict):
-            out = {}
-            for k, v in p.items():
-                if isinstance(v, dict):
-                    out[k] = self._safe_payload(v, depth - 1)
-                elif isinstance(v, list):
-                    out[k] = self._safe_payload(v, depth - 1)
-                elif isinstance(v, tuple):
-                    out[k] = self._safe_payload(v, depth - 1)
-                elif isinstance(v, (set, frozenset)):
-                    out[k] = self._safe_payload(v, depth - 1)
-                else:
-                    out[k] = v
-            return out
+            return {
+                k: self._safe_payload(v, depth - 1) if isinstance(v, container_types) else v
+                for k, v in p.items()
+            }
 
         if isinstance(p, list):
-            out = []
-            for v in p:
-                if isinstance(v, dict):
-                    out.append(self._safe_payload(v, depth - 1))
-                elif isinstance(v, list):
-                    out.append(self._safe_payload(v, depth - 1))
-                elif isinstance(v, tuple):
-                    out.append(self._safe_payload(v, depth - 1))
-                elif isinstance(v, (set, frozenset)):
-                    out.append(self._safe_payload(v, depth - 1))
-                else:
-                    out.append(v)
-            return out
+            return [self._safe_payload(v, depth - 1) if isinstance(v, container_types) else v for v in p]
 
         if isinstance(p, tuple):
-            out = []
-            for v in p:
-                if isinstance(v, dict):
-                    out.append(self._safe_payload(v, depth - 1))
-                elif isinstance(v, list):
-                    out.append(self._safe_payload(v, depth - 1))
-                elif isinstance(v, tuple):
-                    out.append(self._safe_payload(v, depth - 1))
-                elif isinstance(v, (set, frozenset)):
-                    out.append(self._safe_payload(v, depth - 1))
-                else:
-                    out.append(v)
-            return tuple(out)
+            return tuple(
+                self._safe_payload(v, depth - 1) if isinstance(v, container_types) else v for v in p
+            )
 
         if isinstance(p, (set, frozenset)):
-            out = []
-            for v in p:
-                if isinstance(v, dict):
-                    out.append(self._safe_payload(v, depth - 1))
-                elif isinstance(v, list):
-                    out.append(self._safe_payload(v, depth - 1))
-                elif isinstance(v, tuple):
-                    out.append(self._safe_payload(v, depth - 1))
-                elif isinstance(v, (set, frozenset)):
-                    out.append(self._safe_payload(v, depth - 1))
-                else:
-                    out.append(v)
-            return type(p)(out)
+            return type(p)(
+                self._safe_payload(v, depth - 1) if isinstance(v, container_types) else v for v in p
+            )
 
         return p
 
