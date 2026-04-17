@@ -224,10 +224,10 @@ class RegimeMarkovSmoother:
         self.state_to_idx = {name: i for i, name in enumerate(self.states)}
         self.transition = np.array(
             [
-                [0.86, 0.08, 0.03, 0.03],  # TREND ->
-                [0.10, 0.78, 0.08, 0.04],  # RANGE ->
-                [0.03, 0.08, 0.86, 0.03],  # BEAR  ->
-                [0.04, 0.06, 0.05, 0.85],  # TOXIC ->
+                [0.90, 0.05, 0.03, 0.02],  # TREND ->
+                [0.08, 0.82, 0.06, 0.04],  # RANGE ->
+                [0.03, 0.05, 0.90, 0.02],  # BEAR  ->
+                [0.03, 0.05, 0.04, 0.88],  # TOXIC ->
             ],
             dtype=float,
         )
