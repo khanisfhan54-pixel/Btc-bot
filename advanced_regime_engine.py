@@ -1,6 +1,10 @@
 import numpy as np
 from scipy.special import softmax
 import atexit
+try:
+    from observability_controller import ObservabilityController
+except Exception:
+    ObservabilityController = None
 from dataclasses import dataclass
 from typing import Dict, Any, List
 from collections import Counter, OrderedDict
@@ -731,6 +735,7 @@ class AdvancedRegimeEngine:
         self._shock_memory = 0.0
         self._return_ema = 0.0
         self._abs_return_ema = 0.0
+        self._obs_controller = ObservabilityController() if ObservabilityController is not None else None
 
         self._circuit_breaker_active = False
         self._circuit_breaker_reason = None
@@ -798,7 +803,45 @@ class AdvancedRegimeEngine:
         """
         Randomized sampling removes deterministic blind spots (aliasing).
         """
+        controller = getattr(self, "_obs_controller", None)
+        if controller is not None:
+            try:
+                return bool(controller.should_sample())
+            except Exception:
+                pass
         return (int(self._rng.integers(0, self._OBS_SAMPLE_RATE)) == 0)
+
+    def _obs_should_emit_warning(self, key: str, cooldown_s: float) -> bool:
+        controller = getattr(self, "_obs_controller", None)
+        if controller is not None:
+            try:
+                return bool(controller.should_emit_warning(key, cooldown_s))
+            except Exception:
+                pass
+        return True
+
+    def _obs_traceback_budget(self) -> int:
+        controller = getattr(self, "_obs_controller", None)
+        if controller is not None:
+            try:
+                return max(1, int(controller.traceback_budget()))
+            except Exception:
+                pass
+        return int(self._TRACEBACK_MAX_FRAMES)
+
+    def _obs_observe(
+        self,
+        event_type: str,
+        severity: str,
+        context: Dict[str, Any] | None = None,
+    ) -> None:
+        controller = getattr(self, "_obs_controller", None)
+        if controller is None:
+            return
+        try:
+            controller.observe(event_type=event_type, severity=severity, context=context)
+        except Exception:
+            pass
 
     # ==========================================
     # 🚨 CIRCUIT BREAKER TRIGGER
@@ -1031,6 +1074,9 @@ class AdvancedRegimeEngine:
                         self._warning_last_emitted.pop(old_key, None)
                         self._warning_first_seen.pop(old_key, None)
 
+        if emit and not self._obs_should_emit_warning(key, cooldown_s):
+            return
+
         if emit:
             try:
                 self._warning_queue.put_nowait(message)
@@ -1173,10 +1219,11 @@ class AdvancedRegimeEngine:
         tb_exc = traceback.TracebackException.from_exception(exc, capture_locals=False)
         rendered = "".join(tb_exc.format(chain=True)).rstrip()
 
+        budget_frames = self._obs_traceback_budget()
         lines = rendered.splitlines()
-        if len(lines) > self._TRACEBACK_MAX_FRAMES:
+        if len(lines) > budget_frames:
             head = lines[: min(3, len(lines))]
-            tail = lines[-max(4, self._TRACEBACK_MAX_FRAMES - len(head)):]
+            tail = lines[-max(4, budget_frames - len(head)):]
             rendered = "\n".join(head + ["..."] + tail)
 
         clipped_lines = []
@@ -1207,7 +1254,7 @@ class AdvancedRegimeEngine:
         tb_exc = traceback.TracebackException.from_exception(exc, capture_locals=False)
 
         full_stack = list(tb_exc.stack)
-        max_frames = self._TRACEBACK_MAX_FRAMES
+        max_frames = min(self._TRACEBACK_MAX_FRAMES, self._obs_traceback_budget())
 
         # --- HARD CAP ON STACK SIZE (secondary protection) ---
         if len(full_stack) > 100:
@@ -1615,6 +1662,7 @@ class AdvancedRegimeEngine:
             if self._healing_counter > self._HEALING_COOLDOWN_TICKS:
                 self._self_heal()
             else:
+                self._obs_observe("circuit_breaker", "critical", {"reason": self._circuit_breaker_reason})
                 self.last_signed_position_size = 0.0
                 return _build_output(
                     regime_idx=-1,
@@ -1761,6 +1809,7 @@ class AdvancedRegimeEngine:
                     message="MTF fusion failed, falling back to SAFE base timeframe",
                     cooldown_s=30.0,
                 )
+                self._obs_observe("mtf_failure", "high", {"source": "mtf_total_failure"})
                 self._self_heal("E130", {"source": "mtf_total_failure"})
 
                 # 🔒 HARD VALIDATION BEFORE FALLBACK
@@ -1900,6 +1949,7 @@ class AdvancedRegimeEngine:
                     ENGINE_FEED_STATUS.labels(self.engine_id, feed_status).inc()
                     ENGINE_HEALTH.labels(self.engine_id).set(0)
 
+            self._obs_observe("data_failure", "high", {"feed_status": feed_status})
             self._obs_counter += 1  # PRODUCTION HARDENING: prevent rate-limit bypass on outage
 
             return _build_output(
@@ -1984,6 +2034,7 @@ class AdvancedRegimeEngine:
                 message=f"SJM produced non-finite probs, using last valid state",
                 cooldown_s=10.0,
             )
+            self._obs_observe("sjm_non_finite", "high", {"source": "update"})
             self._self_heal("E200", {"source": "sjm_non_finite"})
 
             if self._last_valid_sjm_probs is not None:
@@ -2437,6 +2488,11 @@ class AdvancedRegimeEngine:
             elapsed = time.perf_counter() - start_time
             ENGINE_LATENCY.labels(self.engine_id).observe(elapsed)
 
+        self._obs_observe(
+            "update",
+            {"OK": "low", "DEGRADED": "medium", "RISK": "high", "FAIL": "critical"}.get(self._last_health, "low"),
+            {"feed_status": feed_status, "regime": confirmed_regime},
+        )
         self._obs_counter += 1
 
         # Final execution guard (redundant safety layer)
