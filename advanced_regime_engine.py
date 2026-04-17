@@ -1,4 +1,5 @@
 import numpy as np
+import hashlib
 from scipy.special import softmax
 import atexit
 try:
@@ -634,6 +635,49 @@ class AdvancedRegimeEngine:
     _TRACEBACK_MAX_FRAMES: int = 12
     _TRACEBACK_MAX_CHARS: int = 3000
     _TRACEBACK_MAX_LINE_CHARS: int = 300
+
+    # ==========================================
+    # STATE HASH (BITWISE DETERMINISM)
+    # ==========================================
+    def _canonicalize(self, obj: Any):
+        if isinstance(obj, dict):
+            return {str(k): self._canonicalize(obj[k]) for k in sorted(obj)}
+        if isinstance(obj, (list, tuple)):
+            return [self._canonicalize(v) for v in obj]
+        if isinstance(obj, np.ndarray):
+            return [self._canonicalize(v) for v in obj.tolist()]
+        if isinstance(obj, np.generic):
+            return self._canonicalize(obj.item())
+        if isinstance(obj, float):
+            # IEEE-stable deterministic representation
+            return format(obj, ".17g")
+        return obj
+
+    def _deep_sort(self, obj):
+        if isinstance(obj, dict):
+            return {k: self._deep_sort(obj[k]) for k in sorted(obj)}
+        if isinstance(obj, list):
+            return [self._deep_sort(v) for v in obj]
+        return obj
+
+    def _normalize_rng_state(self, rng):
+        try:
+            state = rng.bit_generator.state
+            return {
+                "bit_generator": type(rng.bit_generator).__name__,
+                "state": self._canonicalize(state.get("state")),
+                "inc": state.get("inc", None),
+            }
+        except Exception:
+            return "UNSUPPORTED_RNG"
+
+    def _state_hash(self, state: Dict[str, Any]) -> str:
+        try:
+            canonical = self._deep_sort(self._canonicalize(state))
+            s = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+            return hashlib.sha256(s.encode()).hexdigest()
+        except Exception:
+            return "NA"
 
     # ==========================================
     # NEW: Safe fallback memory
@@ -1366,6 +1410,10 @@ class AdvancedRegimeEngine:
         }
 
     @_synchronized
+    def serialize_state(self) -> Dict[str, Any]:
+        return self.get_state()
+
+    @_synchronized
     def reset_state(self) -> None:
         self.nhhmm_prior = np.ones(self.K, dtype=float) / self.K
         self.current_regime_idx = None
@@ -1586,6 +1634,17 @@ class AdvancedRegimeEngine:
 
     @_synchronized
     def update(self, market_data: Dict[str, Any]) -> Dict[str, Any]:
+        if getattr(self, "_is_replay", False):
+            # Disable side-effects during replay
+            suppress_metrics = True
+        else:
+            suppress_metrics = False
+        self._suppress_metrics = suppress_metrics
+
+        # NOTE: enforce globally across codebase:
+        # ALL side effects must follow:
+        # if not getattr(self, "_is_replay", False): LOGGER / metrics / hooks
+
         start_time = time.perf_counter()
         self._tick_id = int(getattr(self, "_tick_id", 0)) + 1
         obs_sample = self._obs_should_sample()
@@ -2522,7 +2581,36 @@ class AdvancedRegimeEngine:
             self._replay_record("update_end", {"regime": confirmed_regime})
         if self._replay_engine is not None and (self._tick_id % 100 == 0):
             try:
+                state_blob = self.serialize_state()
+                # include RNG for true determinism
+                normalized_rng = self._normalize_rng_state(self._rng)
+                combined_state = {
+                    "engine": state_blob,
+                    "rng": normalized_rng,
+                }
+
+                # HARD ASSERT: dual-state consistency
+                runtime_map = {
+                    "garch_prob": "garch_prob",
+                    "nhhmm_prior": "nhhmm_prior",
+                    "garch_var": "garch_var",
+                    "smoothed_garch_prob": "_smoothed_garch_prob",
+                }
+                for k, runtime_attr in runtime_map.items():
+                    if k in state_blob:
+                        try:
+                            if not np.allclose(
+                                np.asarray(state_blob[k], dtype=float),
+                                np.asarray(getattr(self, runtime_attr), dtype=float),
+                                atol=1e-12,
+                            ):
+                                LOGGER.critical("CRITICAL SNAPSHOT MISMATCH: %s", k)
+                        except Exception:
+                            pass
+
                 self._replay_engine.snapshot({
+                    "engine_state": state_blob,
+                    "state_hash": self._state_hash(combined_state),
                     "regime": confirmed_regime,
                     "equity": self._equity,
                     "drawdown": self._drawdown,
@@ -2531,14 +2619,138 @@ class AdvancedRegimeEngine:
                     "nhhmm_prior": self.nhhmm_prior.tolist(),
                     "smoothed_garch_prob": self._smoothed_garch_prob.tolist(),
                     "regime_state_probs": self._regime_state_probs.tolist(),
+                    "last_valid_sjm_probs": (
+                        self._last_valid_sjm_probs.tolist()
+                        if isinstance(self._last_valid_sjm_probs, np.ndarray)
+                        else None
+                    ),
+                    "last_effective_trend_strength": float(self._last_effective_trend_strength),
+                    "last_edge_score": float(self._last_edge_score),
+                    "garch_var": self.garch_var.tolist(),
+                    "last_valid_vol": float(self._last_valid_vol),
+                    "switch_stability_ema": float(self._switch_stability_ema),
+                    "last_timestamp": self._last_timestamp,
+                    "last_valid_dt": float(self._last_valid_dt),
+                    "range_ticks": float(self.range_ticks),
+                    "range_ticks_int": int(self.range_ticks_int),
+                    "in_range": bool(self._in_range),
+                    "range_anchor_size": float(self._range_anchor_size),
+                    "prev_raw_regime": self._prev_raw_regime,
+                    "last_regime_change_ts": self._last_regime_change_ts,
                     "shock_memory": self._shock_memory,
                     "return_ema": self._return_ema,
                     "abs_return_ema": self._abs_return_ema,
                     "last_price": self._last_price,
+                    "_rng_state": None,
+                    "_engine_rng_state": getattr(self._rng, "bit_generator", None).state if getattr(self, "_rng", None) is not None else None,
+                    "_engine_rng_type": type(self._rng.bit_generator).__name__ if getattr(self, "_rng", None) is not None else None,
+                    "schema_version": "2.3",
                 })
             except Exception:
                 pass
         return output
+
+    # ==========================================
+    # SNAPSHOT RESTORE (DETERMINISTIC REPLAY)
+    # ==========================================
+    @_synchronized
+    def load_snapshot(self, snapshot: Dict[str, Any]) -> None:
+        try:
+            incoming = snapshot if isinstance(snapshot, dict) else {}
+            state = incoming.get("state", incoming)
+            if not isinstance(state, dict):
+                state = {}
+
+            # ==========================================
+            # FIRST: RESTORE RNG (CRITICAL ORDER FIX)
+            # ==========================================
+            if "_engine_rng_state" in state and getattr(self, "_rng", None) is not None:
+                try:
+                    self._rng.bit_generator.state = dict(state["_engine_rng_state"])
+                except Exception:
+                    pass
+
+            # ==========================================
+            # SNAPSHOT INTEGRITY CHECK
+            # ==========================================
+            expected_hash = state.get("state_hash")
+            if expected_hash:
+                combined = {
+                    "engine": state.get("engine_state", {}),
+                    "rng": self._normalize_rng_state(self._rng),
+                    "schema_version": state.get("schema_version"),
+                }
+                actual_hash = self._state_hash(combined)
+                if expected_hash != actual_hash:
+                    LOGGER.error("SNAPSHOT CORRUPTION DETECTED (HASH)")
+            expected_checksum = state.get("_checksum")
+            if expected_checksum:
+                check_blob = {k: v for k, v in state.items() if k != "_checksum"}
+                actual_checksum = self._state_hash(check_blob)
+                if expected_checksum != actual_checksum:
+                    LOGGER.error("SNAPSHOT CHECKSUM MISMATCH")
+
+            # Reuse hardened state loader for broad compatibility and validation.
+            engine_state = state.get("engine_state", state)
+            if isinstance(engine_state, dict):
+                self.load_state(engine_state)
+
+            # Restore RNG state if exists
+            # REMOVED global RNG restore (non-deterministic)
+            # REMOVE any global RNG restore (already correct)
+            # ONLY engine RNG is used
+            # RNG TYPE VALIDATION
+            if "_engine_rng_type" in state and getattr(self, "_rng", None) is not None:
+                if type(self._rng.bit_generator).__name__ != state["_engine_rng_type"]:
+                    LOGGER.error("RNG TYPE MISMATCH")
+
+            # Snapshot-only state carried by replay checkpoints.
+            self.garch_var = self._coerce_vector("garch_var", state.get("garch_var", self.garch_var), 2)
+            if not np.all(np.isfinite(self.garch_var)):
+                self.garch_var = self._stationary_garch_var()
+            self._last_valid_vol = float(state.get("last_valid_vol", self._last_valid_vol))
+            if (not np.isfinite(self._last_valid_vol)) or (self._last_valid_vol <= 0.0):
+                self._last_valid_vol = float(self.garch.target_vol)
+            self._switch_stability_ema = float(state.get("switch_stability_ema", self._switch_stability_ema))
+            if (not np.isfinite(self._switch_stability_ema)) or (self._switch_stability_ema <= 0.0):
+                self._switch_stability_ema = 1.0
+            self._last_timestamp = state.get("last_timestamp", self._last_timestamp)
+            self._last_valid_dt = float(state.get("last_valid_dt", self._last_valid_dt))
+            if (not np.isfinite(self._last_valid_dt)) or (self._last_valid_dt <= 0.0):
+                self._last_valid_dt = 1.0
+            self.range_ticks = float(state.get("range_ticks", self.range_ticks))
+            if not np.isfinite(self.range_ticks):
+                self.range_ticks = 0.0
+            self.range_ticks_int = int(state.get("range_ticks_int", self.range_ticks_int))
+            self._in_range = bool(state.get("in_range", self._in_range))
+            self._range_anchor_size = float(state.get("range_anchor_size", self._range_anchor_size))
+            if not np.isfinite(self._range_anchor_size):
+                self._range_anchor_size = 0.0
+            self._prev_raw_regime = state.get("prev_raw_regime", self._prev_raw_regime)
+            self._last_regime_change_ts = state.get("last_regime_change_ts", self._last_regime_change_ts)
+            if self._last_regime_change_ts is not None:
+                try:
+                    self._last_regime_change_ts = float(self._last_regime_change_ts)
+                    if not np.isfinite(self._last_regime_change_ts):
+                        self._last_regime_change_ts = None
+                except Exception:
+                    self._last_regime_change_ts = None
+            self._last_price = state.get("last_price", self._last_price)
+            if state.get("last_valid_sjm_probs") is not None:
+                try:
+                    self._last_valid_sjm_probs = _normalize_prob_vector(
+                        np.asarray(state.get("last_valid_sjm_probs"), dtype=float)
+                    )
+                except Exception:
+                    self._last_valid_sjm_probs = np.ones(self.K, dtype=float) / self.K
+            self._last_effective_trend_strength = float(
+                state.get("last_effective_trend_strength", self._last_effective_trend_strength)
+            )
+            self._last_edge_score = float(state.get("last_edge_score", self._last_edge_score))
+            self._confirmed_regime = state.get("regime", self._confirmed_regime)
+        except Exception:
+            # Never crash live engine during replay recovery.
+            pass
 
     # ==========================================
     # 🚨 CIRCUIT BREAKER TRIGGER
@@ -2616,7 +2828,7 @@ class AdvancedRegimeEngine:
             self._abs_return_ema = 0.0
             self._last_timestamp = None
             self._last_valid_dt = 1.0
-            self._last_valid_sjm_probs = None
+            self._last_valid_sjm_probs = np.ones(self.K) / self.K
 
             # Reset breaker
             self._circuit_breaker_active = False

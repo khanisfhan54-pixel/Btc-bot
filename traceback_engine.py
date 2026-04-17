@@ -107,7 +107,7 @@ class TracebackEngine:
                 "func": func_s,
                 "code": code_s,
             }
-            estimated = len(file_s) + len(func_s) + len(code_s) + 32
+            estimated = int((len(file_s) + len(func_s) + len(code_s)) * 1.7) + 128
             if total_chars + estimated > self._max_total_chars:
                 break
             out.append(frame_obj)
