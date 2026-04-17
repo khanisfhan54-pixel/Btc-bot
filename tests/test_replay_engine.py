@@ -44,6 +44,51 @@ class StubReplayTarget:
         self._confirmed_regime = state.get("confirmed_regime", self._confirmed_regime)
 
 
+class FailingSnapshotTarget(StubReplayTarget):
+    def load_snapshot(self, snapshot):
+        self._equity = -999.0  # mutate to prove rollback happens
+        raise RuntimeError("broken snapshot load")
+
+
+class FailingUpdateTarget(StubReplayTarget):
+    def update(self, payload):
+        raise ValueError("update failed")
+
+
+class SnapshotOnlyRollbackTarget:
+    def __init__(self, strict: bool = True):
+        self._strict_replay = strict
+        self._fsm_error = None
+        self._is_replay = False
+        self._equity = 5.0
+        self._confirmed_regime = "BASE"
+        self._fail_updates = True
+
+    def update(self, payload):
+        if self._fail_updates:
+            raise RuntimeError("update failure after snapshot load")
+        self._equity += float(payload.get("price", 0.0))
+        self._confirmed_regime = payload.get("regime", self._confirmed_regime)
+
+    def _trigger_circuit_breaker(self, reason):
+        return reason
+
+    def _self_heal(self, error=None):
+        return error
+
+    def serialize_state(self):
+        return {
+            "schema_version": "2.3",
+            "equity": self._equity,
+            "confirmed_regime": self._confirmed_regime,
+        }
+
+    def load_snapshot(self, snapshot):
+        state = snapshot.get("state", {}) if isinstance(snapshot, dict) else {}
+        self._equity = float(state.get("equity", self._equity))
+        self._confirmed_regime = state.get("confirmed_regime", self._confirmed_regime)
+
+
 def _build_engine_with_snapshot() -> ReplayEngine:
     replay = ReplayEngine()
     replay.record_event("update_start", {"price": 1.0, "regime": "A"})
@@ -98,6 +143,100 @@ def test_fsm_corruption_invalid_sequence_raises():
         replay.apply_events(StubReplayTarget(strict=True))
 
 
+def test_incomplete_fsm_sequence_raises_runtime_error():
+    replay = ReplayEngine()
+    replay.record_event("update_start", {"price": 1.0, "regime": "A"})
+
+    with pytest.raises(RuntimeError, match="incomplete event cycle"):
+        replay.apply_events(StubReplayTarget(strict=True))
+
+
+def test_snapshot_restore_failure_rolls_back_engine_state():
+    replay = _build_engine_with_snapshot()
+    target = FailingSnapshotTarget(strict=True)
+    initial = target.serialize_state()
+
+    with pytest.raises(RuntimeError, match="broken snapshot load"):
+        replay.replay_from_snapshot(target, snapshot_index=-1)
+
+    assert target.serialize_state() == initial
+
+
+def test_unsafe_replay_does_not_mutate_internal_store():
+    replay = ReplayEngine()
+    replay._unsafe_no_copy = True
+    replay.record_event(
+        "update_start",
+        {"price": 1.0, "regime": "A", "nested": {"x": {"y": 1}}, "levels": [{"k": 1}]},
+    )
+
+    events = list(replay.replay())
+    events[0]["payload"]["price"] = 999.0
+    events[0]["payload"]["nested"]["x"]["y"] = 999
+    events[0]["payload"]["levels"][0]["k"] = 999
+    events[0]["type"] = "update_end"
+
+    stored = replay.last_events(1)[0]
+    assert stored["type"] == "update_start"
+    assert stored["payload"]["price"] == 1.0
+    assert stored["payload"]["nested"]["x"]["y"] == 1
+    assert stored["payload"]["levels"][0]["k"] == 1
+
+
+def test_unsafe_replay_tuple_payload_isolation():
+    replay = ReplayEngine()
+    replay._unsafe_no_copy = True
+    replay.record_event("update_start", {"tupled": ({"x": 1}, 2)})
+
+    events = list(replay.replay())
+    events[0]["payload"]["tupled"][0]["x"] = 999
+
+    stored = replay.last_events(1)[0]
+    assert stored["payload"]["tupled"][0]["x"] == 1
+
+
+def test_unsafe_replay_set_payload_isolation():
+    replay = ReplayEngine()
+    replay._unsafe_no_copy = True
+    replay.record_event("update_start", {"tags": {1, 2}})
+
+    events = list(replay.replay())
+    events[0]["payload"]["tags"].add(999)
+
+    stored = replay.last_events(1)[0]
+    assert stored["payload"]["tags"] == {1, 2}
+
+
+def test_unsafe_replay_deep_nested_mutation_isolation():
+    replay = ReplayEngine()
+    replay._unsafe_no_copy = True
+    replay.record_event("update_start", {"a": {"b": {"c": {"d": 1}}}})
+
+    events = list(replay.replay())
+    events[0]["payload"]["a"]["b"]["c"]["d"] = 999
+
+    stored = replay.last_events(1)[0]
+    assert stored["payload"]["a"]["b"]["c"]["d"] == 1
+
+
+def test_safe_payload_nested_mutation_safety_from_original():
+    replay = ReplayEngine()
+    payload = {"x": [{"y": [1, 2, 3]}]}
+    replayed = replay._safe_payload(payload)
+
+    payload["x"][0]["y"][0] = 999
+    assert replayed["x"][0]["y"][0] == 1
+
+
+def test_safe_payload_depth_boundary_correctness():
+    replay = ReplayEngine()
+    payload = {"outer": {"inner": {"leaf": {"k": 1}}}}
+    replayed = replay._safe_payload(payload, depth=2)
+
+    replayed["outer"]["inner"]["leaf"]["k"] = 999
+    assert payload["outer"]["inner"]["leaf"]["k"] == 1
+
+
 def test_unsafe_no_copy_is_faster_for_replay_iteration():
     payload = {
         "price": 1.0,
@@ -149,3 +288,55 @@ def test_validate_replay_rejects_unsafe_mode():
 
     with pytest.raises(RuntimeError, match="_unsafe_no_copy=True"):
         replay.validate_replay(StubReplayTarget)
+
+
+def test_handler_error_reports_correct_previous_event():
+    replay = ReplayEngine()
+    replay.record_event("update_start", {"price": 1.0, "regime": "A"})
+    replay.record_event("update_end", {"regime": "A"})
+
+    target = FailingUpdateTarget(strict=False)
+    replay.apply_events(target)
+
+    assert isinstance(target._fsm_error, dict)
+    assert target._fsm_error["reason"] == "EVENT_HANDLER_ERROR"
+    assert target._fsm_error["last_event"] is None
+    assert target._fsm_error["event"] == "update_start"
+
+
+def test_snapshot_replay_isolation_replay_twice_same_result():
+    replay = _build_engine_with_snapshot()
+    left = StubReplayTarget(strict=True)
+    right = StubReplayTarget(strict=True)
+
+    replay.replay_from_snapshot(left, snapshot_index=-1)
+    replay.replay_from_snapshot(right, snapshot_index=-1)
+
+    assert left.serialize_state() == right.serialize_state()
+    assert replay._state_hash(left.serialize_state()) == replay._state_hash(right.serialize_state())
+
+
+def test_fsm_error_resets_between_snapshot_replays():
+    replay = _build_engine_with_snapshot()
+    replay._snapshots[-1]["state"]["_checksum"] = "tampered"
+    target = StubReplayTarget(strict=False)
+
+    replay.replay_from_snapshot(target, snapshot_index=-1)
+    assert target._fsm_error["reason"] == "SNAPSHOT_CHECKSUM_MISMATCH"
+
+    replay._snapshots[-1]["state"]["_checksum"] = replay._state_hash(
+        {k: v for k, v in replay._snapshots[-1]["state"].items() if k != "_checksum"}
+    )
+    replay.replay_from_snapshot(target, snapshot_index=-1)
+    assert target._fsm_error is None
+
+
+def test_snapshot_rollback_uses_schema_safe_snapshot_fallback():
+    replay = _build_engine_with_snapshot()
+    target = SnapshotOnlyRollbackTarget(strict=True)
+    initial = target.serialize_state()
+
+    with pytest.raises(RuntimeError, match="Replay handler error: update_start"):
+        replay.replay_from_snapshot(target, snapshot_index=-1)
+
+    assert target.serialize_state() == initial

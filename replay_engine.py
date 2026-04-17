@@ -36,6 +36,141 @@ class ReplayEngine:
         self._unsafe_warning_emitted = False
         self._HASH_NAMESPACE = "ADV_REGIME_REPLAY"
 
+    # ==========================================
+    # INTERNAL SAFE COPY (UNSAFE MODE PROTECTION)
+    # ==========================================
+    def _safe_payload(self, p, depth: int = 2):
+        """
+        Deterministic, depth-limited structural copy.
+
+        Guarantees:
+        - No mutation leaks up to depth boundary
+        - No deepcopy performance cliffs
+        - Consistent behavior across container types
+        """
+
+        # At depth boundary → enforce shallow structural freeze
+        if depth <= 0:
+            if isinstance(p, dict):
+                out = {}
+                for k, v in p.items():
+                    if isinstance(v, dict):
+                        out[k] = dict(v)
+                    elif isinstance(v, list):
+                        out[k] = list(v)
+                    elif isinstance(v, tuple):
+                        out[k] = tuple(v)
+                    elif isinstance(v, (set, frozenset)):
+                        out[k] = type(v)(v)
+                    else:
+                        out[k] = v
+                return out
+            if isinstance(p, list):
+                out = []
+                for v in p:
+                    if isinstance(v, dict):
+                        out.append(dict(v))
+                    elif isinstance(v, list):
+                        out.append(list(v))
+                    elif isinstance(v, tuple):
+                        out.append(tuple(v))
+                    elif isinstance(v, (set, frozenset)):
+                        out.append(type(v)(v))
+                    else:
+                        out.append(v)
+                return out
+            if isinstance(p, tuple):
+                out = []
+                for v in p:
+                    if isinstance(v, dict):
+                        out.append(dict(v))
+                    elif isinstance(v, list):
+                        out.append(list(v))
+                    elif isinstance(v, tuple):
+                        out.append(tuple(v))
+                    elif isinstance(v, (set, frozenset)):
+                        out.append(type(v)(v))
+                    else:
+                        out.append(v)
+                return tuple(out)
+            if isinstance(p, (set, frozenset)):
+                out = []
+                for v in p:
+                    if isinstance(v, dict):
+                        out.append(dict(v))
+                    elif isinstance(v, list):
+                        out.append(list(v))
+                    elif isinstance(v, tuple):
+                        out.append(tuple(v))
+                    elif isinstance(v, (set, frozenset)):
+                        out.append(type(v)(v))
+                    else:
+                        out.append(v)
+                return type(p)(out)
+            return p
+
+        if isinstance(p, dict):
+            out = {}
+            for k, v in p.items():
+                if isinstance(v, dict):
+                    out[k] = self._safe_payload(v, depth - 1)
+                elif isinstance(v, list):
+                    out[k] = self._safe_payload(v, depth - 1)
+                elif isinstance(v, tuple):
+                    out[k] = self._safe_payload(v, depth - 1)
+                elif isinstance(v, (set, frozenset)):
+                    out[k] = self._safe_payload(v, depth - 1)
+                else:
+                    out[k] = v
+            return out
+
+        if isinstance(p, list):
+            out = []
+            for v in p:
+                if isinstance(v, dict):
+                    out.append(self._safe_payload(v, depth - 1))
+                elif isinstance(v, list):
+                    out.append(self._safe_payload(v, depth - 1))
+                elif isinstance(v, tuple):
+                    out.append(self._safe_payload(v, depth - 1))
+                elif isinstance(v, (set, frozenset)):
+                    out.append(self._safe_payload(v, depth - 1))
+                else:
+                    out.append(v)
+            return out
+
+        if isinstance(p, tuple):
+            out = []
+            for v in p:
+                if isinstance(v, dict):
+                    out.append(self._safe_payload(v, depth - 1))
+                elif isinstance(v, list):
+                    out.append(self._safe_payload(v, depth - 1))
+                elif isinstance(v, tuple):
+                    out.append(self._safe_payload(v, depth - 1))
+                elif isinstance(v, (set, frozenset)):
+                    out.append(self._safe_payload(v, depth - 1))
+                else:
+                    out.append(v)
+            return tuple(out)
+
+        if isinstance(p, (set, frozenset)):
+            out = []
+            for v in p:
+                if isinstance(v, dict):
+                    out.append(self._safe_payload(v, depth - 1))
+                elif isinstance(v, list):
+                    out.append(self._safe_payload(v, depth - 1))
+                elif isinstance(v, tuple):
+                    out.append(self._safe_payload(v, depth - 1))
+                elif isinstance(v, (set, frozenset)):
+                    out.append(self._safe_payload(v, depth - 1))
+                else:
+                    out.append(v)
+            return type(p)(out)
+
+        return p
+
     def _emit_unsafe_mode_warning(self) -> None:
         if not self._unsafe_no_copy or self._unsafe_warning_emitted:
             return
@@ -197,7 +332,14 @@ class ReplayEngine:
         with self._lock:
             self._emit_unsafe_mode_warning()
             if self._unsafe_no_copy:
-                events = list(self._events)
+                events = [
+                    {
+                        "id": e.get("id"),
+                        "type": e.get("type"),
+                        "payload": self._safe_payload(e.get("payload", {})),
+                    }
+                    for e in self._events
+                ]
             else:
                 events = copy.deepcopy(list(self._events))
         for e in events:
@@ -207,7 +349,14 @@ class ReplayEngine:
         with self._lock:
             self._emit_unsafe_mode_warning()
             if self._unsafe_no_copy:
-                events = list(self._events)
+                events = [
+                    {
+                        "id": e.get("id"),
+                        "type": e.get("type"),
+                        "payload": self._safe_payload(e.get("payload", {})),
+                    }
+                    for e in self._events
+                ]
             else:
                 events = copy.deepcopy(list(self._events))
         for e in events:
@@ -249,17 +398,19 @@ class ReplayEngine:
             setattr(engine, "_is_replay", True)
             setattr(engine, "_fsm_error", None)
             self._fsm_error = None
+            prev_event = None
             for e in self.replay_from(start_id):
                 etype = e.get("type")
                 payload = e.get("payload", {})
+                prev_event = last_event
 
                 # STRICT FSM VALIDATION
-                if last_event not in valid_transitions or etype not in valid_transitions.get(last_event, {}):
-                    err = {"last_event": last_event, "event": etype, "reason": "EVENT_SEQUENCE_CORRUPTION"}
+                if prev_event not in valid_transitions or etype not in valid_transitions.get(prev_event, {}):
+                    err = {"last_event": prev_event, "event": etype, "reason": "EVENT_SEQUENCE_CORRUPTION"}
                     self._fsm_error = err
                     setattr(engine, "_fsm_error", err)
                     if getattr(engine, "_strict_replay", True):
-                        raise RuntimeError(f"Replay corruption: {last_event} -> {etype}")
+                        raise RuntimeError(f"Replay corruption: {prev_event} -> {etype}")
                     else:
                         return
 
@@ -290,7 +441,7 @@ class ReplayEngine:
                     except Exception:
                         pass
                     err = {
-                        "last_event": last_event,
+                        "last_event": prev_event,
                         "event": etype,
                         "reason": "EVENT_HANDLER_ERROR",
                         "error_type": type(exc).__name__,
@@ -305,6 +456,16 @@ class ReplayEngine:
                 setattr(engine, "_is_replay", False)
             except Exception:
                 pass
+
+        # ==========================================
+        # 🚨 FSM COMPLETENESS CHECK
+        # ==========================================
+        if last_event == "update_start":
+            err = {"reason": "INCOMPLETE_EVENT_CYCLE"}
+            self._fsm_error = err
+            setattr(engine, "_fsm_error", err)
+            if getattr(engine, "_strict_replay", True):
+                raise RuntimeError("Replay corruption: incomplete event cycle")
 
     # ==========================================
     # SNAPSHOT RESTORE + REPLAY
@@ -331,6 +492,27 @@ class ReplayEngine:
             self.apply_events(engine, start_id=0)
             return
 
+        # ==========================================
+        # 🚨 RESET FSM STATE BEFORE REPLAY
+        # ==========================================
+        self._fsm_error = None
+        try:
+            setattr(engine, "_fsm_error", None)
+        except Exception:
+            pass
+
+        # ==========================================
+        # 🚨 SNAPSHOT ROLLBACK SAFETY
+        # ==========================================
+        backup = None
+        backup_mode = None
+        if hasattr(engine, "serialize_state"):
+            try:
+                backup = copy.deepcopy(engine.serialize_state())
+                backup_mode = "state"
+            except Exception:
+                backup = None
+
         try:
             state = snapshot.get("state", {}) if isinstance(snapshot, dict) else {}
             if isinstance(state, dict):
@@ -355,6 +537,16 @@ class ReplayEngine:
             start_id = int(snapshot.get("id", 0))
             self.apply_events(engine, start_id=start_id)
         except Exception as exc:
+            # rollback engine to pre-replay state
+            if backup:
+                try:
+                    if hasattr(engine, "load_state") and backup_mode == "state":
+                        engine.load_state(backup)
+                    elif hasattr(engine, "load_snapshot"):
+                        engine.load_snapshot({"state": backup})
+                except Exception:
+                    pass
+
             if getattr(engine, "_strict_replay", True):
                 raise
             err = {
