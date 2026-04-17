@@ -230,11 +230,44 @@ def test_safe_payload_nested_mutation_safety_from_original():
 
 def test_safe_payload_depth_boundary_correctness():
     replay = ReplayEngine()
-    payload = {"outer": {"inner": {"leaf": {"k": 1}}}}
+    payload = {"outer": {"inner": {"leaf": {"k": 1}, "shared": {"z": {"w": 1}}}}}
     replayed = replay._safe_payload(payload, depth=2)
 
     replayed["outer"]["inner"]["leaf"]["k"] = 999
     assert payload["outer"]["inner"]["leaf"]["k"] == 1
+    replayed["outer"]["inner"]["shared"]["z"]["w"] = 777
+    assert payload["outer"]["inner"]["shared"]["z"]["w"] == 777
+
+
+def test_safe_payload_supports_tuple_set_and_frozenset():
+    replay = ReplayEngine()
+    payload = {
+        "tupled": ({"a": 1}, {"b": [1, 2]}),
+        "setv": frozenset({1, 2, 3}),
+    }
+
+    copied = replay._safe_payload(payload, depth=3)
+    assert isinstance(copied["tupled"], tuple)
+    assert isinstance(copied["setv"], frozenset)
+
+    copied["tupled"][0]["a"] = 999
+    assert payload["tupled"][0]["a"] == 1
+
+
+def test_unsafe_replay_determinism_consistency_across_runs():
+    replay = ReplayEngine()
+    replay._unsafe_no_copy = True
+    for i in range(8):
+        replay.record_event("update_start", {"price": float(i), "regime": f"R{i % 3}"})
+        replay.record_event("update_end", {"regime": f"R{i % 3}"})
+
+    first = StubReplayTarget()
+    second = StubReplayTarget()
+    replay.apply_events(first)
+    replay.apply_events(second)
+
+    assert first.serialize_state() == second.serialize_state()
+    assert replay._state_hash(first.serialize_state()) == replay._state_hash(second.serialize_state())
 
 
 def test_unsafe_no_copy_is_faster_for_replay_iteration():
