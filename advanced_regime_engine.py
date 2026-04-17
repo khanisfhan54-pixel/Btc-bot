@@ -1,5 +1,6 @@
 import numpy as np
 import hashlib
+import dataclasses
 from scipy.special import softmax
 import atexit
 try:
@@ -635,38 +636,78 @@ class AdvancedRegimeEngine:
     _TRACEBACK_MAX_FRAMES: int = 12
     _TRACEBACK_MAX_CHARS: int = 3000
     _TRACEBACK_MAX_LINE_CHARS: int = 300
+    _HASH_NAMESPACE: str = "ADV_REGIME_REPLAY"
+
+    def _json_default(self, obj: Any):
+        """
+        Deterministic JSON fallback for unsupported objects.
+        Avoid memory addresses and process-local repr output.
+        """
+        if dataclasses.is_dataclass(obj):
+            return self._canonicalize(dataclasses.asdict(obj))
+        if isinstance(obj, (bytes, bytearray, memoryview)):
+            return {"__bytes__": bytes(obj).hex()}
+        if isinstance(obj, complex):
+            return {"__complex__": [format(obj.real, ".17g"), format(obj.imag, ".17g")]}
+        if isinstance(obj, (set, frozenset)):
+            return sorted(self._canonicalize(v) for v in obj)
+        if hasattr(obj, "__dict__"):
+            return self._canonicalize(vars(obj))
+        return {"__unsupported__": f"{type(obj).__module__}.{type(obj).__qualname__}"}
+
+    @staticmethod
+    def _canonical_sort_key(value: Any) -> str:
+        try:
+            return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        except Exception:
+            return f"{type(value).__name__}:{str(value)}"
 
     # ==========================================
     # STATE HASH (BITWISE DETERMINISM)
     # ==========================================
     def _canonicalize(self, obj: Any):
         if isinstance(obj, dict):
-            return {str(k): self._canonicalize(obj[k]) for k in sorted(obj)}
+            return {
+                str(k): self._canonicalize(obj[k])
+                for k in sorted(obj, key=lambda x: f"{type(x).__name__}:{str(x)}")
+            }
         if isinstance(obj, (list, tuple)):
             return [self._canonicalize(v) for v in obj]
+        if isinstance(obj, (set, frozenset)):
+            canonical_values = [self._canonicalize(v) for v in obj]
+            return sorted(canonical_values, key=self._canonical_sort_key)
         if isinstance(obj, np.ndarray):
             return [self._canonicalize(v) for v in obj.tolist()]
         if isinstance(obj, np.generic):
             return self._canonicalize(obj.item())
         if isinstance(obj, float):
-            # IEEE-stable deterministic representation
+            if not np.isfinite(obj):
+                if np.isnan(obj):
+                    return {"__float__": "NaN"}
+                return {"__float__": "Infinity" if obj > 0 else "-Infinity"}
             return format(obj, ".17g")
         return obj
 
     def _deep_sort(self, obj):
         if isinstance(obj, dict):
-            return {k: self._deep_sort(obj[k]) for k in sorted(obj)}
+            return {
+                k: self._deep_sort(obj[k])
+                for k in sorted(obj, key=lambda x: f"{type(x).__name__}:{str(x)}")
+            }
         if isinstance(obj, list):
             return [self._deep_sort(v) for v in obj]
         return obj
 
     def _normalize_rng_state(self, rng):
         try:
+            if rng is None:
+                return None
             state = rng.bit_generator.state
             return {
                 "bit_generator": type(rng.bit_generator).__name__,
-                "state": self._canonicalize(state.get("state")),
-                "inc": state.get("inc", None),
+                "bit_generator_module": type(rng.bit_generator).__module__,
+                "numpy_version": np.__version__,
+                "internal_state": self._canonicalize(state),
             }
         except Exception:
             return "UNSUPPORTED_RNG"
@@ -674,10 +715,26 @@ class AdvancedRegimeEngine:
     def _state_hash(self, state: Dict[str, Any]) -> str:
         try:
             canonical = self._deep_sort(self._canonicalize(state))
-            s = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
-            return hashlib.sha256(s.encode()).hexdigest()
+            wrapped_payload = {
+                "namespace": self._HASH_NAMESPACE,
+                "schema_version": str(state.get("schema_version", self._STATE_VERSION)),
+                "payload": canonical,
+            }
+            s = json.dumps(
+                wrapped_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                default=self._json_default,
+            )
+            return hashlib.sha256(f"{self._HASH_NAMESPACE}|{s}".encode()).hexdigest()
         except Exception:
-            return "NA"
+            if not getattr(self, "_is_replay", False):
+                try:
+                    LOGGER.error("State hash canonicalization failed", exc_info=True)
+                except Exception:
+                    pass
+            return hashlib.sha256(b"STATE_HASH_ERROR").hexdigest()
 
     # ==========================================
     # NEW: Safe fallback memory
@@ -826,6 +883,8 @@ class AdvancedRegimeEngine:
         self._obs_counter = 0
         self._OBS_SAMPLE_RATE = 5  # update metrics every N ticks
         self._tick_id = 0
+        self._strict_replay = True
+        self._fsm_error = None
         try:
             self._trace_engine = TracebackEngine() if TracebackEngine is not None else None
         except Exception:
@@ -864,6 +923,8 @@ class AdvancedRegimeEngine:
         """
         Randomized sampling removes deterministic blind spots (aliasing).
         """
+        if getattr(self, "_is_replay", False):
+            return False
         controller = getattr(self, "_obs_controller", None)
         if controller is not None:
             try:
@@ -896,6 +957,8 @@ class AdvancedRegimeEngine:
         severity: str,
         context: Dict[str, Any] | None = None,
     ) -> None:
+        if getattr(self, "_is_replay", False):
+            return
         controller = getattr(self, "_obs_controller", None)
         if controller is None:
             return
@@ -905,6 +968,8 @@ class AdvancedRegimeEngine:
             pass
 
     def _replay_record(self, event_type: str, payload: Dict[str, Any] | None = None) -> None:
+        if getattr(self, "_is_replay", False):
+            return
         replay_engine = getattr(self, "_replay_engine", None)
         if replay_engine is None:
             return
@@ -1012,6 +1077,8 @@ class AdvancedRegimeEngine:
         The event is always counted internally, but the Python warning is only
         emitted once per cooldown window for the same key.
         """
+        if getattr(self, "_is_replay", False):
+            return
         emit = False
         with self._warning_lock:
             now = time.monotonic()
@@ -1057,6 +1124,8 @@ class AdvancedRegimeEngine:
         Keep per-timeframe failures isolated while preserving enough traceback
         context to debug the exact failure site from the warning text.
         """
+        if getattr(self, "_is_replay", False):
+            return
         trace_engine = getattr(self, "_trace_engine", None)
         tb = None
         tb_struct = None
@@ -1417,6 +1486,7 @@ class AdvancedRegimeEngine:
     def reset_state(self) -> None:
         self.nhhmm_prior = np.ones(self.K, dtype=float) / self.K
         self.current_regime_idx = None
+        self._fsm_error = None
         self.last_signed_position_size = 0.0
         self._last_effective_trend_strength = 0.0
         self._last_edge_score = 0.0
@@ -1648,7 +1718,7 @@ class AdvancedRegimeEngine:
         start_time = time.perf_counter()
         self._tick_id = int(getattr(self, "_tick_id", 0)) + 1
         obs_sample = self._obs_should_sample()
-        if obs_sample:
+        if obs_sample and not getattr(self, "_is_replay", False):
             self._replay_record(
                 "update_start",
                 {
@@ -1722,7 +1792,7 @@ class AdvancedRegimeEngine:
                     switch_stability_ema=self._switch_stability_ema,
                     execution_side="flat",
                 )
-                if obs_sample:
+                if obs_sample and not getattr(self, "_is_replay", False):
                     self._replay_record("update_end", {"regime": "HALTED"})
                 return output
         
@@ -1822,7 +1892,7 @@ class AdvancedRegimeEngine:
                     )
 
             # OBS: record degradation reasons
-            if _PROM_AVAILABLE:
+            if _PROM_AVAILABLE and not getattr(self, "_is_replay", False):
                 for k, v in mtf_degradation_reasons.items():
                     if v > 0:
                         MTF_DEGRADATION.labels(self.engine_id, k).inc(v)
@@ -1985,7 +2055,7 @@ class AdvancedRegimeEngine:
             expected_vol_frozen = float(np.sqrt(np.dot(safe_prob, safe_var)))
             
             if _PROM_AVAILABLE:
-                if obs_sample:
+                if obs_sample and not getattr(self, "_is_replay", False):
                     ENGINE_FEED_STATUS.labels(self.engine_id, feed_status).inc()
                     ENGINE_HEALTH.labels(self.engine_id).set(0)
 
@@ -2018,7 +2088,7 @@ class AdvancedRegimeEngine:
                 include_signal_valid=True,
                 signal_valid=False,
             )
-            if obs_sample:
+            if obs_sample and not getattr(self, "_is_replay", False):
                 self._replay_record("update_end", {"regime": "UNKNOWN"})
             return output
 
@@ -2037,7 +2107,7 @@ class AdvancedRegimeEngine:
                 )
 
         # OBS: feed tracking
-        if _PROM_AVAILABLE and obs_sample:
+        if _PROM_AVAILABLE and obs_sample and not getattr(self, "_is_replay", False):
             ENGINE_FEED_STATUS.labels(self.engine_id, feed_status).inc()
 
         # Only compute if not already from MTF
@@ -2376,7 +2446,7 @@ class AdvancedRegimeEngine:
         ))
         self._last_edge_score = edge_score
         
-        if _PROM_AVAILABLE and obs_sample:
+        if _PROM_AVAILABLE and obs_sample and not getattr(self, "_is_replay", False):
             ENGINE_VOL.labels(self.engine_id).set(expected_vol)
             ENGINE_CONFIDENCE.labels(self.engine_id).set(regime_scores["confidence"])
             ENGINE_RISK.labels(self.engine_id).set(regime_scores["risk_level"])
@@ -2399,7 +2469,7 @@ class AdvancedRegimeEngine:
         if regime_scores["confidence"] < 0.4:
             position_size *= 0.25
 
-        if _PROM_AVAILABLE and obs_sample:
+        if _PROM_AVAILABLE and obs_sample and not getattr(self, "_is_replay", False):
             ENGINE_POSITION.labels(self.engine_id).set(position_size)
 
         # FIX #4: MORE RESPONSIVE SHOCK DETECTION
@@ -2427,7 +2497,7 @@ class AdvancedRegimeEngine:
 
         self._last_health = health
 
-        if _PROM_AVAILABLE and obs_sample:
+        if _PROM_AVAILABLE and obs_sample and not getattr(self, "_is_replay", False):
             ENGINE_HEALTH.labels(self.engine_id).set(1 if health == "OK" else 0)
 
         if is_toxic:
@@ -2527,7 +2597,7 @@ class AdvancedRegimeEngine:
         rticks = self.range_ticks_int
 
         # OBS: latency tracking
-        if _PROM_AVAILABLE and obs_sample:
+        if _PROM_AVAILABLE and obs_sample and not getattr(self, "_is_replay", False):
             elapsed = time.perf_counter() - start_time
             ENGINE_LATENCY.labels(self.engine_id).observe(elapsed)
 
@@ -2577,17 +2647,12 @@ class AdvancedRegimeEngine:
             include_signal_valid=True,
             signal_valid=True,
         )
-        if obs_sample:
+        if obs_sample and not getattr(self, "_is_replay", False):
             self._replay_record("update_end", {"regime": confirmed_regime})
-        if self._replay_engine is not None and (self._tick_id % 100 == 0):
+        if self._replay_engine is not None and (self._tick_id % 100 == 0) and not getattr(self, "_is_replay", False):
             try:
                 state_blob = self.serialize_state()
-                # include RNG for true determinism
                 normalized_rng = self._normalize_rng_state(self._rng)
-                combined_state = {
-                    "engine": state_blob,
-                    "rng": normalized_rng,
-                }
 
                 # HARD ASSERT: dual-state consistency
                 runtime_map = {
@@ -2608,9 +2673,8 @@ class AdvancedRegimeEngine:
                         except Exception:
                             pass
 
-                self._replay_engine.snapshot({
+                snapshot_payload = {
                     "engine_state": state_blob,
-                    "state_hash": self._state_hash(combined_state),
                     "regime": confirmed_regime,
                     "equity": self._equity,
                     "drawdown": self._drawdown,
@@ -2645,7 +2709,13 @@ class AdvancedRegimeEngine:
                     "_engine_rng_state": getattr(self._rng, "bit_generator", None).state if getattr(self, "_rng", None) is not None else None,
                     "_engine_rng_type": type(self._rng.bit_generator).__name__ if getattr(self, "_rng", None) is not None else None,
                     "schema_version": "2.3",
-                })
+                    "rng": normalized_rng,
+                }
+                hash_payload = dict(snapshot_payload)
+                hash_payload.pop("state_hash", None)
+                hash_payload.pop("_checksum", None)
+                snapshot_payload["state_hash"] = self._state_hash(hash_payload)
+                self._replay_engine.snapshot(snapshot_payload)
             except Exception:
                 pass
         return output
@@ -2675,17 +2745,16 @@ class AdvancedRegimeEngine:
             # ==========================================
             expected_hash = state.get("state_hash")
             if expected_hash:
-                combined = {
-                    "engine": state.get("engine_state", {}),
-                    "rng": self._normalize_rng_state(self._rng),
-                    "schema_version": state.get("schema_version"),
-                }
-                actual_hash = self._state_hash(combined)
+                hash_payload = dict(state)
+                hash_payload.pop("_checksum", None)
+                hash_payload.pop("state_hash", None)
+                actual_hash = self._state_hash(hash_payload)
                 if expected_hash != actual_hash:
                     LOGGER.error("SNAPSHOT CORRUPTION DETECTED (HASH)")
             expected_checksum = state.get("_checksum")
             if expected_checksum:
-                check_blob = {k: v for k, v in state.items() if k != "_checksum"}
+                check_blob = dict(state)
+                check_blob.pop("_checksum", None)
                 actual_checksum = self._state_hash(check_blob)
                 if expected_checksum != actual_checksum:
                     LOGGER.error("SNAPSHOT CHECKSUM MISMATCH")
@@ -2749,6 +2818,11 @@ class AdvancedRegimeEngine:
             self._last_edge_score = float(state.get("last_edge_score", self._last_edge_score))
             self._confirmed_regime = state.get("regime", self._confirmed_regime)
         except Exception:
+            if not getattr(self, "_is_replay", False):
+                try:
+                    LOGGER.error("Snapshot load failed", exc_info=True)
+                except Exception:
+                    pass
             # Never crash live engine during replay recovery.
             pass
 
@@ -2759,10 +2833,12 @@ class AdvancedRegimeEngine:
         self._circuit_breaker_active = True
         self._circuit_breaker_reason = reason
         self._healing_counter = 0
-        self._replay_record("circuit_breaker", {"reason": reason})
+        if not getattr(self, "_is_replay", False):
+            self._replay_record("circuit_breaker", {"reason": reason})
 
         try:
-            LOGGER.critical(f"[CIRCUIT BREAKER TRIGGERED] Reason={reason}")
+            if not getattr(self, "_is_replay", False):
+                LOGGER.critical(f"[CIRCUIT BREAKER TRIGGERED] Reason={reason}")
         except Exception:
             pass
 
@@ -2779,9 +2855,12 @@ class AdvancedRegimeEngine:
         self._healing_count = int(getattr(self, "_healing_count", 0)) + 1
         self._last_healing_error = error_code
         self._last_healing_context = dict(context or {})
+        if getattr(self, "_is_replay", False):
+            context = dict(context or {})
 
         try:
-            LOGGER.warning("[SELF HEALING INITIATED]")
+            if not getattr(self, "_is_replay", False):
+                LOGGER.warning("[SELF HEALING INITIATED]")
         except Exception:
             pass
 
@@ -2835,6 +2914,8 @@ class AdvancedRegimeEngine:
             self._circuit_breaker_reason = None
             self._healing_counter = 0
             self._last_healing_action = "RESET_FULL"
+            if not getattr(self, "_is_replay", False):
+                self._replay_record("self_heal", {"error": error_code, "action": "RESET_FULL"})
             return self._last_healing_action
 
         action = "NO_ACTION"
@@ -2884,13 +2965,14 @@ class AdvancedRegimeEngine:
             self._trigger_circuit_breaker(str(err_code))
             action = "CIRCUIT_BREAK"
 
-        self._replay_record(
-            "self_heal",
-            {
-                "error": error_code,
-                "action": action,
-            },
-        )
+        if not getattr(self, "_is_replay", False):
+            self._replay_record(
+                "self_heal",
+                {
+                    "error": error_code,
+                    "action": action,
+                },
+            )
 
         self._last_healing_action = action
         return action
