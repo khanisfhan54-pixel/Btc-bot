@@ -735,6 +735,10 @@ class AdvancedRegimeEngine:
         self._circuit_breaker_active = False
         self._circuit_breaker_reason = None
         self._healing_counter = 0
+        self._last_healing_action = "NONE"
+        self._last_healing_error = None
+        self._last_healing_context = {}
+        self._healing_count = 0
 
         # Warning de-duplication / rate limiting.
         self._warning_last_emitted: "OrderedDict[str, float]" = OrderedDict()
@@ -812,42 +816,106 @@ class AdvancedRegimeEngine:
     # ==========================================
     # 🔄 SELF HEALING SYSTEM
     # ==========================================
-    def _self_heal(self):
+    def _self_heal(self, error_code: str | None = None, context: Dict[str, Any] | None = None) -> str:
+        """
+        Best-effort healing.
+
+        - Called without an error_code: preserves existing circuit-breaker recovery behavior.
+        - Called with an error_code: applies category-aware recovery action.
+        """
+        self._healing_count = int(getattr(self, "_healing_count", 0)) + 1
+        self._last_healing_error = error_code
+        self._last_healing_context = dict(context or {})
+
         try:
             LOGGER.warning("[SELF HEALING INITIATED]")
         except Exception:
             pass
 
-        # Reset critical states
-        self.nhhmm_prior = np.ones(self.K) / self.K
-        self.garch_prob = np.ones(2) / 2.0
-        self._smoothed_garch_prob = self.garch_prob.copy()
+        # Legacy breaker recovery path: keep existing behavior intact.
+        if error_code is None:
+            # Reset critical states
+            self.nhhmm_prior = np.ones(self.K) / self.K
+            self.garch_prob = np.ones(2) / 2.0
+            self._smoothed_garch_prob = self.garch_prob.copy()
 
-        # Reset volatility memory
-        self.garch_var = self._stationary_garch_var()
-        self._last_valid_vol = self.garch.target_vol
+            # Reset volatility memory
+            self.garch_var = self._stationary_garch_var()
+            self._last_valid_vol = self.garch.target_vol
 
-        # Reset regime memory
-        self.current_regime_idx = None
-        self._confirmed_regime = None
-        self._prev_regime = None
-        self._regime_persistence = 0
-        self.last_signed_position_size = 0.0
+            # Reset regime memory
+            self.current_regime_idx = None
+            self._confirmed_regime = None
+            self._prev_regime = None
+            self._regime_persistence = 0
+            self.last_signed_position_size = 0.0
 
-        # Reset PnL / breaker memory
-        self._equity = 1.0
-        self._equity_peak = 1.0
-        self._drawdown = 0.0
-        self._loss_streak = 0
-        self._last_price = None
-        self._shock_memory = 0.0
-        self._return_ema = 0.0
-        self._abs_return_ema = 0.0
+            # Reset PnL / breaker memory
+            self._equity = 1.0
+            self._equity_peak = 1.0
+            self._drawdown = 0.0
+            self._loss_streak = 0
+            self._last_price = None
+            self._shock_memory = 0.0
+            self._return_ema = 0.0
+            self._abs_return_ema = 0.0
 
-        # Reset breaker
-        self._circuit_breaker_active = False
-        self._circuit_breaker_reason = None
-        self._healing_counter = 0
+            # Reset breaker
+            self._circuit_breaker_active = False
+            self._circuit_breaker_reason = None
+            self._healing_counter = 0
+            self._last_healing_action = "RESET_BREAKER"
+            return self._last_healing_action
+
+        action = "NO_ACTION"
+        try:
+            from errors import get_error
+            err = get_error(error_code)
+            category = getattr(err, "category", "")
+            err_code = getattr(err, "code", error_code)
+        except Exception:
+            category = ""
+            err_code = error_code
+
+        if category == "numerical":
+            self._last_valid_sjm_probs = np.ones(self.K, dtype=float) / self.K
+            smooth_len = int(np.size(self._smoothed_garch_prob))
+            if smooth_len <= 0:
+                self._smoothed_garch_prob = np.ones(2, dtype=float) / 2.0
+            else:
+                self._smoothed_garch_prob = np.ones(smooth_len, dtype=float) / smooth_len
+            self._shock_memory = 0.0
+            if getattr(self, "_regime_smoother", None) is not None:
+                self._regime_smoother.reset()
+            self._regime_state_probs = np.ones(4, dtype=float) / 4.0
+            action = "RESET_NUMERICAL"
+
+        elif category == "state":
+            self.reset_state()
+            action = "RESET_STATE"
+
+        elif category == "smoothing":
+            if getattr(self, "_regime_smoother", None) is not None:
+                self._regime_smoother.reset()
+            self._regime_state_probs = np.ones(4, dtype=float) / 4.0
+            self._confirmed_regime = None
+            self._confirmed_regime_idx = None
+            self._regime_persistence = 0
+            action = "RESET_SMOOTHER"
+
+        elif category == "classification":
+            self._regime_persistence = max(0, int(getattr(self, "_regime_persistence", 0)) - 1)
+            action = "SOFT_REBALANCE"
+
+        elif category == "input":
+            action = "SKIP_AND_DEGRADE"
+
+        elif category == "risk":
+            self._trigger_circuit_breaker(str(err_code))
+            action = "CIRCUIT_BREAK"
+
+        self._last_healing_action = action
+        return action
 
     def _shutdown_warning_worker(self) -> None:
         """
@@ -1268,6 +1336,10 @@ class AdvancedRegimeEngine:
             "equity_peak": float(self._equity_peak),
             "drawdown": float(self._drawdown),
             "loss_streak": int(self._loss_streak),
+            "healing_count": int(getattr(self, "_healing_count", 0)),
+            "last_healing_action": str(getattr(self, "_last_healing_action", "NONE")),
+            "last_healing_error": getattr(self, "_last_healing_error", None),
+            "last_healing_context": dict(getattr(self, "_last_healing_context", {})),
             "shock_memory": float(self._shock_memory),
             "return_ema": float(self._return_ema),
             "abs_return_ema": float(self._abs_return_ema),
@@ -1308,6 +1380,10 @@ class AdvancedRegimeEngine:
         self._shock_memory = 0.0
         self._return_ema = 0.0
         self._abs_return_ema = 0.0
+        self._last_healing_action = "NONE"
+        self._last_healing_error = None
+        self._last_healing_context = {}
+        self._healing_count = 0
 
     @_synchronized
     def load_state(self, state: Dict[str, Any]) -> None:
@@ -1475,6 +1551,11 @@ class AdvancedRegimeEngine:
         self._equity_peak = float(state.get("equity_peak", 1.0))
         self._drawdown = float(state.get("drawdown", 0.0))
         self._loss_streak = int(state.get("loss_streak", 0))
+        self._healing_count = int(state.get("healing_count", 0))
+        self._last_healing_action = str(state.get("last_healing_action", "NONE"))
+        self._last_healing_error = state.get("last_healing_error", None)
+        raw_healing_context = state.get("last_healing_context", {})
+        self._last_healing_context = dict(raw_healing_context) if isinstance(raw_healing_context, dict) else {}
         self._shock_memory = float(state.get("shock_memory", 0.0))
         if not np.isfinite(self._shock_memory):
             self._shock_memory = 0.0
@@ -1680,6 +1761,7 @@ class AdvancedRegimeEngine:
                     message="MTF fusion failed, falling back to SAFE base timeframe",
                     cooldown_s=30.0,
                 )
+                self._self_heal("E130", {"source": "mtf_total_failure"})
 
                 # 🔒 HARD VALIDATION BEFORE FALLBACK
                 try:
@@ -1785,6 +1867,16 @@ class AdvancedRegimeEngine:
                 self.nhhmm_prior = _normalize_prob_vector(safe_nhhmm_posterior)
 
         if is_dim_fail or n_corrupt > 0:
+            self._self_heal(
+                "E120" if is_dim_fail else "E200",
+                {
+                    "source": "update",
+                    "feed_status": (
+                        "DIMENSION_FAILURE"
+                        if is_dim_fail else f"DATA_FAILURE:{n_corrupt}_CORRUPT"
+                    ),
+                },
+            )
             self.last_signed_position_size = 0.0
             self._range_anchor_size = 0.0
             self.range_ticks *= np.exp(-self._DECAY_LAMBDA * decay_dt)
@@ -1892,6 +1984,7 @@ class AdvancedRegimeEngine:
                 message=f"SJM produced non-finite probs, using last valid state",
                 cooldown_s=10.0,
             )
+            self._self_heal("E200", {"source": "sjm_non_finite"})
 
             if self._last_valid_sjm_probs is not None:
                 sjm_probs = self._last_valid_sjm_probs.copy()
@@ -2402,39 +2495,103 @@ class AdvancedRegimeEngine:
     # ==========================================
     # 🔄 SELF HEALING SYSTEM
     # ==========================================
-    def _self_heal(self):
+    def _self_heal(self, error_code: str | None = None, context: Dict[str, Any] | None = None) -> str:
+        """
+        Best-effort healing.
+
+        - Called without an error_code: preserves existing circuit-breaker recovery behavior.
+        - Called with an error_code: applies category-aware recovery action.
+        """
+        self._healing_count = int(getattr(self, "_healing_count", 0)) + 1
+        self._last_healing_error = error_code
+        self._last_healing_context = dict(context or {})
+
         try:
             LOGGER.warning("[SELF HEALING INITIATED]")
         except Exception:
             pass
 
-        # Reset critical states
-        self.nhhmm_prior = np.ones(self.K) / self.K
-        self.garch_prob = np.ones(2) / 2.0
-        self._smoothed_garch_prob = self.garch_prob.copy()
+        # Legacy breaker recovery path: keep existing behavior intact.
+        if error_code is None:
+            # Reset critical states
+            self.nhhmm_prior = np.ones(self.K) / self.K
+            self.garch_prob = np.ones(2) / 2.0
+            self._smoothed_garch_prob = self.garch_prob.copy()
 
-        # Reset volatility memory
-        self.garch_var = self._stationary_garch_var()
-        self._last_valid_vol = self.garch.target_vol
+            # Reset volatility memory
+            self.garch_var = self._stationary_garch_var()
+            self._last_valid_vol = self.garch.target_vol
 
-        # Reset regime memory
-        self.current_regime_idx = None
-        self._confirmed_regime = None
-        self._prev_regime = None
-        self._regime_persistence = 0
-        self.last_signed_position_size = 0.0
+            # Reset regime memory
+            self.current_regime_idx = None
+            self._confirmed_regime = None
+            self._prev_regime = None
+            self._regime_persistence = 0
+            self.last_signed_position_size = 0.0
 
-        # Reset PnL / breaker memory
-        self._equity = 1.0
-        self._equity_peak = 1.0
-        self._drawdown = 0.0
-        self._loss_streak = 0
-        self._last_price = None
-        self._shock_memory = 0.0
-        self._return_ema = 0.0
-        self._abs_return_ema = 0.0
+            # Reset PnL / breaker memory
+            self._equity = 1.0
+            self._equity_peak = 1.0
+            self._drawdown = 0.0
+            self._loss_streak = 0
+            self._last_price = None
+            self._shock_memory = 0.0
+            self._return_ema = 0.0
+            self._abs_return_ema = 0.0
 
-        # Reset breaker
-        self._circuit_breaker_active = False
-        self._circuit_breaker_reason = None
-        self._healing_counter = 0
+            # Reset breaker
+            self._circuit_breaker_active = False
+            self._circuit_breaker_reason = None
+            self._healing_counter = 0
+            self._last_healing_action = "RESET_BREAKER"
+            return self._last_healing_action
+
+        action = "NO_ACTION"
+        try:
+            from errors import get_error
+            err = get_error(error_code)
+            category = getattr(err, "category", "")
+            err_code = getattr(err, "code", error_code)
+        except Exception:
+            category = ""
+            err_code = error_code
+
+        if category == "numerical":
+            self._last_valid_sjm_probs = np.ones(self.K, dtype=float) / self.K
+            smooth_len = int(np.size(self._smoothed_garch_prob))
+            if smooth_len <= 0:
+                self._smoothed_garch_prob = np.ones(2, dtype=float) / 2.0
+            else:
+                self._smoothed_garch_prob = np.ones(smooth_len, dtype=float) / smooth_len
+            self._shock_memory = 0.0
+            if getattr(self, "_regime_smoother", None) is not None:
+                self._regime_smoother.reset()
+            self._regime_state_probs = np.ones(4, dtype=float) / 4.0
+            action = "RESET_NUMERICAL"
+
+        elif category == "state":
+            self.reset_state()
+            action = "RESET_STATE"
+
+        elif category == "smoothing":
+            if getattr(self, "_regime_smoother", None) is not None:
+                self._regime_smoother.reset()
+            self._regime_state_probs = np.ones(4, dtype=float) / 4.0
+            self._confirmed_regime = None
+            self._confirmed_regime_idx = None
+            self._regime_persistence = 0
+            action = "RESET_SMOOTHER"
+
+        elif category == "classification":
+            self._regime_persistence = max(0, int(getattr(self, "_regime_persistence", 0)) - 1)
+            action = "SOFT_REBALANCE"
+
+        elif category == "input":
+            action = "SKIP_AND_DEGRADE"
+
+        elif category == "risk":
+            self._trigger_circuit_breaker(str(err_code))
+            action = "CIRCUIT_BREAK"
+
+        self._last_healing_action = action
+        return action
