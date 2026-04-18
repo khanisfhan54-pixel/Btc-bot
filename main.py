@@ -8,6 +8,7 @@ import os
 import json
 import time
 import math
+import numbers
 import random
 import logging
 import statistics
@@ -1661,22 +1662,81 @@ def run_analysis_cycle(
             predictor_signal = {}
 
     # FINAL GLOBAL SAFETY (never allow NaN/Inf leakage)
-    def _sanitize_dict(d: Dict[str, Any]) -> Dict[str, Any]:
+    def _sanitize_dict(d: Dict[str, Any], _depth: int = 0) -> Dict[str, Any]:
         out = {}
         for k, v in d.items():
-            if isinstance(v, float):
-                if not math.isfinite(v):
-                    out[k] = 0.0
-                else:
+            if _depth > 10:
+                if isinstance(v, bool):
                     out[k] = v
-            elif isinstance(v, dict):
-                out[k] = _sanitize_dict(v)  # recursive safety
-            else:
+                    continue
+                if isinstance(v, numbers.Number):
+                    out[k] = 0.0
+                elif isinstance(v, dict):
+                    out[k] = {}
+                elif isinstance(v, (list, tuple, set)):
+                    out[k] = []
+                else:
+                    out[k] = str(v)
+                continue
+
+            if isinstance(v, bool):
                 out[k] = v
+            elif isinstance(v, numbers.Number):
+                try:
+                    fv = float(v)
+                    out[k] = fv if math.isfinite(fv) else 0.0
+                except Exception:
+                    out[k] = 0.0
+            elif isinstance(v, dict):
+                out[k] = _sanitize_dict(v, _depth + 1)  # recursive safety
+            elif isinstance(v, set):
+                sanitized_set = []
+                for item in v:
+                    if isinstance(item, bool):
+                        sanitized_set.append(item)
+                    elif isinstance(item, numbers.Number):
+                        try:
+                            fi = float(item)
+                            sanitized_set.append(fi if math.isfinite(fi) else 0.0)
+                        except Exception:
+                            sanitized_set.append(0.0)
+                    elif isinstance(item, dict):
+                        sanitized_set.append(_sanitize_dict(item, _depth + 1))
+                    elif isinstance(item, (list, tuple, set)):
+                        sanitized_set.append(
+                            _sanitize_dict({"_": list(item)}, _depth + 1).get("_", [])
+                        )
+                    else:
+                        sanitized_set.append(str(item))
+                out[k] = sorted(sanitized_set, key=lambda x: repr(x))
+            elif isinstance(v, (list, tuple)):
+                sanitized_list = []
+                for item in list(v):
+                    if isinstance(item, bool):
+                        sanitized_list.append(item)
+                    elif isinstance(item, numbers.Number):
+                        try:
+                            fi = float(item)
+                            sanitized_list.append(fi if math.isfinite(fi) else 0.0)
+                        except Exception:
+                            sanitized_list.append(0.0)
+                    elif isinstance(item, dict):
+                        sanitized_list.append(_sanitize_dict(item, _depth + 1))
+                    elif isinstance(item, (list, tuple, set)):
+                        sanitized_list.append(
+                            _sanitize_dict({"_": list(item)}, _depth + 1).get("_", [])
+                        )
+                    else:
+                        sanitized_list.append(str(item))
+                out[k] = sanitized_list
+            else:
+                out[k] = str(v)
         return out
 
     if SIGNAL_PIPELINE_CONFIG.get("signal_only_mode", True):
         signal_value = str(predictor_signal.get("action", "HOLD")).upper()
+        if signal_value not in ("BUY", "SELL", "HOLD"):
+            signal_value = "HOLD"
         if signal_value == "BUY":
             signal_value = "LONG"
         elif signal_value == "SELL":
@@ -1707,6 +1767,7 @@ def run_analysis_cycle(
                 "confidence": _safe_float(regime_context.get("confidence", 0.0), 0.0),
                 "features": dict(regime_context.get("features", {}) or {}),
             }),
+            "metadata": {"execution_skipped": True},
             "status": "SIGNAL_ONLY",
         }
 

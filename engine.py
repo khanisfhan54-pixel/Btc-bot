@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import numbers
 import os
 import statistics
 import sys
@@ -5138,6 +5139,38 @@ class SniperExecutionEngine:
 
         # Normalize predictor output WITHOUT losing fields
         predictor_signal = dict(predictor_signal or {})
+        # GLOBAL SANITIZATION (recursive safety)
+        def _sanitize(v, _depth=0):
+            if _depth > 10:
+                if isinstance(v, bool):
+                    return v
+                if isinstance(v, numbers.Number):
+                    return 0.0
+                if isinstance(v, dict):
+                    return {}
+                if isinstance(v, (list, tuple, set)):
+                    return []
+                return str(v)
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, numbers.Number):
+                try:
+                    vf = float(v)
+                    return vf if math.isfinite(vf) else 0.0
+                except Exception:
+                    return 0.0
+            if isinstance(v, dict):
+                return {k: _sanitize(val, _depth + 1) for k, val in v.items()}
+            if isinstance(v, set):
+                items = [_sanitize(i, _depth + 1) for i in v]
+                return sorted(items, key=lambda x: repr(x))
+            if isinstance(v, (list, tuple)):
+                return [_sanitize(i, _depth + 1) for i in v]
+            if isinstance(v, (str, type(None))):
+                return v
+            return str(v)
+
+        predictor_signal = _sanitize(predictor_signal)
         # Strict action normalization
         raw_action = str(predictor_signal.get("action", "HOLD")).upper()
         if raw_action not in ("BUY", "SELL", "HOLD"):
@@ -5148,17 +5181,25 @@ class SniperExecutionEngine:
             0.0,
             1.0
         )
+        if not math.isfinite(predictor_signal["confidence"]):
+            predictor_signal["confidence"] = 0.0
 
         # Ensure schema completeness
-        predictor_signal.setdefault("prob_above", 0.5)
-        predictor_signal.setdefault("prob_below", 0.5)
-        predictor_signal.setdefault("micro_prob", 0.5)
-        predictor_signal.setdefault("macro_prob", 0.5)
-
-        # Full numeric sanitation (critical for production)
-        for k in ("prob_above", "prob_below", "micro_prob", "macro_prob"):
-            if k in predictor_signal:
-                predictor_signal[k] = _clamp(_safe_float(predictor_signal.get(k, 0.5), 0.5), 0.0, 1.0)
+        predictor_signal["prob_above"] = _clamp(
+            _safe_float(predictor_signal.get("prob_above", 0.5), 0.5), 0.0, 1.0
+        )
+        predictor_signal["prob_below"] = _clamp(
+            _safe_float(predictor_signal.get("prob_below", 0.5), 0.5), 0.0, 1.0
+        )
+        predictor_signal["micro_prob"] = _clamp(
+            _safe_float(predictor_signal.get("micro_prob", 0.5), 0.5), 0.0, 1.0
+        )
+        predictor_signal["macro_prob"] = _clamp(
+            _safe_float(predictor_signal.get("macro_prob", 0.5), 0.5), 0.0, 1.0
+        )
+        # NOTE:
+        # Probability normalization already handled in predictor (_safe_output)
+        # Avoid double normalization to prevent drift
         direction = "LONG" if market_state.get("bias", 0.0) > 0 else "SHORT" if market_state.get("bias", 0.0) < 0 else "WAIT"
         breakout_level = _safe_float(
             liquidity.get("nearest_above", {}).get("price", snapshot.price)
@@ -5192,8 +5233,14 @@ class SniperExecutionEngine:
         # Attach predictor influence (non-breaking enhancement)
         try:
             pred_conf = _clamp(_safe_float(predictor_signal.get("confidence", 0.0), 0.0), 0.0, 1.0)
+            if not math.isfinite(pred_conf):
+                pred_conf = 0.0
             pred_action = predictor_signal.get("action", "HOLD")
+            if pred_action not in ("BUY", "SELL", "HOLD"):
+                pred_action = "HOLD"
             signal_dir = getattr(signal, "bias", None) or getattr(signal, "direction", None) or "WAIT"
+            if signal_dir not in ("LONG", "SHORT", "WAIT"):
+                signal_dir = "WAIT"
             # Confidence gating: ignore weak predictor
             if pred_conf > 0.15:
                 base_conf = _clamp(
@@ -5204,20 +5251,24 @@ class SniperExecutionEngine:
                 # Extra NaN safety
                 if not math.isfinite(base_conf):
                     base_conf = 0.0
-                # Adaptive blending (stronger predictor influence when confident)
-                # Safer adaptive blending (less aggressive)
-                alpha = 0.2 + 0.3 * pred_conf  # scales 0.2 → 0.5
                 disagreement = (
                     (pred_action == "BUY" and signal_dir == "SHORT") or
                     (pred_action == "SELL" and signal_dir == "LONG")
                 )
 
+                # deterministic penalty handling
                 if disagreement:
                     pred_conf *= 0.5
                     base_conf *= 0.85  # symmetric penalty
 
+                if pred_action in ("BUY", "SELL") and pred_conf < 0.5:
+                    pred_conf *= 0.5
+
+                effective_pred_conf = _clamp(pred_conf, 0.0, 1.0)
+                alpha = 0.2 + 0.3 * effective_pred_conf
+
                 signal.confidence_score = _clamp(
-                    (1 - alpha) * base_conf + alpha * pred_conf,
+                    (1 - alpha) * base_conf + alpha * effective_pred_conf,
                     0.0,
                     1.0,
                 )
@@ -5250,6 +5301,7 @@ class SniperExecutionEngine:
 
         # In signal-only mode, DO NOT execute trades (but still generate signals)
         if signal_only_mode:
+            signal.metadata["execution_skipped"] = True
             return
 
     def evaluate(self) -> Optional[SniperSignal]:

@@ -494,14 +494,11 @@ class FeatureEngine:
             )
 
             if isinstance(vol_reg, str):
-                features.setdefault("volatility_regime", vol_reg)
+                features["volatility_regime"] = vol_reg
             if isinstance(liq_reg, str):
-                features.setdefault("liquidity_regime", liq_reg)
-            try:
-                if math.isfinite(trend):
-                    features.setdefault("trend_strength", trend)
-            except Exception:
-                pass
+                features["liquidity_regime"] = liq_reg
+            if isinstance(trend, (int, float)) and math.isfinite(trend):
+                features["trend_strength"] = trend
 
         features = self._sanitize_features(features)
         confidence = _clamp(confidence, 0.0, 1.0)
