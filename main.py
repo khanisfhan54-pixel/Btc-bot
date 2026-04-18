@@ -1758,7 +1758,7 @@ def run_analysis_cycle(
                 k: (
                     _clamp(_safe_float(v, 0.0), 0.0, 1.0)
                     if k in ("confidence", "prob_above", "prob_below", "micro_prob", "macro_prob")
-                    else (_safe_float(v, 0.0) if isinstance(v, (int, float)) else v)
+                    else (v if isinstance(v, bool) else (_safe_float(v, 0.0) if isinstance(v, (int, float)) else v))
                 )
                 for k, v in (predictor_signal or {}).items()
             }),
