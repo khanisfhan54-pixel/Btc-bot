@@ -8,6 +8,16 @@ __all__ = ["predict_sweep", "LiquiditySweepAlpha"]
 LOGIT_TEMP = 1.2
 EPS = 1e-12
 
+# STRICT SAFE FLOAT (guaranteed float output)
+def _safe_num(x: Any, default: float = 0.0) -> float:
+    try:
+        v = float(x)
+        if not math.isfinite(v):
+            return default
+        return v
+    except Exception:
+        return default
+
 def _safe_float(x: Any, default: float = 0.0) -> float:
     try:
         if x is None:
@@ -46,14 +56,32 @@ def _safe_logit(p: float, volatility: float = 0.0) -> float:
     Clamps bounds to prevent domain errors or inf scaling.
     """
     p = _clamp(p, 1e-6, 1.0 - 1e-6)
-    temp = 1.0 + min(1.0, max(0.0, _safe_float(volatility, 0.0)))
+    # HARD clamp volatility locally (do not trust caller)
+    vr = _safe_num(volatility, 0.0)
+    # HARD GLOBAL CAP (prevents scaling instability)
+    if vr > 5.0:
+        vr = 5.0
+    if not math.isfinite(vr):
+        vr = 0.0
+    temp = 1.0 + min(1.0, max(0.0, vr))
     return math.log(p / (1.0 - p)) / (temp * LOGIT_TEMP)
+
+def _safe_logit_guard(x: float, vr: float) -> float:
+    try:
+        val = _safe_logit(x, vr)
+        if not isinstance(val, (int, float)) or not math.isfinite(val):
+            return 0.0
+        return val
+    except Exception:
+        return 0.0
 
 def _standard_sigmoid(x: float) -> float:
     """
     Standard sigmoid evaluating logits to [0,1] probability space.
     Overflow-safe mapping for negative scalars.
     """
+    # HARD CLAMP INPUT (prevents overflow entirely)
+    x = _clamp(x, -60.0, 60.0)
     if x >= 0.0:
         return 1.0 / (1.0 + math.exp(-x))
     else:
@@ -68,14 +96,16 @@ def _safe_output(result: Dict[str, Any]) -> Dict[str, Any]:
     - Stable schema
     - Normalized probabilities
     """
-    prob_above = _clamp(_safe_float(result.get("prob_above"), 0.5), EPS, 1.0 - EPS)
-    prob_below = _clamp(_safe_float(result.get("prob_below"), 0.5), EPS, 1.0 - EPS)
+    # unified clamp (remove EPS distortion)
+    prob_above = _clamp(_safe_float(result.get("prob_above"), 0.5), 0.0, 1.0)
+    prob_below = _clamp(_safe_float(result.get("prob_below"), 0.5), 0.0, 1.0)
     total = prob_above + prob_below
-    if total <= EPS:
+    if not math.isfinite(total) or total <= 1e-12:
         prob_above, prob_below = 0.5, 0.5
     else:
-        prob_above /= total
-        prob_below /= total
+        inv_total = 1.0 / total
+        prob_above *= inv_total
+        prob_below *= inv_total
 
     action = str(result.get("action", "HOLD")).upper()
     if action not in {"BUY", "SELL", "HOLD"}:
@@ -83,6 +113,18 @@ def _safe_output(result: Dict[str, Any]) -> Dict[str, Any]:
 
     # ✅ FIX 5: Ensure strict numeric casting (institutional safety)
     confidence = float(_safe_float(result.get("confidence"), 0.0))
+
+    # Deterministic final normalization:
+    # one rounded value, then its complement.
+    prob_above = round(_clamp(prob_above, 0.0, 1.0), 4)
+    prob_below = round(1.0 - prob_above, 4)
+    if not math.isfinite(prob_above) or not math.isfinite(prob_below):
+        prob_above, prob_below = 0.5, 0.5
+    else:
+        total = prob_above + prob_below
+        if abs(total - 1.0) > 1e-9:
+            prob_above = round(_clamp(prob_above / total, 0.0, 1.0), 4)
+            prob_below = round(1.0 - prob_above, 4)
 
     return {
         "action": action,
@@ -94,8 +136,8 @@ def _safe_output(result: Dict[str, Any]) -> Dict[str, Any]:
         "logic": str(result.get("logic", "No immediate edge")),
         "micro_prob": round(_clamp(_safe_float(result.get("micro_prob"), 0.5), 0.0, 1.0), 4),
         "macro_prob": round(_clamp(_safe_float(result.get("macro_prob"), 0.5), 0.0, 1.0), 4),
-        "prob_above": round(prob_above, 4),
-        "prob_below": round(prob_below, 4),
+        "prob_above": prob_above,
+        "prob_below": prob_below,
     }
 
 def predict_sweep(
@@ -607,6 +649,12 @@ class LiquiditySweepAlpha:
             md = market_data if isinstance(market_data, dict) else {}  # local alias (latency)
 
             # Ensure internal state safety
+            # THREAD-SAFE LOCK INIT (atomic assignment)
+            if "_time_lock" not in self.__dict__:
+                try:
+                    self.__dict__["_time_lock"] = threading.Lock()
+                except Exception:
+                    self._time_lock = threading.Lock()
             if not hasattr(self, "last_trade_time"):
                 self.last_trade_time = 0.0
             price = _safe_float(md.get('price'))
@@ -630,15 +678,21 @@ class LiquiditySweepAlpha:
                 atr = 1e-8
             vol_ratio = atr / (price + 1e-8)
             vol_ratio = _clamp(vol_ratio, 1e-6, 10.0)  # prevent extreme scaling
+            # HARD safety
+            if not math.isfinite(vol_ratio):
+                vol_ratio = 1.0
     
             thresholds = self._normalize_thresholds(atr, price)
     
             # Calculate core signals and cache previous state for deltas
+            prev_trade_time = getattr(self, "last_trade_time", 0.0)
             prev_lambda = self.hawkes_lambda
-            prev_trade_time = self.last_trade_time
             ofi_z = self.calculate_ofi_zscore(md.get('prev_book', {}), md.get('curr_book', {}))
+            ofi_z = _clamp(_safe_float(ofi_z, 0.0), -10.0, 10.0)
             hawkes = self._update_hawkes(md.get('timestamp', 0.0), md.get('trades_count', 0))
+            hawkes = _clamp(_safe_float(hawkes, 0.0), -50.0, 50.0)
             hawkes_delta = hawkes - prev_lambda
+            hawkes_delta = _clamp(_safe_float(hawkes_delta, 0.0), -50.0, 50.0)
     
             regime = self._detect_regime(
                 md.get('ema_fast', price),
@@ -650,6 +704,10 @@ class LiquiditySweepAlpha:
     
             # Microstructure Predictor
             micro_prediction = self._predict_next_sweep(md, ofi_z, hawkes, hawkes_delta)
+            # HARD SANITIZATION
+            micro_prediction = micro_prediction or {}
+            micro_prediction["prob_up"] = _clamp(_safe_float(micro_prediction.get("prob_up", 0.5), 0.5), 0.0, 1.0)
+            micro_prediction["prob_down"] = _clamp(_safe_float(micro_prediction.get("prob_down", 0.5), 0.5), 0.0, 1.0)
     
             # Macro Structural Predictor
             macro_liquidity = md.get('macro_liquidity', {})
@@ -660,8 +718,15 @@ class LiquiditySweepAlpha:
                 macro_reliability = 0.5
             if not macro_market_state or not isinstance(macro_market_state, dict):
                 macro_reliability *= 0.7
+            # GLOBAL SAFETY (must exist before any usage)
+            if not isinstance(macro_reliability, (int, float)) or not math.isfinite(macro_reliability):
+                macro_reliability = 0.5
+            macro_reliability = _clamp(macro_reliability, 0.0, 1.0)
     
             macro_prediction = predict_sweep(macro_liquidity, macro_market_state, macro_volume_intel)
+            macro_prediction = macro_prediction or {}
+            macro_prediction["prob_above"] = _clamp(_safe_float(macro_prediction.get("prob_above", 0.5), 0.5), 0.0, 1.0)
+            macro_prediction["prob_below"] = _clamp(_safe_float(macro_prediction.get("prob_below", 0.5), 0.5), 0.0, 1.0)
     
             # Handle macro fallback gracefully if pools are undefined
             macro_prob_up = macro_prediction.get("prob_above", 0.5)
@@ -690,15 +755,33 @@ class LiquiditySweepAlpha:
                 sweep_side = "high"
     
             # Progressive Confidence Gating: Replaces hard threshold with continuous scaler based on deque warmth.
-            warmup_factor = min(1.0, len(self.ofi_history) / 20.0, len(self.hawkes_history) / 5.0)
+            # Stable warmup (monotonic + balanced)
+            ofi_warm   = _clamp(len(self.ofi_history) / 20.0, 0.0, 1.0)
+            hawkes_warm = _clamp(len(self.hawkes_history) / 5.0, 0.0, 1.0)
+            warmup_factor = 0.5 * ofi_warm + 0.5 * hawkes_warm
+            warmup_factor = _clamp(warmup_factor, 0.0, 1.0)
             # Use data-timestamp inter-tick gap (not wall clock) for backtest fidelity
-            prev_trade_time = _safe_float(md.get("prev_trade_time", 0.0))
-            raw_gap = prev_trade_time - self.last_trade_time if prev_trade_time > 0.0 else 0.0
-            data_gap = _clamp(raw_gap, 0.0, 60.0)  # prevent negative + extreme spikes
-            # Update internal clock safely
-            if prev_trade_time > 0.0:
-                self.last_trade_time = prev_trade_time
+            # ATOMIC TIME READ + UPDATE (fix race condition)
+            with self._time_lock:
+                current_time = _safe_float(md.get("timestamp", self.last_trade_time))
+                if not math.isfinite(current_time):
+                    current_time = self.last_trade_time
+
+                if current_time <= self.last_trade_time:
+                    current_time = self.last_trade_time
+
+                raw_gap = current_time - self.last_trade_time
+                if not math.isfinite(raw_gap):
+                    raw_gap = 0.0
+
+                data_gap = _clamp(raw_gap, 0.0, 60.0)
+                self.last_trade_time = current_time
+
             time_decay = math.exp(-0.01 * data_gap)
+            if not math.isfinite(time_decay):
+                time_decay = 1.0
+
+            time_decay = _clamp(time_decay, 0.0, 1.0)
             warmup_factor = _clamp(0.6 * warmup_factor + 0.4 * _clamp(time_decay, 0.3, 1.0), 0.0, 1.0)
     
             regime_name = str((regime_context or {}).get("regime", "")).upper()
@@ -719,8 +802,18 @@ class LiquiditySweepAlpha:
                 # If approaching 'high', we want prob_up. If 'low', we want prob_down.
                 pred_micro = micro_prediction["prob_up"] if sweep_side == "high" else micro_prediction["prob_down"]
                 pred_macro = macro_prob_up if sweep_side == "high" else macro_prob_down
+                # PRE-CALIBRATION SAFETY (critical)
+                if not math.isfinite(pred_micro):
+                    pred_micro = 0.5
+                if not math.isfinite(pred_macro):
+                    pred_macro = 0.5
                 pred_micro = _calibrate_prob(pred_micro)
                 pred_macro = _calibrate_prob(pred_macro)
+                # HARD safety after calibration (critical)
+                if not math.isfinite(pred_micro):
+                    pred_micro = 0.5
+                if not math.isfinite(pred_macro):
+                    pred_macro = 0.5
                 pred_macro = _clamp(0.5 + (pred_macro - 0.5) * macro_reliability, 0.0, 1.0)
                 micro_prob = _clamp(pred_micro, 0.0, 1.0)
                 macro_prob = _clamp(pred_macro, 0.0, 1.0)
@@ -728,6 +821,9 @@ class LiquiditySweepAlpha:
                 # Feature Decorrelation: Softly reduce macro weight when microstructure z-score is highly active
                 # This mathematically decorrelates structurally repetitive features mapped in both predictive sets.
                 hawkes_term = math.tanh(hawkes / 5.0)
+                # HARD SAFETY BEFORE NONLINEAR TRANSFORM
+                if not math.isfinite(hawkes_term):
+                    hawkes_term = 0.0
 
                 # Clamp reliability
                 macro_reliability = _clamp(_safe_float(macro_reliability, 0.5), 0.0, 1.0)
@@ -738,14 +834,31 @@ class LiquiditySweepAlpha:
                     1.0,
                 )
                 macro_weight = max(0.15 * macro_reliability, 0.4 * (1.0 - corr_proxy) * macro_reliability)
+                # STRICT WEIGHT NORMALIZATION (prevent negative / overflow)
+                macro_weight = _clamp(macro_weight, 0.0, 1.0)
                 micro_weight = 1.0 - macro_weight
+                if micro_weight < 0.0:
+                    micro_weight = 0.0
+                    macro_weight = 1.0
     
                 # Logit Ensemble: Ensures proper probabilistic aggregation rather than linear weighting.
                 pred_micro = _clamp(pred_micro, 1e-6, 1.0 - 1e-6)
                 pred_macro = _clamp(pred_macro, 1e-6, 1.0 - 1e-6)
-                final_logit = (micro_weight * _safe_logit(pred_micro, vol_ratio)) + (macro_weight * _safe_logit(pred_macro, vol_ratio))
+                lm = _safe_logit_guard(pred_micro, min(vol_ratio, 5.0))
+                la = _safe_logit_guard(pred_macro, min(vol_ratio, 5.0))
+                final_logit = (micro_weight * lm) + (macro_weight * la)
+                # HARD SAFETY (missing)
+                if not math.isfinite(final_logit):
+                    final_logit = 0.0
                 combined_prob = _standard_sigmoid(final_logit)
-                min_history_factor = min(1.0, len(self.ofi_history) / 20.0)
+                if not math.isfinite(combined_prob):
+                    combined_prob = 0.5
+                combined_prob = _clamp(combined_prob, 0.0, 1.0)
+                # Align with warmup logic (balanced + stable)
+                ofi_hist   = _clamp(len(self.ofi_history) / 20.0, 0.0, 1.0)
+                hawkes_hist = _clamp(len(self.hawkes_history) / 5.0, 0.0, 1.0)
+                min_history_factor = 0.5 * ofi_hist + 0.5 * hawkes_hist
+                min_history_factor = _clamp(min_history_factor, 0.0, 1.0)
     
                 # Execution threshold dynamically tightens when the system is cold
                 # Absorbs both warmup and history gating without destroying probability calibration
@@ -761,8 +874,6 @@ class LiquiditySweepAlpha:
                     logic_path = "Buildup detected, awaiting breach or stronger confirmation"
     
             elif state == "ACTIVE_SWEEP":
-                # Ensure is_fake exists (critical safety)
-                is_fake = bool(md.get("is_fake", False))
                 if warmup_factor < 0.5:
                     action = "HOLD"
                     confidence = 0.0
@@ -824,13 +935,26 @@ class LiquiditySweepAlpha:
                 # If sweeping 'high', we want high prob_down. If 'low', we want prob_up.
                 pred_micro = micro_prediction["prob_down"] if sweep_side == "high" else micro_prediction["prob_up"]
                 pred_macro = macro_prob_down if sweep_side == "high" else macro_prob_up
+                # PRE-CALIBRATION SAFETY (missing critical fix)
+                if not math.isfinite(pred_micro):
+                    pred_micro = 0.5
+                if not math.isfinite(pred_macro):
+                    pred_macro = 0.5
                 pred_micro = _calibrate_prob(pred_micro)
                 pred_macro = _calibrate_prob(pred_macro)
+                # POST-CALIBRATION SAFETY
+                if not math.isfinite(pred_micro):
+                    pred_micro = 0.5
+                if not math.isfinite(pred_macro):
+                    pred_macro = 0.5
                 pred_macro = _clamp(0.5 + (pred_macro - 0.5) * macro_reliability, 0.0, 1.0)
                 micro_prob = _clamp(pred_micro, 0.0, 1.0)
                 macro_prob = _clamp(pred_macro, 0.0, 1.0)
     
                 hawkes_term = math.tanh(hawkes / 5.0)
+                # HARD SAFETY BEFORE NONLINEAR TRANSFORM (missing)
+                if not math.isfinite(hawkes_term):
+                    hawkes_term = 0.0
                 corr_proxy = _clamp(
                     0.6 * abs(ofi_z) / 3.0 +
                     0.4 * hawkes_term,
@@ -838,12 +962,21 @@ class LiquiditySweepAlpha:
                     1.0,
                 )
                 macro_weight = max(0.15 * macro_reliability, 0.4 * (1.0 - corr_proxy) * macro_reliability)
+                # STRICT WEIGHT NORMALIZATION (ACTIVE_SWEEP FIX)
+                macro_weight = _clamp(macro_weight, 0.0, 1.0)
                 micro_weight = 1.0 - macro_weight
+                if micro_weight < 0.0:
+                    micro_weight = 0.0
+                    macro_weight = 1.0
     
                 # Predictors subset ensemble
                 pred_micro = _clamp(pred_micro, 1e-6, 1.0 - 1e-6)
                 pred_macro = _clamp(pred_macro, 1e-6, 1.0 - 1e-6)
-                pred_logit = (micro_weight * _safe_logit(pred_micro, vol_ratio)) + (macro_weight * _safe_logit(pred_macro, vol_ratio))
+                lm = _safe_logit_guard(pred_micro, min(vol_ratio, 5.0))
+                la = _safe_logit_guard(pred_macro, min(vol_ratio, 5.0))
+                pred_logit = (micro_weight * lm) + (macro_weight * la)
+                if not math.isfinite(pred_logit):
+                    pred_logit = 0.0
 
                 # Logit Ensemble: Full statistical mapping across all primary system variables.
                 # Single clamp (avoid distortion)
@@ -852,12 +985,19 @@ class LiquiditySweepAlpha:
                 liq_prob       = _clamp(liq_prob,       1e-6, 1.0 - 1e-6)
 
                 ensemble_logit = (
-                    0.40 * _safe_logit(reaction_score, vol_ratio) +
-                    0.25 * _safe_logit(ml_prob, vol_ratio) +
-                    0.15 * _safe_logit(liq_prob, vol_ratio) + 
+                    # CONSISTENT LOGIT SCALING (bounded vol_ratio)
+                    0.40 * _safe_logit_guard(reaction_score, min(vol_ratio, 5.0)) +
+                    0.25 * _safe_logit_guard(ml_prob,        min(vol_ratio, 5.0)) +
+                    0.15 * _safe_logit_guard(liq_prob,       min(vol_ratio, 5.0)) +
                     0.20 * pred_logit
                 )
+                # HARD SAFETY BEFORE SIGMOID
+                if not math.isfinite(ensemble_logit):
+                    ensemble_logit = 0.0
                 ensemble_score = _standard_sigmoid(ensemble_logit)
+                if not math.isfinite(ensemble_score):
+                    ensemble_score = 0.5
+                ensemble_score = _clamp(ensemble_score, 0.0, 1.0)
     
                 active_sweep_threshold = _clamp(0.65 + threshold_offset, 0.5, 0.9)
                 if ensemble_score >= active_sweep_threshold and is_fake:
@@ -875,6 +1015,10 @@ class LiquiditySweepAlpha:
                 confidence *= 0.9
             if "DOWNTREND" in regime_label and action == "BUY":
                 confidence *= 0.9
+            # FINAL CONFIDENCE SAFETY (prevent drift)
+            if not math.isfinite(confidence):
+                confidence = 0.0
+            confidence = _clamp(confidence, 0.0, 1.0)
     
             # unify probability schema for engine compatibility
             if micro_prob is None:
@@ -890,11 +1034,31 @@ class LiquiditySweepAlpha:
                     final_prob_up = 1.0 - micro_prob
                 else:
                     final_prob_up = 0.5
-            final_prob_up = _clamp(_safe_float(final_prob_up, 0.5), 0.0, 1.0)
-            final_prob_down = 1.0 - final_prob_up
+            # sanitize both first
+            final_prob_up = _safe_num(final_prob_up, 0.5)
+            final_prob_down = _safe_num(1.0 - final_prob_up, 0.5)
 
-            # Final safety clamp
-            confidence = _clamp(_safe_float(confidence, 0.0), 0.0, 1.0)
+            if not math.isfinite(final_prob_up):
+                final_prob_up = 0.5
+            if not math.isfinite(final_prob_down):
+                final_prob_down = 0.5
+
+            # normalize to ensure sum = 1 (strict probabilistic consistency)
+            total = final_prob_up + final_prob_down
+            if not math.isfinite(total) or total < 1e-12:
+                final_prob_up = 0.5
+                final_prob_down = 0.5
+            else:
+                inv_total = 1.0 / total
+                final_prob_up *= inv_total
+                final_prob_down *= inv_total
+
+            final_prob_up = _clamp(final_prob_up, 0.0, 1.0)
+            final_prob_down = _clamp(final_prob_down, 0.0, 1.0)
+
+            # Final output hardening (never trust upstream)
+            micro_prob = _clamp(_safe_float(micro_prob if micro_prob is not None else 0.5, 0.5), 0.0, 1.0)
+            macro_prob = _clamp(_safe_float(macro_prob if macro_prob is not None else 0.5, 0.5), 0.0, 1.0)
 
             return _safe_output({
                 "action": action,
@@ -904,8 +1068,8 @@ class LiquiditySweepAlpha:
                 "ofi_zscore": ofi_z,
                 "hawkes_intensity": hawkes,
                 "logic": logic_path,
-                "micro_prob": micro_prob if micro_prob is not None else 0.5,
-                "macro_prob": macro_prob if macro_prob is not None else 0.5,
+                "micro_prob": micro_prob,
+                "macro_prob": macro_prob,
                 "prob_above": final_prob_up,
                 "prob_below": final_prob_down,
             })
@@ -932,14 +1096,5 @@ class LiquiditySweepAlpha:
 
         out = self.get_signal(data, regime_context=regime_context) or {}
 
-        # Ensure stable schema (production safety)
-        return {
-            "action": str(out.get("action", "HOLD")).upper(),
-            "confidence": _clamp(_safe_float(out.get("confidence", 0.0), 0.0), 0.0, 1.0),
-            "prob_above": _clamp(_safe_float(out.get("prob_above", 0.5), 0.5), 0.0, 1.0),
-            "prob_below": _clamp(_safe_float(out.get("prob_below", 0.5), 0.5), 0.0, 1.0),
-            "micro_prob": _clamp(_safe_float(out.get("micro_prob", 0.5), 0.5), 0.0, 1.0),
-            "macro_prob": _clamp(_safe_float(out.get("macro_prob", 0.5), 0.5), 0.0, 1.0),
-            "state": str(out.get("state", "UNKNOWN")),
-            "logic": str(out.get("logic", "")),
-        }
+        # HARD GUARANTEE (never bypass safety contract)
+        return _safe_output(out)
