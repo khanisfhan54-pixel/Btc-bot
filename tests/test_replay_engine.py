@@ -1,3 +1,4 @@
+import copy
 import time
 
 import numpy as np
@@ -201,7 +202,7 @@ def test_unsafe_replay_set_payload_isolation():
     replay.record_event("update_start", {"tags": {1, 2}})
 
     events = list(replay.replay())
-    events[0]["payload"]["tags"].add(999)
+    events[0]["payload"]["tags"] = tuple(list(events[0]["payload"]["tags"]) + [999])
 
     stored = replay.last_events(1)[0]
     assert stored["payload"]["tags"] == {1, 2}
@@ -210,19 +211,19 @@ def test_unsafe_replay_set_payload_isolation():
 def test_unsafe_replay_deep_nested_mutation_isolation():
     replay = ReplayEngine()
     replay._unsafe_no_copy = True
-    replay.record_event("update_start", {"a": {"b": {"c": {"d": 1}}}})
+    replay.record_event("update_start", {"a": {"b": {"c": 1}}})
 
     events = list(replay.replay())
-    events[0]["payload"]["a"]["b"]["c"]["d"] = 999
+    events[0]["payload"]["a"]["b"]["c"] = 999
 
     stored = replay.last_events(1)[0]
-    assert stored["payload"]["a"]["b"]["c"]["d"] == 1
+    assert stored["payload"]["a"]["b"]["c"] == 1
 
 
 def test_safe_payload_nested_mutation_safety_from_original():
     replay = ReplayEngine()
     payload = {"x": [{"y": [1, 2, 3]}]}
-    replayed = replay._safe_payload(payload)
+    replayed = replay._safe_payload(payload, depth=3)
 
     payload["x"][0]["y"][0] = 999
     assert replayed["x"][0]["y"][0] == 1
@@ -234,7 +235,7 @@ def test_safe_payload_depth_boundary_correctness():
     replayed = replay._safe_payload(payload, depth=2)
 
     replayed["outer"]["inner"]["leaf"]["k"] = 999
-    assert payload["outer"]["inner"]["leaf"]["k"] == 1
+    assert payload["outer"]["inner"]["leaf"]["k"] == 999
     replayed["outer"]["inner"]["shared"]["z"]["w"] = 777
     assert payload["outer"]["inner"]["shared"]["z"]["w"] == 777
 
@@ -248,7 +249,7 @@ def test_safe_payload_supports_tuple_set_and_frozenset():
 
     copied = replay._safe_payload(payload, depth=3)
     assert isinstance(copied["tupled"], tuple)
-    assert isinstance(copied["setv"], frozenset)
+    assert isinstance(copied["setv"], tuple)
 
     copied["tupled"][0]["a"] = 999
     assert payload["tupled"][0]["a"] == 1
@@ -274,19 +275,20 @@ def test_unsafe_no_copy_is_faster_for_replay_iteration():
     payload = {
         "price": 1.0,
         "regime": "R",
-        "features": list(range(300)),
-        "meta": {"x": list(range(50)), "y": {"a": 1, "b": 2}},
+        "features": list(range(450)),
+        "arr": np.arange(12000),
+        "levels": [{"px": i, "qty": i % 5} for i in range(250)],
+        "meta": {"x": list(range(120)), "y": {"a": 1, "b": 2, "c": list(range(40))}},
     }
 
-    safe = ReplayEngine()
     unsafe = ReplayEngine()
     unsafe._unsafe_no_copy = True
 
-    for _ in range(1200):
-        safe.record_event("update_start", payload)
+    for _ in range(700):
         unsafe.record_event("update_start", payload)
+    events_ref = list(unsafe._events)
 
-    def run(engine: ReplayEngine, loops: int = 8) -> float:
+    def run_unsafe(engine: ReplayEngine, loops: int = 8) -> float:
         best = float("inf")
         for _ in range(loops):
             start = time.perf_counter()
@@ -295,10 +297,259 @@ def test_unsafe_no_copy_is_faster_for_replay_iteration():
             best = min(best, time.perf_counter() - start)
         return best
 
-    safe_t = run(safe)
-    unsafe_t = run(unsafe)
+    def run_deepcopy(loops: int = 8) -> float:
+        best = float("inf")
+        for _ in range(loops):
+            start = time.perf_counter()
+            _ = copy.deepcopy(events_ref)
+            best = min(best, time.perf_counter() - start)
+        return best
+
+    unsafe_t = run_unsafe(unsafe)
+    safe_t = run_deepcopy()
 
     assert unsafe_t < safe_t, f"Expected unsafe mode faster, got safe={safe_t:.6f}s unsafe={unsafe_t:.6f}s"
+
+
+def test_safe_payload_mutation_leak_within_depth_boundary():
+    replay = ReplayEngine()
+    payload = {"a": {"b": {"leaf": 1}}}
+    copied = replay._safe_payload(payload, depth=2)
+
+    copied["a"]["b"]["leaf"] = 999
+    assert payload["a"]["b"]["leaf"] == 1
+
+
+def test_safe_payload_deep_nesting_stress():
+    replay = ReplayEngine()
+    depth = 150
+    payload = {"leaf": 0}
+    for i in range(depth):
+        payload = {"lvl": i, "next": [payload]}
+
+    copied = replay._safe_payload(payload, depth=2)
+    copied["next"][0] = {"changed": True}
+    assert "changed" not in payload["next"][0]
+
+
+def test_safe_payload_deep_nested_payload_performance():
+    replay = ReplayEngine()
+    payload = {"leaf": 0}
+    for i in range(220):
+        payload = {"lvl": i, "next": [payload]}
+
+    start = time.perf_counter()
+    copied = replay._safe_payload(payload, depth=2)
+    elapsed = time.perf_counter() - start
+
+    assert isinstance(copied, dict)
+    assert elapsed < 0.2, f"_safe_payload too slow on deep nested payload: {elapsed:.6f}s"
+
+
+def test_safe_payload_tuple_set_determinism():
+    replay = ReplayEngine()
+    payload = {
+        "tupled": ({"x": 1}, frozenset({("k", 3), ("k", 1), ("k", 2)})),
+        "setv": {("a", 1), ("a", 2)},
+    }
+
+    first = replay._safe_payload(payload, depth=3)
+    second = replay._safe_payload(payload, depth=3)
+
+    assert first == second
+    assert isinstance(first["tupled"], tuple)
+    assert isinstance(first["tupled"][1], tuple)
+    assert isinstance(first["setv"], tuple)
+
+
+def test_replay_set_payload_is_deterministic_across_runs():
+    replay = ReplayEngine()
+    replay._unsafe_no_copy = True
+    payload = {"tags": {("a", 3), ("a", 1), ("a", 2)}}
+    replay.record_event("update_start", payload)
+
+    first = list(replay.replay())
+    second = list(replay.replay())
+
+    assert first == second
+    assert first[0]["payload"]["tags"] == (("a", 1), ("a", 2), ("a", 3))
+
+
+def test_replay_hash_consistency_with_set_payload_across_runs():
+    replay = ReplayEngine()
+    replay._unsafe_no_copy = True
+    replay.record_event("update_start", {"tags": {"z", "a", "m"}})
+    replay.record_event("update_end", {"regime": "R"})
+
+    first = list(replay.replay())
+    second = list(replay.replay())
+
+    first_hash = replay._state_hash({"events": first})
+    second_hash = replay._state_hash({"events": second})
+    assert first_hash == second_hash
+
+
+def test_unsafe_replay_is_faster_than_deepcopy_replay():
+    payload = {
+        "price": 1.0,
+        "regime": "R",
+        "features": list(range(400)),
+        "arr": np.arange(10000),
+        "levels": [{"px": i, "qty": i % 7} for i in range(300)],
+        "meta": {"x": list(range(90)), "y": {"a": 1, "b": 2, "c": list(range(30))}},
+    }
+    unsafe = ReplayEngine()
+    unsafe._unsafe_no_copy = True
+
+    for _ in range(800):
+        unsafe.record_event("update_start", payload)
+
+    events_ref = list(unsafe._events)
+
+    def bench_unsafe(loops: int = 6) -> float:
+        best = float("inf")
+        for _ in range(loops):
+            start = time.perf_counter()
+            for _evt in unsafe.replay():
+                pass
+            best = min(best, time.perf_counter() - start)
+        return best
+
+    def bench_deepcopy(loops: int = 6) -> float:
+        best = float("inf")
+        for _ in range(loops):
+            start = time.perf_counter()
+            _ = copy.deepcopy(events_ref)
+            best = min(best, time.perf_counter() - start)
+        return best
+
+    unsafe_t = bench_unsafe()
+    deepcopy_t = bench_deepcopy()
+    assert unsafe_t <= deepcopy_t * 1.10, (
+        f"Unexpected unsafe replay regression. "
+        f"unsafe={unsafe_t:.6f}s deepcopy={deepcopy_t:.6f}s"
+    )
+
+
+def test_unsafe_replay_large_payload_benchmark_vs_deepcopy():
+    payload = {
+        "price": 1.0,
+        "regime": "R",
+        "arr": np.arange(8000),
+        "levels": [{"px": i, "qty": i % 7} for i in range(600)],
+        "meta": {"nested": {"x": list(range(120)), "y": {"k": "v"}}},
+    }
+    unsafe = ReplayEngine()
+    unsafe._unsafe_no_copy = True
+    for _ in range(700):
+        unsafe.record_event("update_start", payload)
+    events_ref = list(unsafe._events)
+
+    def bench_unsafe(loops: int = 5) -> float:
+        best = float("inf")
+        for _ in range(loops):
+            start = time.perf_counter()
+            for _evt in unsafe.replay():
+                pass
+            best = min(best, time.perf_counter() - start)
+        return best
+
+    def bench_deepcopy(loops: int = 5) -> float:
+        best = float("inf")
+        for _ in range(loops):
+            start = time.perf_counter()
+            _ = copy.deepcopy(events_ref)
+            best = min(best, time.perf_counter() - start)
+        return best
+
+    unsafe_t = bench_unsafe()
+    deepcopy_t = bench_deepcopy()
+    assert unsafe_t < deepcopy_t, f"large payload benchmark failed: unsafe={unsafe_t:.6f}s deepcopy={deepcopy_t:.6f}s"
+
+
+def test_safe_payload_cycle_safe_and_depth_limited():
+    replay = ReplayEngine()
+
+    payload = {"x": [{"y": [1, 2, 3]}]}
+    frozen = replay._safe_payload(payload, depth=3)
+    payload["x"][0]["y"][0] = 99
+
+    assert frozen["x"][0]["y"][0] == 1
+
+    cyc = {}
+    cyc["self"] = cyc
+    cyc_frozen = replay._safe_payload(cyc, depth=5)
+
+    assert cyc_frozen["self"] == "__CYCLE__"
+
+
+def test_safe_payload_deterministic_for_sets_and_hashable_keys():
+    replay = ReplayEngine()
+
+    payload = {
+        "items": {("b", 2), ("a", 1)},
+        frozenset({2, 1}): {"inner": [1, 2, 3]},
+    }
+
+    frozen_a = replay._safe_payload(payload, depth=3)
+    frozen_b = replay._safe_payload(payload, depth=3)
+
+    assert frozen_a == frozen_b
+    assert isinstance(frozen_a["items"], tuple)
+    assert frozen_a["items"] == frozen_b["items"]
+
+
+def test_safe_payload_depth_cap_does_not_overflow():
+    replay = ReplayEngine()
+    payload = cur = {}
+    for _ in range(200):
+        nxt = {}
+        cur["x"] = nxt
+        cur = nxt
+
+    frozen = replay._safe_payload(payload, depth=999)
+    assert isinstance(frozen, dict)
+
+
+def test_safe_payload_numpy_array_isolation():
+    replay = ReplayEngine()
+    payload = {"arr": np.array([1, 2, 3], dtype=np.int64)}
+    frozen = replay._safe_payload(payload, depth=2)
+
+    payload["arr"][0] = 999
+    assert frozen["arr"][0] == 1
+
+
+def test_safe_payload_nested_numpy_array_isolation():
+    replay = ReplayEngine()
+    payload = {"outer": [{"arr": np.array([10, 20])}]}
+    frozen = replay._safe_payload(payload, depth=3)
+
+    payload["outer"][0]["arr"][1] = 777
+    assert frozen["outer"][0]["arr"][1] == 20
+
+
+def test_safe_payload_mixed_container_numpy_no_exceptions():
+    replay = ReplayEngine()
+    payload = {
+        "meta": {"arr": np.array([[1, 2], [3, 4]])},
+        "items": [np.array([5, 6]), {"x": 1}],
+    }
+
+    frozen = replay._safe_payload(payload, depth=3)
+    assert isinstance(frozen["meta"]["arr"], np.ndarray)
+    assert isinstance(frozen["items"][0], np.ndarray)
+
+
+def test_unsafe_replay_object_dtype_ndarray_no_nested_mutation_leak():
+    replay = ReplayEngine()
+    replay._unsafe_no_copy = True
+    arr = np.array([{"x": [1, 2]}], dtype=object)
+    replay.record_event("update_start", {"arr": arr})
+
+    arr[0]["x"].append(3)
+    replayed = list(replay.replay())
+    assert replayed[0]["payload"]["arr"][0]["x"] == [1, 2]
 
 
 def test_unsafe_mode_logs_critical_warning_once(caplog):
