@@ -38,6 +38,8 @@ class ReplayEngine:
         self._strict_replay = True
         self._unsafe_no_copy = False
         self._unsafe_warning_emitted = False
+        self._normalize_floats = True
+        self._normalize_floats_strict_only = True
         self._HASH_NAMESPACE = "ADV_REGIME_REPLAY"
 
     # ==========================================
@@ -55,6 +57,23 @@ class ReplayEngine:
                 out = np.empty(flat.shape, dtype=object)
                 for i in range(len(flat)):
                     out[i] = self._freeze(flat[i], depth, seen)
+                return out.reshape(value.shape)
+            if (
+                self._normalize_floats
+                and np.issubdtype(value.dtype, np.floating)
+                and (not self._normalize_floats_strict_only or self._strict_replay)
+            ):
+                flat = value.ravel()
+                out = np.empty(flat.shape, dtype=object)
+                for i in range(len(flat)):
+                    v = flat[i]
+                    if not np.isfinite(v):
+                        if np.isnan(v):
+                            out[i] = {"__float__": "NaN"}
+                        else:
+                            out[i] = {"__float__": "Infinity" if v > 0 else "-Infinity"}
+                    else:
+                        out[i] = format(v, ".17g")
                 return out.reshape(value.shape)
             return np.array(value, copy=True)
         except Exception:
@@ -93,7 +112,11 @@ class ReplayEngine:
         container_types = (dict, list, tuple, set, frozenset, np.ndarray)
         if isinstance(key, container_types):
             frozen_key = self._freeze(key, depth, seen)
-            return "__KEY__|" + type(frozen_key).__name__ + "|" + self._canonical_key_string(frozen_key)
+            try:
+                hash(frozen_key)
+                return frozen_key
+            except Exception:
+                return "__KEY__|" + type(frozen_key).__name__ + "|" + self._canonical_key_string(frozen_key)
         return key
 
     def _freeze_set_like(self, value, depth: int, seen: set[int]):
@@ -164,10 +187,10 @@ class ReplayEngine:
             finally:
                 seen.discard(obj_id)
 
-        try:
-            return self._canonical_key_string(value)
-        except Exception:
-            return self._canonical_key_string(value)
+        return {
+            "__type__": f"{type(value).__module__}.{type(value).__qualname__}",
+            "__repr__": repr(value),
+        }
 
     def _freeze(self, value, depth: int, seen: set[int]):
         container_types = (dict, list, tuple, set, frozenset, np.ndarray)
