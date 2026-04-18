@@ -286,6 +286,7 @@ class FeatureEngine:
         self,
         snapshot: Dict[str, Any],
         trades: Optional[List[Dict[str, Any]]] = None,
+        regime_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Process one market snapshot.
@@ -308,7 +309,7 @@ class FeatureEngine:
             return self._empty_output(snapshot)
 
         try:
-            return self._compute(snapshot, bids, asks, trades)
+            return self._compute(snapshot, bids, asks, trades, regime_context=regime_context)
         except Exception:
             return self._empty_output(snapshot)
 
@@ -322,6 +323,7 @@ class FeatureEngine:
         bids: List[Level],
         asks: List[Level],
         trades: List[Dict[str, Any]],
+        regime_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         best_bid, best_ask, mid, spread = self._best_prices(bids, asks)
         spread_bps = _safe_div(spread, mid, 0.0) * 10_000.0
@@ -478,6 +480,28 @@ class FeatureEngine:
             "total_depth_n":              total_depth,
             "spoofing_intensity":         spoofing_intensity,
         }
+
+        if isinstance(regime_context, dict):
+            ctx_features = regime_context.get("features", {})
+            if not isinstance(ctx_features, dict):
+                ctx_features = {}
+            vol_reg = ctx_features.get("volatility_regime", regime_context.get("regime", "unknown"))
+            liq_reg = ctx_features.get("liquidity_regime", regime_context.get("regime", "unknown"))
+            trend   = _clamp(
+                _safe_float(ctx_features.get("trend_strength", regime_context.get("confidence", 0.0)), 0.0),
+                0.0,
+                1.0
+            )
+
+            if isinstance(vol_reg, str):
+                features.setdefault("volatility_regime", vol_reg)
+            if isinstance(liq_reg, str):
+                features.setdefault("liquidity_regime", liq_reg)
+            try:
+                if math.isfinite(trend):
+                    features.setdefault("trend_strength", trend)
+            except Exception:
+                pass
 
         features = self._sanitize_features(features)
         confidence = _clamp(confidence, 0.0, 1.0)

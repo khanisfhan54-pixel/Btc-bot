@@ -214,6 +214,18 @@ except Exception:
     LEARNING_ENGINE = None
 
 try:
+    from advanced_regime_engine import AdvancedRegimeEngine
+except Exception as _regime_import_err:
+    logger.warning("advanced_regime_engine import failed: %s", _regime_import_err)
+    AdvancedRegimeEngine = None  # type: ignore
+
+try:
+    from alpha_liquidity_sweep_predictor import LiquiditySweepAlpha
+except Exception as _alpha_import_err:
+    logger.warning("alpha_liquidity_sweep_predictor import failed: %s", _alpha_import_err)
+    LiquiditySweepAlpha = None  # type: ignore
+
+try:
     from exit_quality_engine import ExitQualityEngine
     exit_quality_engine = ExitQualityEngine()
 except Exception as _eq_import_err:
@@ -264,6 +276,21 @@ impact_tracker   = ImpactDecay()
 position_manager = PositionManager()
 trade_lifecycle  = TradeLifecycleManager()
 capital_allocator = CapitalAllocator()
+SIGNAL_PIPELINE_CONFIG: Dict[str, Any] = {
+    "enable_regime_engine": True,
+    "signal_only_mode": True,
+    "regime_update_frequency_sec": 1.0,
+}
+_last_regime_update_ts = 0.0
+_last_regime_context: Dict[str, Any] = {"regime": "UNKNOWN", "confidence": 0.0, "features": {}}
+regime_engine = None
+if AdvancedRegimeEngine is not None:
+    try:
+        regime_engine = AdvancedRegimeEngine()
+    except Exception as _regime_init_err:
+        logger.warning("AdvancedRegimeEngine init failed; continuing without it: %s", _regime_init_err)
+        regime_engine = None
+alpha_predictor = LiquiditySweepAlpha() if LiquiditySweepAlpha is not None else None
 
 try:
     from engine import (
@@ -278,6 +305,7 @@ try:
         evaluate_meta_filter,
         apply_meta_to_decision,
         _default_alpha,
+        SniperExecutionEngine,
     )
 except Exception as _e:
     logger.warning("Engines import failed: %s", _e)
@@ -291,6 +319,20 @@ except Exception as _e:
             "micro_prob": 0.5,
             "macro_prob": 0.5,
         }
+
+_signal_pipeline_engine = None
+if "SniperExecutionEngine" in globals():
+    try:
+        _signal_pipeline_engine = SniperExecutionEngine(
+            symbol=SYMBOL.replace("/", ""),
+            regime_engine=regime_engine,
+            feature_engine=feature_engine,
+            predictor=alpha_predictor,
+            config=SIGNAL_PIPELINE_CONFIG,
+        )
+    except Exception as _spe_err:
+        logger.warning("Signal pipeline engine init failed (non-fatal): %s", _spe_err)
+        _signal_pipeline_engine = None
 
     def run_all_engines(*args, **kwargs):
         return {
@@ -1474,6 +1516,8 @@ def run_analysis_cycle(
     data_exchange: Any = None,
     data_symbol: str = SYMBOL,
 ) -> dict:
+    global _last_regime_update_ts, _last_regime_context
+    result: Dict[str, Any] = {}
     _dex = data_exchange if data_exchange is not None else exchange
     _dsym = data_symbol
     try:
@@ -1529,8 +1573,56 @@ def run_analysis_cycle(
         or {}
     )
 
-    # Base features
-    features = feature_engine.update(orderbook, trades)
+    # Base features + advanced regime context (signal-only safe path)
+    regime_context: Dict[str, Any] = dict(_last_regime_context)
+    update_freq = _safe_float(SIGNAL_PIPELINE_CONFIG.get("regime_update_frequency_sec", 1.0), 1.0)
+    if update_freq <= 0:
+        update_freq = 1.0
+    now_ts = time.time()
+    should_update_regime = (
+        bool(SIGNAL_PIPELINE_CONFIG.get("enable_regime_engine", True))
+        and regime_engine is not None
+        and (now_ts - _last_regime_update_ts >= update_freq)
+    )
+    if should_update_regime:
+        try:
+            reg_out = regime_engine.update(
+                {
+                    "price": current_price,
+                    "orderbook": orderbook,
+                    "trades": trades,
+                    "candles": candles_by_tf,
+                    "open_interest": open_interest,
+                    "funding_rate": funding_rate,
+                }
+            ) or {}
+            r_metrics = reg_out.get("risk_metrics", {}) if isinstance(reg_out, dict) else {}
+            if not isinstance(r_metrics, dict):
+                r_metrics = {}
+            regime_context = {
+                "regime": str(reg_out.get("regime_label", reg_out.get("regime", "UNKNOWN"))),
+                "confidence": _safe_float(reg_out.get("confidence", 0.0), 0.0),
+                "features": {
+                    "volatility_regime": str(r_metrics.get("feed_status", "unknown")),
+                    "liquidity_regime": str(reg_out.get("execution_mode", "unknown")),
+                    "trend_strength": _safe_float(reg_out.get("trend_strength", 0.0), 0.0),
+                },
+            }
+            _last_regime_context = dict(regime_context)
+            _last_regime_update_ts = now_ts
+        except Exception as _re_exc:
+            logger.warning("[REGIME] update failed, keeping prior context: %s", _re_exc)
+            regime_context = dict(_last_regime_context)
+
+    try:
+        snapshot = {
+            "bids": orderbook.get("bids", []),
+            "asks": orderbook.get("asks", []),
+            "timestamp": time.time(),
+        }
+        features = feature_engine.update(snapshot, trades, regime_context=regime_context)
+    except TypeError:
+        features = feature_engine.update(snapshot, trades)
     features = fill_model.enrich(features)
     features = tox_filter.enrich(features)
 
@@ -1540,6 +1632,83 @@ def run_analysis_cycle(
     # Update impact decay using raw features
     impact_status = impact_tracker.update(current_price, feat_dict)
     logger.info("[FEATURE KEYS] %s", sorted(feat_dict.keys()))
+
+    predictor_signal: Dict[str, Any] = {}
+    if alpha_predictor is not None:
+        try:
+            predictor_signal = alpha_predictor.predict(
+                {
+                    "price": current_price,
+                    "close_price": current_price,
+                    "curr_book": orderbook,
+                    "prev_book": orderbook,
+                    "timestamp": time.time(),
+                    "trades_count": len(trades or []),
+                    "atr": max(current_price * 0.001, 1e-8),
+                    "ema_fast": current_price,
+                    "ema_slow": current_price,
+                    "pre_sweep_depth": 0.0,
+                    "curr_depth": 0.0,
+                    "sweep_time_elapsed": 0.0,
+                    "macro_liquidity": engines_out.get("liquidity_map", {}),
+                    "macro_market_state": engines_out.get("market_state", {}),
+                    "macro_volume_intel": volume_intel,
+                },
+                regime_context=regime_context,
+            ) or {}
+        except Exception as _pred_exc:
+            logger.warning("[PREDICTOR] predict failed (non-fatal): %s", _pred_exc)
+            predictor_signal = {}
+
+    # FINAL GLOBAL SAFETY (never allow NaN/Inf leakage)
+    def _sanitize_dict(d: Dict[str, Any]) -> Dict[str, Any]:
+        out = {}
+        for k, v in d.items():
+            if isinstance(v, float):
+                if not math.isfinite(v):
+                    out[k] = 0.0
+                else:
+                    out[k] = v
+            elif isinstance(v, dict):
+                out[k] = _sanitize_dict(v)  # recursive safety
+            else:
+                out[k] = v
+        return out
+
+    if SIGNAL_PIPELINE_CONFIG.get("signal_only_mode", True):
+        signal_value = str(predictor_signal.get("action", "HOLD")).upper()
+        if signal_value == "BUY":
+            signal_value = "LONG"
+        elif signal_value == "SELL":
+            signal_value = "SHORT"
+        signal_payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "signal": signal_value,
+            "regime": regime_context.get("regime", "UNKNOWN"),
+            "confidence": _clamp(
+                _safe_float(predictor_signal.get("confidence", 0.0), 0.0),
+                0.0,
+                1.0
+            ),
+        }
+        logger.info("[SIGNAL_ONLY] %s", signal_payload)
+        return {
+            "signal_output": signal_payload,
+            "predictor_output": _sanitize_dict({
+                k: (
+                    _clamp(_safe_float(v, 0.0), 0.0, 1.0)
+                    if k in ("confidence", "prob_above", "prob_below", "micro_prob", "macro_prob")
+                    else (_safe_float(v, 0.0) if isinstance(v, (int, float)) else v)
+                )
+                for k, v in (predictor_signal or {}).items()
+            }),
+            "regime_context": _sanitize_dict({
+                "regime": str(regime_context.get("regime", "UNKNOWN")),
+                "confidence": _safe_float(regime_context.get("confidence", 0.0), 0.0),
+                "features": dict(regime_context.get("features", {}) or {}),
+            }),
+            "status": "SIGNAL_ONLY",
+        }
 
     # Regime / lifecycle
     lifecycle = trade_lifecycle.update(current_price, feat_dict)
