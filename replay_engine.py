@@ -1,10 +1,10 @@
 import threading
 import logging
 import copy
+from dataclasses import is_dataclass, fields, asdict
 import numpy as np
 import hashlib
 import json
-import dataclasses
 from typing import Any, Dict, List, Optional
 from collections import deque
 
@@ -21,6 +21,10 @@ class ReplayEngine:
     - Snapshot checkpoints
     - Debug rewind capability
     """
+
+    # Keep these helpers local to the replay engine so payload copying stays
+    # deterministic and compatible with existing callers.
+    _MAX_SAFE_PAYLOAD_DEPTH = 50
 
     def __init__(self, max_events: int = 100000):
         self._lock = threading.RLock()
@@ -39,61 +43,187 @@ class ReplayEngine:
     # ==========================================
     # INTERNAL SAFE COPY (UNSAFE MODE PROTECTION)
     # ==========================================
+    def _copy_ndarray(self, value: np.ndarray, depth: int, seen: set[int]) -> np.ndarray:
+        """
+        Copy numpy arrays safely.
+        - Numeric arrays: fast buffer copy
+        - Object arrays: deep-copy nested Python objects to avoid aliasing
+        """
+        try:
+            if getattr(value, "dtype", None) is not None and value.dtype == object:
+                flat = value.ravel()
+                out = np.empty(flat.shape, dtype=object)
+                for i in range(len(flat)):
+                    out[i] = self._freeze(flat[i], depth, seen)
+                return out.reshape(value.shape)
+            return np.array(value, copy=True)
+        except Exception:
+            # Fallback should never mutate caller state.
+            try:
+                return np.array(value, copy=True)
+            except Exception:
+                return value
+
+    def _canonical_key_string(self, value: Any) -> str:
+        """
+        Deterministic string form for dict keys and unsupported leaves.
+        """
+        try:
+            canonical = self._canonicalize(value)
+            return json.dumps(
+                canonical,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                default=self._json_default,
+            )
+        except Exception:
+            return f"__UNSUPPORTED_KEY__:{type(value).__module__}.{type(value).__qualname__}"
+
+    def _stable_item_key(self, value: Any):
+        canonical = self._canonicalize(value)
+        return (
+            self._canonical_sort_key(canonical),
+            type(value).__module__,
+            type(value).__qualname__,
+            self._canonical_key_string(value),
+        )
+
+    def _freeze_key(self, key: Any, depth: int, seen: set[int]):
+        container_types = (dict, list, tuple, set, frozenset, np.ndarray)
+        if isinstance(key, container_types):
+            frozen_key = self._freeze(key, depth, seen)
+            return "__KEY__|" + type(frozen_key).__name__ + "|" + self._canonical_key_string(frozen_key)
+        return key
+
+    def _freeze_set_like(self, value, depth: int, seen: set[int]):
+        frozen_items = [self._freeze(v, depth, seen) for v in value]
+        all_hashable = True
+        for item in frozen_items:
+            try:
+                hash(item)
+            except Exception:
+                all_hashable = False
+                break
+
+        if all_hashable:
+            try:
+                return tuple(sorted(frozen_items, key=self._stable_item_key))
+            except Exception:
+                pass
+
+        # Deterministic fallback for unhashable frozen members.
+        return tuple(sorted(frozen_items, key=self._stable_item_key))
+
+    def _freeze_unknown_object(self, value: Any, cur_depth: int, seen: set[int], freeze_fn=None):
+        """
+        Best-effort leaf handling for non-container objects.
+        Avoids copy.copy() because that can preserve nested aliasing.
+        """
+        if value is None or isinstance(value, (bool, int, float, str, bytes)):
+            return value
+
+        if freeze_fn is None:
+            freeze_fn = lambda v, d, _s: self._freeze(v, d, _s)
+
+        obj_id = id(value)
+        if obj_id in seen:
+            return "__CYCLE__"
+
+        if is_dataclass(value) and not isinstance(value, type):
+            seen.add(obj_id)
+            try:
+                out = {
+                    "__dataclass__": f"{type(value).__module__}.{type(value).__qualname__}",
+                    "fields": {},
+                }
+                next_depth = max(0, cur_depth - 1)
+                for f in fields(value):
+                    try:
+                        field_value = getattr(value, f.name)
+                        out["fields"][f.name] = freeze_fn(field_value, next_depth, seen)
+                    except Exception:
+                        out["fields"][f.name] = "__UNAVAILABLE__"
+                return out
+            finally:
+                seen.discard(obj_id)
+
+        if hasattr(value, "__dict__"):
+            seen.add(obj_id)
+            try:
+                next_depth = max(0, cur_depth)
+                raw_state = dict(vars(value))
+                frozen_state = {
+                    k: freeze_fn(v, next_depth, seen)
+                    for k, v in raw_state.items()
+                }
+                return {
+                    "__object__": f"{type(value).__module__}.{type(value).__qualname__}",
+                    "state": frozen_state,
+                }
+            finally:
+                seen.discard(obj_id)
+
+        try:
+            return self._canonical_key_string(value)
+        except Exception:
+            return self._canonical_key_string(value)
+
+    def _freeze(self, value, depth: int, seen: set[int]):
+        container_types = (dict, list, tuple, set, frozenset, np.ndarray)
+        if not isinstance(value, container_types):
+            return self._freeze_unknown_object(value, max(0, depth - 1), seen, self._freeze)
+
+        obj_id = id(value)
+        if obj_id in seen:
+            return "__CYCLE__"
+
+        seen.add(obj_id)
+        try:
+            if isinstance(value, np.ndarray):
+                return self._copy_ndarray(value, depth, seen)
+
+            if depth <= 0:
+                if isinstance(value, dict):
+                    return {self._freeze_key(k, 0, seen): v for k, v in value.items()}
+                if isinstance(value, list):
+                    return list(value)
+                if isinstance(value, tuple):
+                    return tuple(value)
+                if isinstance(value, (set, frozenset)):
+                    return self._freeze_set_like(value, 0, seen)
+                return self._freeze_unknown_object(value, 0, seen, self._freeze)
+
+            next_depth = max(0, depth - 1)
+            if isinstance(value, dict):
+                return {
+                    self._freeze_key(k, next_depth, seen): self._freeze(v, next_depth, seen)
+                    for k, v in value.items()
+                }
+            if isinstance(value, list):
+                return [self._freeze(v, next_depth, seen) for v in value]
+            if isinstance(value, tuple):
+                return tuple(self._freeze(v, next_depth, seen) for v in value)
+            if isinstance(value, (set, frozenset)):
+                return self._freeze_set_like(value, next_depth, seen)
+            if isinstance(value, np.ndarray):
+                return self._copy_ndarray(value, next_depth, seen)
+            return self._freeze_unknown_object(value, next_depth, seen, self._freeze)
+        finally:
+            seen.discard(obj_id)
+
     def _safe_payload(self, p, depth: int = 2):
         """
         Deterministic, depth-limited structural copy.
 
         Properties:
-        - No mutation leaks at shallow levels
+        - Structural isolation up to the requested depth
         - No deepcopy performance cliffs
-        - Minimal branching for speed
+        - Cycle-safe behavior
+        - Stable handling for nested sets / frozensets and dataclasses
         """
-
-        container_types = (dict, list, tuple, set, frozenset)
-
-        def shallow_structural_copy(value):
-            if isinstance(value, dict):
-                return dict(value)
-            if isinstance(value, list):
-                return list(value)
-            if isinstance(value, tuple):
-                return tuple(value)
-            if isinstance(value, (set, frozenset)):
-                return type(value)(value)
-            return value
-
-        # Depth boundary -> shallow structural freeze.
-        if depth <= 0:
-            if isinstance(p, dict):
-                return {k: shallow_structural_copy(v) for k, v in p.items()}
-            if isinstance(p, list):
-                return [shallow_structural_copy(v) for v in p]
-            if isinstance(p, tuple):
-                return tuple(shallow_structural_copy(v) for v in p)
-            if isinstance(p, (set, frozenset)):
-                return type(p)(shallow_structural_copy(v) for v in p)
-            return p
-
-        if isinstance(p, dict):
-            return {
-                k: self._safe_payload(v, depth - 1) if isinstance(v, container_types) else v
-                for k, v in p.items()
-            }
-
-        if isinstance(p, list):
-            return [self._safe_payload(v, depth - 1) if isinstance(v, container_types) else v for v in p]
-
-        if isinstance(p, tuple):
-            return tuple(
-                self._safe_payload(v, depth - 1) if isinstance(v, container_types) else v for v in p
-            )
-
-        if isinstance(p, (set, frozenset)):
-            return type(p)(
-                self._safe_payload(v, depth - 1) if isinstance(v, container_types) else v for v in p
-            )
-
-        return p
+        depth = max(0, min(int(depth), int(self._MAX_SAFE_PAYLOAD_DEPTH)))
+        return self._freeze(p, depth, set())
 
     def _emit_unsafe_mode_warning(self) -> None:
         if not self._unsafe_no_copy or self._unsafe_warning_emitted:
@@ -148,8 +278,8 @@ class ReplayEngine:
         return obj
 
     def _json_default(self, obj: Any):
-        if dataclasses.is_dataclass(obj):
-            return self._canonicalize(dataclasses.asdict(obj))
+        if is_dataclass(obj):
+            return self._canonicalize(asdict(obj))
         if isinstance(obj, (bytes, bytearray, memoryview)):
             return {"__bytes__": bytes(obj).hex()}
         if isinstance(obj, complex):
