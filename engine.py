@@ -5092,9 +5092,11 @@ class SniperExecutionEngine:
                     "regime": str(reg_out.get("regime_label", reg_out.get("regime", "UNKNOWN"))),
                     "confidence": _safe_float(reg_out.get("confidence", 0.0), 0.0),
                     "features": {
-                        "volatility_regime": str(r_features.get("feed_status", "unknown")),
+                        # Keep naming consistent with main.py (semantic parity).
+                        "volatility_regime": str(reg_out.get("regime_label", "unknown")),
                         "liquidity_regime": str(reg_out.get("execution_mode", "unknown")),
                         "trend_strength": _safe_float(reg_out.get("trend_strength", 0.0), 0.0),
+                        "feed_status": str(r_features.get("feed_status", "unknown")),
                     },
                 }
                 self._regime_state = regime_context

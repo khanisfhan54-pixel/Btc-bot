@@ -303,10 +303,10 @@ class FeatureEngine:
         try:
             bids, asks = self._extract_levels(snapshot)
         except Exception:
-            return self._empty_output(snapshot)
+            return self._empty_output(snapshot, regime_context=regime_context)
 
         if not bids or not asks:
-            return self._empty_output(snapshot)
+            return self._empty_output(snapshot, regime_context=regime_context)
 
         try:
             return self._compute(snapshot, bids, asks, trades, regime_context=regime_context)
@@ -856,7 +856,11 @@ class FeatureEngine:
             return t * 1000.0
         return None
 
-    def _empty_output(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    def _empty_output(
+        self,
+        snapshot: Dict[str, Any],
+        regime_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         ts = self._snapshot_ts_ms(snapshot)
         latency = max(0.0, time.time() * 1000.0 - ts) if ts else 0.0
         f: Dict[str, Any] = {
@@ -885,6 +889,25 @@ class FeatureEngine:
             "bid_depth_n": 0.0, "ask_depth_n": 0.0, "total_depth_n": 0.0,
             "spoofing_intensity": 0.0,
         }
+        # Preserve regime_context overlay so downstream consumers see the
+        # last-known regime even when the orderbook is temporarily empty.
+        if isinstance(regime_context, dict):
+            ctx_features = regime_context.get("features", {})
+            if not isinstance(ctx_features, dict):
+                ctx_features = {}
+            vol_reg = ctx_features.get("volatility_regime", regime_context.get("regime", "unknown"))
+            liq_reg = ctx_features.get("liquidity_regime", regime_context.get("regime", "unknown"))
+            trend = _clamp(
+                _safe_float(ctx_features.get("trend_strength", regime_context.get("confidence", 0.0)), 0.0),
+                0.0,
+                1.0,
+            )
+            if isinstance(vol_reg, str):
+                f["volatility_regime"] = vol_reg
+            if isinstance(liq_reg, str):
+                f["liquidity_regime"] = liq_reg
+            if isinstance(trend, (int, float)) and math.isfinite(trend):
+                f["trend_strength"] = trend
         return {"features": self._sanitize_features(f), "confidence": 0.0}
 
     def _sanitize_features(self, features: Dict[str, Any]) -> Dict[str, Any]:

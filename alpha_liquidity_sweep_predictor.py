@@ -1011,9 +1011,11 @@ class LiquiditySweepAlpha:
 
             if "RANGE" in regime_label:
                 confidence *= 0.9
-            if "UPTREND" in regime_label and action == "SELL":
+            # Match both internal (UPTREND/DOWNTREND) and external (TREND/BEAR)
+            # regime labels emitted by AdvancedRegimeEngine.
+            if ("UPTREND" in regime_label or regime_label == "TREND") and action == "SELL":
                 confidence *= 0.9
-            if "DOWNTREND" in regime_label and action == "BUY":
+            if ("DOWNTREND" in regime_label or regime_label == "BEAR") and action == "BUY":
                 confidence *= 0.9
             # FINAL CONFIDENCE SAFETY (prevent drift)
             if not math.isfinite(confidence):
@@ -1080,16 +1082,22 @@ class LiquiditySweepAlpha:
         - Accepts raw market_data OR {"features": {...}}
         """
         if not isinstance(data, dict):
-            return {
+            # Route through _safe_output so every return honours the full schema
+            # (action, confidence, state, regime, ofi_zscore, hawkes_intensity,
+            # logic, micro_prob, macro_prob, prob_above, prob_below).
+            return _safe_output({
                 "action": "HOLD",
                 "confidence": 0.0,
-                "prob_above": 0.5,
-                "prob_below": 0.5,
+                "state": "UNKNOWN",
+                "regime": "RANGING",
+                "ofi_zscore": 0.0,
+                "hawkes_intensity": 0.0,
+                "logic": "invalid_input",
                 "micro_prob": 0.5,
                 "macro_prob": 0.5,
-                "state": "UNKNOWN",
-                "logic": "invalid_input",
-            }
+                "prob_above": 0.5,
+                "prob_below": 0.5,
+            })
 
         if "features" in data and isinstance(data["features"], dict):
             data = data["features"]
