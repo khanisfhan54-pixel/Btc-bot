@@ -321,20 +321,6 @@ except Exception as _e:
             "macro_prob": 0.5,
         }
 
-_signal_pipeline_engine = None
-if "SniperExecutionEngine" in globals():
-    try:
-        _signal_pipeline_engine = SniperExecutionEngine(
-            symbol=SYMBOL.replace("/", ""),
-            regime_engine=regime_engine,
-            feature_engine=feature_engine,
-            predictor=alpha_predictor,
-            config=SIGNAL_PIPELINE_CONFIG,
-        )
-    except Exception as _spe_err:
-        logger.warning("Signal pipeline engine init failed (non-fatal): %s", _spe_err)
-        _signal_pipeline_engine = None
-
     def run_all_engines(*args, **kwargs):
         return {
             "order_flow_pressure": 0.0,
@@ -522,6 +508,22 @@ if "SniperExecutionEngine" in globals():
 
     def apply_meta_to_decision(decision, meta_result):
         return decision if isinstance(decision, dict) else {}
+
+    SniperExecutionEngine = None  # type: ignore
+
+_signal_pipeline_engine = None
+if globals().get("SniperExecutionEngine") is not None:
+    try:
+        _signal_pipeline_engine = SniperExecutionEngine(
+            symbol=SYMBOL.replace("/", ""),
+            regime_engine=regime_engine,
+            feature_engine=feature_engine,
+            predictor=alpha_predictor,
+            config=SIGNAL_PIPELINE_CONFIG,
+        )
+    except Exception as _spe_err:
+        logger.warning("Signal pipeline engine init failed (non-fatal): %s", _spe_err)
+        _signal_pipeline_engine = None
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -1604,9 +1606,16 @@ def run_analysis_cycle(
                 "regime": str(reg_out.get("regime_label", reg_out.get("regime", "UNKNOWN"))),
                 "confidence": _safe_float(reg_out.get("confidence", 0.0), 0.0),
                 "features": {
-                    "volatility_regime": str(r_metrics.get("feed_status", "unknown")),
+                    # Surface meaningful regime-engine fields. Names match what
+                    # feature_engine.py expects without lying about semantics:
+                    #   volatility_regime -> the engine's regime label (TREND/RANGE/BEAR/TOXIC)
+                    #   liquidity_regime  -> execution_mode (trend_follow / range_mean_revert / flat_or_hedge)
+                    # Expose feed_status + trend_strength separately so downstream code
+                    # can still introspect them without semantic confusion.
+                    "volatility_regime": str(reg_out.get("regime_label", "unknown")),
                     "liquidity_regime": str(reg_out.get("execution_mode", "unknown")),
                     "trend_strength": _safe_float(reg_out.get("trend_strength", 0.0), 0.0),
+                    "feed_status": str(r_metrics.get("feed_status", "unknown")),
                 },
             }
             _last_regime_context = dict(regime_context)
