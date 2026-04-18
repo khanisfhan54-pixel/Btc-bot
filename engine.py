@@ -4432,6 +4432,7 @@ class EntryTriggerEngine:
         trap: Dict[str, Any],
         strategy_bias: str,
         volume_intel: Optional[Dict[str, Any]] = None,
+        regime_context: Optional[Dict[str, Any]] = None,
     ) -> SniperSignal:
         if self.trades_taken >= self.max_trades_per_session:
             return SniperSignal(
@@ -4931,6 +4932,10 @@ class SniperExecutionEngine:
         symbol: str = "BTCUSDT",
         strategy_bias_provider: Optional[Callable[[], str]] = None,
         on_signal: Optional[Callable[[SniperSignal], None]] = None,
+        regime_engine: Optional[Any] = None,
+        feature_engine: Optional[Any] = None,
+        predictor: Optional[Any] = None,
+        config: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.symbol = symbol.replace("/", "").upper()
         self.strategy_bias_provider = strategy_bias_provider or (lambda: "NEUTRAL")
@@ -4940,6 +4945,12 @@ class SniperExecutionEngine:
         self.breakout_validator = BreakoutValidator()
         self.trap_filter = TrapFilter()
         self.entry_engine = EntryTriggerEngine()
+        self.regime_engine = regime_engine
+        self.feature_engine = feature_engine
+        self.predictor = predictor
+        self.config = config or {}
+        self._last_regime_update_ts = 0.0
+        self._regime_state: Dict[str, Any] = {}
         self.rest = BinanceRestData(self.symbol)
         self.stream = BinanceFuturesStreamClient(symbol=self.symbol, on_snapshot=self._on_snapshot)
         self.latest_snapshot: Optional[MarketSnapshot] = None
@@ -5040,9 +5051,114 @@ class SniperExecutionEngine:
     def _on_snapshot(self, snapshot: MarketSnapshot) -> None:
         with self._lock:
             self.latest_snapshot = snapshot
+
+        signal_only_mode = self.config.get("signal_only_mode", True)
+        # Deep-safe copy
+        regime_context = {
+            "regime": str(self._regime_state.get("regime", "UNKNOWN")),
+            "confidence": _safe_float(self._regime_state.get("confidence", 0.0), 0.0),
+            "features": dict(self._regime_state.get("features", {}) or {})
+        } if isinstance(self._regime_state, dict) else {}
+        if isinstance(regime_context.get("features"), dict):
+            regime_context["features"] = dict(regime_context["features"])  # deep copy safety
+        if not regime_context:
+            regime_context = {
+                "regime": "UNKNOWN",
+                "confidence": 0.0,
+                "features": {},
+            }
+        update_freq = _safe_float(self.config.get("regime_update_frequency_sec", 1.0), 1.0)
+        if update_freq <= 0:
+            update_freq = 1.0
+        now_ts = time.time()
+        should_update_regime = False  # Regime handled externally (main.py)
+        if should_update_regime:
+            try:
+                reg_out = self.regime_engine.update(
+                    {
+                        "price": snapshot.price,
+                        "orderbook": snapshot.orderbook,
+                        "trades": snapshot.trades,
+                        "candles": snapshot.candles,
+                        "open_interest": snapshot.open_interest,
+                        "funding_rate": snapshot.funding_rate,
+                    }
+                ) or {}
+                r_features = reg_out.get("risk_metrics", {}) if isinstance(reg_out, dict) else {}
+                if not isinstance(r_features, dict):
+                    r_features = {}
+                regime_context = {
+                    "regime": str(reg_out.get("regime_label", reg_out.get("regime", "UNKNOWN"))),
+                    "confidence": _safe_float(reg_out.get("confidence", 0.0), 0.0),
+                    "features": {
+                        "volatility_regime": str(r_features.get("feed_status", "unknown")),
+                        "liquidity_regime": str(reg_out.get("execution_mode", "unknown")),
+                        "trend_strength": _safe_float(reg_out.get("trend_strength", 0.0), 0.0),
+                    },
+                }
+                self._regime_state = regime_context
+                self._last_regime_update_ts = now_ts
+            except Exception:
+                regime_context = dict(self._regime_state)
         market_state = self.state_detector.detect(snapshot)
         liquidity = self.liquidity_mapper.map(snapshot)
         volume_intel = self._collect_volume_intel(snapshot)
+        if self.feature_engine is not None and hasattr(self.feature_engine, "update"):
+            try:
+                fe_snapshot = {
+                    "bids": snapshot.orderbook.get("bids", []),
+                    "asks": snapshot.orderbook.get("asks", []),
+                    "timestamp": snapshot.timestamp,
+                }
+                self.feature_engine.update(fe_snapshot, snapshot.trades, regime_context=regime_context)
+            except Exception:
+                pass
+        predictor_signal = {}
+        if self.predictor is not None and hasattr(self.predictor, "predict"):
+            try:
+                predictor_signal = self.predictor.predict(
+                    {
+                        "price": snapshot.price,
+                        "close_price": snapshot.price,
+                        "curr_book": snapshot.orderbook,
+                        "prev_book": snapshot.orderbook,
+                        "timestamp": snapshot.timestamp,
+                        "trades_count": len(snapshot.trades or []),
+                        "atr": max(snapshot.price * 0.001, 1e-8),
+                        "ema_fast": snapshot.price,
+                        "ema_slow": snapshot.price,
+                        "pre_sweep_depth": 0.0,
+                        "curr_depth": 0.0,
+                        "sweep_time_elapsed": 0.0,
+                    },
+                    regime_context=regime_context,
+                ) or {}
+            except Exception:
+                predictor_signal = {}
+
+        # Normalize predictor output WITHOUT losing fields
+        predictor_signal = dict(predictor_signal or {})
+        # Strict action normalization
+        raw_action = str(predictor_signal.get("action", "HOLD")).upper()
+        if raw_action not in ("BUY", "SELL", "HOLD"):
+            raw_action = "HOLD"
+        predictor_signal["action"] = raw_action
+        predictor_signal["confidence"] = _clamp(
+            _safe_float(predictor_signal.get("confidence", 0.0), 0.0),
+            0.0,
+            1.0
+        )
+
+        # Ensure schema completeness
+        predictor_signal.setdefault("prob_above", 0.5)
+        predictor_signal.setdefault("prob_below", 0.5)
+        predictor_signal.setdefault("micro_prob", 0.5)
+        predictor_signal.setdefault("macro_prob", 0.5)
+
+        # Full numeric sanitation (critical for production)
+        for k in ("prob_above", "prob_below", "micro_prob", "macro_prob"):
+            if k in predictor_signal:
+                predictor_signal[k] = _clamp(_safe_float(predictor_signal.get(k, 0.5), 0.5), 0.0, 1.0)
         direction = "LONG" if market_state.get("bias", 0.0) > 0 else "SHORT" if market_state.get("bias", 0.0) < 0 else "WAIT"
         breakout_level = _safe_float(
             liquidity.get("nearest_above", {}).get("price", snapshot.price)
@@ -5071,7 +5187,45 @@ class SniperExecutionEngine:
             trap,
             strategy_bias,
             volume_intel=volume_intel,
+            regime_context=regime_context,
         )
+        # Attach predictor influence (non-breaking enhancement)
+        try:
+            pred_conf = _clamp(_safe_float(predictor_signal.get("confidence", 0.0), 0.0), 0.0, 1.0)
+            pred_action = predictor_signal.get("action", "HOLD")
+            signal_dir = getattr(signal, "bias", None) or getattr(signal, "direction", None) or "WAIT"
+            # Confidence gating: ignore weak predictor
+            if pred_conf > 0.15:
+                base_conf = _clamp(
+                    _safe_float(getattr(signal, "confidence_score", 0.0), 0.0),
+                    0.0,
+                    1.0
+                )
+                # Extra NaN safety
+                if not math.isfinite(base_conf):
+                    base_conf = 0.0
+                # Adaptive blending (stronger predictor influence when confident)
+                # Safer adaptive blending (less aggressive)
+                alpha = 0.2 + 0.3 * pred_conf  # scales 0.2 → 0.5
+                disagreement = (
+                    (pred_action == "BUY" and signal_dir == "SHORT") or
+                    (pred_action == "SELL" and signal_dir == "LONG")
+                )
+
+                if disagreement:
+                    pred_conf *= 0.5
+                    base_conf *= 0.85  # symmetric penalty
+
+                signal.confidence_score = _clamp(
+                    (1 - alpha) * base_conf + alpha * pred_conf,
+                    0.0,
+                    1.0,
+                )
+        except Exception:
+            pass
+        # Ensure metadata exists
+        if not hasattr(signal, "metadata") or not isinstance(signal.metadata, dict):
+            signal.metadata = {}
         signal.metadata.update(
             {
                 "market_state": market_state,
@@ -5082,6 +5236,8 @@ class SniperExecutionEngine:
                 "open_interest": snapshot.open_interest if snapshot.open_interest is not None else self.rest.open_interest(),
                 "funding_rate": snapshot.funding_rate if snapshot.funding_rate is not None else self.rest.funding_rate(),
                 "strategy_bias": strategy_bias,
+                "regime_context": regime_context,
+                "predictor_signal": predictor_signal,
             }
         )
         with self._lock:
@@ -5091,6 +5247,10 @@ class SniperExecutionEngine:
                 self.on_signal(signal)
             except Exception:
                 pass
+
+        # In signal-only mode, DO NOT execute trades (but still generate signals)
+        if signal_only_mode:
+            return
 
     def evaluate(self) -> Optional[SniperSignal]:
         with self._lock:
