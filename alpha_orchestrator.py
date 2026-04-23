@@ -1801,8 +1801,30 @@ class AlphaOrchestrator:
         if denom < self.config.min_aggregate_weight:
             return 0.0, 0.0, {"error": "low_aggregate_weight", "denom": denom}
 
+        raw_score = weighted_sum / denom
+
+        # Correlated alpha crowding guard: large same-direction cohorts can
+        # synthetically inflate conviction even when no single source violates
+        # dominance limits. Apply a mild deterministic attenuation only when
+        # directional consensus is highly concentrated and cohort size is large.
+        directional_votes = [
+            1 if s.direction > 0 else -1 if s.direction < 0 else 0
+            for s in signals
+        ]
+        pos_votes = sum(1 for d in directional_votes if d > 0)
+        neg_votes = sum(1 for d in directional_votes if d < 0)
+        non_zero_votes = pos_votes + neg_votes
+        dominant_votes = max(pos_votes, neg_votes)
+
+        crowding_factor = 1.0
+        if signal_count >= 4 and non_zero_votes >= 4:
+            dominant_ratio = dominant_votes / non_zero_votes
+            if dominant_ratio >= 0.8:
+                excess_votes = max(0, dominant_votes - 3)
+                crowding_factor = 1.0 / (1.0 + 0.08 * excess_votes)
+
         return (
-            weighted_sum / denom,
+            _safe_float(raw_score * crowding_factor, 0.0, -1.0, 1.0),
             _safe_float(weighted_edge / denom, 0.0, -_EDGE_BPS_CLAMP, _EDGE_BPS_CLAMP),
             {"breakdown": breakdown},
         )
