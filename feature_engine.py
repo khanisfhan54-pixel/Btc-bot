@@ -62,7 +62,9 @@ def _safe_div(a: float, b: float, default: float = 0.0) -> float:
     try:
         aa = _safe_float(a, default)
         bb = _safe_float(b, 0.0)
-        out = aa / max(abs(bb), 1e-9)
+        if abs(bb) < 1e-9:
+            return default
+        out = aa / bb
         return out if math.isfinite(out) else default
     except Exception:
         return default

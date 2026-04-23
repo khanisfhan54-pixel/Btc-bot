@@ -1276,6 +1276,7 @@ class AlphaOrchestrator:
                     "future_timestamp": 0,
                     "negative_edge_normalized": 0,
                     "unknown_sources_accepted": [],
+                    "duplicates_removed": 0,
                 },
                 "rejection_details": [],
                 "fusion_stats": {
@@ -1997,6 +1998,10 @@ class AlphaOrchestrator:
                 if tf_dir != 0 and tf_dir != dom_dir:
                     # Hard exclusion: conflicting lower TF cannot influence final score.
                     excluded_tfs.append(tf)
+                    logger.debug(
+                        "MTF_DOMINANCE | excluded tf=%s dir=%d | dominant=%s dir=%d",
+                        tf, tf_dir, dom_tf, dom_dir,
+                    )
                     continue
                 elif tf_dir == dom_dir:
                     tw *= 1.0 + self.config.timeframe_alignment_bonus
@@ -2055,7 +2060,7 @@ class AlphaOrchestrator:
         if self.regime_engine and regime_assessment:
             regime_factor = self.regime_engine.quality_regime_factor(regime_assessment)
 
-        combined = max(0.0, min(1.0, s_m * m_m * regime_factor))
+        combined = max(0.1, min(1.0, s_m * m_m * regime_factor))
         return {
             "combined_multiplier": combined,
             "stale_multiplier": s_m,
@@ -2106,6 +2111,10 @@ class AlphaOrchestrator:
             # FIX 9: Per-call list of unknown source IDs accepted via default weight.
             # Always a list; empty when allow_unknown_sources=False.
             "unknown_sources_accepted": [],
+            # FIX (dedup): Per-call counter for duplicate (source_id, timeframe)
+            # pairs collapsed by the post-validation dedup pass. The surviving
+            # entry is the one with the highest timestamp.
+            "duplicates_removed": 0,
         }
 
         # FIX 21: Reject strings/bytes explicitly (they are iterable but invalid).
@@ -2227,6 +2236,25 @@ class AlphaOrchestrator:
                 rejection_details.append(
                     {"source_id": "unknown", "reason": "malformed_payload"}
                 )
+
+        # FIX (dedup): Collapse signals sharing the same (source_id, timeframe)
+        # key down to the single most recent entry. Without this step a source
+        # that emits multiple signals for the same timeframe in one batch would
+        # be independently weighted by _fuse_signals, double-counting its
+        # contribution. The newest timestamp wins; stable order is preserved
+        # via the sorted-index projection below.
+        seen: Dict[Tuple[str, str], int] = {}
+        for idx, sig in enumerate(valid):
+            key = (sig.source_id, sig.timeframe)
+            if key in seen:
+                prev_idx = seen[key]
+                if sig.timestamp >= valid[prev_idx].timestamp:
+                    seen[key] = idx
+                metrics["duplicates_removed"] = metrics.get("duplicates_removed", 0) + 1
+            else:
+                seen[key] = idx
+        if metrics.get("duplicates_removed", 0) > 0:
+            valid = [valid[i] for i in sorted(seen.values())]
 
         return valid, metrics, rejection_details
 
