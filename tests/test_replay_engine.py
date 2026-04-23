@@ -441,28 +441,52 @@ def test_unsafe_replay_is_faster_than_deepcopy_replay():
         list(unsafe.replay())
         copy.deepcopy(events_ref[:10])
 
-    def bench_unsafe(loops: int = 10) -> float:
+    def run_unsafe(engine: ReplayEngine):
+        return list(engine.replay())
+
+    def run_deepcopy():
+        return copy.deepcopy(events_ref)
+
+    def normalize_for_compare(value):
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, dict):
+            return {k: normalize_for_compare(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [normalize_for_compare(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(normalize_for_compare(v) for v in value)
+        return value
+
+    unsafe_result = run_unsafe(unsafe)
+    safe_result = run_deepcopy()
+    assert normalize_for_compare(unsafe_result) == normalize_for_compare(
+        safe_result
+    ), "Unsafe mode produced different results!"
+
+    def median_run(fn, runs: int = 5) -> float:
         times = []
-        for _ in range(loops):
+        for _ in range(runs):
             start = time.perf_counter()
-            for _evt in unsafe.replay():
-                pass
+            fn()
             times.append(time.perf_counter() - start)
         return statistics.median(times)
 
-    def bench_deepcopy(loops: int = 10) -> float:
-        times = []
-        for _ in range(loops):
-            start = time.perf_counter()
-            _ = copy.deepcopy(events_ref)
-            times.append(time.perf_counter() - start)
-        return statistics.median(times)
+    unsafe_t = median_run(lambda: run_unsafe(unsafe))
+    safe_t = median_run(run_deepcopy)
 
-    unsafe_t = bench_unsafe()
-    deepcopy_t = bench_deepcopy()
+    max_slowdown = 3.0  # CI-safe tolerance
+    assert unsafe_t <= safe_t * max_slowdown, (
+        f"Unsafe mode excessively slow: "
+        f"safe={safe_t:.6f}s unsafe={unsafe_t:.6f}s "
+        f"(limit={max_slowdown}x)"
+    )
 
-    # CI-safe performance check: only fails on extreme regression (4x+ slower)
-    _assert_perf_ratio(unsafe_t, deepcopy_t)
+    if unsafe_t > safe_t:
+        print(
+            f"[WARN] Unsafe slower than safe "
+            f"(safe={safe_t:.6f}s unsafe={unsafe_t:.6f}s)"
+        )
 
 
 def test_unsafe_replay_large_payload_benchmark_vs_deepcopy():
