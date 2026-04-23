@@ -232,35 +232,9 @@ class SignalEngine:
             fallback_candles: List[Dict[str, float]] = []
             if isinstance(fallback_source, (list, tuple)):
                 for raw_candle in fallback_source[-3:]:
-                    parsed: Optional[Dict[str, float]] = None
-
-                    if isinstance(raw_candle, dict):
-                        nested = _safe_get(raw_candle, "candle") or _safe_get(raw_candle, "kline")
-                        if isinstance(nested, dict):
-                            raw_candle = nested
-                        o = _safe_float(raw_candle.get("open", raw_candle.get("o", raw_candle.get("Open", 0.0))), 0.0)
-                        h = _safe_float(raw_candle.get("high", raw_candle.get("h", raw_candle.get("High", 0.0))), 0.0)
-                        l = _safe_float(raw_candle.get("low", raw_candle.get("l", raw_candle.get("Low", 0.0))), 0.0)
-                        c = _safe_float(raw_candle.get("close", raw_candle.get("c", raw_candle.get("Close", 0.0))), 0.0)
-                        v = _safe_float(raw_candle.get("volume", raw_candle.get("v", raw_candle.get("Volume", 0.0))), 0.0)
-                        parsed = {"open": o, "high": h, "low": l, "close": c, "volume": v}
-                    elif isinstance(raw_candle, (list, tuple)) and len(raw_candle) >= 6:
-                        o = _safe_float(raw_candle[1], 0.0)
-                        h = _safe_float(raw_candle[2], 0.0)
-                        l = _safe_float(raw_candle[3], 0.0)
-                        c = _safe_float(raw_candle[4], 0.0)
-                        v = _safe_float(raw_candle[5], 0.0)
-                        parsed = {"open": o, "high": h, "low": l, "close": c, "volume": v}
-
+                    parsed = _normalize_candle(raw_candle)
                     if parsed is not None:
-                        if (
-                            parsed["open"] > 0
-                            and parsed["high"] > 0
-                            and parsed["low"] > 0
-                            and parsed["close"] > 0
-                            and parsed["high"] > parsed["low"]
-                        ):
-                            fallback_candles.append(parsed)
+                        fallback_candles.append(parsed)
 
             if len(fallback_candles) == 3:
                 candles = fallback_candles
