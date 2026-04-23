@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import traceback
 import hashlib
 import time
