@@ -1652,11 +1652,36 @@ class AlphaOrchestrator:
         weighted_sum = 0.0
         weighted_edge = 0.0
         denom = 0.0
-        total_raw_weight = 0.0
+        adjusted_total_weight = 0.0
         breakdown: List[Dict[str, Any]] = []
         signal_count = len(signals)
+        correlation_group_sizes: Dict[Tuple[int, str, str], int] = {}
 
-        # Pass 1: Sum raw weights for dynamic dominance capping.
+        def _get_correlation_family(source_id: str) -> str:
+            sid = _normalize_key(source_id)
+            if not sid:
+                return "unknown"
+            sid = sid.lower()
+            sid = re.sub(r"[_-]?\d+$", "", sid)
+            return sid or "unknown"
+
+        # Pre-pass: build correlation bucket sizes.
+        for s in signals:
+            direction = 0
+            if s.direction > 0:
+                direction = 1
+            elif s.direction < 0:
+                direction = -1
+            if direction == 0:
+                continue
+            group_key = (
+                direction,
+                _normalize_key(s.timeframe),
+                _get_correlation_family(s.source_id),
+            )
+            correlation_group_sizes[group_key] = correlation_group_sizes.get(group_key, 0) + 1
+
+        # Pass 1: Sum adjusted weights for dynamic dominance capping.
         for s in signals:
             base_w = _safe_float(
                 self.config.signal_weights.get(s.source_id, self.config.default_unknown_weight),
@@ -1686,10 +1711,29 @@ class AlphaOrchestrator:
             if self.regime_engine and regime_assessment:
                 stress_attenuation = self.regime_engine.signal_stress_attenuation(regime_assessment, s.source_id)
 
-            weight_contrib = eff_w * _safe_float(s.conviction, 0.0, 0.0, 1.0) * alignment * stress_attenuation
+            direction = 0
+            if s.direction > 0:
+                direction = 1
+            elif s.direction < 0:
+                direction = -1
+
+            conviction = _safe_float(s.conviction, 0.0, 0.0, 1.0)
+            weight_contrib = eff_w * conviction * alignment * stress_attenuation
+
+            if direction != 0:
+                group_key = (
+                    direction,
+                    _normalize_key(s.timeframe),
+                    _get_correlation_family(s.source_id),
+                )
+                group_size = max(1, int(correlation_group_sizes.get(group_key, 1)))
+                group_penalty = 1.0 / math.sqrt(group_size)
+                if not math.isfinite(group_penalty):
+                    group_penalty = 1.0
+                weight_contrib *= group_penalty
 
             if weight_contrib > 1e-7:
-                total_raw_weight += weight_contrib
+                adjusted_total_weight += weight_contrib
 
         # Pass 2: Fusion with Concentration Guard.
         for s in signals:
@@ -1743,7 +1787,24 @@ class AlphaOrchestrator:
             if self.regime_engine and regime_assessment:
                 stress_attenuation = self.regime_engine.signal_stress_attenuation(regime_assessment, s.source_id)
 
-            weight_contrib = eff_w * _safe_float(s.conviction, 0.0, 0.0, 1.0) * alignment * stress_attenuation
+            conviction = _safe_float(s.conviction, 0.0, 0.0, 1.0)
+            raw_weight_contrib = eff_w * conviction * alignment * stress_attenuation
+
+            correlation_group_key = None
+            if direction != 0:
+                timeframe_bucket = _normalize_key(s.timeframe)
+                correlation_group_key = (direction, timeframe_bucket, _get_correlation_family(s.source_id))
+
+            similar_count = 1
+            correlation_penalty = 1.0
+            if correlation_group_key is not None:
+                similar_count = max(1, int(correlation_group_sizes.get(correlation_group_key, 1)))
+                correlation_penalty = 1.0 / math.sqrt(similar_count)
+                if not math.isfinite(correlation_penalty):
+                    correlation_penalty = 1.0
+                    similar_count = 1
+
+            weight_contrib = raw_weight_contrib * correlation_penalty
 
             if weight_contrib <= 1e-7:
                 breakdown.append(
@@ -1761,13 +1822,18 @@ class AlphaOrchestrator:
                         "dominance_cap_active": False,
                         "sparse_bypass": True,
                         "stress_attenuation": stress_attenuation,
+                        "correlation_penalty": correlation_penalty,
+                        "similar_signal_count": similar_count,
+                        "correlation_group_key": correlation_group_key,
+                        "group_size": similar_count,
+                        "group_penalty": correlation_penalty,
                     }
                 )
                 continue
 
             dominance_cap_active = False
-            if signal_count >= 3 and total_raw_weight > 1e-7:
-                other_weights_sum = total_raw_weight - weight_contrib
+            if signal_count >= 3 and adjusted_total_weight > 1e-7:
+                other_weights_sum = adjusted_total_weight - weight_contrib
                 strict_cap = (0.4 * other_weights_sum) / 0.6
                 if weight_contrib > strict_cap:
                     weight_contrib = strict_cap
@@ -1795,38 +1861,87 @@ class AlphaOrchestrator:
                     "dominance_cap_active": dominance_cap_active,
                     "final_weight_contribution": weight_contrib,
                     "stress_attenuation": stress_attenuation,
+                    "correlation_penalty": correlation_penalty,
+                    "similar_signal_count": similar_count,
+                    "correlation_group_key": correlation_group_key,
+                    "group_size": similar_count,
+                    "group_penalty": correlation_penalty,
                 }
             )
 
         if denom < self.config.min_aggregate_weight:
             return 0.0, 0.0, {"error": "low_aggregate_weight", "denom": denom}
-
         raw_score = weighted_sum / denom
+        if not math.isfinite(raw_score):
+            raw_score = 0.0
 
-        # Correlated alpha crowding guard: large same-direction cohorts can
-        # synthetically inflate conviction even when no single source violates
-        # dominance limits. Apply a mild deterministic attenuation only when
-        # directional consensus is highly concentrated and cohort size is large.
-        directional_votes = [
-            1 if s.direction > 0 else -1 if s.direction < 0 else 0
-            for s in signals
-        ]
-        pos_votes = sum(1 for d in directional_votes if d > 0)
-        neg_votes = sum(1 for d in directional_votes if d < 0)
-        non_zero_votes = pos_votes + neg_votes
-        dominant_votes = max(pos_votes, neg_votes)
+        correlation_groups = []
+        group_adjusted_weight: Dict[Tuple[int, str, str], float] = {}
+        for row in breakdown:
+            gk = row.get("correlation_group_key")
+            if gk is None:
+                continue
+            group_adjusted_weight[gk] = group_adjusted_weight.get(gk, 0.0) + _safe_float(
+                row.get("final_weight_contribution"), 0.0, 0.0
+            )
 
-        crowding_factor = 1.0
-        if signal_count >= 4 and non_zero_votes >= 4:
-            dominant_ratio = dominant_votes / non_zero_votes
-            if dominant_ratio >= 0.8:
-                excess_votes = max(0, dominant_votes - 3)
-                crowding_factor = 1.0 / (1.0 + 0.08 * excess_votes)
+        largest_group_size = 0
+        for group_key in sorted(correlation_group_sizes.keys()):
+            size = correlation_group_sizes[group_key]
+            group_size = max(1, int(size))
+            largest_group_size = max(largest_group_size, group_size)
+            penalty = 1.0 / math.sqrt(group_size)
+            if not math.isfinite(penalty):
+                penalty = 1.0
+                group_size = 1
+            correlation_groups.append(
+                {
+                    "key": [group_key[0], group_key[1], group_key[2]],
+                    "size": group_size,
+                    "penalty": penalty,
+                    "adjusted_weight": _safe_float(group_adjusted_weight.get(group_key, 0.0), 0.0, 0.0),
+                }
+            )
+
+        correlation_attenuation = 1.0
+        if denom > 1e-12 and correlation_groups:
+            largest_effect = 0.0
+            for g in correlation_groups:
+                share = _safe_float(g.get("adjusted_weight", 0.0), 0.0, 0.0) / denom
+                penalty = _safe_float(g.get("penalty", 1.0), 1.0, 0.0, 1.0)
+                largest_effect = max(largest_effect, share * (1.0 - penalty))
+            correlation_attenuation = max(0.0, min(1.0, 1.0 - largest_effect))
+        if not math.isfinite(correlation_attenuation):
+            correlation_attenuation = 1.0
+
+        logger.debug(
+            "CORRELATION | groups=%d | largest=%d | denom=%.6f",
+            len(correlation_groups),
+            largest_group_size,
+            denom,
+        )
+
+        attenuated_score = raw_score * correlation_attenuation
+        if not math.isfinite(attenuated_score):
+            attenuated_score = 0.0
+
+        blended_edge = weighted_edge / denom
+        if not math.isfinite(blended_edge):
+            blended_edge = 0.0
 
         return (
-            _safe_float(raw_score * crowding_factor, 0.0, -1.0, 1.0),
-            _safe_float(weighted_edge / denom, 0.0, -_EDGE_BPS_CLAMP, _EDGE_BPS_CLAMP),
-            {"breakdown": breakdown},
+            _safe_float(attenuated_score, 0.0, -1.0, 1.0),
+            _safe_float(blended_edge, 0.0, -_EDGE_BPS_CLAMP, _EDGE_BPS_CLAMP),
+            {
+                "breakdown": breakdown,
+                "correlation_summary": {
+                    "groups": correlation_groups,
+                    "total_groups": len(correlation_groups),
+                    "largest_group": largest_group_size,
+                    "largest_group_size": largest_group_size,
+                    "attenuation_factor": correlation_attenuation,
+                },
+            },
         )
 
     # ----------------------------------------
