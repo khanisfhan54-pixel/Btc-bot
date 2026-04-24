@@ -67,15 +67,18 @@ def _coerce_1d_vector(values: Any, expected_size: int, *, name: str) -> np.ndarr
     This keeps n_features=1 and single-value slices valid instead of failing
     after np.squeeze() collapses them to scalars.
     """
-    arr = np.asarray(values, dtype=float)
+    try:
+        arr = np.asarray(values, dtype=float)
+    except Exception:
+        return np.full(int(expected_size), np.nan, dtype=float)
     if arr.ndim == 0:
         arr = arr.reshape(1)
     else:
         arr = np.ravel(arr)
     if arr.shape != (expected_size,):
-        raise ValueError(f"Vector '{name}' must have shape ({expected_size},), got {arr.shape}.")
+        return np.full(int(expected_size), np.nan, dtype=float)
     if not np.all(np.isfinite(arr)):
-        raise ValueError(f"Vector '{name}' contains non-finite values: {arr}.")
+        return np.full(int(expected_size), np.nan, dtype=float)
     return arr
 
 def safe_float(value: Any, default: float = 0.0, min: float | None = None, max: float | None = None) -> float:
@@ -176,7 +179,7 @@ def _validate_output_schema(output: Dict[str, Any]) -> bool:
         version = str(output["schema_version"]).strip()
         if version != _OUTPUT_SCHEMA_VERSION:
             raise ValueError(f"mismatch {version} != {_OUTPUT_SCHEMA_VERSION}")
-        for key in ("regime_idx", "regime_label", "probabilities", "risk_metrics", "alpha"):
+        for key in ("regime_idx", "regime_label", "probabilities", "risk_metrics", "alpha", "conviction"):
             if key not in output:
                 raise ValueError(f"missing required key: {key}")
         if not isinstance(output["probabilities"], dict):
@@ -214,8 +217,11 @@ def _validate_output_schema(output: Dict[str, Any]) -> bool:
         if not np.isfinite(edge_score):
             raise ValueError("non-finite alpha.edge_score")
         confidence = safe_float(output.get("confidence", 0.0), default=np.nan)
+        conviction = safe_float(output.get("conviction", 0.0), default=np.nan)
         if not np.isfinite(confidence) or confidence < 0.0 or confidence > 1.0:
             raise ValueError(f"invalid confidence={confidence}")
+        if not np.isfinite(conviction) or conviction < 0.0 or conviction > 1.0:
+            raise ValueError(f"invalid conviction={conviction}")
         trend_strength = safe_float(output.get("trend_strength", 0.0), default=np.nan)
         risk_level = safe_float(output.get("risk_level", 0.0), default=np.nan)
         position_size = safe_float(output.get("position_size", 0.0), default=np.nan)
@@ -269,6 +275,7 @@ def _build_output(
     trend_strength: float,
     risk_level: float,
     confidence: float,
+    conviction: float = 0.0,
     edge_score: float,
     probabilities: Dict[str, float],
     macro_probs: List[float],
@@ -306,7 +313,9 @@ def _build_output(
         max=safe_position_size,
     )
     safe_risk_level = safe_float(risk_level, default=1.0, min=0.0, max=1.0)
+    # confidence := max probability mass, conviction := entropy-derived certainty.
     safe_confidence = safe_float(confidence, default=0.0, min=0.0, max=1.0)
+    safe_conviction = safe_float(conviction, default=0.0, min=0.0, max=1.0)
     safe_trend_strength = safe_float(trend_strength, default=0.0, min=-1.0, max=1.0)
     safe_edge_score = safe_float(edge_score, default=0.0, min=0.0, max=1.0)
     safe_regime_idx = int(safe_float(regime_idx, default=-1, min=-1, max=4))
@@ -337,13 +346,14 @@ def _build_output(
         'trend_strength': safe_trend_strength,
         'risk_level': safe_risk_level,
         'confidence': safe_confidence,
+        'conviction': safe_conviction,
         'probabilities': safe_probabilities,
         'macro_probs': safe_macro_probs,
         'position_size': safe_position_size,
         'execution_mode': execution_mode,
         'execution_side': execution_side,
         'signed_position_size': safe_signed_position,
-        'extended_schema': bool(extended_schema) if extended_schema else False,
+        'extended_schema': bool(extended_schema),
         **({'signal_valid': bool(signal_valid)} if include_signal_valid else {}),
         
         # --- NEW: forward compatibility anchor ---
@@ -382,6 +392,7 @@ def _build_output(
             "trend_strength": 0.0,
             "risk_level": 1.0,
             "confidence": 0.0,
+            "conviction": 0.0,
             "probabilities": {
                 "bull": fail_safe_probs[0],
                 "bear": fail_safe_probs[1],
@@ -397,9 +408,9 @@ def _build_output(
                 "version": _OUTPUT_SCHEMA_VERSION,
                 "backward_compatible": True
             },
-                "risk_metrics": {
-                    "expected_volatility": 0.0,
-                    "raw_leverage": 0.0,
+            "risk_metrics": {
+                "expected_volatility": 0.0,
+                "raw_leverage": 0.0,
                 "last_valid_vol": safe_last_valid_vol,
                 "switch_stability_ema": safe_switch_stability,
                 "toxic_penalty_applied": True,
@@ -630,9 +641,22 @@ class NHHMM_Engine:
         
     def load_weights(self, beta: np.ndarray, mu: np.ndarray, sigma: np.ndarray):
         """Inject pre-trained parameters for live inference."""
-        self.beta = np.asarray(beta, dtype=float)
-        self.mu = np.asarray(mu, dtype=float)
-        self.sigma = np.asarray(sigma, dtype=float)
+        beta_arr = np.asarray(beta, dtype=float)
+        mu_arr = np.asarray(mu, dtype=float)
+        sigma_arr = np.asarray(sigma, dtype=float)
+        if beta_arr.shape != (self.K, self.K, self.n_features):
+            raise ValueError(
+                f"beta must have shape {(self.K, self.K, self.n_features)}, got {beta_arr.shape}"
+            )
+        if mu_arr.shape != (self.K,) or sigma_arr.shape != (self.K,):
+            raise ValueError(
+                f"mu/sigma must both have shape {(self.K,)}, got mu={mu_arr.shape}, sigma={sigma_arr.shape}"
+            )
+        if not (np.all(np.isfinite(beta_arr)) and np.all(np.isfinite(mu_arr)) and np.all(np.isfinite(sigma_arr))):
+            raise ValueError("NHHMM weights contain non-finite values.")
+        self.beta = beta_arr
+        self.mu = mu_arr
+        self.sigma = np.clip(np.abs(sigma_arr), 1e-8, None)
 
     def _compute_transition_matrix(self, x_t: np.ndarray) -> np.ndarray:
         try:
@@ -690,8 +714,20 @@ class SparseJumpModel:
         
     def load_weights(self, means: np.ndarray, weights: np.ndarray):
         """Inject pre-trained centroids for live inference."""
-        self.means = np.asarray(means, dtype=float)
-        self.weights = np.asarray(weights, dtype=float)
+        means_arr = np.asarray(means, dtype=float)
+        weights_arr = np.asarray(weights, dtype=float)
+        if means_arr.ndim != 2:
+            raise ValueError(f"means must be 2-D [K, n_features], got ndim={means_arr.ndim}")
+        if means_arr.shape[0] != self.K:
+            raise ValueError(f"means first dimension must equal K={self.K}, got {means_arr.shape[0]}")
+        if weights_arr.ndim != 1 or weights_arr.shape[0] != means_arr.shape[1]:
+            raise ValueError(
+                f"weights must be 1-D and match means feature dimension ({means_arr.shape[1]}), got {weights_arr.shape}"
+            )
+        if not (np.all(np.isfinite(means_arr)) and np.all(np.isfinite(weights_arr))):
+            raise ValueError("SJM weights contain non-finite values.")
+        self.means = means_arr
+        self.weights = weights_arr
 
     def online_predict(
         self,
@@ -715,11 +751,14 @@ class SparseJumpModel:
         if self.means is None:
             self.means = np.zeros((self.K, n_feat), dtype=float)
             if n_feat > 0:
-                self.means[0, 0] = 0.0030
+                if n_feat == 1:
+                    self.means[0, 0] = 0.01
+                else:
+                    self.means[0, 0] = 0.0030
                 if self.K > 1:
-                    self.means[1, 0] = -0.0030
+                    self.means[1, 0] = -0.01 if n_feat == 1 else -0.0030
                 if self.K > 2:
-                    crisis_idx = min(2, n_feat - 1)
+                    crisis_idx = 0 if n_feat == 1 else min(2, n_feat - 1)
                     self.means[2, crisis_idx] = 0.05
             self.weights = np.ones(n_feat) / np.sqrt(n_feat)
         elif self.means.shape[1] != n_feat:
@@ -992,6 +1031,7 @@ class AdvancedRegimeEngine:
         strict_mtf_keys: bool = True,
         mtf_weights: Dict[str, float] = None,
         seed: int | None = 7,
+        engine_id: str | None = None,
     ):
         if n_states != 3:
             raise ValueError(
@@ -1110,7 +1150,12 @@ class AdvancedRegimeEngine:
         self._warning_drop_alerted = False
         self._warning_backend_failure_count = 0
 
-        self.engine_id = f"engine_{id(self)}"
+        if engine_id is not None:
+            self.engine_id = str(engine_id)
+        else:
+            stable_source = f"{int(n_states)}|{int(n_features)}|{float(target_vol):.10g}|{self._rng_seed}"
+            stable_hash = hashlib.sha256(stable_source.encode("utf-8")).hexdigest()[:16]
+            self.engine_id = f"engine_{stable_hash}"
 
         # ==========================================
         # NEW: Async Warning Queue (Non-blocking I/O)
@@ -1129,8 +1174,10 @@ class AdvancedRegimeEngine:
             self._warning_worker = None
         self._warning_finalizer = weakref.finalize(
             self,
-            AdvancedRegimeEngine._finalize_warning_worker,
-            weakref.ref(self),
+            AdvancedRegimeEngine._shutdown_worker,
+            self._warning_stop_event,
+            self._warning_queue,
+            self._warning_worker,
         )
 
         self._errors_module_available = True
@@ -1260,13 +1307,21 @@ class AdvancedRegimeEngine:
             self._warn_rate_limited("replay_record_failure", f"Replay record failed: {exc}", cooldown_s=30.0)
 
     def _shutdown_warning_worker(self) -> None:
+        AdvancedRegimeEngine._shutdown_worker(
+            getattr(self, "_warning_stop_event", None),
+            getattr(self, "_warning_queue", None),
+            getattr(self, "_warning_worker", None),
+        )
+
+    @staticmethod
+    def _shutdown_worker(
+        stop_event: threading.Event | None,
+        warning_queue: "queue.Queue[str] | None",
+        worker: threading.Thread | None,
+    ) -> None:
         """
         Best-effort shutdown path to flush queued warnings before process exit.
         """
-        stop_event = getattr(self, "_warning_stop_event", None)
-        worker = getattr(self, "_warning_worker", None)
-        warning_queue = getattr(self, "_warning_queue", None)
-
         if stop_event is None or worker is None or warning_queue is None:
             return
 
@@ -1274,16 +1329,10 @@ class AdvancedRegimeEngine:
         try:
             warning_queue.put_nowait(None)
         except queue.Full:
-            self._warn_rate_limited("warning_queue_full_shutdown", "Warning queue full during shutdown", cooldown_s=30.0)
+            pass
 
         if worker.is_alive():
             worker.join(timeout=1.0)
-
-    @staticmethod
-    def _finalize_warning_worker(self_ref: "weakref.ReferenceType[AdvancedRegimeEngine]") -> None:
-        obj = self_ref()
-        if obj is not None:
-            obj._shutdown_warning_worker()
 
     @staticmethod
     def _normalize_timestamp(ts: Any) -> float | None:
@@ -1388,6 +1437,20 @@ class AdvancedRegimeEngine:
     # ==========================================
     # NEW: Async Warning Emitter Loop
     # ==========================================
+    @staticmethod
+    def _emit_warning_with_timeout(message: str, timeout_s: float = 1.0) -> bool:
+        done = threading.Event()
+
+        def _emit() -> None:
+            try:
+                LOGGER.warning(message)
+            finally:
+                done.set()
+
+        t = threading.Thread(target=_emit, daemon=True, name="warning_log_emit")
+        t.start()
+        return bool(done.wait(timeout=max(float(timeout_s), 0.01)))
+
     def _warning_emitter_loop(self) -> None:
         """
         Dedicated background thread for warning emission.
@@ -1408,7 +1471,17 @@ class AdvancedRegimeEngine:
                 continue
 
             try:
-                LOGGER.warning(msg)
+                emitted = self._emit_warning_with_timeout(msg, timeout_s=1.0)
+                if not emitted:
+                    self._warning_backend_failure_count = int(getattr(self, "_warning_backend_failure_count", 0)) + 1
+                    try:
+                        warnings.warn(
+                            "LOGGER.warning timeout in background worker; message emission skipped.",
+                            RuntimeWarning,
+                            stacklevel=3,
+                        )
+                    except Exception:
+                        pass
             except Exception:
                 self._warning_backend_failure_count = int(getattr(self, "_warning_backend_failure_count", 0)) + 1
                 try:
@@ -1814,6 +1887,11 @@ class AdvancedRegimeEngine:
             "garch_prob": self.garch_prob.astype(float).tolist(),
             "smoothed_garch_prob": self._smoothed_garch_prob.astype(float).tolist(),
             "regime_state_probs": self._regime_state_probs.astype(float).tolist(),
+            "regime_smoother_prev_probs": (
+                self._regime_smoother.prev_probs.astype(float).tolist()
+                if getattr(self, "_regime_smoother", None) is not None
+                else self._regime_state_probs.astype(float).tolist()
+            ),
             "garch_var": self.garch_var.astype(float).tolist(),
             "circuit_breaker_active": bool(self._circuit_breaker_active),
             "circuit_breaker_reason": self._circuit_breaker_reason,
@@ -1986,7 +2064,19 @@ class AdvancedRegimeEngine:
             self._log_state_load_issue("last_regime_change_ts", ValueError("invalid timestamp"), state.get("last_regime_change_ts"))
 
         self._prev_regime = state.get("prev_regime", None)
-        self._prev_directional_label = state.get("prev_directional_label", None)
+        raw_directional_label = state.get("prev_directional_label", None)
+        allowed_labels = {"TREND", "BEAR", "RANGE", "TOXIC"}
+        if raw_directional_label is None:
+            self._prev_directional_label = None
+        elif isinstance(raw_directional_label, str) and raw_directional_label in allowed_labels:
+            self._prev_directional_label = raw_directional_label
+        else:
+            self._log_state_load_issue(
+                "prev_directional_label",
+                ValueError(f"invalid label: {raw_directional_label}"),
+                raw_directional_label,
+            )
+            self._prev_directional_label = None
         self._prev_raw_regime = state.get("prev_raw_regime", None)
         self._confirmed_regime = state.get("confirmed_regime", None)
 
@@ -2028,8 +2118,17 @@ class AdvancedRegimeEngine:
             normalize_probabilities=True,
         )
 
-        if "regime_state_probs" in state and state["regime_state_probs"] is not None:
-            self._regime_state_probs = self._state_vector(
+        smoother_key = "regime_smoother_prev_probs"
+        if smoother_key in state and state[smoother_key] is not None:
+            synced_probs = self._state_vector(
+                state,
+                smoother_key,
+                4,
+                fallback=np.ones(4, dtype=float) / 4.0,
+                normalize_probabilities=True,
+            )
+        elif "regime_state_probs" in state and state["regime_state_probs"] is not None:
+            synced_probs = self._state_vector(
                 state,
                 "regime_state_probs",
                 4,
@@ -2037,9 +2136,11 @@ class AdvancedRegimeEngine:
                 normalize_probabilities=True,
             )
         else:
-            self._regime_state_probs = np.ones(4, dtype=float) / 4.0
+            synced_probs = np.ones(4, dtype=float) / 4.0
+        self._regime_state_probs = np.asarray(synced_probs, dtype=float)
         if getattr(self, "_regime_smoother", None) is not None:
             self._regime_smoother.set_prev_probs(self._regime_state_probs)
+            self._regime_state_probs = np.asarray(self._regime_smoother.prev_probs, dtype=float).copy()
 
         self.garch_var = self._state_vector(
             state,
@@ -2107,6 +2208,9 @@ class AdvancedRegimeEngine:
 
         start_time = time.perf_counter()
         self._tick_id = int(getattr(self, "_tick_id", 0)) + 1
+        valid_tf_count = 0
+        expected_weighted_tf_count = 0
+        total_candidate_tfs = 0
         obs_sample = self._obs_should_sample()
         if obs_sample and not getattr(self, "_is_replay", False):
             self._replay_record(
@@ -2131,6 +2235,7 @@ class AdvancedRegimeEngine:
                 trend_strength=0.0,
                 risk_level=1.0,
                 confidence=0.0,
+                conviction=0.0,
                 edge_score=0.0,
                 probabilities={"bull": 0.0, "bear": 0.0, "crisis": 1.0},
                 macro_probs=[1 / 3, 1 / 3, 1 / 3],
@@ -2149,14 +2254,35 @@ class AdvancedRegimeEngine:
             )
 
         # ==========================================
-        # 🚨 STEP -1: PnL TRACKING (NEW)
+        # 🚨 STEP 0: CIRCUIT BREAKER CHECK
+        # ==========================================
+        if self._circuit_breaker_active:
+            self._healing_counter += 1
+
+            if self._healing_counter > self._HEALING_COOLDOWN_TICKS:
+                self._self_heal()
+                output = _build_halted_output()
+                _observe_latency()
+                if obs_sample and not getattr(self, "_is_replay", False):
+                    self._replay_record("update_end", {"regime": "HALTED_HEALING"})
+                return output
+            else:
+                self._obs_observe("circuit_breaker", "critical", {"reason": self._circuit_breaker_reason})
+                output = _build_halted_output()
+                _observe_latency()
+                if obs_sample and not getattr(self, "_is_replay", False):
+                    self._replay_record("update_end", {"regime": "HALTED"})
+                return output
+
+        # ==========================================
+        # 🚨 STEP -1: PnL TRACKING
         # ==========================================
         price = market_data.get("price", None)
         if price is not None:
             try:
                 price = float(price)
                 if np.isfinite(price):
-                    if not self._circuit_breaker_active and self._last_price is not None:
+                    if self._last_price is not None:
                         prev_price = float(self._last_price)
                         if np.isfinite(prev_price) and abs(prev_price) > 1e-12:
                             frac_ret = (price - prev_price) / prev_price
@@ -2192,27 +2318,6 @@ class AdvancedRegimeEngine:
                     cooldown_s=15.0,
                 )
                 self._obs_observe("pnl_tracking_failure", "medium", {"reason": "price_parse_error"})
-
-        # ==========================================
-        # 🚨 STEP 0: CIRCUIT BREAKER CHECK
-        # ==========================================
-        if self._circuit_breaker_active:
-            self._healing_counter += 1
-
-            if self._healing_counter > self._HEALING_COOLDOWN_TICKS:
-                self._self_heal()
-                output = _build_halted_output()
-                _observe_latency()
-                if obs_sample and not getattr(self, "_is_replay", False):
-                    self._replay_record("update_end", {"regime": "HALTED_HEALING"})
-                return output
-            else:
-                self._obs_observe("circuit_breaker", "critical", {"reason": self._circuit_breaker_reason})
-                output = _build_halted_output()
-                _observe_latency()
-                if obs_sample and not getattr(self, "_is_replay", False):
-                    self._replay_record("update_end", {"regime": "HALTED"})
-                return output
         
         # ==========================================
         # FIXED: Explicit base timeframe + safe MTF fusion
@@ -2378,6 +2483,39 @@ class AdvancedRegimeEngine:
             # ==========================================
             y_t = market_data.get('return', None)
             x_t = market_data.get('features', None)
+            if y_t is None or x_t is None:
+                self._warn_rate_limited(
+                    key="single_tf_missing_data",
+                    message="Single-TF update missing required return/features payload; emitting fail-safe output.",
+                    cooldown_s=30.0,
+                )
+                output = _build_output(
+                    regime_idx=-1,
+                    regime_label="UNKNOWN",
+                    execution_mode="fail_safe",
+                    trend_strength=float(getattr(self, "_last_effective_trend_strength", 0.0)),
+                    risk_level=1.0,
+                    confidence=0.0,
+                    conviction=0.0,
+                    edge_score=0.0,
+                    probabilities={'bull': 0.0, 'bear': 0.0, 'crisis': 1.0},
+                    macro_probs=self.nhhmm_prior.tolist(),
+                    position_size=0.0,
+                    expected_vol=float(getattr(self, "_last_valid_vol", self.garch.target_vol)),
+                    raw_size=0.0,
+                    is_toxic=True,
+                    garch_regime_probs=self.garch_prob.tolist(),
+                    feed_status='MISSING_DATA',
+                    last_valid_vol=float(getattr(self, "_last_valid_vol", self.garch.target_vol)),
+                    switch_stability_ema=float(getattr(self, "_switch_stability_ema", 1.0)),
+                    execution_side='flat',
+                    extended_schema=self._emit_extended_schema,
+                    range_ticks=self.range_ticks_int,
+                    include_signal_valid=True,
+                    signal_valid=False,
+                )
+                _observe_latency()
+                return output
 
         # ==========================================
         # FIX #2: Preserve valid MTF posterior before execution validation
@@ -2412,7 +2550,7 @@ class AdvancedRegimeEngine:
                 name="update x_t",
             )
         except (ValueError, TypeError):
-            x_t = np.array([], dtype=float)
+            x_t = np.full(self.n_features, np.nan, dtype=float)
 
         # Repair corrupted risk state before it can contaminate the next tick.
         if not np.all(np.isfinite(self.garch_var)):
@@ -2422,8 +2560,19 @@ class AdvancedRegimeEngine:
         if self._last_timestamp is None or current_ts is None:
             time_delta = self._last_valid_dt
         else:
-            raw_dt = max(current_ts - self._last_timestamp, 0.0)
-            time_delta = min(raw_dt, self._MAX_DT)
+            raw_dt = current_ts - self._last_timestamp
+            if raw_dt < 0.0:
+                self._warn_rate_limited(
+                    key="timestamp_regression",
+                    message=(
+                        f"Timestamp regression detected (current={current_ts}, last={self._last_timestamp}); "
+                        "using last_valid_dt to avoid decay discontinuity."
+                    ),
+                    cooldown_s=30.0,
+                )
+                time_delta = float(self._last_valid_dt)
+            else:
+                time_delta = min(raw_dt, self._MAX_DT)
         decay_dt = max(time_delta, 0.0)
         if time_delta > 0:
             self._last_valid_dt = time_delta
@@ -2493,6 +2642,7 @@ class AdvancedRegimeEngine:
                 trend_strength=safe_trend_strength,
                 risk_level=1.0,
                 confidence=0.0,
+                conviction=0.0,
                 edge_score=0.0,
                 probabilities={'bull': 0.0, 'bear': 0.0, 'crisis': 1.0},
                 macro_probs=self.nhhmm_prior.tolist(),
@@ -2562,9 +2712,11 @@ class AdvancedRegimeEngine:
         nhhmm_confidence = float(np.max(nhhmm_posterior))
         effective_bias_weight = float(np.clip(nhhmm_confidence, 0.0, 1.0))
         sjm_x_t = np.asarray(x_t, dtype=float).copy()
-        if sjm_x_t.size > self._SJM_RESERVED_ABS_RETURN_IDX and np.isfinite(y_t):
-            sjm_x_t[self._SJM_RESERVED_RETURN_IDX] = float(y_t)
-            sjm_x_t[self._SJM_RESERVED_ABS_RETURN_IDX] = abs(float(y_t))
+        if np.isfinite(y_t):
+            if sjm_x_t.size >= 1:
+                sjm_x_t[0] = float(y_t)
+            if sjm_x_t.size >= 3:
+                sjm_x_t[2] = abs(float(y_t))
         sjm_state, sjm_probs = self.sjm.online_predict(
             x_t=sjm_x_t,
             expected_n_features=self.n_features,
@@ -3127,6 +3279,7 @@ class AdvancedRegimeEngine:
             trend_strength=float(effective_trend_strength),
             risk_level=float(regime_scores["risk_level"]),
             confidence=float(regime_scores["confidence"]),
+            conviction=float(regime_scores["conviction"]),
             edge_score=float(edge_score),
             probabilities={
                 'bull': float(regime_scores["bull"]),
@@ -3439,7 +3592,6 @@ class AdvancedRegimeEngine:
             self._equity_peak = 1.0
             self._drawdown = 0.0
             self._loss_streak = 0
-            self._last_price = None
 
             # Reset memory variables
             self._shock_memory = 0.0
