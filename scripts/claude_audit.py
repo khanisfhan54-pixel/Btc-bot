@@ -154,7 +154,7 @@ def call_claude(prompt):
                     {"role": "user", "content": prompt}
                 ]
             },
-            timeout=120
+            timeout=500
         )
 
         data = response.json()
