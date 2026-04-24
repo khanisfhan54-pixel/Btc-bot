@@ -366,7 +366,13 @@ def test_load_state_logs_degrade_fields(engine, caplog):
 
 
 def test_load_state_signature_and_version_mismatch_do_not_crash(engine):
+    engine.current_regime_idx = 2
+    engine._circuit_breaker_active = True
+    engine._drawdown = 0.9
     engine.load_state({"model_signature": "bad", "state_version": "0.0.0"})
+    assert engine.current_regime_idx is None
+    assert engine._circuit_breaker_active is False
+    assert engine._drawdown == 0.0
     out = engine.update(_md(ret=0.001, ts=1.0))
     assert out["schema_version"] == "1.2.0"
 
@@ -376,6 +382,7 @@ def test_safe_deserialization_helpers_never_raise_and_normalize():
     assert _safe_int("x", default=3, min=0, max=5) == 3
     vec = _safe_array([1.0, float("nan"), "bad"], shape=(3,), default=[0.0, 0.0, 0.0])
     assert vec.shape == (3,)
+    assert np.all(np.isfinite(vec))
     probs = _safe_prob_vector([1.0, float("nan"), -2.0], 3)
     assert np.isclose(float(np.sum(probs)), 1.0)
     assert np.all(np.isfinite(probs))
@@ -452,7 +459,32 @@ def test_circuit_breaker_vol_shock_short_circuits_same_tick(engine):
     assert out["regime_label"] == "HALTED"
     assert out["execution_mode"] == "circuit_breaker"
     assert out["risk_metrics"]["feed_status"] == "CIRCUIT_BREAKER:VOL_SHOCK"
+    assert out["signal_valid"] is False
+    assert out["position_size"] == 0.0
+    assert out["signed_position_size"] == 0.0
+    assert out["execution_side"] == "flat"
+    assert out["confidence"] == 0.0
+    assert out["alpha"]["edge_score"] == 0.0
+    assert out["risk_metrics"]["toxic_penalty_applied"] is True
     assert engine._circuit_breaker_active is True
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["MAX_DRAWDOWN", "LOSS_STREAK", "VOL_SHOCK", "CONFIDENCE_COLLAPSE", "MANUAL_TRIGGER"],
+)
+def test_halted_output_invariants_hold_for_all_breaker_reasons(engine, reason):
+    engine._trigger_circuit_breaker(reason)
+    out = engine.update(_md(ret=0.001, ts=10.0))
+    assert out["regime_label"] == "HALTED"
+    assert out["execution_mode"] == "circuit_breaker"
+    assert out["signal_valid"] is False
+    assert out["position_size"] == 0.0
+    assert out["signed_position_size"] == 0.0
+    assert out["execution_side"] == "flat"
+    assert out["confidence"] == 0.0
+    assert out["alpha"]["edge_score"] == 0.0
+    assert out["risk_metrics"]["toxic_penalty_applied"] is True
 
 
 def test_reset_state_clears_breaker_healing_and_price(engine):
