@@ -1,133 +1,47 @@
-import os
-import requests
-import json
+name: claude-audit
 
-API_KEY = os.getenv("CLAUDE_API_KEY")
+on:
+  push:
+    branches: [ main, dev ]
+  pull_request:
 
-TARGET_FILES = [
-    "advanced_regime_engine.py",
-    "alpha_orchestrator.py"
-]
+jobs:
+  claude-audit:
+    runs-on: ubuntu-latest
 
-MAX_INPUT_CHARS = 200000
+    steps:
+      # Checkout
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
+      # Python setup
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-# ===============================
-# READ TARGET FILES
-# ===============================
-def read_repo():
-    code = ""
+      # Install deps
+      - name: Install dependencies
+        run: |
+          pip install requests
 
-    for root, _, files in os.walk("."):
-        for f in files:
-            if f in TARGET_FILES:
-                path = os.path.join(root, f)
+      # Run Claude audit
+      - name: Run Claude Audit
+        env:
+          CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
+        run: |
+          echo "🚀 Running Claude audit..."
+          python scripts/claude_audit.py
 
-                with open(path, "r", encoding="utf-8") as file:
-                    code += f"\n\n# FILE: {path}\n\n"
-                    code += file.read()
+      # Upload report
+      - name: Upload audit artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-audit-report
+          path: CLAUDE_AUDIT.md
 
-    return code[:MAX_INPUT_CHARS]
-
-
-# ===============================
-# PROMPT (STRICT FORMAT)
-# ===============================
-def build_prompt(code):
-    return f"""
-You are a senior production-grade Python systems auditor.
-
-STRICT RULES (NON-NEGOTIABLE):
-- DO NOT rewrite full files
-- DO NOT output full implementations
-- DO NOT modify files directly
-- ONLY produce audit + root cause + unified diff patches
-
-OUTPUT FORMAT (STRICT):
-
-## 🔍 AUDIT SUMMARY
-- List ALL critical bugs
-- Be precise (file + function + issue)
-
-## ⚠️ ROOT CAUSE
-- Explain WHY each issue exists
-
-## 🧩 PATCH DIFF
-- Provide ONLY unified diff patches
-- Use standard git diff format
-- Include correct file paths
-- DO NOT include explanations here
-
-EXAMPLE DIFF FORMAT:
-
---- a/file.py
-+++ b/file.py
-@@
-- old line
-+ new line
-
-
-CODE:
-{code}
-"""
-
-
-# ===============================
-# CLAUDE CALL
-# ===============================
-def call_claude(prompt):
-    response = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json"
-        },
-        json={
-            "model": "claude-opus-4-6",  # as you requested
-            "max_tokens": 16000,
-            "temperature": 0,
-            "messages": [
-                {"role": "user", "content": prompt}
-            ]
-        }
-    )
-
-    if response.status_code != 200:
-        raise Exception(f"Claude API error: {response.text}")
-
-    return response.json()
-
-
-# ===============================
-# MAIN
-# ===============================
-def main():
-    if not API_KEY:
-        raise ValueError("Missing CLAUDE_API_KEY")
-
-    print("📂 Reading repo...")
-    code = read_repo()
-
-    print("🧠 Running Claude audit...")
-    prompt = build_prompt(code)
-    result = call_claude(prompt)
-
-    try:
-        output = result["content"][0]["text"]
-    except Exception:
-        raise Exception(f"Invalid Claude response: {result}")
-
-    # Save report only (NO AUTO APPLY)
-    with open("CLAUDE_AUDIT.md", "w", encoding="utf-8") as f:
-        f.write(output)
-
-    print("✅ Audit complete")
-    print("📄 Saved to CLAUDE_AUDIT.md")
-    print("⚠️ Review patch manually before applying")
-
-
-if __name__ == "__main__":
-    main()
-      
-      
+      # Optional: Print summary in logs
+      - name: Show audit output
+        run: |
+          echo "===== CLAUDE AUDIT OUTPUT ====="
+          cat CLAUDE_AUDIT.md
