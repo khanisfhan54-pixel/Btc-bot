@@ -77,10 +77,26 @@ def _coerce_1d_vector(values: Any, expected_size: int, *, name: str) -> np.ndarr
         raise ValueError(f"Vector '{name}' contains non-finite values: {arr}.")
     return arr
 
+def safe_float(value: Any, default: float = 0.0, min: float | None = None, max: float | None = None) -> float:
+    """Best-effort scalar coercion for schema/output hardening."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = float(default)
+    if not np.isfinite(parsed):
+        parsed = float(default)
+    if min is not None and parsed < min:
+        parsed = float(min)
+    if max is not None and parsed > max:
+        parsed = float(max)
+    return float(parsed)
+
+
 def _normalize_prob_vector(values: np.ndarray, floor: float = 1e-12) -> np.ndarray:
     arr = np.asarray(values, dtype=float)
     if arr.ndim != 1 or arr.size == 0:
         raise ValueError(f"Probability vector must be a non-empty 1-D array, got shape {arr.shape}.")
+    arr = np.where(np.isfinite(arr), arr, floor)
     arr = np.clip(arr, floor, None)
     total = float(arr.sum())
     if not np.isfinite(total) or total <= 0.0:
@@ -162,6 +178,20 @@ def _validate_output_schema(output: Dict[str, Any]) -> bool:
         macro_sum = sum(float(v) for v in macro_probs)
         if abs(macro_sum - 1.0) > 1e-3:
             raise ValueError(f"invalid macro_probs sum={macro_sum}")
+        garch_regime_probs = output["risk_metrics"].get("garch_regime_probs")
+        if not isinstance(garch_regime_probs, list) or len(garch_regime_probs) != 2:
+            raise ValueError("risk_metrics.garch_regime_probs must be a 2-element list")
+        if any(not np.isfinite(float(v)) for v in garch_regime_probs):
+            raise ValueError("risk_metrics.garch_regime_probs contains non-finite values")
+        garch_sum = sum(float(v) for v in garch_regime_probs)
+        if abs(garch_sum - 1.0) > 1e-3:
+            raise ValueError(f"invalid garch_regime_probs sum={garch_sum}")
+        if position_size < 0.0 or position_size > 0.35:
+            raise ValueError(f"invalid position_size={position_size}")
+        if abs(signed_size) > (position_size + 1e-9):
+            raise ValueError(
+                f"signed_position_size magnitude exceeds position_size: {signed_size} vs {position_size}"
+            )
 
         return True
     except Exception as e:
@@ -204,28 +234,55 @@ def _build_output(
     paths emit identical key sets, eliminating downstream KeyError risks from
     schema divergence between code paths.
     """
-    try:
-        safe_expected_vol = float(expected_vol)
-    except (TypeError, ValueError):
-        safe_expected_vol = 0.0
-    if not np.isfinite(safe_expected_vol) or safe_expected_vol < 0.0:
-        safe_expected_vol = 0.0
-    safe_last_valid_vol = float(last_valid_vol)
-    if not np.isfinite(safe_last_valid_vol) or safe_last_valid_vol <= 0.0:
-        safe_last_valid_vol = max(safe_expected_vol, 1e-12)
+    safe_expected_vol = safe_float(expected_vol, default=0.0, min=0.0)
+    safe_last_valid_vol = safe_float(last_valid_vol, default=max(safe_expected_vol, 1e-12), min=1e-12)
+    safe_switch_stability = safe_float(switch_stability_ema, default=1.0, min=1e-6)
+    safe_raw_size = safe_float(raw_size, default=0.0, min=0.0, max=10.0)
+    safe_position_size = safe_float(position_size, default=0.0, min=0.0, max=0.35)
+    safe_signed_position = safe_float(
+        signed_position_size,
+        default=0.0,
+        min=-safe_position_size,
+        max=safe_position_size,
+    )
+    safe_risk_level = safe_float(risk_level, default=1.0, min=0.0, max=1.0)
+    safe_confidence = safe_float(confidence, default=0.0, min=0.0, max=1.0)
+    safe_trend_strength = safe_float(trend_strength, default=0.0, min=-1.0, max=1.0)
+    safe_edge_score = safe_float(edge_score, default=0.0, min=0.0, max=1.0)
+    safe_regime_idx = int(safe_float(regime_idx, default=-1, min=-1, max=4))
+    probabilities = probabilities if isinstance(probabilities, dict) else {}
+    safe_prob_values = _normalize_prob_vector(np.asarray([
+        safe_float(probabilities.get("bull", 1.0 / 3.0), default=1.0 / 3.0, min=0.0),
+        safe_float(probabilities.get("bear", 1.0 / 3.0), default=1.0 / 3.0, min=0.0),
+        safe_float(probabilities.get("crisis", 1.0 / 3.0), default=1.0 / 3.0, min=0.0),
+    ], dtype=float))
+    safe_probabilities = {
+        "bull": float(safe_prob_values[0]),
+        "bear": float(safe_prob_values[1]),
+        "crisis": float(safe_prob_values[2]),
+    }
+    macro_probs = macro_probs if isinstance(macro_probs, list) else []
+    safe_macro_probs = _normalize_prob_vector(np.asarray([
+        safe_float(macro_probs[i] if len(macro_probs) > i else 1.0 / 3.0, default=1.0 / 3.0, min=0.0)
+        for i in range(3)
+    ], dtype=float)).tolist()
+    safe_garch_probs = _normalize_prob_vector(np.asarray([
+        safe_float(garch_regime_probs[i] if isinstance(garch_regime_probs, list) and len(garch_regime_probs) > i else 0.5, default=0.5, min=0.0)
+        for i in range(2)
+    ], dtype=float)).tolist()
     out = {
         'schema_version': _OUTPUT_SCHEMA_VERSION,
-        'regime_idx': regime_idx,
-        'regime_label': regime_label,
-        'trend_strength': trend_strength,
-        'risk_level': risk_level,
-        'confidence': confidence,
-        'probabilities': probabilities,
-        'macro_probs': macro_probs,
-        'position_size': position_size,
+        'regime_idx': safe_regime_idx,
+        'regime_label': str(regime_label or "UNKNOWN"),
+        'trend_strength': safe_trend_strength,
+        'risk_level': safe_risk_level,
+        'confidence': safe_confidence,
+        'probabilities': safe_probabilities,
+        'macro_probs': safe_macro_probs,
+        'position_size': safe_position_size,
         'execution_mode': execution_mode,
         'execution_side': execution_side,
-        'signed_position_size': float(signed_position_size),
+        'signed_position_size': safe_signed_position,
         'extended_schema': bool(extended_schema) if extended_schema else False,
         **({'signal_valid': bool(signal_valid)} if include_signal_valid else {}),
         
@@ -237,19 +294,19 @@ def _build_output(
         
         'risk_metrics': {
             'expected_volatility': safe_expected_vol,
-            'raw_leverage': float(raw_size),
+            'raw_leverage': safe_raw_size,
             'last_valid_vol': safe_last_valid_vol,
-            'switch_stability_ema': float(switch_stability_ema),
+            'switch_stability_ema': safe_switch_stability,
             'toxic_penalty_applied': bool(is_toxic),
-            'garch_regime_probs': garch_regime_probs,
-            'feed_status': feed_status,
-            'range_ticks': range_ticks,
+            'garch_regime_probs': safe_garch_probs,
+            'feed_status': str(feed_status or "UNKNOWN"),
+            'range_ticks': int(safe_float(range_ticks, default=0.0, min=0.0, max=1e9)),
         },
         # ==========================================
         # EDGE OUTPUT (NEW - FIXES SCHEMA GAP)
         # ==========================================
         'alpha': {
-            'edge_score': float(edge_score)
+            'edge_score': safe_edge_score
         },
     }
     
@@ -273,11 +330,11 @@ def _build_output(
                 "version": _OUTPUT_SCHEMA_VERSION,
                 "backward_compatible": True
             },
-            "risk_metrics": {
-                "expected_volatility": 0.0,
-                "raw_leverage": 0.0,
-                "last_valid_vol": float(last_valid_vol),
-                "switch_stability_ema": float(switch_stability_ema),
+                "risk_metrics": {
+                    "expected_volatility": 0.0,
+                    "raw_leverage": 0.0,
+                "last_valid_vol": safe_last_valid_vol,
+                "switch_stability_ema": safe_switch_stability,
                 "toxic_penalty_applied": True,
                 "garch_regime_probs": [0.5, 0.5],
                 "feed_status": "SCHEMA_FAILURE",
@@ -508,8 +565,10 @@ class NHHMM_Engine:
         Filtered alpha_t using strictly forward data (current + past only).
         Fully vectorised; log-space emission prevents underflow on extreme returns.
         """
+        y_t = safe_float(y_t, default=0.0, min=-2.0, max=2.0)
+        prior_prob = _normalize_prob_vector(np.asarray(prior_prob, dtype=float))
         P_t = self._compute_transition_matrix(x_t)
-        pred_prob = np.dot(prior_prob, P_t)  # Chapman-Kolmogorov prediction
+        pred_prob = _normalize_prob_vector(np.dot(prior_prob, P_t))  # Chapman-Kolmogorov prediction
 
         # Vectorised log N(y_t | mu_k, sigma_k) across all K states.
         sigma_safe = self.sigma + 1e-12
@@ -579,6 +638,10 @@ class SparseJumpModel:
                 f"SJM feature dimension mismatch: expected {self.means.shape[1]}, "
                 f"got {n_feat}. Check upstream feature pipeline."
             )
+        try:
+            nhhmm_probs = _normalize_prob_vector(np.asarray(nhhmm_probs, dtype=float))
+        except Exception:
+            nhhmm_probs = np.ones(self.K, dtype=float) / self.K
 
         weighted_x = x_t * self.weights  # (n_feat,)
 
@@ -641,11 +704,17 @@ class MSGARCH_RiskEngine:
     def _garch_update(
         self, current_var: np.ndarray, return_t: float
     ) -> np.ndarray:
+        current_var = np.asarray(current_var, dtype=float)
+        current_var = np.where(np.isfinite(current_var), current_var, self.target_vol ** 2)
+        current_var = np.clip(current_var, 1e-8, self._VAR_CEIL)
+        return_t = safe_float(return_t, default=0.0, min=-2.0, max=2.0)
         new_var = (
             self.omega
             + self.alpha * (return_t ** 2)
             + self.beta_garch * current_var
         )
+        if not np.all(np.isfinite(new_var)):
+            return np.full(2, max(self.target_vol ** 2, 1e-8), dtype=float)
         return np.clip(new_var, 1e-8, self._VAR_CEIL)
 
     def _update_regime_probs(
@@ -654,13 +723,13 @@ class MSGARCH_RiskEngine:
         predicted_var: np.ndarray,
         return_t: float,
     ) -> np.ndarray:
+        current_probs = _normalize_prob_vector(np.asarray(current_probs, dtype=float))
+        return_t = safe_float(return_t, default=0.0, min=-2.0, max=2.0)
         predicted_var = np.clip(
             np.asarray(predicted_var, dtype=float), 1e-8, None
         )
         if not np.all(np.isfinite(predicted_var)):
-            raise ValueError(
-                f"Non-finite predicted variance entering Bayesian filter: {predicted_var}"
-            )
+            predicted_var = np.full(2, max(self.target_vol ** 2, 1e-8), dtype=float)
         log_likelihoods = (
             -0.5 * np.log(2.0 * np.pi * predicted_var + 1e-12)
             - 0.5 * (return_t ** 2) / (predicted_var + 1e-12)
@@ -2117,11 +2186,16 @@ class AdvancedRegimeEngine:
 
         y_t = self._coerce_finite_scalar(y_t, default=0.0)
         if abs(y_t) > 2.0:
-            raise ValueError(
-                f"Return value {y_t:.6f} exceeds plausible fractional range "
-                f"(|r| > 2.0). Verify upstream pipeline normalises to fractional "
-                "returns before calling update()."
+            self._warn_rate_limited(
+                key="return_out_of_bounds",
+                message=(
+                    f"Return value {y_t:.6f} exceeds plausible fractional range (|r| > 2.0); "
+                    "clamping to preserve engine continuity."
+                ),
+                cooldown_s=30.0,
             )
+            self._obs_observe("return_out_of_bounds", "medium", {"source": "update"})
+            y_t = float(np.clip(y_t, -2.0, 2.0))
 
         if x_t is None:
             x_t = np.zeros(self.n_features)
