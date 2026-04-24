@@ -1707,6 +1707,9 @@ class AlphaOrchestrator:
         def _approx_equal(a: float, b: float) -> bool:
             return abs(a - b) <= eps * max(1.0, abs(a), abs(b))
 
+        def _effectively_zero(v: float) -> bool:
+            return _approx_equal(v, 0.0)
+
         def _canonical_group_key(direction: int, timeframe_bucket: str, group_id: str) -> Optional[Tuple[int, str, str]]:
             if direction not in (-1, 1):
                 return None
@@ -1749,45 +1752,62 @@ class AlphaOrchestrator:
         regime_feedback_enabled = self.config.regime_feedback_enabled
         feedback_max_multiplier = self.config.feedback_max_multiplier
 
-        def _dominance_cap_closed_form(weights: List[float], cap_ratio: float = 0.4) -> List[float]:
-            """Deterministic closed-form cap where each final weight <= cap_ratio * total_final."""
+        def _dominance_cap_projection(weights: List[float], cap_ratio: float = 0.4) -> List[float]:
+            """Exact projection under reduction-only cap: min ||x-w|| with 0<=x<=w and x_i<=c*sum(x)."""
             n = len(weights)
             if n == 0:
                 return []
             clamped = [_safe_float(w, 0.0, 0.0) for w in weights]
-            if n < 3:
-                return clamped
             cap_ratio = _safe_float(cap_ratio, 0.4, 0.0, 0.999999)
             total = sum(clamped)
-            if total <= eps:
+            if _effectively_zero(total):
                 return [0.0] * n
-            max_w = max(clamped)
-            if max_w <= cap_ratio * total + eps:
+            if max(clamped) <= cap_ratio * total + eps * max(1.0, total):
                 return clamped
 
-            # General water-filling: solve t from x_i=min(w_i,t), t=cap_ratio*sum(x).
             sorted_w = sorted(clamped)
-            inv_c = 1.0 / cap_ratio
-            threshold = 0.0
-            solved = False
             prefix = [0.0]
             for w in sorted_w:
                 prefix.append(prefix[-1] + w)
+
+            threshold: Optional[float] = None
             for j in range(0, n + 1):
                 capped_count = n - j
-                denom = inv_c - float(capped_count)
-                if denom <= eps:
-                    continue
-                t = prefix[j] / denom
+                denom = 1.0 - cap_ratio * float(capped_count)
                 lo = sorted_w[j - 1] if j > 0 else 0.0
                 hi = sorted_w[j] if j < n else math.inf
-                if t + eps >= lo and t <= hi + eps:
-                    threshold = max(0.0, t)
-                    solved = True
-                    break
-            if not solved:
-                threshold = 0.0
-            return [min(w, threshold) for w in clamped]
+
+                if _effectively_zero(denom):
+                    if _effectively_zero(prefix[j]):
+                        candidate = lo
+                        if lo - eps * max(1.0, abs(lo)) <= candidate <= hi + eps * max(1.0, abs(hi) if math.isfinite(hi) else 1.0):
+                            threshold = max(0.0, candidate) if threshold is None else max(threshold, max(0.0, candidate))
+                    continue
+
+                candidate = cap_ratio * prefix[j] / denom
+                if lo - eps * max(1.0, abs(lo), abs(candidate)) <= candidate <= hi + eps * max(
+                    1.0, abs(hi) if math.isfinite(hi) else abs(candidate), abs(candidate)
+                ):
+                    bounded = min(max(candidate, lo), hi)
+                    threshold = bounded if threshold is None else max(threshold, bounded)
+
+            if threshold is None:
+                # Strict fail-fast instead of silent fallback.
+                raise RuntimeError("Dominance cap threshold solve failed")
+
+            projected = [min(w, threshold) for w in clamped]
+
+            proj_total = sum(projected)
+            if any((not math.isfinite(x)) for x in projected):
+                raise RuntimeError("Non-finite dominance projection output")
+            if any(x < -eps * max(1.0, abs(x)) for x in projected):
+                raise RuntimeError("Dominance projection produced negative weights")
+            if not _effectively_zero(proj_total):
+                cap_limit = cap_ratio * proj_total
+                for x in projected:
+                    if x > cap_limit + eps * max(1.0, abs(cap_limit), abs(x)):
+                        raise RuntimeError("Dominance cap projection infeasible")
+            return projected
 
         # Pass 2: Compute raw and pre-cap adjusted contributions.
         for prepared in prepared_signals:
@@ -1891,12 +1911,12 @@ class AlphaOrchestrator:
             )
 
         directional_idx = [i for i, row in enumerate(pre_cap_rows) if row["direction"] in (-1, 1)]
-        if signal_count >= 3 and directional_idx:
+        if directional_idx:
             directional_pre_cap = [
                 _safe_float(pre_cap_rows[i]["final_weight_contribution"], 0.0, 0.0)
                 for i in directional_idx
             ]
-            directional_post_cap = _dominance_cap_closed_form(directional_pre_cap, 0.4)
+            directional_post_cap = _dominance_cap_projection(directional_pre_cap, 0.4)
             for idx, capped_weight in zip(directional_idx, directional_post_cap):
                 original_weight = _safe_float(pre_cap_rows[idx]["final_weight_contribution"], 0.0, 0.0)
                 final_weight = _safe_float(capped_weight, 0.0, 0.0)
@@ -1910,11 +1930,15 @@ class AlphaOrchestrator:
             pre_cap_weight = _safe_float(row["effective_weight_contribution"], 0.0, 0.0)
             if pre_cap_weight > raw_weight + eps:
                 raise RuntimeError("Per-signal pre-cap weight exceeds raw weight")
+            if final_weight > pre_cap_weight + eps:
+                raise RuntimeError("Per-signal final weight exceeds pre-cap weight")
+            if final_weight < -eps:
+                raise RuntimeError("Per-signal final weight is negative")
             if direction not in (-1, 1):
                 row["final_weight_contribution"] = 0.0
                 breakdown.append(row)
                 continue
-            if final_weight <= 1e-7:
+            if _approx_equal(final_weight, 0.0):
                 row["final_weight_contribution"] = 0.0
                 breakdown.append(row)
                 continue
@@ -1937,12 +1961,44 @@ class AlphaOrchestrator:
             raise RuntimeError("Non-directional signal contributed to adjusted denominator")
         if not _approx_equal(total_breakdown_final_weight, denom):
             raise RuntimeError("Breakdown final-weight sum mismatch against denom")
+        recomputed_weighted_sum = sum(
+            _safe_float(r.get("final_weight_contribution"), 0.0, 0.0) * int(r.get("direction", 0))
+            for r in breakdown
+            if int(r.get("direction", 0)) in (-1, 1)
+        )
+        recomputed_weighted_edge = sum(
+            _safe_float(r.get("final_weight_contribution"), 0.0, 0.0)
+            * int(r.get("direction", 0))
+            * _safe_float(r.get("expected_edge_bps"), 0.0, 0.0, _EDGE_BPS_CLAMP)
+            for r in breakdown
+            if int(r.get("direction", 0)) in (-1, 1)
+        )
+        if not _approx_equal(recomputed_weighted_sum, weighted_sum):
+            raise RuntimeError("Non-directional leakage into weighted_sum")
+        if not _approx_equal(recomputed_weighted_edge, weighted_edge):
+            raise RuntimeError("Non-directional leakage into weighted_edge")
+        raw_directional_sum = sum(
+            _safe_float(r.get("raw_weight_contribution"), 0.0, 0.0)
+            for r in breakdown
+            if int(r.get("direction", 0)) in (-1, 1)
+        )
+        if not _approx_equal(raw_directional_sum, raw_denom):
+            raise RuntimeError("Raw directional denominator mismatch")
+        non_directional_raw_sum = sum(
+            _safe_float(r.get("raw_weight_contribution"), 0.0, 0.0)
+            for r in breakdown
+            if int(r.get("direction", 0)) not in (-1, 1)
+        )
+        if not _effectively_zero(non_directional_raw_sum + raw_directional_sum - sum(
+            _safe_float(r.get("raw_weight_contribution"), 0.0, 0.0) for r in breakdown
+        )):
+            raise RuntimeError("Raw breakdown mass partition mismatch")
 
         low_aggregate_weight = denom < self.config.min_aggregate_weight
-        if denom < -1e-12 or raw_denom < -1e-12:
+        if denom < -eps * max(1.0, abs(denom)) or raw_denom < -eps * max(1.0, abs(raw_denom)):
             raise RuntimeError("Negative denominator detected in fusion")
         raw_score_unadjusted = 0.0
-        if raw_denom > 1e-12:
+        if not _effectively_zero(raw_denom):
             raw_score_unadjusted = raw_weighted_sum / raw_denom
         if not math.isfinite(raw_score_unadjusted):
             raw_score_unadjusted = 0.0
@@ -1990,6 +2046,9 @@ class AlphaOrchestrator:
         total_adjusted_weight = 0.0
         total_correlation_impact = 0.0
         total_dominance_cap_impact = 0.0
+        total_group_correlation_ratio = 0.0
+        total_group_dominance_ratio = 0.0
+        ratio_group_count = 0
         all_group_keys: Set[Tuple[int, str, str]] = set(correlation_group_sizes.keys()) | set(group_raw_weight.keys())
         for group_key in sorted(all_group_keys):
             size = correlation_group_sizes.get(group_key, 0)
@@ -2006,7 +2065,7 @@ class AlphaOrchestrator:
             pre_cap_group_weight = _safe_float(group_pre_cap_weight.get(group_key, 0.0), 0.0, 0.0)
             adjusted_group_weight = _safe_float(group_adjusted_weight.get(group_key, 0.0), 0.0, 0.0)
             realized_attenuation = (
-                adjusted_group_weight / raw_group_weight if raw_group_weight > 1e-12 else 1.0
+                adjusted_group_weight / raw_group_weight if not _effectively_zero(raw_group_weight) else 1.0
             )
             if not math.isfinite(realized_attenuation):
                 realized_attenuation = 1.0
@@ -2014,7 +2073,7 @@ class AlphaOrchestrator:
             all_signals_gated = gated_count == sig_count and sig_count > 0
             correlation_penalty_model = (
                 group_model_penalty_weighted_sum.get(group_key, 0.0) / raw_group_weight
-                if raw_group_weight > 1e-12
+                if not _effectively_zero(raw_group_weight)
                 else 1.0
             )
             if not math.isfinite(correlation_penalty_model):
@@ -2024,11 +2083,17 @@ class AlphaOrchestrator:
                 raise RuntimeError("Group adjusted_weight exceeds raw_weight")
             if pre_cap_group_weight > raw_group_weight + eps:
                 raise RuntimeError("Group pre_cap_weight exceeds raw_weight")
+            if adjusted_group_weight > pre_cap_group_weight + eps:
+                raise RuntimeError("Group adjusted_weight exceeds pre_cap_weight")
             total_raw_weight += raw_group_weight
             total_pre_cap_weight += pre_cap_group_weight
             total_adjusted_weight += adjusted_group_weight
             total_correlation_impact += max(0.0, raw_group_weight - pre_cap_group_weight)
             total_dominance_cap_impact += dominance_cap_effect
+            if not _effectively_zero(raw_group_weight):
+                total_group_correlation_ratio += max(0.0, (raw_group_weight - pre_cap_group_weight) / raw_group_weight)
+                total_group_dominance_ratio += max(0.0, dominance_cap_effect / raw_group_weight)
+                ratio_group_count += 1
             correlation_groups.append(
                 {
                     "key": [group_key[0], group_key[1], group_key[2]],
@@ -2063,16 +2128,16 @@ class AlphaOrchestrator:
             denom,
         )
 
-        adjusted_score = weighted_sum / denom if denom > 1e-12 else 0.0
+        adjusted_score = weighted_sum / denom if not _effectively_zero(denom) else 0.0
         if not math.isfinite(adjusted_score):
             adjusted_score = 0.0
 
         raw_blended_edge = 0.0
-        if raw_denom > 1e-12:
+        if not _effectively_zero(raw_denom):
             raw_blended_edge = raw_weighted_edge / raw_denom
         if not math.isfinite(raw_blended_edge):
             raw_blended_edge = 0.0
-        blended_edge = weighted_edge / denom if denom > 1e-12 else 0.0
+        blended_edge = weighted_edge / denom if not _effectively_zero(denom) else 0.0
         if not math.isfinite(blended_edge):
             blended_edge = 0.0
 
@@ -2080,14 +2145,14 @@ class AlphaOrchestrator:
         final_edge = 0.0 if low_aggregate_weight else blended_edge
 
         score_attenuation = 1.0
-        if abs(raw_score_unadjusted) > 1e-12:
-            score_attenuation = max(0.0, min(1.0, abs(final_score / raw_score_unadjusted)))
+        if not _effectively_zero(raw_score_unadjusted):
+            score_attenuation = max(0.0, min(1.0, abs(adjusted_score / raw_score_unadjusted)))
         else:
-            score_attenuation = 1.0 if abs(final_score) <= 1e-12 else 0.0
+            score_attenuation = 1.0 if _effectively_zero(adjusted_score) else 0.0
         if not math.isfinite(score_attenuation):
             score_attenuation = 1.0
         correlation_attenuation = 1.0
-        if abs(raw_blended_edge) > 1e-12:
+        if not _effectively_zero(raw_blended_edge):
             correlation_attenuation = max(
                 0.0, min(1.0, abs(final_edge) / abs(raw_blended_edge))
             )
@@ -2097,7 +2162,7 @@ class AlphaOrchestrator:
         if not math.isfinite(score_attenuation):
             raise RuntimeError("Invalid score attenuation factor")
 
-        if total_raw_weight > 1e-12:
+        if not _effectively_zero(total_raw_weight):
             if total_pre_cap_weight > total_raw_weight + eps:
                 raise RuntimeError("Total pre-cap weight exceeds total raw weight")
             if total_adjusted_weight > total_pre_cap_weight + eps:
@@ -2107,27 +2172,35 @@ class AlphaOrchestrator:
         else:
             total_correlation_impact = 0.0
             total_dominance_cap_impact = 0.0
+        group_normalized_correlation_impact = (
+            total_group_correlation_ratio / ratio_group_count if ratio_group_count > 0 else 0.0
+        )
+        group_normalized_dominance_impact = (
+            total_group_dominance_ratio / ratio_group_count if ratio_group_count > 0 else 0.0
+        )
 
-        if raw_denom > 1e-12:
+        if not _effectively_zero(raw_denom):
             if not _approx_equal(raw_score_unadjusted, raw_weighted_sum / raw_denom):
                 raise RuntimeError("raw_score invariant violated")
             if not _approx_equal(raw_blended_edge, raw_weighted_edge / raw_denom):
                 raise RuntimeError("raw_blended_edge invariant violated")
-        elif abs(raw_score_unadjusted) > 1e-12 or abs(raw_blended_edge) > 1e-12:
+        elif not _effectively_zero(raw_score_unadjusted) or not _effectively_zero(raw_blended_edge):
             raise RuntimeError("raw zero-denominator invariant violated")
 
-        if denom > 1e-12:
+        if not _effectively_zero(denom):
             if not _approx_equal(adjusted_score, weighted_sum / denom):
                 raise RuntimeError("adjusted_score invariant violated")
             if not _approx_equal(blended_edge, weighted_edge / denom):
                 raise RuntimeError("blended_edge invariant violated")
-        elif abs(adjusted_score) > 1e-12 or abs(blended_edge) > 1e-12:
+        elif not _effectively_zero(adjusted_score) or not _effectively_zero(blended_edge):
             raise RuntimeError("adjusted zero-denominator invariant violated")
 
-        if raw_denom > 1e-12 and not _approx_equal(total_raw_weight, raw_denom):
+        if not _effectively_zero(raw_denom) and not _approx_equal(total_raw_weight, raw_denom):
             raise RuntimeError("raw group-weight total mismatch")
-        if denom > 1e-12 and not _approx_equal(total_adjusted_weight, denom):
+        if not _effectively_zero(denom) and not _approx_equal(total_adjusted_weight, denom):
             raise RuntimeError("adjusted group-weight total mismatch")
+        if not _approx_equal(total_breakdown_final_weight, denom):
+            raise RuntimeError("final contribution sum mismatch")
 
         exposed_numeric_fields = {
             "raw_score": raw_score_unadjusted,
@@ -2141,6 +2214,8 @@ class AlphaOrchestrator:
             "total_adjusted_weight": total_adjusted_weight,
             "total_correlation_impact": total_correlation_impact,
             "total_dominance_cap_impact": total_dominance_cap_impact,
+            "group_normalized_correlation_impact": group_normalized_correlation_impact,
+            "group_normalized_dominance_cap_impact": group_normalized_dominance_impact,
         }
         for field_name, numeric_value in exposed_numeric_fields.items():
             if not math.isfinite(float(numeric_value)):
@@ -2160,46 +2235,11 @@ class AlphaOrchestrator:
                     raise RuntimeError(f"Non-finite group summary field: {group_field}")
 
         logger.debug(
-            "CORRELATION_ATTENUATION | raw_score=%.6f | final_score=%.6f | "
-            "raw_edge=%.6f | final_edge=%.6f | score_factor=%.6f | edge_factor=%.6f",
+            "CORRELATION_ATTENUATION | raw_score=%.6f | final_score=%.6f | raw_edge=%.6f | final_edge=%.6f",
             raw_score_unadjusted,
             final_score,
             raw_blended_edge,
             final_edge,
-            score_attenuation,
-            correlation_attenuation,
-        )
-        logger.debug(
-            "FUSION_SCORE | raw=%.6f | final=%.6f",
-            raw_score_unadjusted,
-            final_score,
-        )
-        logger.debug(
-            "CORRELATION_GROUP_CONCENTRATION | gate_active=%s | summary=%s",
-            conviction_gate_active,
-            [
-                {
-                    "key": g["key"],
-                    "size": g["size"],
-                    "avg_conviction": g["avg_group_conviction"],
-                    "raw_weight": g["raw_weight"],
-                    "adjusted_weight": g["adjusted_weight"],
-                    "gated_signal_count": g["gated_signal_count"],
-                }
-                for g in correlation_groups
-            ],
-        )
-        logger.debug(
-            "CORRELATION_SEMANTICS | model_vs_effective=%s",
-            [
-                {
-                    "group": g["key"],
-                    "model": g["correlation_penalty_model"],
-                    "effective": g["realized_attenuation"],
-                    "impact": g["dominance_cap_effect"],
-                }
-                for g in correlation_groups
-            ],
         )
 
         output_score = final_score
@@ -2218,6 +2258,8 @@ class AlphaOrchestrator:
             "total_adjusted_weight": _safe_float(total_adjusted_weight, 0.0, 0.0),
             "total_correlation_impact": _safe_float(total_correlation_impact, 0.0, 0.0),
             "total_dominance_cap_impact": _safe_float(total_dominance_cap_impact, 0.0, 0.0),
+            "group_normalized_correlation_impact": _safe_float(group_normalized_correlation_impact, 0.0, 0.0, 1.0),
+            "group_normalized_dominance_cap_impact": _safe_float(group_normalized_dominance_impact, 0.0, 0.0, 1.0),
             "penalty_condition": (
                 f"conviction>={self.config.correlation_min_conviction:.3f} "
                 f"and group_size>={self.config.correlation_min_group_size}"
