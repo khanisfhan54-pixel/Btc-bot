@@ -81,7 +81,7 @@ def safe_float(value: Any, default: float = 0.0, min: float | None = None, max: 
     """Best-effort scalar coercion for schema/output hardening."""
     try:
         parsed = float(value)
-    except (TypeError, ValueError):
+    except Exception:
         parsed = float(default)
     if not np.isfinite(parsed):
         parsed = float(default)
@@ -93,11 +93,15 @@ def safe_float(value: Any, default: float = 0.0, min: float | None = None, max: 
 
 
 def _normalize_prob_vector(values: np.ndarray, floor: float = 1e-12) -> np.ndarray:
-    arr = np.asarray(values, dtype=float)
+    try:
+        arr = np.asarray(values, dtype=float)
+    except Exception:
+        arr = np.asarray([], dtype=float)
     if arr.ndim != 1 or arr.size == 0:
         raise ValueError(f"Probability vector must be a non-empty 1-D array, got shape {arr.shape}.")
-    arr = np.where(np.isfinite(arr), arr, floor)
-    arr = np.clip(arr, floor, None)
+    safe_floor = safe_float(floor, default=1e-12, min=1e-15, max=1e-2)
+    arr = np.where(np.isfinite(arr), arr, safe_floor)
+    arr = np.clip(arr, safe_floor, None)
     total = float(arr.sum())
     if not np.isfinite(total) or total <= 0.0:
         return np.ones(arr.size, dtype=float) / arr.size
@@ -124,12 +128,12 @@ def _validate_output_schema(output: Dict[str, Any]) -> bool:
         for pkey in ("bull", "bear", "crisis"):
             if pkey not in output["probabilities"]:
                 raise ValueError(f"missing probabilities.{pkey}")
-            pval = float(output["probabilities"][pkey])
+            pval = safe_float(output["probabilities"][pkey], default=np.nan)
             if not np.isfinite(pval):
                 raise ValueError(f"non-finite probabilities.{pkey}")
             if pval < 0.0 or pval > 1.0:
                 raise ValueError(f"out-of-bounds probabilities.{pkey}={pval}")
-        prob_sum = sum(float(output["probabilities"][k]) for k in ("bull", "bear", "crisis"))
+        prob_sum = sum(safe_float(output["probabilities"][k], default=np.nan) for k in ("bull", "bear", "crisis"))
         if not np.isfinite(prob_sum) or abs(prob_sum - 1.0) > 1e-3:
             raise ValueError(f"invalid probabilities sum={prob_sum}")
         if not isinstance(output["risk_metrics"], dict):
@@ -137,7 +141,7 @@ def _validate_output_schema(output: Dict[str, Any]) -> bool:
         for rk in ("expected_volatility", "raw_leverage", "last_valid_vol", "switch_stability_ema"):
             if rk not in output["risk_metrics"]:
                 raise ValueError(f"missing risk_metrics.{rk}")
-            rval = float(output["risk_metrics"][rk])
+            rval = safe_float(output["risk_metrics"][rk], default=np.nan)
             if not np.isfinite(rval):
                 raise ValueError(f"non-finite risk_metrics.{rk}")
         if output["risk_metrics"]["expected_volatility"] < 0.0:
@@ -150,16 +154,16 @@ def _validate_output_schema(output: Dict[str, Any]) -> bool:
             raise ValueError("alpha must be a dict")
         if "edge_score" not in output["alpha"]:
             raise ValueError("missing alpha.edge_score")
-        edge_score = float(output["alpha"]["edge_score"])
+        edge_score = safe_float(output["alpha"]["edge_score"], default=np.nan)
         if not np.isfinite(edge_score):
             raise ValueError("non-finite alpha.edge_score")
-        confidence = float(output.get("confidence", 0.0))
+        confidence = safe_float(output.get("confidence", 0.0), default=np.nan)
         if not np.isfinite(confidence) or confidence < 0.0 or confidence > 1.0:
             raise ValueError(f"invalid confidence={confidence}")
-        trend_strength = float(output.get("trend_strength", 0.0))
-        risk_level = float(output.get("risk_level", 0.0))
-        position_size = float(output.get("position_size", 0.0))
-        signed_size = float(output.get("signed_position_size", 0.0))
+        trend_strength = safe_float(output.get("trend_strength", 0.0), default=np.nan)
+        risk_level = safe_float(output.get("risk_level", 0.0), default=np.nan)
+        position_size = safe_float(output.get("position_size", 0.0), default=np.nan)
+        signed_size = safe_float(output.get("signed_position_size", 0.0), default=np.nan)
         for name, val in (
             ("trend_strength", trend_strength),
             ("risk_level", risk_level),
@@ -173,17 +177,17 @@ def _validate_output_schema(output: Dict[str, Any]) -> bool:
         macro_probs = output.get("macro_probs")
         if not isinstance(macro_probs, list) or len(macro_probs) != 3:
             raise ValueError("macro_probs must be a 3-element list")
-        if any(not np.isfinite(float(v)) for v in macro_probs):
+        if any(not np.isfinite(safe_float(v, default=np.nan)) for v in macro_probs):
             raise ValueError("macro_probs contains non-finite values")
-        macro_sum = sum(float(v) for v in macro_probs)
+        macro_sum = sum(safe_float(v, default=np.nan) for v in macro_probs)
         if abs(macro_sum - 1.0) > 1e-3:
             raise ValueError(f"invalid macro_probs sum={macro_sum}")
         garch_regime_probs = output["risk_metrics"].get("garch_regime_probs")
         if not isinstance(garch_regime_probs, list) or len(garch_regime_probs) != 2:
             raise ValueError("risk_metrics.garch_regime_probs must be a 2-element list")
-        if any(not np.isfinite(float(v)) for v in garch_regime_probs):
+        if any(not np.isfinite(safe_float(v, default=np.nan)) for v in garch_regime_probs):
             raise ValueError("risk_metrics.garch_regime_probs contains non-finite values")
-        garch_sum = sum(float(v) for v in garch_regime_probs)
+        garch_sum = sum(safe_float(v, default=np.nan) for v in garch_regime_probs)
         if abs(garch_sum - 1.0) > 1e-3:
             raise ValueError(f"invalid garch_regime_probs sum={garch_sum}")
         if position_size < 0.0 or position_size > 0.35:
@@ -312,6 +316,9 @@ def _build_output(
     
     # --- HARD GUARD (fail-safe, NON-BREAKING) ---
     if not _validate_output_schema(out):
+        fail_safe_probs = [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]
+        fail_safe_macro_probs = _normalize_prob_vector(np.asarray(fail_safe_probs, dtype=float)).tolist()
+        fail_safe_garch_probs = _normalize_prob_vector(np.asarray([0.5, 0.5], dtype=float)).tolist()
         return {
             "schema_version": _OUTPUT_SCHEMA_VERSION,
             "regime_idx": -1,
@@ -319,8 +326,12 @@ def _build_output(
             "trend_strength": 0.0,
             "risk_level": 1.0,
             "confidence": 0.0,
-            "probabilities": {"bull": 1/3, "bear": 1/3, "crisis": 1/3},
-            "macro_probs": [1/3, 1/3, 1/3],
+            "probabilities": {
+                "bull": fail_safe_probs[0],
+                "bear": fail_safe_probs[1],
+                "crisis": fail_safe_probs[2],
+            },
+            "macro_probs": fail_safe_macro_probs,
             "position_size": 0.0,
             "execution_mode": "fail_safe",
             "execution_side": "flat",
@@ -336,7 +347,7 @@ def _build_output(
                 "last_valid_vol": safe_last_valid_vol,
                 "switch_stability_ema": safe_switch_stability,
                 "toxic_penalty_applied": True,
-                "garch_regime_probs": [0.5, 0.5],
+                "garch_regime_probs": fail_safe_garch_probs,
                 "feed_status": "SCHEMA_FAILURE",
                 "range_ticks": 0,
             },
@@ -571,7 +582,7 @@ class NHHMM_Engine:
         pred_prob = _normalize_prob_vector(np.dot(prior_prob, P_t))  # Chapman-Kolmogorov prediction
 
         # Vectorised log N(y_t | mu_k, sigma_k) across all K states.
-        sigma_safe = self.sigma + 1e-12
+        sigma_safe = np.clip(np.abs(np.asarray(self.sigma, dtype=float)), 1e-8, None)
         log_emission = (
             -0.5 * np.log(2.0 * np.pi)
             - np.log(sigma_safe)
@@ -582,6 +593,7 @@ class NHHMM_Engine:
         log_posterior_unnorm = log_pred + log_emission
         log_posterior_unnorm -= logsumexp(log_posterior_unnorm)
         posterior_prob = np.exp(log_posterior_unnorm)
+        posterior_prob = _normalize_prob_vector(np.asarray(posterior_prob, dtype=float))
 
         return posterior_prob, P_t
 
@@ -1173,7 +1185,7 @@ class AdvancedRegimeEngine:
     def _coerce_finite_scalar(value: Any, *, default: float = 0.0) -> float:
         try:
             parsed = float(value)
-        except (TypeError, ValueError):
+        except Exception:
             return float(default)
         if not np.isfinite(parsed):
             return float(default)

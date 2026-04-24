@@ -190,6 +190,12 @@ def test_normalize_prob_vector_non_finite_degrades_to_valid_distribution():
     assert np.isclose(float(out.sum()), 1.0)
 
 
+def test_normalize_prob_vector_handles_adversarial_floor():
+    out = _normalize_prob_vector(np.array([0.0, 0.0], dtype=float), floor="bad-floor")
+    assert np.all(np.isfinite(out))
+    assert np.isclose(float(out.sum()), 1.0)
+
+
 def test_build_output_hardens_corrupt_values_without_crash():
     out = _build_output(
         regime_idx="bad",
@@ -241,6 +247,63 @@ def test_build_output_fallback_path_never_throws_on_schema_failure(monkeypatch):
     assert np.isfinite(out["risk_metrics"]["last_valid_vol"])
     assert np.isfinite(out["risk_metrics"]["switch_stability_ema"])
     assert np.isclose(sum(out["macro_probs"]), 1.0)
+    assert np.isclose(sum(out["risk_metrics"]["garch_regime_probs"]), 1.0)
+
+
+def test_build_output_fallback_handles_runtime_float_exceptions(monkeypatch):
+    import advanced_regime_engine as module
+
+    class ExplosiveFloat:
+        def __float__(self):
+            raise RuntimeError("explode")
+
+    monkeypatch.setattr(module, "_validate_output_schema", lambda _out: False)
+    out = module._build_output(
+        regime_idx=0,
+        regime_label="TREND",
+        trend_strength=0.5,
+        risk_level=0.2,
+        confidence=0.9,
+        edge_score=0.2,
+        probabilities={"bull": 0.8, "bear": 0.1, "crisis": 0.1},
+        macro_probs=[0.7, 0.2, 0.1],
+        position_size=0.2,
+        expected_vol=0.01,
+        raw_size=0.3,
+        is_toxic=False,
+        garch_regime_probs=[0.6, 0.4],
+        feed_status="OK",
+        last_valid_vol=ExplosiveFloat(),
+        switch_stability_ema=ExplosiveFloat(),
+    )
+    assert out["risk_metrics"]["feed_status"] == "SCHEMA_FAILURE"
+    assert np.isfinite(out["risk_metrics"]["last_valid_vol"])
+    assert np.isfinite(out["risk_metrics"]["switch_stability_ema"])
+    assert np.isclose(sum(out["macro_probs"]), 1.0)
+
+
+def test_validate_output_schema_rejects_non_finite_position_size():
+    bad = {
+        "schema_version": "1.2.0",
+        "regime_idx": 0,
+        "regime_label": "TREND",
+        "trend_strength": 0.2,
+        "risk_level": 0.2,
+        "confidence": 0.9,
+        "probabilities": {"bull": 0.6, "bear": 0.3, "crisis": 0.1},
+        "macro_probs": [0.4, 0.4, 0.2],
+        "position_size": float("nan"),
+        "signed_position_size": 0.0,
+        "risk_metrics": {
+            "expected_volatility": 0.01,
+            "raw_leverage": 0.5,
+            "last_valid_vol": 0.02,
+            "switch_stability_ema": 1.0,
+            "garch_regime_probs": [0.5, 0.5],
+        },
+        "alpha": {"edge_score": 0.1},
+    }
+    assert _validate_output_schema(bad) is False
 
 
 def test_load_state_corrupted_scalars_do_not_poison_engine(engine):
