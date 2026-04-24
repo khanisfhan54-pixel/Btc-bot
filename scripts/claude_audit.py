@@ -34,44 +34,28 @@ def read_repo():
 
 
 # ===============================
-# BUILD STRICT PROMPT
+# PROMPT
 # ===============================
 def build_prompt(code):
     return f"""
-You are a senior quantitative trading systems engineer and production Python auditor.
+You are a senior production-grade Python auditor.
 
-STRICT RULES (NON-NEGOTIABLE):
+STRICT RULES:
 - DO NOT rewrite full files
-- DO NOT output full implementations
-- DO NOT apply fixes
-- DO NOT suggest future improvements
+- DO NOT modify code
 - ONLY output:
-    1. Audit summary
-    2. Root cause
-    3. Unified diff patch
+  1. Audit summary
+  2. Root cause
+  3. Patch diff
 
-OUTPUT FORMAT (STRICT):
+FORMAT:
 
 ## 🔍 AUDIT SUMMARY
-- List ALL critical bugs
-- Include file + function + issue
 
 ## ⚠️ ROOT CAUSE
-- Explain WHY each issue exists
 
 ## 🧩 PATCH DIFF
-- Provide ONLY unified git diff patches
-- NO explanations in this section
-- MUST be directly applicable with `git apply`
-
-FORMAT EXAMPLE:
-
---- a/file.py
-+++ b/file.py
-@@
-- old line
-+ new line
-
+(standard unified diff only)
 
 CODE:
 {code}
@@ -107,41 +91,48 @@ def call_claude(prompt):
 
 
 # ===============================
-# EXTRACT RESPONSE TEXT
+# EXTRACT TEXT
 # ===============================
 def extract_text(response):
     try:
         return response["content"][0]["text"]
     except Exception:
-        raise Exception(f"Invalid Claude response: {json.dumps(response, indent=2)}")
+        raise Exception(f"Invalid response: {json.dumps(response, indent=2)}")
 
 
 # ===============================
-# MAIN
+# MAIN (THIS IS WHAT YOU ASKED ABOUT)
 # ===============================
 def main():
-    if not API_KEY:
-        raise ValueError("Missing CLAUDE_API_KEY")
+    try:
+        # 🔴 1. Check API key
+        if not API_KEY:
+            raise ValueError("Missing CLAUDE_API_KEY")
 
-    print("📂 Reading repository...")
-    code = read_repo()
+        # 🔴 2. Read repo files
+        print("📂 Reading repository...")
+        code = read_repo()
 
-    if not code.strip():
-        raise ValueError("No target files found")
+        if not code.strip():
+            raise ValueError("No target files found")
 
-    print("🧠 Running Claude audit (Opus 4.6)...")
-    prompt = build_prompt(code)
+        # 🔴 3. Call Claude
+        print("🧠 Running Claude audit...")
+        prompt = build_prompt(code)
 
-    result = call_claude(prompt)
-    output = extract_text(result)
+        result = call_claude(prompt)
+        output = extract_text(result)
 
-    # Save output only (NO AUTO PATCH)
-    with open("CLAUDE_AUDIT.md", "w", encoding="utf-8") as f:
-        f.write(output)
+        # 🔴 4. Save output (NO auto patching)
+        with open("CLAUDE_AUDIT.md", "w", encoding="utf-8") as f:
+            f.write(output)
 
-    print("✅ Audit complete")
-    print("📄 Output saved to CLAUDE_AUDIT.md")
-    print("⚠️ Manually review patch before applying")
+        print("✅ Audit complete")
+
+    except Exception as e:
+        # 🔴 This is CRITICAL for debugging GitHub Actions
+        print("❌ ERROR:", str(e))
+        raise
 
 
 if __name__ == "__main__":
