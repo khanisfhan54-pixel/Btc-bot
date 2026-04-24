@@ -4,52 +4,68 @@ import json
 
 API_KEY = os.getenv("CLAUDE_API_KEY")
 
-# ===============================
-# READ FULL REPO CODE
-# ===============================
+# ==========================================
+# READ ONLY TARGET MODULES
+# ==========================================
 def read_repo():
+    TARGET_FILES = [
+        "advanced_regime_engine.py",
+        "alpha_orchestrator.py"
+    ]
+
     code = ""
+
     for root, _, files in os.walk("."):
         for f in files:
-            if f.endswith(".py"):
+            if f in TARGET_FILES:
                 path = os.path.join(root, f)
                 try:
                     with open(path, "r", encoding="utf-8") as file:
                         code += f"\n\n# FILE: {path}\n\n"
                         code += file.read()
-                except:
-                    pass
+                except Exception as e:
+                    print(f"⚠️ Skipping {path}: {e}")
 
-    return code[:200000]  # prevent overflow
+    return code[:200000]
 
 
-# ===============================
-# BUILD PROMPT (YOUR CORE POWER)
-# ===============================
+# ==========================================
+# BUILD STRICT AUDIT PROMPT
+# ==========================================
 def build_prompt(code):
     return f"""
-You are a senior quantitative engineer, production backend architect, and testing specialist.
+You are a senior quantitative trading systems engineer, Python backend auditor, and automated testing specialist.
 
-Your job is NOT to suggest ideas or plans.
-Your job is to deliver COMPLETE, production-ready implementations.
+⚠️ STRICT SCOPE:
+You MUST ONLY analyze:
+- advanced_regime_engine.py
+- alpha_orchestrator.py
 
-## CORE STANDARD (NON-NEGOTIABLE)
-- No partial solutions
-- No TODOs
-- No placeholders
-- Fix everything completely
+DO NOT mention or suggest changes outside these modules.
 
 ---
 
-## TASK
+## OBJECTIVE
 
-Audit, debug, and upgrade this entire codebase.
+Audit, debug, and upgrade ONLY these modules to production-grade quality.
 
-### REQUIRED OUTPUT FORMAT:
+---
+
+## REQUIREMENTS (NON-NEGOTIABLE)
+
+- No partial fixes
+- No TODOs
+- No placeholders
+- No vague suggestions
+- Deliver FULL working code
+
+---
+
+## OUTPUT FORMAT
 
 # 🚨 CRITICAL BUGS
 - Exact issue
-- Why it happens
+- Root cause
 - FULL FIXED CODE
 
 # ⚠️ LOGIC ISSUES
@@ -61,22 +77,22 @@ Audit, debug, and upgrade this entire codebase.
 - Optimized code
 
 # 🧪 TEST FIXES
-- Fix failing tests completely
+- Fix failing tests (if relevant)
 
 # 🧠 FINAL PATCHED FILES
-Return FULL FILES, not snippets.
+Return FULL FILES, not snippets
 
 ---
 
-## CODEBASE:
+## CODE
 
 {code}
 """
 
 
-# ===============================
+# ==========================================
 # CALL CLAUDE API
-# ===============================
+# ==========================================
 def call_claude(prompt):
     url = "https://api.anthropic.com/v1/messages"
 
@@ -100,37 +116,38 @@ def call_claude(prompt):
 
     try:
         result = response.json()
-    except:
+    except Exception:
         print("❌ Failed to parse JSON")
         print(response.text)
-        return None, "error"
+        return None
 
-    return result, payload["model"]
+    return result
 
 
-# ===============================
+# ==========================================
 # MAIN EXECUTION
-# ===============================
+# ==========================================
 def main():
     if not API_KEY:
         raise ValueError("❌ CLAUDE_API_KEY not set")
 
-    print("🚀 Reading repo...")
+    print("🚀 Reading target modules...")
     code = read_repo()
+
+    if not code.strip():
+        raise ValueError("❌ Target files not found")
 
     print("🧠 Building prompt...")
     prompt = build_prompt(code)
 
     print("🤖 Calling Claude...")
-    result, model_used = call_claude(prompt)
+    result = call_claude(prompt)
 
     if result is None:
         print("❌ No result received")
         return
 
-    # ===============================
-    # SAFE EXTRACTION (THIS IS YOUR TRY PART)
-    # ===============================
+    # SAFE EXTRACTION
     try:
         text = result["content"][0]["text"]
         print("✅ Clean text extracted")
@@ -138,17 +155,15 @@ def main():
         print("⚠️ Fallback to raw JSON:", str(e))
         text = json.dumps(result, indent=2)
 
-    # ===============================
-    # SAVE CLEAN REPORT
-    # ===============================
+    # SAVE REPORT
     with open("CLAUDE_REPORT.md", "w", encoding="utf-8") as f:
         f.write(text)
 
     print("✅ Report saved: CLAUDE_REPORT.md")
 
 
-# ===============================
+# ==========================================
 # ENTRY POINT
-# ===============================
+# ==========================================
 if __name__ == "__main__":
     main()
