@@ -91,6 +91,60 @@ def safe_float(value: Any, default: float = 0.0, min: float | None = None, max: 
         parsed = float(max)
     return float(parsed)
 
+def _safe_float(value: Any, default: float = 0.0, min: float | None = None, max: float | None = None) -> float:
+    """Crash-proof scalar parser for state/input hydration."""
+    return safe_float(value, default=default, min=min, max=max)
+
+
+def _safe_int(value: Any, default: int = 0, min: int | None = None, max: int | None = None) -> int:
+    parsed = _safe_float(value, default=float(default))
+    try:
+        out = int(parsed)
+    except Exception:
+        out = int(default)
+    if min is not None and out < int(min):
+        out = int(min)
+    if max is not None and out > int(max):
+        out = int(max)
+    return int(out)
+
+
+def _safe_array(
+    value: Any,
+    shape: tuple[int, ...] | None = None,
+    default: Any = None,
+) -> np.ndarray:
+    """Best-effort finite array coercion that never raises."""
+    fallback = np.asarray(default if default is not None else [], dtype=float)
+    try:
+        arr = np.asarray(value, dtype=float)
+    except Exception:
+        arr = fallback
+    if arr.ndim == 0:
+        arr = arr.reshape(1)
+    else:
+        arr = np.ravel(arr)
+    arr = np.where(np.isfinite(arr), arr, np.nan)
+    if shape is not None:
+        expected_size = int(np.prod(shape))
+        if arr.size != expected_size:
+            arr = np.asarray(fallback, dtype=float).reshape(-1)
+        if arr.size != expected_size:
+            fill = 0.0
+            if fallback.size > 0 and np.all(np.isfinite(fallback)):
+                fill = float(np.ravel(fallback)[0])
+            arr = np.full(expected_size, fill, dtype=float)
+        arr = np.ravel(arr).reshape(shape)
+    return np.asarray(arr, dtype=float)
+
+
+def _safe_prob_vector(vec: Any, size: int) -> np.ndarray:
+    base = np.ones(int(size), dtype=float) / max(int(size), 1)
+    arr = _safe_array(vec, shape=(int(size),), default=base)
+    arr = np.where(np.isfinite(arr), arr, 0.0)
+    arr = np.clip(arr, 0.0, None)
+    return _normalize_prob_vector(arr)
+
 
 def _normalize_prob_vector(values: np.ndarray, floor: float = 1e-12) -> np.ndarray:
     try:
@@ -1183,13 +1237,7 @@ class AdvancedRegimeEngine:
 
     @staticmethod
     def _coerce_finite_scalar(value: Any, *, default: float = 0.0) -> float:
-        try:
-            parsed = float(value)
-        except Exception:
-            return float(default)
-        if not np.isfinite(parsed):
-            return float(default)
-        return float(parsed)
+        return _safe_float(value, default=float(default))
 
     def _log_state_load_issue(self, field: str, exc: Exception, value: Any = None) -> None:
         if getattr(self, "_is_replay", False):
@@ -1206,11 +1254,7 @@ class AdvancedRegimeEngine:
 
     @staticmethod
     def _coerce_vector(name: str, values: Any, expected_size: int) -> np.ndarray:
-        arr = np.asarray(values, dtype=float)
-        if arr.ndim == 0:
-            arr = arr.reshape(1)
-        else:
-            arr = np.ravel(arr)
+        arr = _safe_array(values, shape=(expected_size,), default=np.zeros(expected_size, dtype=float))
         if arr.shape != (expected_size,):
             raise ValueError(f"Vector '{name}' must have shape ({expected_size},), got {arr.shape}.")
         if not np.all(np.isfinite(arr)):
@@ -1227,7 +1271,7 @@ class AdvancedRegimeEngine:
         max_value: float | None = None,
     ) -> float:
         raw = state.get(field, default)
-        parsed = self._coerce_finite_scalar(raw, default=default)
+        parsed = _safe_float(raw, default=float(default))
         invalid_reason = None
         if not np.isfinite(parsed):
             invalid_reason = "non-finite"
@@ -1254,9 +1298,11 @@ class AdvancedRegimeEngine:
         normalize_probabilities: bool = False,
     ) -> np.ndarray:
         try:
-            arr = self._coerce_vector(field, state.get(field, fallback), expected_size)
+            arr = _safe_array(state.get(field, fallback), shape=(expected_size,), default=fallback)
+            if not np.all(np.isfinite(arr)):
+                raise ValueError(f"vector '{field}' contains non-finite values")
             if normalize_probabilities:
-                arr = _normalize_prob_vector(arr)
+                arr = _safe_prob_vector(arr, expected_size)
             return arr
         except Exception as exc:
             self._log_state_load_issue(field, exc, state.get(field, None))
@@ -1753,19 +1799,24 @@ class AdvancedRegimeEngine:
     @_synchronized
     def load_state(self, state: Dict[str, Any]) -> None:
         if not isinstance(state, dict):
-            raise TypeError(f"state must be a dict, got {type(state).__name__}.")
+            self._log_state_load_issue("state", TypeError("state must be dict"), type(state).__name__)
+            return
 
         expected_signature = f"AdvancedRegimeEngine|v={self._STATE_VERSION}|schema={_OUTPUT_SCHEMA_VERSION}|n_states={self.K}|n_features={self.n_features}"
         incoming_signature = state.get("model_signature")
         if incoming_signature is not None and incoming_signature != expected_signature:
-            raise ValueError(
-                f"Model signature mismatch. Expected {expected_signature}, got {incoming_signature}."
+            self._log_state_load_issue(
+                "model_signature",
+                ValueError("signature mismatch"),
+                incoming_signature,
             )
 
         incoming_version = state.get("state_version")
         if incoming_version is not None and incoming_version != self._STATE_VERSION:
-            raise ValueError(
-                f"State version mismatch. Expected {self._STATE_VERSION}, got {incoming_version}."
+            self._log_state_load_issue(
+                "state_version",
+                ValueError("version mismatch"),
+                incoming_version,
             )
 
         ts = self._normalize_timestamp(state.get("last_timestamp", None))
@@ -1777,14 +1828,12 @@ class AdvancedRegimeEngine:
 
         current_regime_idx = state.get("current_regime_idx", None)
         if current_regime_idx is not None:
-            try:
-                self.current_regime_idx = int(current_regime_idx)
-                if self.current_regime_idx < 0 or self.current_regime_idx >= self.K:
-                    self._log_state_load_issue("current_regime_idx", ValueError("out of bounds"), current_regime_idx)
-                    self.current_regime_idx = None
-            except (TypeError, ValueError):
-                self._log_state_load_issue("current_regime_idx", ValueError("invalid int"), current_regime_idx)
+            parsed_idx = _safe_int(current_regime_idx, default=-1)
+            if parsed_idx < 0 or parsed_idx >= self.K:
+                self._log_state_load_issue("current_regime_idx", ValueError("out of bounds"), current_regime_idx)
                 self.current_regime_idx = None
+            else:
+                self.current_regime_idx = int(parsed_idx)
         else:
             self.current_regime_idx = None
 
@@ -1837,25 +1886,19 @@ class AdvancedRegimeEngine:
 
         confirmed_idx = state.get("confirmed_regime_idx", None)
         if confirmed_idx is not None:
-            try:
-                self._confirmed_regime_idx = int(confirmed_idx)
-                if self._confirmed_regime_idx < 0 or self._confirmed_regime_idx >= self.K:
-                    self._log_state_load_issue("confirmed_regime_idx", ValueError("out of bounds"), confirmed_idx)
-                    self._confirmed_regime_idx = None
-            except (TypeError, ValueError):
-                self._log_state_load_issue("confirmed_regime_idx", ValueError("invalid int"), confirmed_idx)
+            parsed_confirmed = _safe_int(confirmed_idx, default=-1)
+            if parsed_confirmed < 0 or parsed_confirmed >= self.K:
+                self._log_state_load_issue("confirmed_regime_idx", ValueError("out of bounds"), confirmed_idx)
                 self._confirmed_regime_idx = None
+            else:
+                self._confirmed_regime_idx = int(parsed_confirmed)
         else:
             self._confirmed_regime_idx = None
 
-        try:
-            self._regime_persistence = int(state.get("regime_persistence", 0))
-            if self._regime_persistence < 0:
-                self._log_state_load_issue("regime_persistence", ValueError("negative value"), self._regime_persistence)
-                self._regime_persistence = 0
-        except (TypeError, ValueError):
-            self._log_state_load_issue("regime_persistence", ValueError("invalid int"), state.get("regime_persistence"))
-            self._regime_persistence = 0
+        raw_regime_persistence = state.get("regime_persistence", 0)
+        self._regime_persistence = _safe_int(raw_regime_persistence, default=0, min=0)
+        if str(raw_regime_persistence) != str(self._regime_persistence):
+            self._log_state_load_issue("regime_persistence", ValueError("invalid int"), raw_regime_persistence)
 
         self.nhhmm_prior = self._state_vector(
             state,
@@ -1904,7 +1947,7 @@ class AdvancedRegimeEngine:
             self._log_state_load_issue("garch_var", ValueError("non-finite garch_var after coercion"), self.garch_var.tolist())
             self.garch_var = self._stationary_garch_var()
 
-        self.range_ticks_int = int(self.range_ticks)
+        self.range_ticks_int = _safe_int(self.range_ticks, default=0, min=0)
         self._circuit_breaker_active = bool(state.get("circuit_breaker_active", False))
         self._circuit_breaker_reason = state.get("circuit_breaker_reason", None)
         self._equity = self._state_scalar(state, "equity", default=1.0, min_value=0.0)
@@ -1913,21 +1956,15 @@ class AdvancedRegimeEngine:
             self._log_state_load_issue("equity_peak", ValueError("equity_peak<equity"), self._equity_peak)
             self._equity_peak = self._equity
         self._drawdown = self._state_scalar(state, "drawdown", default=0.0, min_value=0.0, max_value=1.0)
-        try:
-            self._loss_streak = int(state.get("loss_streak", 0))
-            if self._loss_streak < 0:
-                raise ValueError("negative")
-        except Exception:
-            self._log_state_load_issue("loss_streak", ValueError("invalid int"), state.get("loss_streak"))
-            self._loss_streak = 0
-        try:
-            self._healing_count = int(state.get("healing_count", 0))
-            if self._healing_count < 0:
-                raise ValueError("negative")
-        except Exception:
-            self._log_state_load_issue("healing_count", ValueError("invalid int"), state.get("healing_count"))
-            self._healing_count = 0
-        self._last_healing_action = str(state.get("last_healing_action", "NONE"))
+        raw_loss_streak = state.get("loss_streak", 0)
+        self._loss_streak = _safe_int(raw_loss_streak, default=0, min=0)
+        if str(raw_loss_streak) != str(self._loss_streak):
+            self._log_state_load_issue("loss_streak", ValueError("invalid int"), raw_loss_streak)
+        raw_healing_count = state.get("healing_count", 0)
+        self._healing_count = _safe_int(raw_healing_count, default=0, min=0)
+        if str(raw_healing_count) != str(self._healing_count):
+            self._log_state_load_issue("healing_count", ValueError("invalid int"), raw_healing_count)
+        self._last_healing_action = str(state.get("last_healing_action", "NONE"))[:64]
         self._last_healing_error = state.get("last_healing_error", None)
         raw_healing_context = state.get("last_healing_context", {})
         self._last_healing_context = dict(raw_healing_context) if isinstance(raw_healing_context, dict) else {}
@@ -1937,6 +1974,14 @@ class AdvancedRegimeEngine:
 
     @_synchronized
     def update(self, market_data: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(market_data, dict):
+            market_data = {}
+            self._obs_observe("input_validation", "high", {"reason": "market_data_not_dict"})
+            self._warn_rate_limited(
+                key="market_data_not_dict",
+                message="update() received non-dict market_data; degraded to fail-safe defaults.",
+                cooldown_s=30.0,
+            )
         if getattr(self, "_is_replay", False):
             # Disable side-effects during replay
             suppress_metrics = True
@@ -2019,8 +2064,13 @@ class AdvancedRegimeEngine:
                                 if self._loss_streak >= self._MAX_CONSECUTIVE_LOSSES:
                                     self._trigger_circuit_breaker("LOSS_STREAK")
                     self._last_price = price
-            except Exception:
-                pass
+            except Exception as exc:
+                self._warn_rate_limited(
+                    key="pnl_tracking_failure",
+                    message=f"PnL tracking degraded due to price parse error: {exc}",
+                    cooldown_s=15.0,
+                )
+                self._obs_observe("pnl_tracking_failure", "medium", {"reason": "price_parse_error"})
 
         # ==========================================
         # 🚨 STEP 0: CIRCUIT BREAKER CHECK
