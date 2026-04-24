@@ -10,24 +10,43 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
+      # ✅ Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
+      # ✅ Setup Python
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+      # ✅ Install dependencies
       - name: Install dependencies
         run: pip install requests
 
+      # ✅ DEBUG: Check API key exists
+      - name: Check API Key
+        env:
+          CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
+        run: |
+          if [ -z "$CLAUDE_API_KEY" ]; then
+            echo "❌ API KEY NOT FOUND"
+            exit 1
+          else
+            echo "✅ API KEY LOADED"
+          fi
+
+      # ✅ Run Claude audit
       - name: Run Claude Audit
         env:
           CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
-        run: python scripts/claude_audit.py
+        run: |
+          echo "🚀 Running Claude audit..."
+          python scripts/claude_audit.py
 
-      - name: Upload report
+      # ✅ Upload report
+      - name: Upload Audit Report
         uses: actions/upload-artifact@v4
         with:
-          name: claude-audit
+          name: claude-audit-report
           path: CLAUDE_AUDIT.md
