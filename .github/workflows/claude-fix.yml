@@ -38,7 +38,7 @@ jobs:
 
       # 5. Upload result as artifact
       - name: Upload Claude Report
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: claude-report
           path: claude_output.json
