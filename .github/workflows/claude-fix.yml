@@ -3,23 +3,53 @@ name: Claude Debugger
 on:
   workflow_dispatch:
   push:
+    branches: [ main ]
+
+permissions:
+  contents: write
 
 jobs:
-  debug:
+  claude-debug:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v3
+      # 1. Checkout repo
+      - name: Checkout repository
+        uses: actions/checkout@v3
 
-    - uses: actions/setup-python@v4
-      with:
-        python-version: "3.10"
+      # 2. Setup Python
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
 
-    - run: pip install requests
+      # 3. Install dependencies
+      - name: Install dependencies
+        run: |
+          pip install requests
 
-    - name: Run Claude
-      env:
-        CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
-      run: |
-        echo "Running Claude..."
-        python scripts/claude_audit.py
+      # 4. Run Claude audit
+      - name: Run Claude Audit
+        env:
+          CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
+        run: |
+          echo "Running Claude analysis..."
+          python scripts/claude_audit.py
+
+      # 5. Upload result as artifact
+      - name: Upload Claude Report
+        uses: actions/upload-artifact@v3
+        with:
+          name: claude-report
+          path: claude_output.json
+
+      # 6. (Optional) Save result in repo
+      - name: Commit report (optional)
+        run: |
+          git config --global user.name "ai-bot"
+          git config --global user.email "ai@bot.com"
+
+          git add claude_output.json || echo "Nothing to add"
+          git commit -m "AI: Claude audit report" || echo "No changes"
+
+          git push || echo "Nothing to push"
