@@ -1,0 +1,25 @@
+name: Claude Debugger
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - uses: actions/setup-python@v4
+      with:
+        python-version: "3.10"
+
+    - run: pip install requests
+
+    - name: Run Claude
+      env:
+        CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
+      run: |
+        echo "Running Claude..."
+        python scripts/claude_audit.py
