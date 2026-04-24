@@ -1,75 +1,50 @@
-import os
-import requests
-import json
+name: Claude Debugger
 
-API_KEY = os.getenv("CLAUDE_API_KEY")
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
 
-def read_repo():
-    code = ""
-    for root, _, files in os.walk("."):
-        for f in files:
-            if f.endswith(".py"):
-                path = os.path.join(root, f)
-                try:
-                    with open(path, "r", encoding="utf-8") as file:
-                        code += f"\n# FILE: {path}\n\n"
-                        code += file.read()
-                except:
-                    pass
-    return code[:100000]  # limit tokens
+permissions:
+  contents: write
 
+jobs:
+  claude-debug:
+    runs-on: ubuntu-latest
 
-def run_claude():
-    code = read_repo()
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    prompt = f"""
-You are a senior quant engineer.
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
 
-Audit this BTC trading bot code.
-Find:
-- bugs
-- logic flaws
-- missing risk management
-- performance issues
+      - name: Install dependencies
+        run: pip install requests
 
-Return clear fixes.
+      - name: Run Claude Audit
+        env:
+          CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
+        run: |
+          echo "🚀 Running Claude analysis..."
+          python scripts/claude_audit.py
 
-CODE:
-{code}
-"""
+          echo "📄 Claude Output:"
+          cat claude_output.json || echo "❌ No output file generated"
 
-    response = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json"
-        },
-        json={
-            "model": "claude-3-sonnet-20240229",
-            "max_tokens": 2000,
-            "messages": [
-                {"role": "user", "content": prompt}
-            ]
-        }
-    )
+      - name: Upload Claude Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-report
+          path: claude_output.json
 
-    print("Status:", response.status_code)
+      - name: Commit report (optional)
+        run: |
+          git config --global user.name "ai-bot"
+          git config --global user.email "ai@bot.com"
 
-    try:
-        result = response.json()
-    except:
-        print("❌ Invalid response:", response.text)
-        return
-
-    print("Claude response received")
-
-    # 🔥 SAVE OUTPUT (VERY IMPORTANT)
-    with open("claude_output.json", "w") as f:
-        json.dump(result, f, indent=2)
-
-    print("✅ Saved to claude_output.json")
-
-
-if __name__ == "__main__":
-    run_claude()
+          git add claude_output.json || echo "Nothing to add"
+          git commit -m "AI: Claude audit report" || echo "No changes"
+          git push || echo "Nothing to push"
