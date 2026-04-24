@@ -2,7 +2,7 @@
   "type": "error",
   "error": {
     "type": "not_found_error",
-    "message": "model: claude-3-haiku-20240307"
+    "message": "model: claude-3-sonnet-20240229"
   },
-  "request_id": "req_011CaNVAvAvYCKthSWAg8MpD"
+  "request_id": "req_011CaNWA9GZTk4tacSm7rvrW"
 }
