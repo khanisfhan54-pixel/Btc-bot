@@ -1,6 +1,7 @@
 import os
 import sys
 import math
+import random
 
 import pytest
 
@@ -150,9 +151,9 @@ def test_large_correlated_cluster_is_penalized(orchestrator, regime_ctx, fq, exe
     groups = out.meta_info["tf_fusion_breakdown"]["1m"]["fusion_meta"]["correlation_summary"]["groups"]
     grp = next(g for g in groups if g["key"][2] == "cluster_x")
     assert grp["size"] == 10
-    assert grp["penalty"] == grp["model_penalty"]
-    assert grp["model_penalty"] == pytest.approx(1.0 / math.sqrt(1.0 + 0.5 * (10 - 1)), rel=1e-6)
-    assert grp["effective_attenuation"] == pytest.approx(grp["adjusted_weight"] / grp["raw_weight"], rel=1e-7)
+    assert grp["penalty"] == grp["correlation_penalty_model"]
+    assert grp["correlation_penalty_model"] == pytest.approx(1.0 / math.sqrt(1.0 + 0.5 * (10 - 1)), rel=1e-6)
+    assert grp["realized_attenuation"] == pytest.approx(grp["adjusted_weight"] / grp["raw_weight"], rel=1e-7)
     rows = out.meta_info["per_signal_breakdown"]
     assert all(r["effective_weight_contribution"] < r["raw_weight_contribution"] for r in rows)
 
@@ -180,7 +181,7 @@ def test_unrelated_sources_not_over_penalized(orchestrator, regime_ctx, fq, exec
     ]
     out = orchestrator.orchestrate(signals, regime_ctx, fq, exec_state, current_time=ts)
     summary = out.meta_info["tf_fusion_breakdown"]["1m"]["fusion_meta"]["correlation_summary"]
-    assert summary["attenuation_factor"] == pytest.approx(1.0, rel=1e-7)
+    assert summary["edge_attenuation_factor"] == pytest.approx(1.0, rel=1e-7)
     assert out.expected_edge_bps == pytest.approx(50.0, rel=1e-6)
 
 
@@ -290,7 +291,7 @@ def test_correlation_summary_observability(orchestrator, regime_ctx, fq, exec_st
     assert "groups" in summary
     assert "largest_group_size" in summary
     assert "total_groups" in summary
-    assert "attenuation_factor" in summary
+    assert "edge_attenuation_factor" in summary
     assert "raw_blended_edge_bps" in summary
     assert "attenuated_blended_edge_bps" in summary
     assert "penalty_logic" in summary
@@ -358,7 +359,7 @@ def test_non_correlated_signals_do_not_suppress_edge(orchestrator, regime_ctx, f
     ]
     out = orchestrator.orchestrate(signals, regime_ctx, fq, exec_state, current_time=ts)
     summary = out.meta_info["tf_fusion_breakdown"]["1m"]["fusion_meta"]["correlation_summary"]
-    assert summary["attenuation_factor"] == pytest.approx(1.0, rel=1e-8)
+    assert summary["edge_attenuation_factor"] == pytest.approx(1.0, rel=1e-8)
     assert isinstance(summary["groups"], list)
     assert all("size" in g and "key" in g for g in summary["groups"])
     assert out.expected_edge_bps == pytest.approx(50.0, rel=1e-6)
@@ -372,7 +373,7 @@ def test_blended_edge_matches_score_attenuation_factor(orchestrator, regime_ctx,
     ]
     out = orchestrator.orchestrate(signals, regime_ctx, fq, exec_state, current_time=ts)
     summary = out.meta_info["tf_fusion_breakdown"]["1m"]["fusion_meta"]["correlation_summary"]
-    attenuation = summary["attenuation_factor"]
+    attenuation = summary["edge_attenuation_factor"]
     raw_edge = summary["raw_blended_edge_bps"]
     attenuated_edge = summary["attenuated_blended_edge_bps"]
     assert attenuation <= 1.0
@@ -474,6 +475,19 @@ def test_score_and_edge_attenuation_are_observable_and_consistent(orchestrator, 
     assert summary["penalty_condition"].startswith("conviction>=")
 
 
+def test_score_attenuation_near_zero_raw_score_is_stable(orchestrator, regime_ctx, fq, exec_state):
+    ts = 1_700_010_797451.0
+    signals = [
+        {"source_id": "alpha_good", "direction": 1, "conviction": 1.0, "expected_edge_bps": 30, "timestamp": ts, "timeframe": "1m"},
+        {"source_id": "alpha_mid", "direction": -1, "conviction": 1.0, "expected_edge_bps": 30, "timestamp": ts, "timeframe": "1m"},
+    ]
+    out = orchestrator.orchestrate(signals, regime_ctx, fq, exec_state, current_time=ts)
+    summary = out.meta_info["tf_fusion_breakdown"]["1m"]["fusion_meta"]["correlation_summary"]
+    assert abs(summary["raw_score"]) < 1e-12
+    assert abs(summary["adjusted_score"]) < 1e-12
+    assert summary["score_attenuation_factor"] == pytest.approx(1.0, rel=1e-12)
+
+
 def test_conviction_gate_summary_matches_execution_behavior(orchestrator, regime_ctx, fq, exec_state):
     ts = 1_700_010_79746.0
     high_conviction = [
@@ -531,8 +545,8 @@ def test_model_penalty_matches_helper_output(orchestrator, regime_ctx, fq, exec_
     summary = out.meta_info["tf_fusion_breakdown"]["1m"]["fusion_meta"]["correlation_summary"]
     grp = next(g for g in summary["groups"] if g["key"][2] == "penalty_match")
     expected_penalty, _ = orchestrator._correlation_penalty(1.0, 6)
-    assert grp["model_penalty"] == pytest.approx(expected_penalty, rel=1e-9)
-    assert grp["effective_attenuation"] == pytest.approx(
+    assert grp["correlation_penalty_model"] == pytest.approx(expected_penalty, rel=1e-9)
+    assert grp["realized_attenuation"] == pytest.approx(
         grp["adjusted_weight"] / grp["raw_weight"], rel=1e-9
     )
 
@@ -560,11 +574,13 @@ def test_dominance_distortion_is_observable():
     )
     summary = out.meta_info["tf_fusion_breakdown"]["1m"]["fusion_meta"]["correlation_summary"]
     grp = summary["groups"][0]
-    assert grp["dominance_impact"] > 0.0
-    assert grp["effective_attenuation"] < grp["model_penalty"]
-    assert grp["effective_attenuation"] <= grp["model_penalty"] + 1e-12
-    assert summary["total_dominance_impact"] > 0.0
+    assert grp["dominance_cap_effect"] > 0.0
+    assert grp["realized_attenuation"] < grp["correlation_penalty_model"]
+    assert grp["realized_attenuation"] <= grp["correlation_penalty_model"] + 1e-12
+    assert summary["total_dominance_cap_impact"] > 0.0
+    assert summary["total_correlation_impact"] > 0.0
     assert summary["total_raw_weight"] >= summary["total_adjusted_weight"]
+    assert all(g["adjusted_weight"] <= g["raw_weight"] + 1e-12 for g in summary["groups"])
 
 
 def test_raw_observability_pre_filter_independence(orchestrator, regime_ctx, fq, exec_state):
@@ -617,6 +633,64 @@ def test_adjusted_score_uses_weighted_sum_contributors(orchestrator, regime_ctx,
     assert tf_score == pytest.approx(weighted_sum / denom, rel=1e-9)
 
 
+def test_fuse_signals_weighted_sum_regression_no_name_error():
+    cfg = OrchestratorConfig(
+        signal_weights={"alpha_good": 1.0, "alpha_mid": 1.0},
+        min_aggregate_weight=0.0,
+        allow_unknown_sources=True,
+    )
+    orch = AlphaOrchestrator(cfg)
+    score, edge, meta = orch._fuse_signals(
+        signals=[
+            AlphaSignal("alpha_good", 1, 1.0, 40.0, 1_700_010_7974641.0, timeframe="1m"),
+            AlphaSignal("alpha_mid", -1, 0.5, 20.0, 1_700_010_7974642.0, timeframe="1m"),
+        ],
+        regime_name="trend",
+        safe_dd=0.0,
+        perf_snapshot={},
+        regime_assessment=None,
+    )
+    rows = meta["breakdown"]
+    denom = sum(r["final_weight_contribution"] for r in rows)
+    weighted_sum = sum(r["final_weight_contribution"] * r["direction"] for r in rows)
+    weighted_edge = sum(
+        r["final_weight_contribution"] * r["direction"] * r["expected_edge_bps"] for r in rows
+    )
+    assert score == pytest.approx(weighted_sum / denom, rel=1e-9)
+    assert edge == pytest.approx(weighted_edge / denom, rel=1e-9)
+
+
+def test_directionless_signals_do_not_dilute_adjusted_metrics():
+    cfg = OrchestratorConfig(
+        signal_weights={"alpha_good": 1.0, "alpha_mid": 1.0, "alpha_v1": 1.0},
+        min_aggregate_weight=0.0,
+        allow_unknown_sources=True,
+    )
+    orch = AlphaOrchestrator(cfg)
+    score, edge, meta = orch._fuse_signals(
+        signals=[
+            AlphaSignal("alpha_good", 1, 1.0, 50.0, 1_700_010_7974643.0, timeframe="1m"),
+            AlphaSignal("alpha_mid", -1, 0.5, 10.0, 1_700_010_7974644.0, timeframe="1m"),
+            AlphaSignal("alpha_v1", 0, 1.0, 999.0, 1_700_010_7974645.0, timeframe="1m"),
+        ],
+        regime_name="trend",
+        safe_dd=0.0,
+        perf_snapshot={},
+        regime_assessment=None,
+    )
+    directional = [r for r in meta["breakdown"] if r["direction"] in (-1, 1)]
+    neutral = [r for r in meta["breakdown"] if r["direction"] == 0]
+    assert len(neutral) == 1
+    assert neutral[0]["final_weight_contribution"] == 0.0
+    denom = sum(r["final_weight_contribution"] for r in directional)
+    weighted_sum = sum(r["final_weight_contribution"] * r["direction"] for r in directional)
+    weighted_edge = sum(
+        r["final_weight_contribution"] * r["direction"] * r["expected_edge_bps"] for r in directional
+    )
+    assert score == pytest.approx(weighted_sum / denom, rel=1e-9)
+    assert edge == pytest.approx(weighted_edge / denom, rel=1e-9)
+
+
 def test_zero_denom_blended_edge_is_guarded():
     cfg = OrchestratorConfig(
         signal_weights={"alpha_good": 1.0},
@@ -644,6 +718,173 @@ def test_zero_denom_blended_edge_is_guarded():
     assert score == 0.0
     assert edge == 0.0
     assert "correlation_summary" in meta
+
+
+def test_raw_and_adjusted_identity_fields_are_exact(orchestrator, regime_ctx, fq, exec_state):
+    ts = 1_700_010_797471.0
+    signals = [
+        {"source_id": "alpha_good", "direction": 1, "conviction": 1.0, "expected_edge_bps": 60, "timestamp": ts, "timeframe": "1m"},
+        {"source_id": "alpha_mid", "direction": -1, "conviction": 0.4, "expected_edge_bps": 20, "timestamp": ts, "timeframe": "1m"},
+    ]
+    out = orchestrator.orchestrate(signals, regime_ctx, fq, exec_state, current_time=ts)
+    summary = out.meta_info["tf_fusion_breakdown"]["1m"]["fusion_meta"]["correlation_summary"]
+    rows = out.meta_info["per_signal_breakdown"]
+    directional = [r for r in rows if r["direction"] in (-1, 1)]
+    raw_denom = sum(r["raw_weight_contribution"] for r in directional)
+    raw_weighted_sum = sum(r["raw_weight_contribution"] * r["direction"] for r in directional)
+    raw_weighted_edge = sum(
+        r["raw_weight_contribution"] * r["direction"] * r["expected_edge_bps"] for r in directional
+    )
+    adjusted_denom = sum(r["final_weight_contribution"] for r in directional)
+    adjusted_weighted_sum = sum(r["final_weight_contribution"] * r["direction"] for r in directional)
+    adjusted_weighted_edge = sum(
+        r["final_weight_contribution"] * r["direction"] * r["expected_edge_bps"] for r in directional
+    )
+    assert summary["raw_score"] == pytest.approx(raw_weighted_sum / raw_denom, rel=1e-9)
+    assert summary["raw_blended_edge_bps"] == pytest.approx(raw_weighted_edge / raw_denom, rel=1e-9)
+    assert summary["adjusted_score"] == pytest.approx(adjusted_weighted_sum / adjusted_denom, rel=1e-9)
+    assert summary["attenuated_blended_edge_bps"] == pytest.approx(adjusted_weighted_edge / adjusted_denom, rel=1e-9)
+    assert summary["total_raw_weight"] == pytest.approx(raw_denom, rel=1e-9)
+    assert summary["total_adjusted_weight"] == pytest.approx(adjusted_denom, rel=1e-9)
+
+
+def test_dominance_cap_closed_form_constraint_holds():
+    cfg = OrchestratorConfig(
+        signal_weights={"a": 10.0, "b": 1.0, "c": 1.0, "d": 1.0},
+        min_aggregate_weight=0.0,
+        allow_unknown_sources=True,
+    )
+    orch = AlphaOrchestrator(cfg)
+    score, edge, meta = orch._fuse_signals(
+        signals=[
+            AlphaSignal("a", 1, 1.0, 50.0, 1_700_010_797472.0, timeframe="1m", correlation_group_id="g"),
+            AlphaSignal("b", 1, 1.0, 50.0, 1_700_010_797473.0, timeframe="1m", correlation_group_id="g"),
+            AlphaSignal("c", 1, 1.0, 50.0, 1_700_010_797474.0, timeframe="1m", correlation_group_id="g"),
+            AlphaSignal("d", 1, 1.0, 50.0, 1_700_010_797475.0, timeframe="1m", correlation_group_id="g"),
+        ],
+        regime_name="trend",
+        safe_dd=0.0,
+        perf_snapshot={},
+        regime_assessment=None,
+    )
+    assert math.isfinite(score)
+    assert math.isfinite(edge)
+    directional = [r for r in meta["breakdown"] if r["direction"] in (-1, 1)]
+    denom = sum(r["final_weight_contribution"] for r in directional)
+    assert denom > 1e-12
+    for r in directional:
+        assert r["final_weight_contribution"] <= 0.4 * denom + 1e-8
+
+
+def test_multiple_dominant_signals_are_all_capped():
+    cfg = OrchestratorConfig(
+        signal_weights={"a": 8.0, "b": 8.0, "c": 1.0, "d": 1.0, "e": 1.0},
+        min_aggregate_weight=0.0,
+        allow_unknown_sources=True,
+    )
+    orch = AlphaOrchestrator(cfg)
+    _, _, meta = orch._fuse_signals(
+        signals=[
+            AlphaSignal("a", 1, 1.0, 20.0, 1_700_010_797476.0, timeframe="1m", correlation_group_id="g"),
+            AlphaSignal("b", 1, 1.0, 20.0, 1_700_010_797477.0, timeframe="1m", correlation_group_id="g"),
+            AlphaSignal("c", 1, 1.0, 20.0, 1_700_010_797478.0, timeframe="1m", correlation_group_id="g"),
+            AlphaSignal("d", 1, 1.0, 20.0, 1_700_010_797479.0, timeframe="1m", correlation_group_id="g"),
+            AlphaSignal("e", 1, 1.0, 20.0, 1_700_010_7974791.0, timeframe="1m", correlation_group_id="g"),
+        ],
+        regime_name="trend",
+        safe_dd=0.0,
+        perf_snapshot={},
+        regime_assessment=None,
+    )
+    directional = [r for r in meta["breakdown"] if r["direction"] in (-1, 1)]
+    denom = sum(r["final_weight_contribution"] for r in directional)
+    assert denom > 0.0
+    assert sum(1 for r in directional if r["dominance_cap_active"]) >= 2
+    assert all(r["final_weight_contribution"] <= 0.4 * denom + 1e-8 for r in directional)
+
+
+def test_fusion_is_deterministic_over_100_runs():
+    cfg = OrchestratorConfig(
+        signal_weights={f"s{i}": 1.0 + (i % 3) for i in range(12)},
+        min_aggregate_weight=0.0,
+        allow_unknown_sources=True,
+    )
+    orch = AlphaOrchestrator(cfg)
+    base_signals = [
+        AlphaSignal(
+            source_id=f"s{i}",
+            direction=1 if i % 2 == 0 else -1,
+            conviction=0.2 + 0.07 * (i % 5),
+            expected_edge_bps=10.0 + 3.0 * i,
+            timestamp=1_700_010_797480.0 + i,
+            timeframe="1m",
+            correlation_group_id=f"grp_{i % 3}",
+        )
+        for i in range(12)
+    ]
+    first = None
+    for _ in range(100):
+        out = orch._fuse_signals(
+            signals=base_signals,
+            regime_name="trend",
+            safe_dd=0.0,
+            perf_snapshot={},
+            regime_assessment=None,
+        )
+        if first is None:
+            first = out
+        assert out == first
+
+
+def test_monte_carlo_stress_no_nan_or_inf():
+    rnd = random.Random(42)
+    cfg = OrchestratorConfig(
+        signal_weights={f"m{i}": 0.5 + (i % 7) * 0.3 for i in range(40)},
+        min_aggregate_weight=0.0,
+        allow_unknown_sources=True,
+    )
+    orch = AlphaOrchestrator(cfg)
+    for k in range(10_000):
+        n = rnd.randint(1, 35)
+        signals = []
+        for i in range(n):
+            sid = f"m{rnd.randint(0, 39)}"
+            d = rnd.choice([-1, 0, 1])
+            conv = rnd.random()
+            edge = rnd.uniform(0.0, 200.0)
+            tf = rnd.choice(["1m", "5m", "1h", "default"])
+            gid = f"g{rnd.randint(0, 8)}"
+            signals.append(
+                AlphaSignal(
+                    source_id=sid,
+                    direction=d,
+                    conviction=conv,
+                    expected_edge_bps=edge,
+                    timestamp=1_700_010_797500.0 + i + k * 0.1,
+                    timeframe=tf,
+                    correlation_group_id=gid,
+                )
+            )
+        score, edge, meta = orch._fuse_signals(
+            signals=signals,
+            regime_name="trend",
+            safe_dd=0.0,
+            perf_snapshot={},
+            regime_assessment=None,
+        )
+        assert math.isfinite(score)
+        assert math.isfinite(edge)
+        summary = meta["correlation_summary"]
+        assert math.isfinite(summary["raw_score"])
+        assert math.isfinite(summary["adjusted_score"])
+        assert math.isfinite(summary["raw_blended_edge_bps"])
+        assert math.isfinite(summary["attenuated_blended_edge_bps"])
+        assert summary["total_pre_cap_weight"] <= summary["total_raw_weight"] + 1e-8
+        assert summary["total_adjusted_weight"] <= summary["total_pre_cap_weight"] + 1e-8
+        for r in meta["breakdown"]:
+            assert r["raw_weight_contribution"] >= 0.0
+            assert r["effective_weight_contribution"] >= 0.0
+            assert r["final_weight_contribution"] >= 0.0
 
 
 def test_legacy_signal_without_timeframe_and_correlation_group_id(orchestrator, regime_ctx, fq, exec_state):

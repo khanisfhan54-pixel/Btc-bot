@@ -1686,7 +1686,6 @@ class AlphaOrchestrator:
         raw_weighted_sum = 0.0
         raw_weighted_edge = 0.0
         raw_denom = 0.0
-        adjusted_total_weight = 0.0
         breakdown: List[Dict[str, Any]] = []
         signal_count = len(signals)
         correlation_group_sizes: Dict[Tuple[int, str, str], int] = {}
@@ -1703,79 +1702,102 @@ class AlphaOrchestrator:
             sid = re.sub(r"[_-](copy|clone|dup|replica|shadow|alt)\d*$", "", sid)
             return sid or _normalize_key(signal.source_id)
 
-        # Pre-pass: build correlation bucket sizes.
+        eps = 1e-8
+
+        def _approx_equal(a: float, b: float) -> bool:
+            return abs(a - b) <= eps * max(1.0, abs(a), abs(b))
+
+        def _canonical_group_key(direction: int, timeframe_bucket: str, group_id: str) -> Optional[Tuple[int, str, str]]:
+            if direction not in (-1, 1):
+                return None
+            tf = _normalize_key(timeframe_bucket) or _DEFAULT_TIMEFRAME
+            gid = _normalize_key(group_id)
+            if not gid:
+                return None
+            return int(direction), tf, gid
+
+        prepared_signals: List[Dict[str, Any]] = []
+        # Pre-pass: normalize directional metadata and build correlation bucket sizes.
         for s in signals:
             direction = 0
             if s.direction > 0:
                 direction = 1
             elif s.direction < 0:
                 direction = -1
-            if direction == 0:
-                continue
-            group_key = (
-                direction,
-                _normalize_key(s.timeframe),
-                _resolve_correlation_group_id(s),
-            )
-            correlation_group_sizes[group_key] = correlation_group_sizes.get(group_key, 0) + 1
-
-        # Pass 1: Sum adjusted weights for dynamic dominance capping.
-        for s in signals:
-            base_w = _safe_float(
-                self.config.signal_weights.get(s.source_id, self.config.default_unknown_weight),
-                0.0,
-            )
-            perf_mult = 1.0
-
-            # FIX 1: Read from snapshot, not live self.performance_stats.
-            st_snap = perf_snapshot.get(s.source_id) if perf_snapshot else None
-            if self.config.feedback_enabled and st_snap:
-                perf_mult = st_snap["current_multiplier"]
-                if self.config.regime_feedback_enabled:
-                    r_snap = st_snap["regimes"].get(regime_name)
-                    if r_snap:
-                        perf_mult = r_snap["current_multiplier"]
-
-            eff_w = min(base_w * perf_mult, self.config.feedback_max_multiplier * base_w)
-
-            alignment = _safe_float(
-                self.config.regime_alignment.get(s.source_id, {}).get(regime_name, 1.0),
-                1.0,
-                0.0,
-                3.0,
-            )
-
-            stress_attenuation = 1.0
-            if self.regime_engine and regime_assessment:
-                stress_attenuation = self.regime_engine.signal_stress_attenuation(regime_assessment, s.source_id)
-
-            direction = 0
-            if s.direction > 0:
-                direction = 1
-            elif s.direction < 0:
-                direction = -1
-
-            conviction = _safe_float(s.conviction, 0.0, 0.0, 1.0)
-            raw_weight_contrib = eff_w * conviction * alignment * stress_attenuation
-
-            correlation_penalty = 1.0
-            if direction != 0:
-                group_key = (
-                    direction,
-                    _normalize_key(s.timeframe),
-                    _resolve_correlation_group_id(s),
+            timeframe_bucket = _normalize_key(s.timeframe) or _DEFAULT_TIMEFRAME
+            correlation_group_id = _resolve_correlation_group_id(s) if direction != 0 else ""
+            correlation_group_key = _canonical_group_key(direction, timeframe_bucket, correlation_group_id)
+            if correlation_group_key is not None:
+                correlation_group_sizes[correlation_group_key] = (
+                    correlation_group_sizes.get(correlation_group_key, 0) + 1
                 )
-                similar_count = max(1, int(correlation_group_sizes.get(group_key, 1)))
-                correlation_penalty, _ = self._correlation_penalty(conviction, similar_count)
+            prepared_signals.append(
+                {
+                    "signal": s,
+                    "direction": direction,
+                    "timeframe_bucket": timeframe_bucket,
+                    "correlation_group_id": correlation_group_id,
+                    "correlation_group_key": correlation_group_key,
+                }
+            )
 
-            effective_weight_contrib = raw_weight_contrib * correlation_penalty
-            if effective_weight_contrib > 1e-7:
-                adjusted_total_weight += effective_weight_contrib
+        pre_cap_rows: List[Dict[str, Any]] = []
+        signal_weights_map = self.config.signal_weights
+        regime_alignment_map = self.config.regime_alignment
+        default_unknown_weight = self.config.default_unknown_weight
+        feedback_enabled = self.config.feedback_enabled
+        regime_feedback_enabled = self.config.regime_feedback_enabled
+        feedback_max_multiplier = self.config.feedback_max_multiplier
 
-        # Pass 2: Fusion with Concentration Guard.
-        for s in signals:
+        def _dominance_cap_closed_form(weights: List[float], cap_ratio: float = 0.4) -> List[float]:
+            """Deterministic closed-form cap where each final weight <= cap_ratio * total_final."""
+            n = len(weights)
+            if n == 0:
+                return []
+            clamped = [_safe_float(w, 0.0, 0.0) for w in weights]
+            if n < 3:
+                return clamped
+            cap_ratio = _safe_float(cap_ratio, 0.4, 0.0, 0.999999)
+            total = sum(clamped)
+            if total <= eps:
+                return [0.0] * n
+            max_w = max(clamped)
+            if max_w <= cap_ratio * total + eps:
+                return clamped
+
+            # General water-filling: solve t from x_i=min(w_i,t), t=cap_ratio*sum(x).
+            sorted_w = sorted(clamped)
+            inv_c = 1.0 / cap_ratio
+            threshold = 0.0
+            solved = False
+            prefix = [0.0]
+            for w in sorted_w:
+                prefix.append(prefix[-1] + w)
+            for j in range(0, n + 1):
+                capped_count = n - j
+                denom = inv_c - float(capped_count)
+                if denom <= eps:
+                    continue
+                t = prefix[j] / denom
+                lo = sorted_w[j - 1] if j > 0 else 0.0
+                hi = sorted_w[j] if j < n else math.inf
+                if t + eps >= lo and t <= hi + eps:
+                    threshold = max(0.0, t)
+                    solved = True
+                    break
+            if not solved:
+                threshold = 0.0
+            return [min(w, threshold) for w in clamped]
+
+        # Pass 2: Compute raw and pre-cap adjusted contributions.
+        for prepared in prepared_signals:
+            s = prepared["signal"]
+            direction = int(prepared["direction"])
+            timeframe_bucket = str(prepared["timeframe_bucket"])
+            correlation_group_id = str(prepared["correlation_group_id"])
+            correlation_group_key = prepared["correlation_group_key"]
             base_w = _safe_float(
-                self.config.signal_weights.get(s.source_id, self.config.default_unknown_weight),
+                signal_weights_map.get(s.source_id, default_unknown_weight),
                 0.0,
             )
             perf_mult = 1.0
@@ -1788,33 +1810,27 @@ class AlphaOrchestrator:
             #                       and weighted via default_unknown_weight.
             source_policy = (
                 "known"
-                if s.source_id in self.config.signal_weights
+                if s.source_id in signal_weights_map
                 else "unknown_defaulted"
             )
 
             # FIX 1: Read from snapshot, not live self.performance_stats.
             st_snap = perf_snapshot.get(s.source_id) if perf_snapshot else None
-            if self.config.feedback_enabled and st_snap:
+            if feedback_enabled and st_snap:
                 perf_mult = st_snap["current_multiplier"]
                 is_fb = st_snap["fallback_used"]
                 is_dr = st_snap["drift_detected"]
-                if self.config.regime_feedback_enabled:
+                if regime_feedback_enabled:
                     r_snap = st_snap["regimes"].get(regime_name)
                     if r_snap:
                         perf_mult = r_snap["current_multiplier"]
                         is_fb = r_snap["fallback_used"]
                         is_dr = r_snap["drift_detected"]
 
-            eff_w = min(base_w * perf_mult, self.config.feedback_max_multiplier * base_w)
-
-            direction = 0
-            if s.direction > 0:
-                direction = 1
-            elif s.direction < 0:
-                direction = -1
+            eff_w = min(base_w * perf_mult, feedback_max_multiplier * base_w)
 
             alignment = _safe_float(
-                self.config.regime_alignment.get(s.source_id, {}).get(regime_name, 1.0),
+                regime_alignment_map.get(s.source_id, {}).get(regime_name, 1.0),
                 1.0,
                 0.0,
                 3.0,
@@ -1833,14 +1849,6 @@ class AlphaOrchestrator:
                     direction * _safe_float(s.expected_edge_bps, 0.0, 0.0, _EDGE_BPS_CLAMP)
                 )
 
-            correlation_group_id = ""
-            if direction != 0:
-                timeframe_bucket = _normalize_key(s.timeframe)
-                correlation_group_id = _resolve_correlation_group_id(s)
-                correlation_group_key = (direction, timeframe_bucket, correlation_group_id)
-            else:
-                correlation_group_key = None
-
             similar_count = 1
             correlation_penalty = 1.0
             conviction_gate_applies = False
@@ -1851,74 +1859,24 @@ class AlphaOrchestrator:
                     correlation_penalty = 1.0
                     similar_count = 1
 
-            weight_contrib = raw_weight_contrib * correlation_penalty
-            effective_weight_contrib = weight_contrib
-
-            if weight_contrib <= 1e-7:
-                breakdown.append(
-                    {
-                        "source_id": s.source_id,
-                        "source_policy": source_policy,
-                        "perf_multiplier": perf_mult,
-                        "timeframe": _normalize_key(s.timeframe),
-                        "direction": direction,
-                        "conviction": conviction,
-                        "expected_edge_bps": s.expected_edge_bps,
-                        "base_weight": base_w,
-                        "regime_alignment_weight": alignment,
-                        "raw_weight_contribution": raw_weight_contrib,
-                        "effective_weight_contribution": effective_weight_contrib,
-                        "final_weight_contribution": 0.0,
-                        "fallback_active": is_fb,
-                        "drift_active": is_dr,
-                        "dominance_cap_active": False,
-                        "stress_attenuation": stress_attenuation,
-                        "correlation_penalty": correlation_penalty,
-                        "conviction_gate_applies": conviction_gate_applies,
-                        "similar_signal_count": similar_count,
-                        "correlation_group_id": correlation_group_id,
-                        "correlation_group_key": (
-                            [correlation_group_key[0], correlation_group_key[1], correlation_group_key[2]]
-                            if correlation_group_key is not None
-                            else None
-                        ),
-                    }
-                )
-                continue
-
-            dominance_cap_active = False
-            if signal_count >= 3 and adjusted_total_weight > 1e-7:
-                other_weights_sum = adjusted_total_weight - weight_contrib
-                strict_cap = (0.4 * other_weights_sum) / 0.6
-                if weight_contrib > strict_cap:
-                    weight_contrib = max(0.0, strict_cap)
-                    dominance_cap_active = True
-
-            denom += weight_contrib
-            if direction != 0:
-                weighted_sum += weight_contrib * direction
-                # FIX 5: expected_edge_bps is absolute magnitude; direction gives sign.
-                weighted_edge += weight_contrib * (
-                    direction * _safe_float(s.expected_edge_bps, 0.0, 0.0, _EDGE_BPS_CLAMP)
-                )
-
-            breakdown.append(
+            pre_cap_weight = raw_weight_contrib * correlation_penalty if direction != 0 else 0.0
+            pre_cap_rows.append(
                 {
                     "source_id": s.source_id,
                     "source_policy": source_policy,
                     "perf_multiplier": perf_mult,
-                    "timeframe": _normalize_key(s.timeframe),
+                    "timeframe": timeframe_bucket,
                     "direction": direction,
                     "conviction": conviction,
                     "expected_edge_bps": s.expected_edge_bps,
                     "base_weight": base_w,
                     "regime_alignment_weight": alignment,
                     "raw_weight_contribution": raw_weight_contrib,
-                    "effective_weight_contribution": effective_weight_contrib,
+                    "effective_weight_contribution": pre_cap_weight,
                     "fallback_active": is_fb,
                     "drift_active": is_dr,
-                    "dominance_cap_active": dominance_cap_active,
-                    "final_weight_contribution": weight_contrib,
+                    "dominance_cap_active": False,
+                    "final_weight_contribution": pre_cap_weight,
                     "stress_attenuation": stress_attenuation,
                     "correlation_penalty": correlation_penalty,
                     "conviction_gate_applies": conviction_gate_applies,
@@ -1932,8 +1890,55 @@ class AlphaOrchestrator:
                 }
             )
 
-        if denom < self.config.min_aggregate_weight:
-            return 0.0, 0.0, {"error": "low_aggregate_weight", "denom": denom}
+        directional_idx = [i for i, row in enumerate(pre_cap_rows) if row["direction"] in (-1, 1)]
+        if signal_count >= 3 and directional_idx:
+            directional_pre_cap = [
+                _safe_float(pre_cap_rows[i]["final_weight_contribution"], 0.0, 0.0)
+                for i in directional_idx
+            ]
+            directional_post_cap = _dominance_cap_closed_form(directional_pre_cap, 0.4)
+            for idx, capped_weight in zip(directional_idx, directional_post_cap):
+                original_weight = _safe_float(pre_cap_rows[idx]["final_weight_contribution"], 0.0, 0.0)
+                final_weight = _safe_float(capped_weight, 0.0, 0.0)
+                pre_cap_rows[idx]["final_weight_contribution"] = final_weight
+                pre_cap_rows[idx]["dominance_cap_active"] = final_weight + eps < original_weight
+
+        for row in pre_cap_rows:
+            direction = int(row["direction"])
+            final_weight = _safe_float(row["final_weight_contribution"], 0.0, 0.0)
+            raw_weight = _safe_float(row["raw_weight_contribution"], 0.0, 0.0)
+            pre_cap_weight = _safe_float(row["effective_weight_contribution"], 0.0, 0.0)
+            if pre_cap_weight > raw_weight + eps:
+                raise RuntimeError("Per-signal pre-cap weight exceeds raw weight")
+            if direction not in (-1, 1):
+                row["final_weight_contribution"] = 0.0
+                breakdown.append(row)
+                continue
+            if final_weight <= 1e-7:
+                row["final_weight_contribution"] = 0.0
+                breakdown.append(row)
+                continue
+            denom += final_weight
+            weighted_sum += final_weight * direction
+            weighted_edge += final_weight * (
+                direction * _safe_float(row["expected_edge_bps"], 0.0, 0.0, _EDGE_BPS_CLAMP)
+            )
+            breakdown.append(row)
+
+        total_breakdown_final_weight = sum(
+            _safe_float(r.get("final_weight_contribution"), 0.0, 0.0) for r in breakdown
+        )
+        non_directional_final_weight = sum(
+            _safe_float(r.get("final_weight_contribution"), 0.0, 0.0)
+            for r in breakdown
+            if int(r.get("direction", 0)) not in (-1, 1)
+        )
+        if non_directional_final_weight > eps:
+            raise RuntimeError("Non-directional signal contributed to adjusted denominator")
+        if not _approx_equal(total_breakdown_final_weight, denom):
+            raise RuntimeError("Breakdown final-weight sum mismatch against denom")
+
+        low_aggregate_weight = denom < self.config.min_aggregate_weight
         if denom < -1e-12 or raw_denom < -1e-12:
             raise RuntimeError("Negative denominator detected in fusion")
         raw_score_unadjusted = 0.0
@@ -1944,6 +1949,7 @@ class AlphaOrchestrator:
 
         correlation_groups = []
         group_adjusted_weight: Dict[Tuple[int, str, str], float] = {}
+        group_pre_cap_weight: Dict[Tuple[int, str, str], float] = {}
         group_raw_weight: Dict[Tuple[int, str, str], float] = {}
         group_conviction_sum: Dict[Tuple[int, str, str], float] = {}
         group_signal_count: Dict[Tuple[int, str, str], int] = {}
@@ -1955,11 +1961,14 @@ class AlphaOrchestrator:
                 row.get("source_timeframe", "")
             )
             group_id = _normalize_key(row.get("correlation_group_id"))
-            if direction not in (-1, 1) or not group_id:
+            gk = _canonical_group_key(int(direction) if direction in (-1, 1) else 0, timeframe_bucket, group_id)
+            if gk is None:
                 continue
-            gk = (int(direction), timeframe_bucket or _DEFAULT_TIMEFRAME, group_id)
             group_adjusted_weight[gk] = group_adjusted_weight.get(gk, 0.0) + _safe_float(
                 row.get("final_weight_contribution"), 0.0, 0.0
+            )
+            group_pre_cap_weight[gk] = group_pre_cap_weight.get(gk, 0.0) + _safe_float(
+                row.get("effective_weight_contribution"), 0.0, 0.0
             )
             group_raw_weight[gk] = group_raw_weight.get(gk, 0.0) + _safe_float(
                 row.get("raw_weight_contribution"), 0.0, 0.0
@@ -1977,11 +1986,14 @@ class AlphaOrchestrator:
 
         largest_group_size = 0
         total_raw_weight = 0.0
+        total_pre_cap_weight = 0.0
         total_adjusted_weight = 0.0
-        total_dominance_impact = 0.0
-        for group_key in sorted(correlation_group_sizes.keys()):
-            size = correlation_group_sizes[group_key]
-            group_size = max(1, int(size))
+        total_correlation_impact = 0.0
+        total_dominance_cap_impact = 0.0
+        all_group_keys: Set[Tuple[int, str, str]] = set(correlation_group_sizes.keys()) | set(group_raw_weight.keys())
+        for group_key in sorted(all_group_keys):
+            size = correlation_group_sizes.get(group_key, 0)
+            group_size = max(1, int(size if size > 0 else group_signal_count.get(group_key, 1)))
             largest_group_size = max(largest_group_size, group_size)
             avg_conviction = 0.0
             sig_count = max(1, int(group_signal_count.get(group_key, group_size)))
@@ -1991,35 +2003,41 @@ class AlphaOrchestrator:
                 )
             gated_count = int(group_gated_signal_count.get(group_key, 0))
             raw_group_weight = _safe_float(group_raw_weight.get(group_key, 0.0), 0.0, 0.0)
+            pre_cap_group_weight = _safe_float(group_pre_cap_weight.get(group_key, 0.0), 0.0, 0.0)
             adjusted_group_weight = _safe_float(group_adjusted_weight.get(group_key, 0.0), 0.0, 0.0)
-            effective_attenuation = (
+            realized_attenuation = (
                 adjusted_group_weight / raw_group_weight if raw_group_weight > 1e-12 else 1.0
             )
-            if not math.isfinite(effective_attenuation):
-                effective_attenuation = 1.0
+            if not math.isfinite(realized_attenuation):
+                realized_attenuation = 1.0
             any_signal_gated = gated_count > 0
             all_signals_gated = gated_count == sig_count and sig_count > 0
-            model_penalty = (
+            correlation_penalty_model = (
                 group_model_penalty_weighted_sum.get(group_key, 0.0) / raw_group_weight
                 if raw_group_weight > 1e-12
                 else 1.0
             )
-            if not math.isfinite(model_penalty):
-                model_penalty = 1.0
-            dominance_impact = model_penalty - effective_attenuation
-            if effective_attenuation > model_penalty + 1e-9:
-                raise RuntimeError("Effective attenuation exceeds model penalty")
+            if not math.isfinite(correlation_penalty_model):
+                correlation_penalty_model = 1.0
+            dominance_cap_effect = max(0.0, pre_cap_group_weight - adjusted_group_weight)
+            if adjusted_group_weight > raw_group_weight + eps:
+                raise RuntimeError("Group adjusted_weight exceeds raw_weight")
+            if pre_cap_group_weight > raw_group_weight + eps:
+                raise RuntimeError("Group pre_cap_weight exceeds raw_weight")
             total_raw_weight += raw_group_weight
+            total_pre_cap_weight += pre_cap_group_weight
             total_adjusted_weight += adjusted_group_weight
-            total_dominance_impact += abs(dominance_impact) * raw_group_weight
+            total_correlation_impact += max(0.0, raw_group_weight - pre_cap_group_weight)
+            total_dominance_cap_impact += dominance_cap_effect
             correlation_groups.append(
                 {
                     "key": [group_key[0], group_key[1], group_key[2]],
                     "size": group_size,
-                    "penalty": model_penalty,
-                    "model_penalty": model_penalty,
-                    "effective_attenuation": effective_attenuation,
-                    "dominance_impact": dominance_impact,
+                    "penalty": correlation_penalty_model,
+                    "correlation_penalty_model": correlation_penalty_model,
+                    "realized_attenuation": realized_attenuation,
+                    "dominance_cap_effect": dominance_cap_effect,
+                    "pre_cap_weight": pre_cap_group_weight,
                     "penalty_condition": (
                         f"conviction>={self.config.correlation_min_conviction:.3f} "
                         f"and group_size>={self.config.correlation_min_group_size}"
@@ -2058,17 +2076,20 @@ class AlphaOrchestrator:
         if not math.isfinite(blended_edge):
             blended_edge = 0.0
 
+        final_score = 0.0 if low_aggregate_weight else adjusted_score
+        final_edge = 0.0 if low_aggregate_weight else blended_edge
+
         score_attenuation = 1.0
         if abs(raw_score_unadjusted) > 1e-12:
-            score_attenuation = max(
-                0.0, min(1.0, abs(adjusted_score) / abs(raw_score_unadjusted))
-            )
+            score_attenuation = max(0.0, min(1.0, abs(final_score / raw_score_unadjusted)))
+        else:
+            score_attenuation = 1.0 if abs(final_score) <= 1e-12 else 0.0
         if not math.isfinite(score_attenuation):
             score_attenuation = 1.0
         correlation_attenuation = 1.0
         if abs(raw_blended_edge) > 1e-12:
             correlation_attenuation = max(
-                0.0, min(1.0, abs(blended_edge) / abs(raw_blended_edge))
+                0.0, min(1.0, abs(final_edge) / abs(raw_blended_edge))
             )
         if not math.isfinite(correlation_attenuation):
             correlation_attenuation = 1.0
@@ -2077,24 +2098,81 @@ class AlphaOrchestrator:
             raise RuntimeError("Invalid score attenuation factor")
 
         if total_raw_weight > 1e-12:
-            total_dominance_impact /= total_raw_weight
+            if total_pre_cap_weight > total_raw_weight + eps:
+                raise RuntimeError("Total pre-cap weight exceeds total raw weight")
+            if total_adjusted_weight > total_pre_cap_weight + eps:
+                raise RuntimeError("Total adjusted weight exceeds total pre-cap weight")
+            total_correlation_impact /= total_raw_weight
+            total_dominance_cap_impact /= total_raw_weight
         else:
-            total_dominance_impact = 0.0
+            total_correlation_impact = 0.0
+            total_dominance_cap_impact = 0.0
+
+        if raw_denom > 1e-12:
+            if not _approx_equal(raw_score_unadjusted, raw_weighted_sum / raw_denom):
+                raise RuntimeError("raw_score invariant violated")
+            if not _approx_equal(raw_blended_edge, raw_weighted_edge / raw_denom):
+                raise RuntimeError("raw_blended_edge invariant violated")
+        elif abs(raw_score_unadjusted) > 1e-12 or abs(raw_blended_edge) > 1e-12:
+            raise RuntimeError("raw zero-denominator invariant violated")
+
+        if denom > 1e-12:
+            if not _approx_equal(adjusted_score, weighted_sum / denom):
+                raise RuntimeError("adjusted_score invariant violated")
+            if not _approx_equal(blended_edge, weighted_edge / denom):
+                raise RuntimeError("blended_edge invariant violated")
+        elif abs(adjusted_score) > 1e-12 or abs(blended_edge) > 1e-12:
+            raise RuntimeError("adjusted zero-denominator invariant violated")
+
+        if raw_denom > 1e-12 and not _approx_equal(total_raw_weight, raw_denom):
+            raise RuntimeError("raw group-weight total mismatch")
+        if denom > 1e-12 and not _approx_equal(total_adjusted_weight, denom):
+            raise RuntimeError("adjusted group-weight total mismatch")
+
+        exposed_numeric_fields = {
+            "raw_score": raw_score_unadjusted,
+            "adjusted_score": final_score,
+            "score_attenuation_factor": score_attenuation,
+            "raw_blended_edge_bps": raw_blended_edge,
+            "attenuated_blended_edge_bps": final_edge,
+            "edge_attenuation_factor": correlation_attenuation,
+            "total_raw_weight": total_raw_weight,
+            "total_pre_cap_weight": total_pre_cap_weight,
+            "total_adjusted_weight": total_adjusted_weight,
+            "total_correlation_impact": total_correlation_impact,
+            "total_dominance_cap_impact": total_dominance_cap_impact,
+        }
+        for field_name, numeric_value in exposed_numeric_fields.items():
+            if not math.isfinite(float(numeric_value)):
+                raise RuntimeError(f"Non-finite correlation summary field: {field_name}")
+        for group in correlation_groups:
+            for group_field in (
+                "penalty",
+                "correlation_penalty_model",
+                "realized_attenuation",
+                "dominance_cap_effect",
+                "pre_cap_weight",
+                "avg_group_conviction",
+                "raw_weight",
+                "adjusted_weight",
+            ):
+                if not math.isfinite(float(group[group_field])):
+                    raise RuntimeError(f"Non-finite group summary field: {group_field}")
 
         logger.debug(
-            "CORRELATION_ATTENUATION | raw_score=%.6f | adj_score=%.6f | "
-            "raw_edge=%.6f | adj_edge=%.6f | score_factor=%.6f | edge_factor=%.6f",
+            "CORRELATION_ATTENUATION | raw_score=%.6f | final_score=%.6f | "
+            "raw_edge=%.6f | final_edge=%.6f | score_factor=%.6f | edge_factor=%.6f",
             raw_score_unadjusted,
-            adjusted_score,
+            final_score,
             raw_blended_edge,
-            blended_edge,
+            final_edge,
             score_attenuation,
             correlation_attenuation,
         )
         logger.debug(
-            "FUSION_SCORE | raw=%.6f | adjusted=%.6f",
+            "FUSION_SCORE | raw=%.6f | final=%.6f",
             raw_score_unadjusted,
-            adjusted_score,
+            final_score,
         )
         logger.debug(
             "CORRELATION_GROUP_CONCENTRATION | gate_active=%s | summary=%s",
@@ -2116,45 +2194,56 @@ class AlphaOrchestrator:
             [
                 {
                     "group": g["key"],
-                    "model": g["model_penalty"],
-                    "effective": g["effective_attenuation"],
-                    "impact": g["dominance_impact"],
+                    "model": g["correlation_penalty_model"],
+                    "effective": g["realized_attenuation"],
+                    "impact": g["dominance_cap_effect"],
                 }
                 for g in correlation_groups
             ],
         )
 
+        output_score = final_score
+        output_edge = final_edge
+        correlation_summary: Dict[str, Any] = {
+            "groups": correlation_groups,
+            "total_groups": len(correlation_groups),
+            "largest_group_size": largest_group_size,
+            "edge_attenuation_factor": correlation_attenuation,
+            "attenuation_mode": "score_and_edge",
+            "score_attenuation_factor": score_attenuation,
+            "penalty_logic": "smooth_inverse_sqrt_size",
+            "conviction_gate_active": conviction_gate_active,
+            "total_raw_weight": _safe_float(total_raw_weight, 0.0, 0.0),
+            "total_pre_cap_weight": _safe_float(total_pre_cap_weight, 0.0, 0.0),
+            "total_adjusted_weight": _safe_float(total_adjusted_weight, 0.0, 0.0),
+            "total_correlation_impact": _safe_float(total_correlation_impact, 0.0, 0.0),
+            "total_dominance_cap_impact": _safe_float(total_dominance_cap_impact, 0.0, 0.0),
+            "penalty_condition": (
+                f"conviction>={self.config.correlation_min_conviction:.3f} "
+                f"and group_size>={self.config.correlation_min_group_size}"
+            ),
+            "raw_score": _safe_float(raw_score_unadjusted, 0.0, -1.0, 1.0),
+            "adjusted_score": _safe_float(output_score, 0.0, -1.0, 1.0),
+            "raw_blended_edge_bps": _safe_float(
+                raw_blended_edge, 0.0, -_EDGE_BPS_CLAMP, _EDGE_BPS_CLAMP
+            ),
+            "attenuated_blended_edge_bps": _safe_float(
+                output_edge, 0.0, -_EDGE_BPS_CLAMP, _EDGE_BPS_CLAMP
+            ),
+            "low_aggregate_weight": low_aggregate_weight,
+            "aggregate_weight_threshold": _safe_float(self.config.min_aggregate_weight, 0.0, 0.0),
+        }
+        meta_payload: Dict[str, Any] = {
+            "breakdown": breakdown,
+            "correlation_summary": correlation_summary,
+        }
+        if low_aggregate_weight:
+            meta_payload["error"] = "low_aggregate_weight"
+            meta_payload["denom"] = denom
         return (
-            _safe_float(adjusted_score, 0.0, -1.0, 1.0),
-            _safe_float(blended_edge, 0.0, -_EDGE_BPS_CLAMP, _EDGE_BPS_CLAMP),
-            {
-                "breakdown": breakdown,
-                "correlation_summary": {
-                    "groups": correlation_groups,
-                    "total_groups": len(correlation_groups),
-                    "largest_group_size": largest_group_size,
-                    "attenuation_factor": correlation_attenuation,
-                    "attenuation_mode": "score_and_edge",
-                    "score_attenuation_factor": score_attenuation,
-                    "penalty_logic": "smooth_inverse_sqrt_size",
-                    "conviction_gate_active": conviction_gate_active,
-                    "total_raw_weight": _safe_float(total_raw_weight, 0.0, 0.0),
-                    "total_adjusted_weight": _safe_float(total_adjusted_weight, 0.0, 0.0),
-                    "total_dominance_impact": _safe_float(total_dominance_impact, 0.0, 0.0),
-                    "penalty_condition": (
-                        f"conviction>={self.config.correlation_min_conviction:.3f} "
-                        f"and group_size>={self.config.correlation_min_group_size}"
-                    ),
-                    "raw_score": _safe_float(raw_score_unadjusted, 0.0, -1.0, 1.0),
-                    "adjusted_score": _safe_float(adjusted_score, 0.0, -1.0, 1.0),
-                    "raw_blended_edge_bps": _safe_float(
-                        raw_blended_edge, 0.0, -_EDGE_BPS_CLAMP, _EDGE_BPS_CLAMP
-                    ),
-                    "attenuated_blended_edge_bps": _safe_float(
-                        blended_edge, 0.0, -_EDGE_BPS_CLAMP, _EDGE_BPS_CLAMP
-                    ),
-                },
-            },
+            _safe_float(output_score, 0.0, -1.0, 1.0),
+            _safe_float(output_edge, 0.0, -_EDGE_BPS_CLAMP, _EDGE_BPS_CLAMP),
+            meta_payload,
         )
 
     # ----------------------------------------
