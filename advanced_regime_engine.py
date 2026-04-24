@@ -124,17 +124,18 @@ def _safe_array(
         arr = arr.reshape(1)
     else:
         arr = np.ravel(arr)
-    arr = np.where(np.isfinite(arr), arr, np.nan)
+    fill = 0.0
+    if fallback.size > 0 and np.all(np.isfinite(fallback)):
+        fill = float(np.ravel(fallback)[0])
+    arr = np.where(np.isfinite(arr), arr, fill)
     if shape is not None:
         expected_size = int(np.prod(shape))
         if arr.size != expected_size:
             arr = np.asarray(fallback, dtype=float).reshape(-1)
         if arr.size != expected_size:
-            fill = 0.0
-            if fallback.size > 0 and np.all(np.isfinite(fallback)):
-                fill = float(np.ravel(fallback)[0])
             arr = np.full(expected_size, fill, dtype=float)
         arr = np.ravel(arr).reshape(shape)
+    arr = np.where(np.isfinite(arr), arr, fill)
     return np.asarray(arr, dtype=float)
 
 
@@ -257,7 +258,7 @@ def _validate_output_schema(output: Dict[str, Any]) -> bool:
         try:
             LOGGER.error(f"[SCHEMA VIOLATION] {e} | output={str(output)[:500]}")
         except Exception:
-            pass
+            warnings.warn("Schema violation logging failed", RuntimeWarning, stacklevel=2)
         return False
 
 def _build_output(
@@ -944,7 +945,7 @@ class AdvancedRegimeEngine:
                 try:
                     LOGGER.error("State hash canonicalization failed", exc_info=True)
                 except Exception:
-                    pass
+                    warnings.warn("State hash logging failed", RuntimeWarning, stacklevel=2)
             return hashlib.sha256(b"STATE_HASH_ERROR").hexdigest()
 
     def __init__(
@@ -1136,8 +1137,8 @@ class AdvancedRegimeEngine:
         if controller is not None:
             try:
                 return bool(controller.should_sample())
-            except Exception:
-                pass
+            except Exception as exc:
+                self._warn_rate_limited("obs_should_sample_failure", f"Observability sample fallback: {exc}", cooldown_s=30.0)
         return (int(self._rng.integers(0, self._OBS_SAMPLE_RATE)) == 0)
 
     def _obs_should_emit_warning(self, key: str, cooldown_s: float) -> bool:
@@ -1145,8 +1146,8 @@ class AdvancedRegimeEngine:
         if controller is not None:
             try:
                 return bool(controller.should_emit_warning(key, cooldown_s))
-            except Exception:
-                pass
+            except Exception as exc:
+                self._warn_rate_limited("obs_emit_warning_failure", f"Warning gate fallback: {exc}", cooldown_s=30.0)
         return True
 
     def _obs_traceback_budget(self) -> int:
@@ -1154,8 +1155,8 @@ class AdvancedRegimeEngine:
         if controller is not None:
             try:
                 return max(1, int(controller.traceback_budget()))
-            except Exception:
-                pass
+            except Exception as exc:
+                self._warn_rate_limited("obs_traceback_budget_failure", f"Traceback budget fallback: {exc}", cooldown_s=30.0)
         return int(self._TRACEBACK_MAX_FRAMES)
 
     def _obs_observe(
@@ -1171,8 +1172,8 @@ class AdvancedRegimeEngine:
             return
         try:
             controller.observe(event_type=event_type, severity=severity, context=context)
-        except Exception:
-            pass
+        except Exception as exc:
+            self._warn_rate_limited("obs_observe_failure", f"Observability observe failed: {exc}", cooldown_s=30.0)
 
     def _replay_record(self, event_type: str, payload: Dict[str, Any] | None = None) -> None:
         if getattr(self, "_is_replay", False):
@@ -1192,8 +1193,8 @@ class AdvancedRegimeEngine:
                     safe_payload[k] = "UNSERIALIZABLE"
         try:
             replay_engine.record_event(event_type, safe_payload)
-        except Exception:
-            pass
+        except Exception as exc:
+            self._warn_rate_limited("replay_record_failure", f"Replay record failed: {exc}", cooldown_s=30.0)
 
     def _shutdown_warning_worker(self) -> None:
         """
@@ -1210,7 +1211,7 @@ class AdvancedRegimeEngine:
         try:
             warning_queue.put_nowait(None)
         except queue.Full:
-            pass
+            self._warn_rate_limited("warning_queue_full_shutdown", "Warning queue full during shutdown", cooldown_s=30.0)
 
         if worker.is_alive():
             worker.join(timeout=1.0)
@@ -1250,11 +1251,15 @@ class AdvancedRegimeEngine:
                 repr(value)[:200],
             )
         except Exception:
-            pass
+            warnings.warn(f"STATE_LOAD_DEGRADE logging failed for field={field}", RuntimeWarning, stacklevel=2)
 
     @staticmethod
     def _coerce_vector(name: str, values: Any, expected_size: int) -> np.ndarray:
-        arr = _safe_array(values, shape=(expected_size,), default=np.zeros(expected_size, dtype=float))
+        arr = np.asarray(values, dtype=float)
+        if arr.ndim == 0:
+            arr = arr.reshape(1)
+        else:
+            arr = np.ravel(arr)
         if arr.shape != (expected_size,):
             raise ValueError(f"Vector '{name}' must have shape ({expected_size},), got {arr.shape}.")
         if not np.all(np.isfinite(arr)):
@@ -1339,7 +1344,7 @@ class AdvancedRegimeEngine:
                 try:
                     warnings.warn(msg, RuntimeWarning, stacklevel=3)
                 except Exception:
-                    pass
+                    warnings.warn("Warning emission fallback failed", RuntimeWarning, stacklevel=2)
 
     def _warn_rate_limited(self, key: str, message: str, cooldown_s: float = 30.0) -> None:
         """
@@ -1442,7 +1447,7 @@ class AdvancedRegimeEngine:
                     tb = tb[: self._TRACEBACK_MAX_CHARS - 3] + "..."
             except Exception:
                 # Preserve existing traceback fallback behavior.
-                pass
+                self._warn_rate_limited("traceback_structured_failure", "Structured traceback rendering failed", cooldown_s=30.0)
         if tb is None or tb_struct is None:
             tb = self._summarize_traceback(exc)
             tb_struct = self._summarize_traceback_structured(exc)
@@ -1787,6 +1792,10 @@ class AdvancedRegimeEngine:
         self._shock_memory = 0.0
         self._return_ema = 0.0
         self._abs_return_ema = 0.0
+        self._equity = 1.0
+        self._equity_peak = 1.0
+        self._drawdown = 0.0
+        self._loss_streak = 0
         self._last_price = None
         self._circuit_breaker_active = False
         self._circuit_breaker_reason = None
@@ -1810,6 +1819,8 @@ class AdvancedRegimeEngine:
                 ValueError("signature mismatch"),
                 incoming_signature,
             )
+            self.reset_state()
+            return
 
         incoming_version = state.get("state_version")
         if incoming_version is not None and incoming_version != self._STATE_VERSION:
@@ -1818,6 +1829,8 @@ class AdvancedRegimeEngine:
                 ValueError("version mismatch"),
                 incoming_version,
             )
+            self.reset_state()
+            return
 
         ts = self._normalize_timestamp(state.get("last_timestamp", None))
         if state.get("last_timestamp", None) is not None and ts is None:
@@ -1843,12 +1856,7 @@ class AdvancedRegimeEngine:
         # --- NEW: restore SJM fallback memory ---
         self._last_valid_sjm_probs = None
         if "last_valid_sjm_probs" in state and state["last_valid_sjm_probs"] is not None:
-            try:
-                self._last_valid_sjm_probs = _normalize_prob_vector(
-                    self._coerce_vector("last_valid_sjm_probs", state["last_valid_sjm_probs"], self.K)
-                )
-            except Exception as e:
-                self._log_state_load_issue("last_valid_sjm_probs", e, state.get("last_valid_sjm_probs"))
+            self._last_valid_sjm_probs = _safe_prob_vector(state["last_valid_sjm_probs"], self.K)
 
         self._range_anchor_size = self._state_scalar(state, "range_anchor_size", default=0.0, min_value=0.0)
         self.last_signed_position_size = self._state_scalar(
@@ -1948,8 +1956,9 @@ class AdvancedRegimeEngine:
             self.garch_var = self._stationary_garch_var()
 
         self.range_ticks_int = _safe_int(self.range_ticks, default=0, min=0)
-        self._circuit_breaker_active = bool(state.get("circuit_breaker_active", False))
-        self._circuit_breaker_reason = state.get("circuit_breaker_reason", None)
+        self._circuit_breaker_active = bool(_safe_int(state.get("circuit_breaker_active", 0), default=0, min=0, max=1))
+        breaker_reason = state.get("circuit_breaker_reason", None)
+        self._circuit_breaker_reason = None if breaker_reason is None else str(breaker_reason)[:128]
         self._equity = self._state_scalar(state, "equity", default=1.0, min_value=0.0)
         self._equity_peak = self._state_scalar(state, "equity_peak", default=max(self._equity, 1.0), min_value=0.0)
         if self._equity_peak < self._equity:
@@ -2032,6 +2041,8 @@ class AdvancedRegimeEngine:
                 last_valid_vol=self._last_valid_vol,
                 switch_stability_ema=self._switch_stability_ema,
                 execution_side="flat",
+                include_signal_valid=True,
+                signal_valid=False,
             )
 
         # ==========================================
@@ -3003,8 +3014,8 @@ class AdvancedRegimeEngine:
                                 atol=1e-12,
                             ):
                                 LOGGER.critical("CRITICAL SNAPSHOT MISMATCH: %s", k)
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            self._warn_rate_limited("snapshot_consistency_check_failure", f"Snapshot consistency check failed for {k}: {exc}", cooldown_s=30.0)
 
                 snapshot_payload = {
                     "engine_state": state_blob,
@@ -3049,8 +3060,8 @@ class AdvancedRegimeEngine:
                 hash_payload.pop("_checksum", None)
                 snapshot_payload["state_hash"] = self._state_hash(hash_payload)
                 self._replay_engine.snapshot(snapshot_payload)
-            except Exception:
-                pass
+            except Exception as exc:
+                self._warn_rate_limited("snapshot_emit_failure", f"Snapshot emission failed: {exc}", cooldown_s=30.0)
         return output
 
     # ==========================================
@@ -3070,8 +3081,8 @@ class AdvancedRegimeEngine:
             if "_engine_rng_state" in state and getattr(self, "_rng", None) is not None:
                 try:
                     self._rng.bit_generator.state = dict(state["_engine_rng_state"])
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self._log_state_load_issue("snapshot._engine_rng_state", exc, state.get("_engine_rng_state"))
 
             # ==========================================
             # SNAPSHOT INTEGRITY CHECK
@@ -3128,7 +3139,7 @@ class AdvancedRegimeEngine:
             self._last_timestamp = snapshot_ts
             self._last_valid_dt = self._state_scalar(state, "last_valid_dt", default=1.0, min_value=1e-9)
             self.range_ticks = self._state_scalar(state, "range_ticks", default=0.0, min_value=0.0)
-            self.range_ticks_int = int(state.get("range_ticks_int", self.range_ticks_int))
+            self.range_ticks_int = _safe_int(state.get("range_ticks_int", self.range_ticks_int), default=0, min=0)
             self._in_range = bool(state.get("in_range", self._in_range))
             self._range_anchor_size = self._state_scalar(state, "range_anchor_size", default=0.0, min_value=0.0)
             self._prev_raw_regime = state.get("prev_raw_regime", self._prev_raw_regime)
@@ -3143,13 +3154,7 @@ class AdvancedRegimeEngine:
                 )
             self._last_price = state.get("last_price", self._last_price)
             if state.get("last_valid_sjm_probs") is not None:
-                try:
-                    self._last_valid_sjm_probs = _normalize_prob_vector(
-                        np.asarray(state.get("last_valid_sjm_probs"), dtype=float)
-                    )
-                except Exception as e:
-                    self._log_state_load_issue("snapshot.last_valid_sjm_probs", e, state.get("last_valid_sjm_probs"))
-                    self._last_valid_sjm_probs = None
+                self._last_valid_sjm_probs = _safe_prob_vector(state.get("last_valid_sjm_probs"), self.K)
             self._last_effective_trend_strength = self._state_scalar(
                 state,
                 "last_effective_trend_strength",
@@ -3175,9 +3180,9 @@ class AdvancedRegimeEngine:
                         exc_info=True,
                     )
                 except Exception:
-                    pass
+                    LOGGER.debug("Snapshot load error logging failed")
             # Never crash live engine during replay recovery.
-            pass
+            return
 
     # ==========================================
     # 🚨 CIRCUIT BREAKER TRIGGER
@@ -3193,7 +3198,7 @@ class AdvancedRegimeEngine:
             if not getattr(self, "_is_replay", False):
                 LOGGER.critical(f"[CIRCUIT BREAKER TRIGGERED] Reason={reason}")
         except Exception:
-            pass
+            self._warn_rate_limited("circuit_breaker_log_failure", "Circuit breaker logging failed", cooldown_s=30.0)
 
     # ==========================================
     # 🔄 SELF HEALING SYSTEM
@@ -3215,7 +3220,7 @@ class AdvancedRegimeEngine:
             if not getattr(self, "_is_replay", False):
                 LOGGER.warning("[SELF HEALING INITIATED]")
         except Exception:
-            pass
+            self._warn_rate_limited("self_heal_log_failure", "Self-healing logging failed", cooldown_s=30.0)
 
         # Legacy breaker recovery path: keep existing behavior intact.
         if error_code is None:
