@@ -1,169 +1,139 @@
 import os
 import requests
 import json
+import re
 
 API_KEY = os.getenv("CLAUDE_API_KEY")
 
-# ==========================================
-# READ ONLY TARGET MODULES
-# ==========================================
-def read_repo():
-    TARGET_FILES = [
-        "advanced_regime_engine.py",
-        "alpha_orchestrator.py"
-    ]
+TARGET_FILES = [
+    "advanced_regime_engine.py",
+    "alpha_orchestrator.py"
+]
 
+# ===============================
+# READ TARGET FILES
+# ===============================
+def read_repo():
     code = ""
 
     for root, _, files in os.walk("."):
         for f in files:
             if f in TARGET_FILES:
                 path = os.path.join(root, f)
-                try:
-                    with open(path, "r", encoding="utf-8") as file:
-                        code += f"\n\n# FILE: {path}\n\n"
-                        code += file.read()
-                except Exception as e:
-                    print(f"⚠️ Skipping {path}: {e}")
+                with open(path, "r", encoding="utf-8") as file:
+                    code += f"\n\n# FILE: {path}\n\n"
+                    code += file.read()
 
     return code[:200000]
 
 
-# ==========================================
-# BUILD STRICT AUDIT PROMPT
-# ==========================================
-def build_prompt(code):
+# ===============================
+# CLAUDE CALL
+# ===============================
+def call_claude(prompt):
+    response = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json"
+        },
+        json={
+            "model": "claude-opus-4-6",
+            "max_tokens": 12000,
+            "messages": [{"role": "user", "content": prompt}]
+        }
+    )
+
+    return response.json()
+
+
+# ===============================
+# MULTI PASS PROMPTS
+# ===============================
+def bug_pass(code):
     return f"""
-You are a senior quantitative trading systems engineer, Python backend auditor, and automated testing specialist.
+Find ALL critical bugs and FIX them with FULL FILE OUTPUT.
 
-⚠️ STRICT SCOPE:
-You MUST ONLY analyze:
-- advanced_regime_engine.py
-- alpha_orchestrator.py
+ONLY output final fixed files.
 
-DO NOT mention or suggest changes outside these modules.
-
----
-
-## OBJECTIVE
-
-Audit, debug, and upgrade ONLY these modules to production-grade quality.
-
----
-
-## REQUIREMENTS (NON-NEGOTIABLE)
-
-- No partial fixes
-- No TODOs
-- No placeholders
-- No vague suggestions
-- Deliver FULL working code
-
----
-
-## OUTPUT FORMAT
-
-# 🚨 CRITICAL BUGS
-- Exact issue
-- Root cause
-- FULL FIXED CODE
-
-# ⚠️ LOGIC ISSUES
-- Explain flaw
-- Provide corrected implementation
-
-# ⚡ PERFORMANCE IMPROVEMENTS
-- Bottlenecks
-- Optimized code
-
-# 🧪 TEST FIXES
-- Fix failing tests (if relevant)
-
-# 🧠 FINAL PATCHED FILES
-Return FULL FILES, not snippets
-
----
-
-## CODE
-
+CODE:
 {code}
 """
 
+def logic_pass(code):
+    return f"""
+Fix ALL logic issues and improve architecture.
 
-# ==========================================
-# CALL CLAUDE API
-# ==========================================
-def call_claude(prompt):
-    url = "https://api.anthropic.com/v1/messages"
+ONLY output final fixed files.
 
-    headers = {
-        "x-api-key": API_KEY,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json"
-    }
+CODE:
+{code}
+"""
 
-    payload = {
-        "model": "claude-opus-4-6",
-        "max_tokens": 16000,
-        "messages": [
-            {"role": "user", "content": prompt}
-        ]
-    }
+def performance_pass(code):
+    return f"""
+Optimize performance and efficiency.
 
-    response = requests.post(url, headers=headers, json=payload)
+ONLY output final fixed files.
 
-    print(f"Status: {response.status_code}")
+CODE:
+{code}
+"""
 
-    try:
-        result = response.json()
-    except Exception:
-        print("❌ Failed to parse JSON")
-        print(response.text)
-        return None
+# ===============================
+# PATCH EXTRACTOR
+# ===============================
+def extract_and_apply(text):
+    pattern = r"## FILE: (.*?)\n(.*?)(?=## FILE:|\Z)"
+    matches = re.findall(pattern, text, re.DOTALL)
 
-    return result
+    for filename, content in matches:
+        filename = filename.strip()
+        content = content.strip()
+
+        print(f"✏️ Updating {filename}")
+
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(content)
 
 
-# ==========================================
-# MAIN EXECUTION
-# ==========================================
+# ===============================
+# MAIN
+# ===============================
 def main():
     if not API_KEY:
-        raise ValueError("❌ CLAUDE_API_KEY not set")
+        raise ValueError("Missing API key")
 
-    print("🚀 Reading target modules...")
     code = read_repo()
 
-    if not code.strip():
-        raise ValueError("❌ Target files not found")
+    print("🔴 Bug pass...")
+    bug_result = call_claude(bug_pass(code))
 
-    print("🧠 Building prompt...")
-    prompt = build_prompt(code)
+    print("🟡 Logic pass...")
+    logic_result = call_claude(logic_pass(code))
 
-    print("🤖 Calling Claude...")
-    result = call_claude(prompt)
+    print("🟢 Performance pass...")
+    perf_result = call_claude(performance_pass(code))
 
-    if result is None:
-        print("❌ No result received")
-        return
+    # Combine outputs
+    combined = ""
 
-    # SAFE EXTRACTION
-    try:
-        text = result["content"][0]["text"]
-        print("✅ Clean text extracted")
-    except Exception as e:
-        print("⚠️ Fallback to raw JSON:", str(e))
-        text = json.dumps(result, indent=2)
+    for r in [bug_result, logic_result, perf_result]:
+        try:
+            combined += r["content"][0]["text"] + "\n\n"
+        except:
+            pass
 
-    # SAVE REPORT
-    with open("CLAUDE_REPORT.md", "w", encoding="utf-8") as f:
-        f.write(text)
+    # Save raw report
+    with open("CLAUDE_REPORT.md", "w") as f:
+        f.write(combined)
 
-    print("✅ Report saved: CLAUDE_REPORT.md")
+    print("📄 Report saved")
+
+    # APPLY PATCHES
+    extract_and_apply(combined)
 
 
-# ==========================================
-# ENTRY POINT
-# ==========================================
 if __name__ == "__main__":
     main()
