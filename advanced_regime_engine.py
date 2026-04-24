@@ -842,6 +842,7 @@ class AdvancedRegimeEngine:
     _MAX_CONSECUTIVE_LOSSES = 7
     _VOL_SHOCK_MULTIPLIER = 3.5
     _CONFIDENCE_COLLAPSE_THRESHOLD = 0.35
+    _CONFIDENCE_COLLAPSE_MIN_STREAK = 3
     _HEALING_COOLDOWN_TICKS = 20
 
     _EWM_ALPHA: float = 0.15
@@ -1092,6 +1093,7 @@ class AdvancedRegimeEngine:
 
         self._circuit_breaker_active = False
         self._circuit_breaker_reason = None
+        self._circuit_breaker_trigger_tick = -1
         self._healing_counter = 0
         self._last_healing_action = "NONE"
         self._last_healing_error = None
@@ -1151,6 +1153,7 @@ class AdvancedRegimeEngine:
         self._obs_counter = 0
         self._OBS_SAMPLE_RATE = 5  # update metrics every N ticks
         self._tick_id = 0
+        self._confidence_collapse_streak = 0
         self._strict_replay = True
         self._fsm_error = None
         try:
@@ -1814,6 +1817,7 @@ class AdvancedRegimeEngine:
             "garch_var": self.garch_var.astype(float).tolist(),
             "circuit_breaker_active": bool(self._circuit_breaker_active),
             "circuit_breaker_reason": self._circuit_breaker_reason,
+            "circuit_breaker_trigger_tick": int(getattr(self, "_circuit_breaker_trigger_tick", -1)),
             "equity": float(self._equity),
             "equity_peak": float(self._equity_peak),
             "drawdown": float(self._drawdown),
@@ -1831,6 +1835,7 @@ class AdvancedRegimeEngine:
                 dict(self._rng.bit_generator.state)
                 if getattr(self, "_rng", None) is not None else None
             ),
+            "confidence_collapse_streak": int(getattr(self, "_confidence_collapse_streak", 0)),
             # Explicitly mark deprecated field as False to avoid confusion in external systems
             "emit_extended_schema": False,
         }
@@ -1881,11 +1886,13 @@ class AdvancedRegimeEngine:
         self._last_price = None
         self._circuit_breaker_active = False
         self._circuit_breaker_reason = None
+        self._circuit_breaker_trigger_tick = -1
         self._healing_counter = 0
         self._last_healing_action = "NONE"
         self._last_healing_error = None
         self._last_healing_context = {}
         self._healing_count = 0
+        self._confidence_collapse_streak = 0
 
     @_synchronized
     def load_state(self, state: Dict[str, Any]) -> None:
@@ -2050,6 +2057,7 @@ class AdvancedRegimeEngine:
         self._circuit_breaker_active = bool(_safe_int(state.get("circuit_breaker_active", 0), default=0, min=0, max=1))
         breaker_reason = state.get("circuit_breaker_reason", None)
         self._circuit_breaker_reason = None if breaker_reason is None else str(breaker_reason)[:128]
+        self._circuit_breaker_trigger_tick = _safe_int(state.get("circuit_breaker_trigger_tick", -1), default=-1)
         self._equity = self._state_scalar(state, "equity", default=1.0, min_value=self._MIN_EQUITY_FLOOR)
         self._equity_peak = self._state_scalar(state, "equity_peak", default=max(self._equity, 1.0), min_value=self._MIN_EQUITY_FLOOR)
         if self._equity_peak < self._equity:
@@ -2075,6 +2083,7 @@ class AdvancedRegimeEngine:
         self._shock_memory = self._state_scalar(state, "shock_memory", default=0.0, min_value=0.0)
         self._return_ema = self._state_scalar(state, "return_ema", default=0.0)
         self._abs_return_ema = self._state_scalar(state, "abs_return_ema", default=0.0, min_value=0.0)
+        self._confidence_collapse_streak = _safe_int(state.get("confidence_collapse_streak", 0), default=0, min=0)
         rng_state = state.get("engine_rng_state", None)
         if isinstance(rng_state, dict) and getattr(self, "_rng", None) is not None:
             try:
@@ -2222,11 +2231,15 @@ class AdvancedRegimeEngine:
             # ==========================================
             # FIX 1: BASE TF MUST BE DEFINED FIRST
             # ==========================================
+            if not isinstance(mtf_data, dict):
+                raise ValueError("MTF payload must be a dict keyed by timeframe")
             base_tf = mtf_data.get("base", None)
             if base_tf is None:
                 raise ValueError(
                     "MTF payload must include explicit 'base' timeframe key"
                 )
+            if not isinstance(base_tf, dict):
+                raise ValueError("MTF payload base timeframe must be a dict")
 
             y_t = base_tf.get("return", 0.0)
             x_t = base_tf.get("features", np.zeros(self.n_features))
@@ -2612,11 +2625,20 @@ class AdvancedRegimeEngine:
         )
         self._prev_directional_label = regime_scores.get("directional_label")
         regime = regime_scores["regime"]
+        directional_recovery_label: str | None = None
         if getattr(self, "_regime_smoother", None) is not None:
             regime, self._regime_state_probs = self._regime_smoother.update(
                 regime_scores,
                 self._confirmed_regime,
             )
+        if regime == "RANGE":
+            directional_recovery = (
+                regime_scores["trend_score"] > (regime_scores["range_score"] + 0.15)
+                and float(regime_scores.get("directional_margin", 0.0)) >= (2.0 * self._DIRECTION_SWITCH_GAP)
+                and float(regime_scores.get("risk_level", 1.0)) < 0.35
+            )
+            if directional_recovery:
+                directional_recovery_label = str(regime_scores.get("directional_label", "RANGE"))
 
         # Capture base trend strength before any execution-level overrides (fixes Issue 1)
         base_trend_strength = float(regime_scores["trend_strength"])
@@ -2654,6 +2676,13 @@ class AdvancedRegimeEngine:
         else:
             confirmed_regime = self._confirmed_regime
             confirmed_regime_idx = self._confirmed_regime_idx
+        if (
+            confirmed_regime == "RANGE"
+            and directional_recovery_label in ("TREND", "BEAR")
+            and self._regime_persistence >= self._REGIME_CONFIRMATION_TICKS
+        ):
+            confirmed_regime = directional_recovery_label
+            confirmed_regime_idx = self.current_regime_idx
 
         if regime == "TOXIC":
             confirmed_regime = "TOXIC"
@@ -2694,7 +2723,13 @@ class AdvancedRegimeEngine:
         # Prevent weak trend signals from activating directional modes
         # ==========================================
         if confirmed_regime in ("TREND", "BEAR"):
-            if regime_edge < self._EDGE_MIN_DIRECTIONAL_CONFIDENCE:
+            directional_margin = float(regime_scores.get("directional_margin", 0.0))
+            weak_directional_evidence = (
+                regime_edge < self._EDGE_MIN_DIRECTIONAL_CONFIDENCE
+                and regime_scores["conviction"] < 0.55
+                and directional_margin < max(self._DIRECTION_SWITCH_GAP, 0.04)
+            )
+            if weak_directional_evidence:
                 confirmed_regime = "RANGE"
 
         # ==========================================
@@ -2720,7 +2755,7 @@ class AdvancedRegimeEngine:
         if regime_changed:
             switch_gate = self._EDGE_MIN_SWITCH_CONFIDENCE
             if confirmed_regime in ("TREND", "BEAR"):
-                switch_gate = self._EDGE_MIN_DIRECTIONAL_CONFIDENCE
+                switch_gate = min(self._EDGE_MIN_DIRECTIONAL_CONFIDENCE, 0.50)
 
             if mtf_partial_survival:
                 switch_gate += self._SWITCH_EDGE_BUFFER
@@ -2745,7 +2780,7 @@ class AdvancedRegimeEngine:
                 cooldown_ok = elapsed_since_change >= self._SWITCH_COOLDOWN_SEC
 
             persistence_ok = self._regime_persistence >= self._SWITCH_MIN_PERSISTENCE
-            confidence_ok = regime_scores["conviction"] >= 0.70
+            confidence_ok = regime_scores["conviction"] >= 0.20
             toxic_override = confirmed_regime == "TOXIC"
 
             if not toxic_override:
@@ -2854,6 +2889,14 @@ class AdvancedRegimeEngine:
         collapse_signal = (
             regime_scores["conviction"] < 0.05
             and regime_scores["confidence"] < self._CONFIDENCE_COLLAPSE_THRESHOLD
+        )
+        if collapse_signal:
+            self._confidence_collapse_streak = int(getattr(self, "_confidence_collapse_streak", 0)) + 1
+        else:
+            self._confidence_collapse_streak = 0
+        collapse_signal = (
+            collapse_signal
+            and self._confidence_collapse_streak >= self._CONFIDENCE_COLLAPSE_MIN_STREAK
         )
         if collapse_signal:
             self._trigger_circuit_breaker("CONFIDENCE_COLLAPSE")
@@ -3200,14 +3243,14 @@ class AdvancedRegimeEngine:
                 hash_payload.pop("state_hash", None)
                 actual_hash = self._state_hash(hash_payload)
                 if expected_hash != actual_hash:
-                    LOGGER.error("SNAPSHOT CORRUPTION DETECTED (HASH)")
+                    raise ValueError("SNAPSHOT_CORRUPTION_HASH_MISMATCH")
             expected_checksum = state.get("_checksum")
             if expected_checksum:
                 check_blob = dict(state)
                 check_blob.pop("_checksum", None)
                 actual_checksum = self._state_hash(check_blob)
                 if expected_checksum != actual_checksum:
-                    LOGGER.error("SNAPSHOT CHECKSUM MISMATCH")
+                    raise ValueError("SNAPSHOT_CORRUPTION_CHECKSUM_MISMATCH")
 
             engine_state = state.get("engine_state", state)
             if not isinstance(engine_state, dict):
@@ -3312,10 +3355,16 @@ class AdvancedRegimeEngine:
     # 🚨 CIRCUIT BREAKER TRIGGER
     # ==========================================
     def _trigger_circuit_breaker(self, reason: str):
+        current_tick = int(getattr(self, "_tick_id", -1))
         if self._circuit_breaker_active:
+            if self._circuit_breaker_reason is None:
+                self._circuit_breaker_reason = str(reason)
+            return
+        if int(getattr(self, "_circuit_breaker_trigger_tick", -1)) == current_tick:
             return
         self._circuit_breaker_active = True
         self._circuit_breaker_reason = str(reason)
+        self._circuit_breaker_trigger_tick = current_tick
         self._healing_counter = 0
         if not getattr(self, "_is_replay", False):
             self._replay_record("circuit_breaker", {"reason": reason})
@@ -3396,7 +3445,9 @@ class AdvancedRegimeEngine:
             # Reset breaker
             self._circuit_breaker_active = False
             self._circuit_breaker_reason = None
+            self._circuit_breaker_trigger_tick = -1
             self._healing_counter = 0
+            self._confidence_collapse_streak = 0
             self._last_healing_action = "RESET_FULL"
             if not getattr(self, "_is_replay", False):
                 self._replay_record("self_heal", {"error": error_code, "action": "RESET_FULL"})
@@ -3463,6 +3514,13 @@ class AdvancedRegimeEngine:
         elif category == "risk":
             self._trigger_circuit_breaker(str(err_code))
             action = "CIRCUIT_BREAK"
+        else:
+            # Deterministic fallback: always execute a safe degradation path.
+            self.nhhmm_prior = _normalize_prob_vector(self.nhhmm_prior)
+            self.garch_prob = _safe_prob_vector(self.garch_prob, 2)
+            self._smoothed_garch_prob = _safe_prob_vector(self._smoothed_garch_prob, 2)
+            self._confidence_collapse_streak = 0
+            action = "SKIP_AND_DEGRADE"
 
         if not getattr(self, "_is_replay", False):
             self._replay_record(
