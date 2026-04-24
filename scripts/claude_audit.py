@@ -1,70 +1,61 @@
 import os
 import requests
-import json
 
 API_KEY = os.getenv("CLAUDE_API_KEY")
 
-TARGET_FILES = [
-    "advanced_regime_engine.py",
-    "alpha_orchestrator.py"
-]
-
-MAX_INPUT_CHARS = 200000
+TARGET_FILE = "advanced_regime_engine.py"
+MAX_INPUT_CHARS = 120000
 
 
-# ===============================
-# READ TARGET FILES
-# ===============================
-def read_repo():
-    code = ""
-
+def read_file():
     for root, _, files in os.walk("."):
         for f in files:
-            if f in TARGET_FILES:
+            if f == TARGET_FILE:
                 path = os.path.join(root, f)
-
-                try:
-                    with open(path, "r", encoding="utf-8") as file:
-                        code += f"\n\n# FILE: {path}\n\n"
-                        code += file.read()
-                except Exception as e:
-                    print(f"⚠️ Failed to read {path}: {e}")
-
-    return code[:MAX_INPUT_CHARS]
+                with open(path, "r", encoding="utf-8") as file:
+                    return file.read()[:MAX_INPUT_CHARS]
+    return ""
 
 
-# ===============================
-# PROMPT
-# ===============================
 def build_prompt(code):
     return f"""
-You are a senior production-grade Python auditor.
+You are a senior quantitative engineer, distributed systems expert, and production auditor.
 
-STRICT RULES:
-- DO NOT rewrite full files
-- DO NOT modify code
-- ONLY output:
-  1. Audit summary
-  2. Root cause
-  3. Patch diff
+Perform a DEEP PRODUCTION-GRADE AUDIT.
 
-FORMAT:
+You must:
+- Analyze line-by-line
+- Detect ALL critical issues
+- Focus on:
+  - hidden state bugs
+  - regime logic correctness
+  - probabilistic consistency
+  - numerical stability
+  - concurrency safety
+  - silent failures
+  - incomplete implementations
+
+STRICT OUTPUT FORMAT:
 
 ## 🔍 AUDIT SUMMARY
+- List ALL critical issues
 
 ## ⚠️ ROOT CAUSE
+- Explain WHY each issue occurs
 
 ## 🧩 PATCH DIFF
-(standard unified diff only)
+- Unified git diff ONLY
+- Must be directly applicable
+- No full file rewrite
+- No explanations inside diff
+
+FILE: advanced_regime_engine.py
 
 CODE:
 {code}
 """
 
 
-# ===============================
-# CLAUDE CALL
-# ===============================
 def call_claude(prompt):
     response = requests.post(
         "https://api.anthropic.com/v1/messages",
@@ -77,62 +68,29 @@ def call_claude(prompt):
             "model": "claude-opus-4-6",
             "max_tokens": 16000,
             "temperature": 0,
-            "messages": [
-                {"role": "user", "content": prompt}
-            ]
-        },
-        timeout=120
+            "messages": [{"role": "user", "content": prompt}]
+        }
     )
-
-    if response.status_code != 200:
-        raise Exception(f"Claude API error: {response.text}")
 
     return response.json()
 
 
-# ===============================
-# EXTRACT TEXT
-# ===============================
-def extract_text(response):
-    try:
-        return response["content"][0]["text"]
-    except Exception:
-        raise Exception(f"Invalid response: {json.dumps(response, indent=2)}")
-
-
-# ===============================
-# MAIN (THIS IS WHAT YOU ASKED ABOUT)
-# ===============================
 def main():
-    try:
-        # 🔴 1. Check API key
-        if not API_KEY:
-            raise ValueError("Missing CLAUDE_API_KEY")
+    if not API_KEY:
+        raise ValueError("CLAUDE_API_KEY missing")
 
-        # 🔴 2. Read repo files
-        print("📂 Reading repository...")
-        code = read_repo()
+    code = read_file()
 
-        if not code.strip():
-            raise ValueError("No target files found")
+    print("🚀 Running deep audit...")
 
-        # 🔴 3. Call Claude
-        print("🧠 Running Claude audit...")
-        prompt = build_prompt(code)
+    result = call_claude(build_prompt(code))
 
-        result = call_claude(prompt)
-        output = extract_text(result)
+    output = result.get("content", [{}])[0].get("text", "")
 
-        # 🔴 4. Save output (NO auto patching)
-        with open("CLAUDE_AUDIT.md", "w", encoding="utf-8") as f:
-            f.write(output)
+    with open("CLAUDE_AUDIT.md", "w") as f:
+        f.write(output)
 
-        print("✅ Audit complete")
-
-    except Exception as e:
-        # 🔴 This is CRITICAL for debugging GitHub Actions
-        print("❌ ERROR:", str(e))
-        raise
+    print("✅ Audit saved to CLAUDE_AUDIT.md")
 
 
 if __name__ == "__main__":
