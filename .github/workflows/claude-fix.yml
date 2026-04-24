@@ -1,50 +1,40 @@
-name: Claude Debugger
+name: Claude Auto Fix PR
 
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
-
-permissions:
-  contents: write
+    branches: [main]
 
 jobs:
-  claude-debug:
+  autofix:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
 
-      - name: Install dependencies
-        run: pip install requests
+      - run: pip install requests
 
-      - name: Run Claude Audit
+      - name: Run Claude Autofix
         env:
           CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
+        run: python scripts/claude_audit.py
+
+      - name: Commit changes
         run: |
-          echo "🚀 Running Claude analysis..."
-          python scripts/claude_audit.py
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git checkout -b claude-autofix
+          git add .
+          git commit -m "Claude auto fixes" || echo "No changes"
 
-          echo "📄 Claude Output:"
-          cat claude_output.json || echo "❌ No output file generated"
-
-      - name: Upload Claude Report
-        uses: actions/upload-artifact@v4
+      - name: Create PR
+        uses: peter-evans/create-pull-request@v6
         with:
-          name: claude-report
-          path: claude_output.json
-
-      - name: Commit report (optional)
-        run: |
-          git config --global user.name "ai-bot"
-          git config --global user.email "ai@bot.com"
-
-          git add claude_output.json || echo "Nothing to add"
-          git commit -m "AI: Claude audit report" || echo "No changes"
-          git push || echo "Nothing to push"
+          branch: claude-autofix
+          title: "🤖 Claude Auto Fix"
+          body: "Automated fixes by Claude Opus"
+        
