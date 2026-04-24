@@ -1,47 +1,44 @@
 import os
 import requests
+import json
 
 API_KEY = os.getenv("CLAUDE_API_KEY")
 
-
 def read_repo():
     code = ""
+
     for root, _, files in os.walk("."):
         for f in files:
             if f.endswith(".py"):
                 path = os.path.join(root, f)
                 try:
                     with open(path, "r", encoding="utf-8") as file:
-                        code += f"\n\n# FILE: {path}\n\n"
+                        code += f"\n# FILE: {path}\n\n"
                         code += file.read()
                 except:
                     pass
+
     return code[:120000]
 
 
-def main():
-    code = read_repo()
-
+def call_claude(code):
     prompt = f"""
-You are a senior quantitative trading systems engineer.
+You are a senior quantitative trading engineer.
 
-STRICT SCOPE:
-Only analyze regime_engine.py
+Analyze this BTC trading bot code.
 
-TASK:
-- Find ALL logic bugs
-- Fix ROOT causes only
-- No assumptions
-- No partial fixes
+Tasks:
+1. Find bugs
+2. Find logical errors
+3. Identify performance issues
+4. Suggest fixes
+5. Output FIXED CODE (only modified parts)
 
-CRITICAL:
-- No lookahead bias
-- No NaN issues
-- No invalid state transitions
-
-OUTPUT:
-Return ONLY valid git patch (diff format)
-No explanation.
+Respond in JSON:
+{{
+  "issues": [...],
+  "fixes": "...python code..."
+}}
 
 CODE:
 {code}
@@ -55,21 +52,25 @@ CODE:
             "content-type": "application/json"
         },
         json={
-            "model": "claude-3-opus-20240229",
-            "max_tokens": 4000,
+            "model": "claude-3-haiku-20240307",
+            "max_tokens": 2000,
             "messages": [
                 {"role": "user", "content": prompt}
             ]
         }
     )
 
-    result = response.json()
+    return response.json()
 
-    output = result.get("content", [{}])[0].get("text", "")
 
-    with open("fix.patch", "w") as f:
-        f.write(output)
+def save_output(result):
+    with open("claude_output.json", "w") as f:
+        json.dump(result, f, indent=2)
 
 
 if __name__ == "__main__":
-    main()
+    code = read_repo()
+    result = call_claude(code)
+    save_output(result)
+
+    print("Claude analysis saved.")
