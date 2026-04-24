@@ -6,7 +6,6 @@ API_KEY = os.getenv("CLAUDE_API_KEY")
 
 def read_repo():
     code = ""
-
     for root, _, files in os.walk("."):
         for f in files:
             if f.endswith(".py"):
@@ -17,28 +16,23 @@ def read_repo():
                         code += file.read()
                 except:
                     pass
+    return code[:100000]  # limit tokens
 
-    return code[:120000]
 
+def run_claude():
+    code = read_repo()
 
-def call_claude(code):
     prompt = f"""
-You are a senior quantitative trading engineer.
+You are a senior quant engineer.
 
-Analyze this BTC trading bot code.
+Audit this BTC trading bot code.
+Find:
+- bugs
+- logic flaws
+- missing risk management
+- performance issues
 
-Tasks:
-1. Find bugs
-2. Find logical errors
-3. Identify performance issues
-4. Suggest fixes
-5. Output FIXED CODE (only modified parts)
-
-Respond in JSON:
-{{
-  "issues": [...],
-  "fixes": "...python code..."
-}}
+Return clear fixes.
 
 CODE:
 {code}
@@ -52,7 +46,7 @@ CODE:
             "content-type": "application/json"
         },
         json={
-            "model": "claude-3-haiku-20240307",
+            "model": "claude-3-sonnet-20240229",
             "max_tokens": 2000,
             "messages": [
                 {"role": "user", "content": prompt}
@@ -60,17 +54,22 @@ CODE:
         }
     )
 
-    return response.json()
+    print("Status:", response.status_code)
 
+    try:
+        result = response.json()
+    except:
+        print("❌ Invalid response:", response.text)
+        return
 
-def save_output(result):
+    print("Claude response received")
+
+    # 🔥 SAVE OUTPUT (VERY IMPORTANT)
     with open("claude_output.json", "w") as f:
         json.dump(result, f, indent=2)
 
+    print("✅ Saved to claude_output.json")
+
 
 if __name__ == "__main__":
-    code = read_repo()
-    result = call_claude(code)
-    save_output(result)
-
-    print("Claude analysis saved.")
+    run_claude()
