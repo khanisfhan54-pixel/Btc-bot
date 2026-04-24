@@ -108,12 +108,60 @@ def _validate_output_schema(output: Dict[str, Any]) -> bool:
         for pkey in ("bull", "bear", "crisis"):
             if pkey not in output["probabilities"]:
                 raise ValueError(f"missing probabilities.{pkey}")
+            pval = float(output["probabilities"][pkey])
+            if not np.isfinite(pval):
+                raise ValueError(f"non-finite probabilities.{pkey}")
+            if pval < 0.0 or pval > 1.0:
+                raise ValueError(f"out-of-bounds probabilities.{pkey}={pval}")
+        prob_sum = sum(float(output["probabilities"][k]) for k in ("bull", "bear", "crisis"))
+        if not np.isfinite(prob_sum) or abs(prob_sum - 1.0) > 1e-3:
+            raise ValueError(f"invalid probabilities sum={prob_sum}")
         if not isinstance(output["risk_metrics"], dict):
             raise ValueError("risk_metrics must be a dict")
+        for rk in ("expected_volatility", "raw_leverage", "last_valid_vol", "switch_stability_ema"):
+            if rk not in output["risk_metrics"]:
+                raise ValueError(f"missing risk_metrics.{rk}")
+            rval = float(output["risk_metrics"][rk])
+            if not np.isfinite(rval):
+                raise ValueError(f"non-finite risk_metrics.{rk}")
+        if output["risk_metrics"]["expected_volatility"] < 0.0:
+            raise ValueError("risk_metrics.expected_volatility must be >= 0")
+        if output["risk_metrics"]["last_valid_vol"] <= 0.0:
+            raise ValueError("risk_metrics.last_valid_vol must be > 0")
+        if output["risk_metrics"]["switch_stability_ema"] <= 0.0:
+            raise ValueError("risk_metrics.switch_stability_ema must be > 0")
         if not isinstance(output["alpha"], dict):
             raise ValueError("alpha must be a dict")
         if "edge_score" not in output["alpha"]:
             raise ValueError("missing alpha.edge_score")
+        edge_score = float(output["alpha"]["edge_score"])
+        if not np.isfinite(edge_score):
+            raise ValueError("non-finite alpha.edge_score")
+        confidence = float(output.get("confidence", 0.0))
+        if not np.isfinite(confidence) or confidence < 0.0 or confidence > 1.0:
+            raise ValueError(f"invalid confidence={confidence}")
+        trend_strength = float(output.get("trend_strength", 0.0))
+        risk_level = float(output.get("risk_level", 0.0))
+        position_size = float(output.get("position_size", 0.0))
+        signed_size = float(output.get("signed_position_size", 0.0))
+        for name, val in (
+            ("trend_strength", trend_strength),
+            ("risk_level", risk_level),
+            ("position_size", position_size),
+            ("signed_position_size", signed_size),
+        ):
+            if not np.isfinite(val):
+                raise ValueError(f"non-finite {name}")
+        if risk_level < 0.0 or risk_level > 1.0:
+            raise ValueError(f"invalid risk_level={risk_level}")
+        macro_probs = output.get("macro_probs")
+        if not isinstance(macro_probs, list) or len(macro_probs) != 3:
+            raise ValueError("macro_probs must be a 3-element list")
+        if any(not np.isfinite(float(v)) for v in macro_probs):
+            raise ValueError("macro_probs contains non-finite values")
+        macro_sum = sum(float(v) for v in macro_probs)
+        if abs(macro_sum - 1.0) > 1e-3:
+            raise ValueError(f"invalid macro_probs sum={macro_sum}")
 
         return True
     except Exception as e:
@@ -156,6 +204,15 @@ def _build_output(
     paths emit identical key sets, eliminating downstream KeyError risks from
     schema divergence between code paths.
     """
+    try:
+        safe_expected_vol = float(expected_vol)
+    except (TypeError, ValueError):
+        safe_expected_vol = 0.0
+    if not np.isfinite(safe_expected_vol) or safe_expected_vol < 0.0:
+        safe_expected_vol = 0.0
+    safe_last_valid_vol = float(last_valid_vol)
+    if not np.isfinite(safe_last_valid_vol) or safe_last_valid_vol <= 0.0:
+        safe_last_valid_vol = max(safe_expected_vol, 1e-12)
     out = {
         'schema_version': _OUTPUT_SCHEMA_VERSION,
         'regime_idx': regime_idx,
@@ -179,9 +236,9 @@ def _build_output(
         },
         
         'risk_metrics': {
-            'expected_volatility': float(expected_vol),
+            'expected_volatility': safe_expected_vol,
             'raw_leverage': float(raw_size),
-            'last_valid_vol': float(last_valid_vol),
+            'last_valid_vol': safe_last_valid_vol,
             'switch_stability_ema': float(switch_stability_ema),
             'toxic_penalty_applied': bool(is_toxic),
             'garch_regime_probs': garch_regime_probs,
@@ -205,7 +262,7 @@ def _build_output(
             "trend_strength": 0.0,
             "risk_level": 1.0,
             "confidence": 0.0,
-            "probabilities": {"bull": 0.0, "bear": 0.0, "crisis": 0.0},
+            "probabilities": {"bull": 1/3, "bear": 1/3, "crisis": 1/3},
             "macro_probs": [1/3, 1/3, 1/3],
             "position_size": 0.0,
             "execution_mode": "fail_safe",
@@ -1079,6 +1136,54 @@ class AdvancedRegimeEngine:
             raise ValueError(f"Vector '{name}' contains non-finite values: {arr}.")
         return arr
 
+    def _state_scalar(
+        self,
+        state: Dict[str, Any],
+        field: str,
+        *,
+        default: float,
+        min_value: float | None = None,
+        max_value: float | None = None,
+    ) -> float:
+        raw = state.get(field, default)
+        parsed = self._coerce_finite_scalar(raw, default=default)
+        invalid_reason = None
+        if not np.isfinite(parsed):
+            invalid_reason = "non-finite"
+        elif min_value is not None and parsed < min_value:
+            invalid_reason = f"value<{min_value}"
+        elif max_value is not None and parsed > max_value:
+            invalid_reason = f"value>{max_value}"
+        if invalid_reason is not None:
+            self._log_state_load_issue(
+                field,
+                ValueError(f"invalid scalar ({invalid_reason})"),
+                raw,
+            )
+            parsed = float(default)
+        return float(parsed)
+
+    def _state_vector(
+        self,
+        state: Dict[str, Any],
+        field: str,
+        expected_size: int,
+        *,
+        fallback: np.ndarray,
+        normalize_probabilities: bool = False,
+    ) -> np.ndarray:
+        try:
+            arr = self._coerce_vector(field, state.get(field, fallback), expected_size)
+            if normalize_probabilities:
+                arr = _normalize_prob_vector(arr)
+            return arr
+        except Exception as exc:
+            self._log_state_load_issue(field, exc, state.get(field, None))
+            out = np.asarray(fallback, dtype=float).reshape(expected_size)
+            if normalize_probabilities:
+                out = _normalize_prob_vector(out)
+            return out
+
     # ==========================================
     # NEW: Async Warning Emitter Loop
     # ==========================================
@@ -1577,31 +1682,27 @@ class AdvancedRegimeEngine:
                 f"State version mismatch. Expected {self._STATE_VERSION}, got {incoming_version}."
             )
 
-        self._last_timestamp = state.get("last_timestamp", None)
-        if self._last_timestamp is not None:
-            try:
-                self._last_timestamp = float(self._last_timestamp)
-                if not np.isfinite(self._last_timestamp):
-                    self._last_timestamp = None
-            except (TypeError, ValueError):
-                self._last_timestamp = None
+        ts = self._normalize_timestamp(state.get("last_timestamp", None))
+        if state.get("last_timestamp", None) is not None and ts is None:
+            self._log_state_load_issue("last_timestamp", ValueError("invalid timestamp"), state.get("last_timestamp"))
+        self._last_timestamp = ts
 
-        self._last_valid_dt = float(state.get("last_valid_dt", 1.0))
-        if not np.isfinite(self._last_valid_dt) or self._last_valid_dt <= 0.0:
-            self._last_valid_dt = 1.0
+        self._last_valid_dt = self._state_scalar(state, "last_valid_dt", default=1.0, min_value=1e-9)
 
         current_regime_idx = state.get("current_regime_idx", None)
         if current_regime_idx is not None:
             try:
                 self.current_regime_idx = int(current_regime_idx)
+                if self.current_regime_idx < 0 or self.current_regime_idx >= self.K:
+                    self._log_state_load_issue("current_regime_idx", ValueError("out of bounds"), current_regime_idx)
+                    self.current_regime_idx = None
             except (TypeError, ValueError):
+                self._log_state_load_issue("current_regime_idx", ValueError("invalid int"), current_regime_idx)
                 self.current_regime_idx = None
         else:
             self.current_regime_idx = None
 
-        self.range_ticks = max(float(state.get("range_ticks", 0.0)), 0.0)
-        if not np.isfinite(self.range_ticks):
-            self.range_ticks = 0.0
+        self.range_ticks = self._state_scalar(state, "range_ticks", default=0.0, min_value=0.0)
         self.range_ticks_int = int(self.range_ticks)
 
         # --- NEW: restore SJM fallback memory ---
@@ -1614,52 +1715,35 @@ class AdvancedRegimeEngine:
             except Exception as e:
                 self._log_state_load_issue("last_valid_sjm_probs", e, state.get("last_valid_sjm_probs"))
 
-        self._range_anchor_size = float(state.get("range_anchor_size", 0.0))
-        if not np.isfinite(self._range_anchor_size):
-            self._range_anchor_size = 0.0
-
-        self.last_signed_position_size = float(state.get("last_signed_position_size", 0.0))
+        self._range_anchor_size = self._state_scalar(state, "range_anchor_size", default=0.0, min_value=0.0)
+        self.last_signed_position_size = self._state_scalar(
+            state,
+            "last_signed_position_size",
+            default=0.0,
+            min_value=-1.0,
+            max_value=1.0,
+        )
         self._in_range = bool(state.get("in_range", False))
 
-        # --- FIX: restore last valid trend strength for fail-safe continuity ---
-        try:
-            self._last_effective_trend_strength = float(
-                state.get("last_effective_trend_strength", 0.0)
-            )
-            if not np.isfinite(self._last_effective_trend_strength):
-                self._last_effective_trend_strength = 0.0
-        except (TypeError, ValueError):
-            self._last_effective_trend_strength = 0.0
+        self._last_effective_trend_strength = self._state_scalar(
+            state,
+            "last_effective_trend_strength",
+            default=0.0,
+            min_value=-1.0,
+            max_value=1.0,
+        )
+        self._last_edge_score = self._state_scalar(state, "last_edge_score", default=0.0, min_value=-1.0, max_value=1.0)
+        self._last_valid_vol = self._state_scalar(
+            state,
+            "last_valid_vol",
+            default=float(self.garch.target_vol),
+            min_value=1e-12,
+        )
+        self._switch_stability_ema = self._state_scalar(state, "switch_stability_ema", default=1.0, min_value=1e-12)
 
-        try:
-            self._last_edge_score = float(state.get("last_edge_score", 0.0))
-            if not np.isfinite(self._last_edge_score):
-                self._last_edge_score = 0.0
-        except (TypeError, ValueError):
-            self._last_edge_score = 0.0
-
-        try:
-            self._last_valid_vol = float(state.get("last_valid_vol", self.garch.target_vol))
-            if not np.isfinite(self._last_valid_vol) or self._last_valid_vol <= 0.0:
-                self._last_valid_vol = float(self.garch.target_vol)
-        except (TypeError, ValueError):
-            self._last_valid_vol = float(self.garch.target_vol)
-
-        try:
-            self._switch_stability_ema = float(state.get("switch_stability_ema", 1.0))
-            if not np.isfinite(self._switch_stability_ema) or self._switch_stability_ema <= 0.0:
-                self._switch_stability_ema = 1.0
-        except (TypeError, ValueError):
-            self._switch_stability_ema = 1.0
-
-        self._last_regime_change_ts = state.get("last_regime_change_ts", None)
-        if self._last_regime_change_ts is not None:
-            try:
-                self._last_regime_change_ts = float(self._last_regime_change_ts)
-                if not np.isfinite(self._last_regime_change_ts):
-                    self._last_regime_change_ts = None
-            except (TypeError, ValueError):
-                self._last_regime_change_ts = None
+        self._last_regime_change_ts = self._normalize_timestamp(state.get("last_regime_change_ts", None))
+        if state.get("last_regime_change_ts", None) is not None and self._last_regime_change_ts is None:
+            self._log_state_load_issue("last_regime_change_ts", ValueError("invalid timestamp"), state.get("last_regime_change_ts"))
 
         self._prev_regime = state.get("prev_regime", None)
         self._prev_raw_regime = state.get("prev_raw_regime", None)
@@ -1669,78 +1753,101 @@ class AdvancedRegimeEngine:
         if confirmed_idx is not None:
             try:
                 self._confirmed_regime_idx = int(confirmed_idx)
+                if self._confirmed_regime_idx < 0 or self._confirmed_regime_idx >= self.K:
+                    self._log_state_load_issue("confirmed_regime_idx", ValueError("out of bounds"), confirmed_idx)
+                    self._confirmed_regime_idx = None
             except (TypeError, ValueError):
+                self._log_state_load_issue("confirmed_regime_idx", ValueError("invalid int"), confirmed_idx)
                 self._confirmed_regime_idx = None
         else:
             self._confirmed_regime_idx = None
 
         try:
             self._regime_persistence = int(state.get("regime_persistence", 0))
+            if self._regime_persistence < 0:
+                self._log_state_load_issue("regime_persistence", ValueError("negative value"), self._regime_persistence)
+                self._regime_persistence = 0
         except (TypeError, ValueError):
+            self._log_state_load_issue("regime_persistence", ValueError("invalid int"), state.get("regime_persistence"))
             self._regime_persistence = 0
 
-        if "nhhmm_prior" in state:
-            self.nhhmm_prior = _normalize_prob_vector(
-                self._coerce_vector("nhhmm_prior", state["nhhmm_prior"], self.K)
-            )
-        else:
-            self.nhhmm_prior = _normalize_prob_vector(self.nhhmm_prior)
-
-        if "garch_prob" in state:
-            self.garch_prob = _normalize_prob_vector(
-                self._coerce_vector("garch_prob", state["garch_prob"], 2)
-            )
-        else:
-            self.garch_prob = _normalize_prob_vector(self.garch_prob)
-
-        if "smoothed_garch_prob" in state:
-            self._smoothed_garch_prob = _normalize_prob_vector(
-                self._coerce_vector("smoothed_garch_prob", state["smoothed_garch_prob"], 2)
-            )
-        else:
-            self._smoothed_garch_prob = _normalize_prob_vector(self._smoothed_garch_prob)
+        self.nhhmm_prior = self._state_vector(
+            state,
+            "nhhmm_prior",
+            self.K,
+            fallback=np.ones(self.K, dtype=float) / self.K,
+            normalize_probabilities=True,
+        )
+        self.garch_prob = self._state_vector(
+            state,
+            "garch_prob",
+            2,
+            fallback=np.ones(2, dtype=float) / 2.0,
+            normalize_probabilities=True,
+        )
+        self._smoothed_garch_prob = self._state_vector(
+            state,
+            "smoothed_garch_prob",
+            2,
+            fallback=self.garch_prob.copy(),
+            normalize_probabilities=True,
+        )
 
         if "regime_state_probs" in state and state["regime_state_probs"] is not None:
-            try:
-                self._regime_state_probs = _normalize_prob_vector(
-                    self._coerce_vector("regime_state_probs", state["regime_state_probs"], 4)
-                )
-            except Exception:
-                self._regime_state_probs = np.ones(4, dtype=float) / 4.0
+            self._regime_state_probs = self._state_vector(
+                state,
+                "regime_state_probs",
+                4,
+                fallback=np.ones(4, dtype=float) / 4.0,
+                normalize_probabilities=True,
+            )
         else:
             self._regime_state_probs = np.ones(4, dtype=float) / 4.0
         if getattr(self, "_regime_smoother", None) is not None:
             self._regime_smoother.set_prev_probs(self._regime_state_probs)
 
-        self.garch_var = self._coerce_vector("garch_var", state.get("garch_var", self.garch_var), 2)
+        self.garch_var = self._state_vector(
+            state,
+            "garch_var",
+            2,
+            fallback=self._stationary_garch_var(),
+            normalize_probabilities=False,
+        )
         # HARD SAFETY: prevent NaN/Inf contamination from snapshots
         if not np.all(np.isfinite(self.garch_var)):
+            self._log_state_load_issue("garch_var", ValueError("non-finite garch_var after coercion"), self.garch_var.tolist())
             self.garch_var = self._stationary_garch_var()
 
-        # HARD SAFETY: signed position must be finite
-        if not np.isfinite(self.last_signed_position_size):
-            self.last_signed_position_size = 0.0
         self.range_ticks_int = int(self.range_ticks)
         self._circuit_breaker_active = bool(state.get("circuit_breaker_active", False))
         self._circuit_breaker_reason = state.get("circuit_breaker_reason", None)
-        self._equity = float(state.get("equity", 1.0))
-        self._equity_peak = float(state.get("equity_peak", 1.0))
-        self._drawdown = float(state.get("drawdown", 0.0))
-        self._loss_streak = int(state.get("loss_streak", 0))
-        self._healing_count = int(state.get("healing_count", 0))
+        self._equity = self._state_scalar(state, "equity", default=1.0, min_value=0.0)
+        self._equity_peak = self._state_scalar(state, "equity_peak", default=max(self._equity, 1.0), min_value=0.0)
+        if self._equity_peak < self._equity:
+            self._log_state_load_issue("equity_peak", ValueError("equity_peak<equity"), self._equity_peak)
+            self._equity_peak = self._equity
+        self._drawdown = self._state_scalar(state, "drawdown", default=0.0, min_value=0.0, max_value=1.0)
+        try:
+            self._loss_streak = int(state.get("loss_streak", 0))
+            if self._loss_streak < 0:
+                raise ValueError("negative")
+        except Exception:
+            self._log_state_load_issue("loss_streak", ValueError("invalid int"), state.get("loss_streak"))
+            self._loss_streak = 0
+        try:
+            self._healing_count = int(state.get("healing_count", 0))
+            if self._healing_count < 0:
+                raise ValueError("negative")
+        except Exception:
+            self._log_state_load_issue("healing_count", ValueError("invalid int"), state.get("healing_count"))
+            self._healing_count = 0
         self._last_healing_action = str(state.get("last_healing_action", "NONE"))
         self._last_healing_error = state.get("last_healing_error", None)
         raw_healing_context = state.get("last_healing_context", {})
         self._last_healing_context = dict(raw_healing_context) if isinstance(raw_healing_context, dict) else {}
-        self._shock_memory = float(state.get("shock_memory", 0.0))
-        if not np.isfinite(self._shock_memory):
-            self._shock_memory = 0.0
-        self._return_ema = float(state.get("return_ema", 0.0))
-        if not np.isfinite(self._return_ema):
-            self._return_ema = 0.0
-        self._abs_return_ema = float(state.get("abs_return_ema", 0.0))
-        if not np.isfinite(self._abs_return_ema) or self._abs_return_ema < 0.0:
-            self._abs_return_ema = 0.0
+        self._shock_memory = self._state_scalar(state, "shock_memory", default=0.0, min_value=0.0)
+        self._return_ema = self._state_scalar(state, "return_ema", default=0.0)
+        self._abs_return_ema = self._state_scalar(state, "abs_return_ema", default=0.0, min_value=0.0)
 
     @_synchronized
     def update(self, market_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -2107,7 +2214,7 @@ class AdvancedRegimeEngine:
                 risk_level=1.0,
                 confidence=0.0,
                 edge_score=0.0,
-                probabilities={'bull': 0.0, 'bear': 0.0, 'crisis': 0.0},
+                probabilities={'bull': 0.0, 'bear': 0.0, 'crisis': 1.0},
                 macro_probs=self.nhhmm_prior.tolist(),
                 position_size=0.0,
                 expected_vol=expected_vol_frozen,
@@ -2837,36 +2944,40 @@ class AdvancedRegimeEngine:
                     LOGGER.error("RNG TYPE MISMATCH")
 
             # Snapshot-only state carried by replay checkpoints.
-            self.garch_var = self._coerce_vector("garch_var", state.get("garch_var", self.garch_var), 2)
+            self.garch_var = self._state_vector(
+                state,
+                "garch_var",
+                2,
+                fallback=self._stationary_garch_var(),
+                normalize_probabilities=False,
+            )
             if not np.all(np.isfinite(self.garch_var)):
                 self.garch_var = self._stationary_garch_var()
-            self._last_valid_vol = float(state.get("last_valid_vol", self._last_valid_vol))
-            if (not np.isfinite(self._last_valid_vol)) or (self._last_valid_vol <= 0.0):
-                self._last_valid_vol = float(self.garch.target_vol)
-            self._switch_stability_ema = float(state.get("switch_stability_ema", self._switch_stability_ema))
-            if (not np.isfinite(self._switch_stability_ema)) or (self._switch_stability_ema <= 0.0):
-                self._switch_stability_ema = 1.0
-            self._last_timestamp = state.get("last_timestamp", self._last_timestamp)
-            self._last_valid_dt = float(state.get("last_valid_dt", self._last_valid_dt))
-            if (not np.isfinite(self._last_valid_dt)) or (self._last_valid_dt <= 0.0):
-                self._last_valid_dt = 1.0
-            self.range_ticks = float(state.get("range_ticks", self.range_ticks))
-            if not np.isfinite(self.range_ticks):
-                self.range_ticks = 0.0
+            self._last_valid_vol = self._state_scalar(
+                state, "last_valid_vol", default=float(self.garch.target_vol), min_value=1e-12
+            )
+            self._switch_stability_ema = self._state_scalar(
+                state, "switch_stability_ema", default=1.0, min_value=1e-12
+            )
+            snapshot_ts = self._normalize_timestamp(state.get("last_timestamp", self._last_timestamp))
+            if state.get("last_timestamp", self._last_timestamp) is not None and snapshot_ts is None:
+                self._log_state_load_issue("snapshot.last_timestamp", ValueError("invalid timestamp"), state.get("last_timestamp"))
+            self._last_timestamp = snapshot_ts
+            self._last_valid_dt = self._state_scalar(state, "last_valid_dt", default=1.0, min_value=1e-9)
+            self.range_ticks = self._state_scalar(state, "range_ticks", default=0.0, min_value=0.0)
             self.range_ticks_int = int(state.get("range_ticks_int", self.range_ticks_int))
             self._in_range = bool(state.get("in_range", self._in_range))
-            self._range_anchor_size = float(state.get("range_anchor_size", self._range_anchor_size))
-            if not np.isfinite(self._range_anchor_size):
-                self._range_anchor_size = 0.0
+            self._range_anchor_size = self._state_scalar(state, "range_anchor_size", default=0.0, min_value=0.0)
             self._prev_raw_regime = state.get("prev_raw_regime", self._prev_raw_regime)
-            self._last_regime_change_ts = state.get("last_regime_change_ts", self._last_regime_change_ts)
-            if self._last_regime_change_ts is not None:
-                try:
-                    self._last_regime_change_ts = float(self._last_regime_change_ts)
-                    if not np.isfinite(self._last_regime_change_ts):
-                        self._last_regime_change_ts = None
-                except Exception:
-                    self._last_regime_change_ts = None
+            self._last_regime_change_ts = self._normalize_timestamp(
+                state.get("last_regime_change_ts", self._last_regime_change_ts)
+            )
+            if state.get("last_regime_change_ts", self._last_regime_change_ts) is not None and self._last_regime_change_ts is None:
+                self._log_state_load_issue(
+                    "snapshot.last_regime_change_ts",
+                    ValueError("invalid timestamp"),
+                    state.get("last_regime_change_ts"),
+                )
             self._last_price = state.get("last_price", self._last_price)
             if state.get("last_valid_sjm_probs") is not None:
                 try:
@@ -2876,10 +2987,20 @@ class AdvancedRegimeEngine:
                 except Exception as e:
                     self._log_state_load_issue("snapshot.last_valid_sjm_probs", e, state.get("last_valid_sjm_probs"))
                     self._last_valid_sjm_probs = None
-            self._last_effective_trend_strength = float(
-                state.get("last_effective_trend_strength", self._last_effective_trend_strength)
+            self._last_effective_trend_strength = self._state_scalar(
+                state,
+                "last_effective_trend_strength",
+                default=self._last_effective_trend_strength,
+                min_value=-1.0,
+                max_value=1.0,
             )
-            self._last_edge_score = float(state.get("last_edge_score", self._last_edge_score))
+            self._last_edge_score = self._state_scalar(
+                state,
+                "last_edge_score",
+                default=self._last_edge_score,
+                min_value=-1.0,
+                max_value=1.0,
+            )
             self._confirmed_regime = state.get("regime", self._confirmed_regime)
         except Exception as e:
             if not getattr(self, "_is_replay", False):

@@ -104,6 +104,96 @@ def test_validate_output_schema_requires_nested_fields():
     assert _validate_output_schema({"schema_version": "1.2.0"}) is False
 
 
+def test_validate_output_schema_rejects_bad_probability_math():
+    bad = {
+        "schema_version": "1.2.0",
+        "regime_idx": 0,
+        "regime_label": "TREND",
+        "trend_strength": 0.2,
+        "risk_level": 0.2,
+        "confidence": 0.9,
+        "probabilities": {"bull": 0.9, "bear": 0.9, "crisis": 0.1},
+        "macro_probs": [0.4, 0.4, 0.2],
+        "position_size": 0.5,
+        "signed_position_size": 0.5,
+        "risk_metrics": {
+            "expected_volatility": 0.01,
+            "raw_leverage": 0.5,
+            "last_valid_vol": 0.02,
+            "switch_stability_ema": 1.0,
+        },
+        "alpha": {"edge_score": 0.1},
+    }
+    assert _validate_output_schema(bad) is False
+
+
+def test_load_state_corrupted_scalars_do_not_poison_engine(engine):
+    engine.load_state(
+        {
+            "last_valid_dt": "oops",
+            "range_ticks": float("nan"),
+            "range_anchor_size": -5.0,
+            "last_signed_position_size": float("inf"),
+            "last_effective_trend_strength": float("-inf"),
+            "last_edge_score": float("nan"),
+            "last_valid_vol": 0.0,
+            "switch_stability_ema": -1.0,
+            "shock_memory": float("nan"),
+            "return_ema": float("inf"),
+            "abs_return_ema": -1.0,
+            "garch_var": [float("nan"), float("inf")],
+        }
+    )
+    assert engine._last_valid_dt > 0.0
+    assert engine.range_ticks >= 0.0
+    assert engine._range_anchor_size >= 0.0
+    assert np.isfinite(engine.last_signed_position_size)
+    assert np.isfinite(engine._last_effective_trend_strength)
+    assert np.isfinite(engine._last_edge_score)
+    assert engine._last_valid_vol > 0.0
+    assert engine._switch_stability_ema > 0.0
+    assert engine._shock_memory >= 0.0
+    assert np.isfinite(engine._return_ema)
+    assert engine._abs_return_ema >= 0.0
+    assert np.all(np.isfinite(engine.garch_var))
+
+
+def test_load_state_logs_degrade_fields(engine, caplog):
+    caplog.set_level("ERROR")
+    engine.load_state(
+        {
+            "current_regime_idx": "bad",
+            "confirmed_regime_idx": 999,
+            "loss_streak": "bad",
+            "healing_count": -3,
+        }
+    )
+    assert "STATE_LOAD_DEGRADE field=current_regime_idx" in caplog.text
+    assert "STATE_LOAD_DEGRADE field=confirmed_regime_idx" in caplog.text
+    assert "STATE_LOAD_DEGRADE field=loss_streak" in caplog.text
+    assert "STATE_LOAD_DEGRADE field=healing_count" in caplog.text
+
+
+def test_load_snapshot_corruption_recovery_no_crash(engine):
+    snapshot = {
+        "engine_state": {
+            "garch_var": [float("nan"), float("nan")],
+            "last_valid_vol": float("nan"),
+            "switch_stability_ema": 0.0,
+            "range_ticks": float("inf"),
+            "last_effective_trend_strength": float("nan"),
+            "last_edge_score": float("nan"),
+        },
+        "garch_var": [float("nan"), float("nan")],
+        "last_valid_vol": float("nan"),
+    }
+    engine.load_snapshot(snapshot)
+    out = engine.update(_md(ret=0.002, ts=3.0))
+    assert out["schema_version"] == "1.2.0"
+    assert np.isfinite(out["risk_metrics"]["expected_volatility"])
+    assert 0.0 <= out["confidence"] <= 1.0
+
+
 def test_model_components_normal_flow():
     nhhmm = NHHMM_Engine(n_states=3, n_features=3)
     post, _ = nhhmm.forward_pass_step(0.001, np.array([0.1, 0.2, 0.3]), np.ones(3) / 3)
