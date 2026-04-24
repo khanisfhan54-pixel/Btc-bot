@@ -1,7 +1,6 @@
 import os
 import requests
 import json
-import re
 
 API_KEY = os.getenv("CLAUDE_API_KEY")
 
@@ -9,6 +8,9 @@ TARGET_FILES = [
     "advanced_regime_engine.py",
     "alpha_orchestrator.py"
 ]
+
+MAX_INPUT_CHARS = 200000
+
 
 # ===============================
 # READ TARGET FILES
@@ -20,11 +22,60 @@ def read_repo():
         for f in files:
             if f in TARGET_FILES:
                 path = os.path.join(root, f)
-                with open(path, "r", encoding="utf-8") as file:
-                    code += f"\n\n# FILE: {path}\n\n"
-                    code += file.read()
 
-    return code[:200000]
+                try:
+                    with open(path, "r", encoding="utf-8") as file:
+                        code += f"\n\n# FILE: {path}\n\n"
+                        code += file.read()
+                except Exception as e:
+                    print(f"⚠️ Failed to read {path}: {e}")
+
+    return code[:MAX_INPUT_CHARS]
+
+
+# ===============================
+# BUILD STRICT PROMPT
+# ===============================
+def build_prompt(code):
+    return f"""
+You are a senior quantitative trading systems engineer and production Python auditor.
+
+STRICT RULES (NON-NEGOTIABLE):
+- DO NOT rewrite full files
+- DO NOT output full implementations
+- DO NOT apply fixes
+- DO NOT suggest future improvements
+- ONLY output:
+    1. Audit summary
+    2. Root cause
+    3. Unified diff patch
+
+OUTPUT FORMAT (STRICT):
+
+## 🔍 AUDIT SUMMARY
+- List ALL critical bugs
+- Include file + function + issue
+
+## ⚠️ ROOT CAUSE
+- Explain WHY each issue exists
+
+## 🧩 PATCH DIFF
+- Provide ONLY unified git diff patches
+- NO explanations in this section
+- MUST be directly applicable with `git apply`
+
+FORMAT EXAMPLE:
+
+--- a/file.py
++++ b/file.py
+@@
+- old line
++ new line
+
+
+CODE:
+{code}
+"""
 
 
 # ===============================
@@ -40,62 +91,29 @@ def call_claude(prompt):
         },
         json={
             "model": "claude-opus-4-6",
-            "max_tokens": 12000,
-            "messages": [{"role": "user", "content": prompt}]
-        }
+            "max_tokens": 16000,
+            "temperature": 0,
+            "messages": [
+                {"role": "user", "content": prompt}
+            ]
+        },
+        timeout=120
     )
+
+    if response.status_code != 200:
+        raise Exception(f"Claude API error: {response.text}")
 
     return response.json()
 
 
 # ===============================
-# MULTI PASS PROMPTS
+# EXTRACT RESPONSE TEXT
 # ===============================
-def bug_pass(code):
-    return f"""
-Find ALL critical bugs and FIX them with FULL FILE OUTPUT.
-
-ONLY output final fixed files.
-
-CODE:
-{code}
-"""
-
-def logic_pass(code):
-    return f"""
-Fix ALL logic issues and improve architecture.
-
-ONLY output final fixed files.
-
-CODE:
-{code}
-"""
-
-def performance_pass(code):
-    return f"""
-Optimize performance and efficiency.
-
-ONLY output final fixed files.
-
-CODE:
-{code}
-"""
-
-# ===============================
-# PATCH EXTRACTOR
-# ===============================
-def extract_and_apply(text):
-    pattern = r"## FILE: (.*?)\n(.*?)(?=## FILE:|\Z)"
-    matches = re.findall(pattern, text, re.DOTALL)
-
-    for filename, content in matches:
-        filename = filename.strip()
-        content = content.strip()
-
-        print(f"✏️ Updating {filename}")
-
-        with open(filename, "w", encoding="utf-8") as f:
-            f.write(content)
+def extract_text(response):
+    try:
+        return response["content"][0]["text"]
+    except Exception:
+        raise Exception(f"Invalid Claude response: {json.dumps(response, indent=2)}")
 
 
 # ===============================
@@ -103,36 +121,27 @@ def extract_and_apply(text):
 # ===============================
 def main():
     if not API_KEY:
-        raise ValueError("Missing API key")
+        raise ValueError("Missing CLAUDE_API_KEY")
 
+    print("📂 Reading repository...")
     code = read_repo()
 
-    print("🔴 Bug pass...")
-    bug_result = call_claude(bug_pass(code))
+    if not code.strip():
+        raise ValueError("No target files found")
 
-    print("🟡 Logic pass...")
-    logic_result = call_claude(logic_pass(code))
+    print("🧠 Running Claude audit (Opus 4.6)...")
+    prompt = build_prompt(code)
 
-    print("🟢 Performance pass...")
-    perf_result = call_claude(performance_pass(code))
+    result = call_claude(prompt)
+    output = extract_text(result)
 
-    # Combine outputs
-    combined = ""
+    # Save output only (NO AUTO PATCH)
+    with open("CLAUDE_AUDIT.md", "w", encoding="utf-8") as f:
+        f.write(output)
 
-    for r in [bug_result, logic_result, perf_result]:
-        try:
-            combined += r["content"][0]["text"] + "\n\n"
-        except:
-            pass
-
-    # Save raw report
-    with open("CLAUDE_REPORT.md", "w") as f:
-        f.write(combined)
-
-    print("📄 Report saved")
-
-    # APPLY PATCHES
-    extract_and_apply(combined)
+    print("✅ Audit complete")
+    print("📄 Output saved to CLAUDE_AUDIT.md")
+    print("⚠️ Manually review patch before applying")
 
 
 if __name__ == "__main__":
