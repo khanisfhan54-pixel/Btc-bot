@@ -2,6 +2,12 @@ import numpy as np
 import pytest
 import threading
 import queue
+import warnings
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+import advanced_regime_engine as module
 
 from advanced_regime_engine import (
     AdvancedRegimeEngine,
@@ -14,6 +20,7 @@ from advanced_regime_engine import (
     _safe_prob_vector,
     _build_output,
     _normalize_prob_vector,
+    _POSITION_SIZE_CAP,
     _validate_output_schema,
     compute_hmm_regime,
 )
@@ -534,3 +541,156 @@ def test_warning_drop_counter_thread_safe_when_queue_is_full(engine):
         t.join()
 
     assert engine._warning_drop_count == n_threads
+
+
+def test_breaker_reason_and_healing_counter_not_overwritten_same_tick(engine):
+    engine._last_price = 100.0
+    engine.last_signed_position_size = 1.0
+    engine._loss_streak = engine._MAX_CONSECUTIVE_LOSSES - 1
+    out = engine.update(_md(ret=0.0, ts=1.0) | {"price": 80.0})
+    assert out["regime_label"] == "HALTED"
+    assert engine._circuit_breaker_reason == "MAX_DRAWDOWN"
+    assert engine._healing_counter == 1
+
+
+def test_self_heal_fallback_mapping_without_errors_module(engine):
+    engine._error_category_resolver = None
+    engine._errors_module_available = False
+    action = engine._self_heal("E200", {"source": "test"})
+    assert action == "RESET_NUMERICAL"
+
+
+def test_rng_seed_and_state_restore_are_deterministic():
+    e1 = AdvancedRegimeEngine(n_states=3, n_features=3, seed=123)
+    e2 = AdvancedRegimeEngine(n_states=3, n_features=3, seed=123)
+    e3 = AdvancedRegimeEngine(n_states=3, n_features=3, seed=999)
+    try:
+        seq1 = [e1._obs_should_sample() for _ in range(20)]
+        seq2 = [e2._obs_should_sample() for _ in range(20)]
+        assert seq1 == seq2
+
+        state = e1.get_state()
+        e3.load_state(state)
+        assert [e1._obs_should_sample() for _ in range(10)] == [e3._obs_should_sample() for _ in range(10)]
+    finally:
+        e1._shutdown_warning_worker()
+        e2._shutdown_warning_worker()
+        e3._shutdown_warning_worker()
+
+
+def test_healing_branch_returns_immediately_after_self_heal(engine, monkeypatch):
+    engine._circuit_breaker_active = True
+    engine._healing_counter = engine._HEALING_COOLDOWN_TICKS + 1
+    monkeypatch.setattr(engine.nhhmm, "forward_pass_step", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("must not run")))
+    out = engine.update(_md(ret=0.001, ts=1.0))
+    assert out["regime_label"] == "HALTED"
+
+
+def test_range_decay_is_single_pass_and_monotonic(monkeypatch):
+    def _forced_scores(*_args, **_kwargs):
+        return {
+            "regime": "RANGE",
+            "bull": 0.5,
+            "bear": 0.49,
+            "crisis": 0.01,
+            "trend_strength": 0.01,
+            "risk_level": 0.01,
+            "confidence": 0.5,
+            "conviction": 0.6,
+            "uncertainty": 0.4,
+            "directional_margin": 0.01,
+            "directional_label": "TREND",
+            "edge_score": 0.8,
+            "trend_score": 0.1,
+            "range_score": 0.9,
+            "toxic_score": 0.0,
+        }
+    monkeypatch.setattr(module, "compute_hmm_regime", _forced_scores)
+
+    e_fast = AdvancedRegimeEngine(n_states=3, n_features=3, seed=7)
+    e_slow = AdvancedRegimeEngine(n_states=3, n_features=3, seed=7)
+    try:
+        for eng, ticks in ((e_fast, 1.0), (e_slow, 40.0)):
+            eng._regime_smoother = None
+            eng._confirmed_regime = "RANGE"
+            eng._prev_regime = "RANGE"
+            eng._range_anchor_size = 0.2
+            eng.last_signed_position_size = 0.2
+            eng.range_ticks = ticks
+        out_fast = e_fast.update(_md(ret=0.001, ts=1.0))
+        out_slow = e_slow.update(_md(ret=0.001, ts=1.0))
+        assert abs(out_slow["signed_position_size"]) <= abs(out_fast["signed_position_size"])
+    finally:
+        e_fast._shutdown_warning_worker()
+        e_slow._shutdown_warning_worker()
+
+
+def test_conviction_metric_and_boundary_hysteresis():
+    uniform = compute_hmm_regime(np.array([1 / 3, 1 / 3, 1 / 3], dtype=float))
+    crisis = compute_hmm_regime(np.array([0.05, 0.05, 0.90], dtype=float))
+    assert uniform["conviction"] < crisis["conviction"]
+    hold = compute_hmm_regime(
+        np.array([0.49, 0.51, 0.0], dtype=float),
+        prev_directional_label="TREND",
+        direction_switch_gap=0.03,
+    )
+    assert hold["directional_label"] == "TREND"
+
+
+def test_last_price_persisted_via_get_state_load_state(engine):
+    engine._last_price = 123.45
+    state = engine.get_state()
+    restored = AdvancedRegimeEngine(n_states=3, n_features=3, seed=7)
+    try:
+        restored.load_state(state)
+        assert restored._last_price == pytest.approx(123.45)
+    finally:
+        restored._shutdown_warning_worker()
+
+
+def test_negative_equity_clamped_and_breaker_tripped(engine):
+    engine._last_price = 100.0
+    engine.last_signed_position_size = 1.0
+    engine.update(_md(ret=0.0, ts=1.0) | {"price": 0.0})
+    assert engine._equity >= engine._MIN_EQUITY_FLOOR
+    assert engine._circuit_breaker_active is True
+
+
+def test_warning_queue_saturation_fallback_never_recurses(engine, monkeypatch):
+    engine._shutdown_warning_worker()
+    engine._warning_queue = queue.Queue(maxsize=1)
+    engine._warning_queue.put_nowait("full")
+    monkeypatch.setattr(warnings, "warn", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("warn fail")))
+    engine._warn_rate_limited("k", "msg", 0.0)
+    assert engine._warning_drop_count >= 1
+
+
+@pytest.mark.parametrize("n_features", [1, 2])
+def test_sjm_feature_injection_does_not_overwrite_small_vectors(monkeypatch, n_features):
+    captured = {}
+    eng = AdvancedRegimeEngine(n_states=3, n_features=n_features, seed=1)
+    try:
+        def _capture(**kwargs):
+            captured["x_t"] = np.asarray(kwargs["x_t"], dtype=float).copy()
+            return 0, np.array([0.7, 0.2, 0.1], dtype=float)
+        monkeypatch.setattr(eng.sjm, "online_predict", _capture)
+        feats = np.arange(1, n_features + 1, dtype=float)
+        eng.update({"timestamp": 1.0, "return": 0.01, "features": feats, "price": 100.0})
+        assert np.allclose(captured["x_t"], feats)
+    finally:
+        eng._shutdown_warning_worker()
+
+
+def test_load_snapshot_is_atomic_on_failure(engine):
+    engine._last_price = 222.0
+    before = engine.serialize_state()
+    bad_snapshot = {"engine_state": before, "last_price": float("nan")}
+    engine.load_snapshot(bad_snapshot)
+    after = engine.serialize_state()
+    assert after["last_price"] == before["last_price"]
+
+
+def test_position_size_cap_single_source_of_truth(engine):
+    out = engine.update(_md(ret=0.001, ts=1.0))
+    assert module.AdvancedRegimeEngine._MAX_POSITION_SIZE == _POSITION_SIZE_CAP
+    assert out["position_size"] <= _POSITION_SIZE_CAP
