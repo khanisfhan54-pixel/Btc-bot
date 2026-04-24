@@ -101,6 +101,7 @@ class AlphaSignal:
     # timeframe must remain the last field so the default does not break
     # positional construction of existing callers who do provide it.
     timeframe: str = _DEFAULT_TIMEFRAME
+    correlation_group_id: str = ""
 
 @dataclass(frozen=True)
 class RegimeContext:
@@ -219,6 +220,9 @@ class OrchestratorConfig:
     min_aggregate_weight: float = 0.1
     timeframe_alignment_bonus: float = 0.15
     timeframe_conflict_penalty: float = 0.25
+    correlation_group_map: Dict[str, str] = field(default_factory=dict)
+    correlation_min_conviction: float = 0.5
+    correlation_min_group_size: int = 3
 
     def __post_init__(self) -> None:
         # ---- Numeric range clamping ----
@@ -232,6 +236,8 @@ class OrchestratorConfig:
         object.__setattr__(self, "default_unknown_weight", max(0.0, min(100.0, self.default_unknown_weight)))
         object.__setattr__(self, "timeframe_alignment_bonus", max(0.0, min(1.0, self.timeframe_alignment_bonus)))
         object.__setattr__(self, "timeframe_conflict_penalty", max(0.0, min(1.0, self.timeframe_conflict_penalty)))
+        object.__setattr__(self, "correlation_min_conviction", max(0.0, min(1.0, self.correlation_min_conviction)))
+        object.__setattr__(self, "correlation_min_group_size", max(2, int(self.correlation_min_group_size)))
 
         # ---- Multiplier bound validation (fail fast) ----
         if self.feedback_min_multiplier > self.feedback_max_multiplier:
@@ -311,6 +317,16 @@ class OrchestratorConfig:
                     raise ValueError("Regime mult out of bounds.")
                 safe_regimes[clean_src][clean_rk] = mult
         object.__setattr__(self, "regime_alignment", safe_regimes)
+
+        # ---- Validate and sanitize correlation_group_map ----
+        safe_correlation_map: Dict[str, str] = {}
+        for src, group_id in self.correlation_group_map.items():
+            clean_src = _validate_id_strict(src, field_name="correlation_group_map.source_id")
+            clean_group = _validate_id_strict(
+                group_id, field_name="correlation_group_map.correlation_group_id"
+            )
+            safe_correlation_map[clean_src] = clean_group
+        object.__setattr__(self, "correlation_group_map", safe_correlation_map)
 
         # ---- Validate and deduplicate timeframe_order ----
         safe_tf_order: List[str] = []
@@ -1652,18 +1668,25 @@ class AlphaOrchestrator:
         weighted_sum = 0.0
         weighted_edge = 0.0
         denom = 0.0
+        raw_weighted_sum = 0.0
+        raw_weighted_edge = 0.0
+        raw_denom = 0.0
         adjusted_total_weight = 0.0
         breakdown: List[Dict[str, Any]] = []
         signal_count = len(signals)
         correlation_group_sizes: Dict[Tuple[int, str, str], int] = {}
 
-        def _get_correlation_family(source_id: str) -> str:
-            sid = _normalize_key(source_id)
-            if not sid:
-                return "unknown"
-            sid = sid.lower()
-            sid = re.sub(r"[_-]?\d+$", "", sid)
-            return sid or "unknown"
+        def _resolve_correlation_group_id(signal: AlphaSignal) -> str:
+            explicit_group_id = _normalize_key(getattr(signal, "correlation_group_id", ""))
+            if explicit_group_id:
+                return explicit_group_id
+            mapped_group_id = _normalize_key(self.config.correlation_group_map.get(signal.source_id, ""))
+            if mapped_group_id:
+                return mapped_group_id
+            sid = _normalize_key(signal.source_id)
+            sid = re.sub(r"[_-]?(v|ver|variant)?\d+$", "", sid)
+            sid = re.sub(r"[_-](copy|clone|dup|replica|shadow|alt)\d*$", "", sid)
+            return sid or _normalize_key(signal.source_id)
 
         # Pre-pass: build correlation bucket sizes.
         for s in signals:
@@ -1677,7 +1700,7 @@ class AlphaOrchestrator:
             group_key = (
                 direction,
                 _normalize_key(s.timeframe),
-                _get_correlation_family(s.source_id),
+                _resolve_correlation_group_id(s),
             )
             correlation_group_sizes[group_key] = correlation_group_sizes.get(group_key, 0) + 1
 
@@ -1718,22 +1741,30 @@ class AlphaOrchestrator:
                 direction = -1
 
             conviction = _safe_float(s.conviction, 0.0, 0.0, 1.0)
-            weight_contrib = eff_w * conviction * alignment * stress_attenuation
+            raw_weight_contrib = eff_w * conviction * alignment * stress_attenuation
+            if raw_weight_contrib > 1e-7:
+                raw_denom += raw_weight_contrib
 
+            correlation_penalty = 1.0
             if direction != 0:
                 group_key = (
                     direction,
                     _normalize_key(s.timeframe),
-                    _get_correlation_family(s.source_id),
+                    _resolve_correlation_group_id(s),
                 )
-                group_size = max(1, int(correlation_group_sizes.get(group_key, 1)))
-                group_penalty = 1.0 / math.sqrt(group_size)
-                if not math.isfinite(group_penalty):
-                    group_penalty = 1.0
-                weight_contrib *= group_penalty
+                similar_count = max(1, int(correlation_group_sizes.get(group_key, 1)))
+                if (
+                    conviction >= self.config.correlation_min_conviction
+                    and similar_count >= self.config.correlation_min_group_size
+                ):
+                    smooth_size = 1.0 + 0.5 * float(similar_count - 1)
+                    correlation_penalty = 1.0 / math.sqrt(smooth_size)
+                if not math.isfinite(correlation_penalty):
+                    correlation_penalty = 1.0
 
-            if weight_contrib > 1e-7:
-                adjusted_total_weight += weight_contrib
+            effective_weight_contrib = raw_weight_contrib * correlation_penalty
+            if effective_weight_contrib > 1e-7:
+                adjusted_total_weight += effective_weight_contrib
 
         # Pass 2: Fusion with Concentration Guard.
         for s in signals:
@@ -1790,21 +1821,30 @@ class AlphaOrchestrator:
             conviction = _safe_float(s.conviction, 0.0, 0.0, 1.0)
             raw_weight_contrib = eff_w * conviction * alignment * stress_attenuation
 
-            correlation_group_key = None
+            correlation_group_id = ""
             if direction != 0:
                 timeframe_bucket = _normalize_key(s.timeframe)
-                correlation_group_key = (direction, timeframe_bucket, _get_correlation_family(s.source_id))
+                correlation_group_id = _resolve_correlation_group_id(s)
+                correlation_group_key = (direction, timeframe_bucket, correlation_group_id)
+            else:
+                correlation_group_key = None
 
             similar_count = 1
             correlation_penalty = 1.0
             if correlation_group_key is not None:
                 similar_count = max(1, int(correlation_group_sizes.get(correlation_group_key, 1)))
-                correlation_penalty = 1.0 / math.sqrt(similar_count)
+                if (
+                    conviction >= self.config.correlation_min_conviction
+                    and similar_count >= self.config.correlation_min_group_size
+                ):
+                    smooth_size = 1.0 + 0.5 * float(similar_count - 1)
+                    correlation_penalty = 1.0 / math.sqrt(smooth_size)
                 if not math.isfinite(correlation_penalty):
                     correlation_penalty = 1.0
                     similar_count = 1
 
             weight_contrib = raw_weight_contrib * correlation_penalty
+            effective_weight_contrib = weight_contrib
 
             if weight_contrib <= 1e-7:
                 breakdown.append(
@@ -1812,21 +1852,26 @@ class AlphaOrchestrator:
                         "source_id": s.source_id,
                         "source_policy": source_policy,
                         "perf_multiplier": perf_mult,
+                        "timeframe": _normalize_key(s.timeframe),
                         "direction": direction,
                         "expected_edge_bps": s.expected_edge_bps,
                         "base_weight": base_w,
                         "regime_alignment_weight": alignment,
+                        "raw_weight_contribution": raw_weight_contrib,
+                        "effective_weight_contribution": effective_weight_contrib,
                         "final_weight_contribution": 0.0,
                         "fallback_active": is_fb,
                         "drift_active": is_dr,
                         "dominance_cap_active": False,
-                        "sparse_bypass": True,
                         "stress_attenuation": stress_attenuation,
                         "correlation_penalty": correlation_penalty,
                         "similar_signal_count": similar_count,
-                        "correlation_group_key": correlation_group_key,
-                        "group_size": similar_count,
-                        "group_penalty": correlation_penalty,
+                        "correlation_group_id": correlation_group_id,
+                        "correlation_group_key": (
+                            [correlation_group_key[0], correlation_group_key[1], correlation_group_key[2]]
+                            if correlation_group_key is not None
+                            else None
+                        ),
                     }
                 )
                 continue
@@ -1841,6 +1886,10 @@ class AlphaOrchestrator:
 
             denom += weight_contrib
             if direction != 0:
+                raw_weighted_sum += raw_weight_contrib * direction
+                raw_weighted_edge += raw_weight_contrib * (
+                    direction * _safe_float(s.expected_edge_bps, 0.0, 0.0, _EDGE_BPS_CLAMP)
+                )
                 weighted_sum += weight_contrib * direction
                 # FIX 5: expected_edge_bps is absolute magnitude; direction gives sign.
                 weighted_edge += weight_contrib * (
@@ -1852,10 +1901,13 @@ class AlphaOrchestrator:
                     "source_id": s.source_id,
                     "source_policy": source_policy,
                     "perf_multiplier": perf_mult,
+                    "timeframe": _normalize_key(s.timeframe),
                     "direction": direction,
                     "expected_edge_bps": s.expected_edge_bps,
                     "base_weight": base_w,
                     "regime_alignment_weight": alignment,
+                    "raw_weight_contribution": raw_weight_contrib,
+                    "effective_weight_contribution": effective_weight_contrib,
                     "fallback_active": is_fb,
                     "drift_active": is_dr,
                     "dominance_cap_active": dominance_cap_active,
@@ -1863,9 +1915,12 @@ class AlphaOrchestrator:
                     "stress_attenuation": stress_attenuation,
                     "correlation_penalty": correlation_penalty,
                     "similar_signal_count": similar_count,
-                    "correlation_group_key": correlation_group_key,
-                    "group_size": similar_count,
-                    "group_penalty": correlation_penalty,
+                    "correlation_group_id": correlation_group_id,
+                    "correlation_group_key": (
+                        [correlation_group_key[0], correlation_group_key[1], correlation_group_key[2]]
+                        if correlation_group_key is not None
+                        else None
+                    ),
                 }
             )
 
@@ -1874,13 +1929,23 @@ class AlphaOrchestrator:
         raw_score = weighted_sum / denom
         if not math.isfinite(raw_score):
             raw_score = 0.0
+        raw_score_unadjusted = 0.0
+        if raw_denom > 1e-12:
+            raw_score_unadjusted = raw_weighted_sum / raw_denom
+        if not math.isfinite(raw_score_unadjusted):
+            raw_score_unadjusted = 0.0
 
         correlation_groups = []
         group_adjusted_weight: Dict[Tuple[int, str, str], float] = {}
         for row in breakdown:
-            gk = row.get("correlation_group_key")
-            if gk is None:
+            direction = row.get("direction")
+            timeframe_bucket = _normalize_key(row.get("timeframe", "")) or _normalize_key(
+                row.get("source_timeframe", "")
+            )
+            group_id = _normalize_key(row.get("correlation_group_id"))
+            if direction not in (-1, 1) or not group_id:
                 continue
+            gk = (int(direction), timeframe_bucket or _DEFAULT_TIMEFRAME, group_id)
             group_adjusted_weight[gk] = group_adjusted_weight.get(gk, 0.0) + _safe_float(
                 row.get("final_weight_contribution"), 0.0, 0.0
             )
@@ -1890,7 +1955,10 @@ class AlphaOrchestrator:
             size = correlation_group_sizes[group_key]
             group_size = max(1, int(size))
             largest_group_size = max(largest_group_size, group_size)
-            penalty = 1.0 / math.sqrt(group_size)
+            penalty = 1.0
+            if group_size >= self.config.correlation_min_group_size:
+                smooth_size = 1.0 + 0.5 * float(group_size - 1)
+                penalty = 1.0 / math.sqrt(smooth_size)
             if not math.isfinite(penalty):
                 penalty = 1.0
                 group_size = 1
@@ -1903,31 +1971,39 @@ class AlphaOrchestrator:
                 }
             )
 
-        correlation_attenuation = 1.0
-        if denom > 1e-12 and correlation_groups:
-            largest_effect = 0.0
-            for g in correlation_groups:
-                share = _safe_float(g.get("adjusted_weight", 0.0), 0.0, 0.0) / denom
-                penalty = _safe_float(g.get("penalty", 1.0), 1.0, 0.0, 1.0)
-                largest_effect = max(largest_effect, share * (1.0 - penalty))
-            correlation_attenuation = max(0.0, min(1.0, 1.0 - largest_effect))
-        if not math.isfinite(correlation_attenuation):
-            correlation_attenuation = 1.0
-
         logger.debug(
-            "CORRELATION | groups=%d | largest=%d | denom=%.6f",
+            "CORRELATION | groups=%d | largest=%d | raw_denom=%.6f | adj_denom=%.6f",
             len(correlation_groups),
             largest_group_size,
+            raw_denom,
             denom,
         )
 
-        attenuated_score = raw_score * correlation_attenuation
+        attenuated_score = raw_score
         if not math.isfinite(attenuated_score):
             attenuated_score = 0.0
 
+        raw_blended_edge = 0.0
+        if raw_denom > 1e-12:
+            raw_blended_edge = raw_weighted_edge / raw_denom
+        if not math.isfinite(raw_blended_edge):
+            raw_blended_edge = 0.0
         blended_edge = weighted_edge / denom
         if not math.isfinite(blended_edge):
             blended_edge = 0.0
+        correlation_attenuation = 1.0
+        if abs(raw_blended_edge) > 1e-12:
+            correlation_attenuation = max(
+                0.0, min(1.0, abs(blended_edge) / abs(raw_blended_edge))
+            )
+        if not math.isfinite(correlation_attenuation):
+            correlation_attenuation = 1.0
+        logger.debug(
+            "CORRELATION_ATTENUATION | raw_edge=%.6f | adj_edge=%.6f | factor=%.6f",
+            raw_blended_edge,
+            blended_edge,
+            correlation_attenuation,
+        )
 
         return (
             _safe_float(attenuated_score, 0.0, -1.0, 1.0),
@@ -1937,9 +2013,16 @@ class AlphaOrchestrator:
                 "correlation_summary": {
                     "groups": correlation_groups,
                     "total_groups": len(correlation_groups),
-                    "largest_group": largest_group_size,
                     "largest_group_size": largest_group_size,
                     "attenuation_factor": correlation_attenuation,
+                    "penalty_logic": "smooth_inverse_sqrt_size",
+                    "conviction_gate_active": False,
+                    "raw_blended_edge_bps": _safe_float(
+                        raw_blended_edge, 0.0, -_EDGE_BPS_CLAMP, _EDGE_BPS_CLAMP
+                    ),
+                    "attenuated_blended_edge_bps": _safe_float(
+                        blended_edge, 0.0, -_EDGE_BPS_CLAMP, _EDGE_BPS_CLAMP
+                    ),
                 },
             },
         )
@@ -2273,6 +2356,7 @@ class AlphaOrchestrator:
                     direction_raw = s.get("direction")
                     conviction_raw = s.get("conviction")
                     edge_raw = s.get("expected_edge_bps")
+                    correlation_group_raw = s.get("correlation_group_id", "")
                 else:
                     src_raw = getattr(s, "source_id", "")
                     tf_raw = getattr(s, "timeframe", "")
@@ -2280,6 +2364,7 @@ class AlphaOrchestrator:
                     direction_raw = getattr(s, "direction", None)
                     conviction_raw = getattr(s, "conviction", 0.0)
                     edge_raw = getattr(s, "expected_edge_bps", 0.0)
+                    correlation_group_raw = getattr(s, "correlation_group_id", "")
 
                 src = _normalize_key(src_raw)
                 ts = _safe_float(ts_raw, 0.0)
@@ -2295,6 +2380,14 @@ class AlphaOrchestrator:
                     metrics["invalid"] += 1
                     rejection_details.append(
                         {"source_id": src_raw, "reason": "invalid_id_or_timeframe"}
+                    )
+                    continue
+
+                correlation_group_id = _normalize_key(correlation_group_raw)
+                if correlation_group_id and not VALID_ID_REGEX.match(correlation_group_id):
+                    metrics["invalid"] += 1
+                    rejection_details.append(
+                        {"source_id": src, "reason": "invalid_correlation_group_id"}
                     )
                     continue
 
@@ -2364,7 +2457,15 @@ class AlphaOrchestrator:
                     metrics["unknown_sources_accepted"].append(src)
 
                 valid.append(
-                    AlphaSignal(src, direction, conviction, expected_edge_bps, ts, tf)
+                    AlphaSignal(
+                        src,
+                        direction,
+                        conviction,
+                        expected_edge_bps,
+                        ts,
+                        tf,
+                        correlation_group_id,
+                    )
                 )
                 metrics["accepted"] += 1
 
