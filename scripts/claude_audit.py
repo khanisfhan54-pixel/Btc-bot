@@ -1,12 +1,16 @@
 import os
 import requests
+import sys
+import re
 
 API_KEY = os.getenv("CLAUDE_API_KEY")
-
 TARGET_FILE = "advanced_regime_engine.py"
 MAX_INPUT_CHARS = 120000
 
 
+# ===============================
+# READ FILE (STRICT)
+# ===============================
 def read_file():
     for root, _, files in os.walk("."):
         for f in files:
@@ -14,40 +18,46 @@ def read_file():
                 path = os.path.join(root, f)
                 with open(path, "r", encoding="utf-8") as file:
                     return file.read()[:MAX_INPUT_CHARS]
-    return ""
+    raise FileNotFoundError(f"{TARGET_FILE} not found")
 
 
+# ===============================
+# STRICT PROMPT
+# ===============================
 def build_prompt(code):
     return f"""
-You are a senior quantitative engineer, distributed systems expert, and production auditor.
+You are a senior quantitative engineer and production system auditor.
 
-Perform a DEEP PRODUCTION-GRADE AUDIT.
+MANDATORY RULES:
+- No assumptions without proof
+- No vague statements
+- No skipped analysis
+- Every issue must reference exact logic behavior
 
-You must:
+You MUST:
 - Analyze line-by-line
 - Detect ALL critical issues
-- Focus on:
-  - hidden state bugs
-  - regime logic correctness
-  - probabilistic consistency
-  - numerical stability
-  - concurrency safety
-  - silent failures
-  - incomplete implementations
+- Include edge cases and silent failures
+- Ensure probabilistic correctness
+- Ensure no directional signal suppression (IMPORTANT)
 
-STRICT OUTPUT FORMAT:
+CRITICAL:
+- Do NOT convert directional signals into HOLD due to penalties
+- Penalization must reduce conviction, NOT eliminate action
+
+OUTPUT FORMAT (STRICT — DO NOT VIOLATE):
 
 ## 🔍 AUDIT SUMMARY
-- List ALL critical issues
+- Exhaustive bullet list
 
 ## ⚠️ ROOT CAUSE
-- Explain WHY each issue occurs
+- Deep explanation per issue
 
 ## 🧩 PATCH DIFF
-- Unified git diff ONLY
+- Unified git diff
 - Must be directly applicable
-- No full file rewrite
 - No explanations inside diff
+- No full file rewrite
 
 FILE: advanced_regime_engine.py
 
@@ -56,6 +66,9 @@ CODE:
 """
 
 
+# ===============================
+# CLAUDE CALL
+# ===============================
 def call_claude(prompt):
     response = requests.post(
         "https://api.anthropic.com/v1/messages",
@@ -72,25 +85,58 @@ def call_claude(prompt):
         }
     )
 
-    return response.json()
+    data = response.json()
+
+    try:
+        return data["content"][0]["text"]
+    except:
+        print("❌ Claude response invalid:", data)
+        sys.exit(1)
 
 
+# ===============================
+# OUTPUT VALIDATION (CRITICAL)
+# ===============================
+def validate_output(text):
+    required_sections = [
+        "## 🔍 AUDIT SUMMARY",
+        "## ⚠️ ROOT CAUSE",
+        "## 🧩 PATCH DIFF"
+    ]
+
+    for section in required_sections:
+        if section not in text:
+            print(f"❌ Missing section: {section}")
+            return False
+
+    if "diff --git" not in text:
+        print("❌ Missing patch diff")
+        return False
+
+    return True
+
+
+# ===============================
+# MAIN
+# ===============================
 def main():
     if not API_KEY:
         raise ValueError("CLAUDE_API_KEY missing")
 
     code = read_file()
 
-    print("🚀 Running deep audit...")
+    print("🚀 Running production-grade audit...")
 
-    result = call_claude(build_prompt(code))
+    output = call_claude(build_prompt(code))
 
-    output = result.get("content", [{}])[0].get("text", "")
+    if not validate_output(output):
+        print("❌ Invalid Claude output — failing pipeline")
+        sys.exit(1)
 
     with open("CLAUDE_AUDIT.md", "w") as f:
         f.write(output)
 
-    print("✅ Audit saved to CLAUDE_AUDIT.md")
+    print("✅ Audit saved and validated")
 
 
 if __name__ == "__main__":
