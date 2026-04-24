@@ -6,6 +6,8 @@ from advanced_regime_engine import (
     MSGARCH_RiskEngine,
     NHHMM_Engine,
     SparseJumpModel,
+    _build_output,
+    _normalize_prob_vector,
     _validate_output_schema,
     compute_hmm_regime,
 )
@@ -95,6 +97,13 @@ def test_garch_var_nan_is_repaired(engine):
     assert np.isfinite(out["risk_metrics"]["expected_volatility"])
 
 
+def test_update_handles_extreme_returns_beyond_two_sigma_bounds(engine):
+    out_hi = engine.update(_md(ret=2.5, ts=10.0))
+    out_lo = engine.update(_md(ret=-2.5, ts=11.0))
+    assert _validate_output_schema(out_hi) is True
+    assert _validate_output_schema(out_lo) is True
+
+
 def test_compute_hmm_regime_trend_score_bounded_after_scaling():
     scores = compute_hmm_regime(np.array([1.0, 0.0, 0.0], dtype=float))
     assert 0.0 <= scores["trend_score"] <= 1.0
@@ -125,6 +134,113 @@ def test_validate_output_schema_rejects_bad_probability_math():
         "alpha": {"edge_score": 0.1},
     }
     assert _validate_output_schema(bad) is False
+
+
+def test_validate_output_schema_rejects_invalid_garch_probability_vector():
+    bad = {
+        "schema_version": "1.2.0",
+        "regime_idx": 0,
+        "regime_label": "TREND",
+        "trend_strength": 0.2,
+        "risk_level": 0.2,
+        "confidence": 0.9,
+        "probabilities": {"bull": 0.6, "bear": 0.3, "crisis": 0.1},
+        "macro_probs": [0.4, 0.4, 0.2],
+        "position_size": 0.2,
+        "signed_position_size": 0.1,
+        "risk_metrics": {
+            "expected_volatility": 0.01,
+            "raw_leverage": 0.5,
+            "last_valid_vol": 0.02,
+            "switch_stability_ema": 1.0,
+            "garch_regime_probs": [0.9, 0.9],
+        },
+        "alpha": {"edge_score": 0.1},
+    }
+    assert _validate_output_schema(bad) is False
+
+
+def test_validate_output_schema_rejects_signed_position_inconsistency():
+    bad = {
+        "schema_version": "1.2.0",
+        "regime_idx": 0,
+        "regime_label": "TREND",
+        "trend_strength": 0.2,
+        "risk_level": 0.2,
+        "confidence": 0.9,
+        "probabilities": {"bull": 0.6, "bear": 0.3, "crisis": 0.1},
+        "macro_probs": [0.4, 0.4, 0.2],
+        "position_size": 0.1,
+        "signed_position_size": 0.25,
+        "risk_metrics": {
+            "expected_volatility": 0.01,
+            "raw_leverage": 0.5,
+            "last_valid_vol": 0.02,
+            "switch_stability_ema": 1.0,
+            "garch_regime_probs": [0.5, 0.5],
+        },
+        "alpha": {"edge_score": 0.1},
+    }
+    assert _validate_output_schema(bad) is False
+
+
+def test_normalize_prob_vector_non_finite_degrades_to_valid_distribution():
+    out = _normalize_prob_vector(np.array([np.nan, np.inf, -np.inf], dtype=float))
+    assert np.all(np.isfinite(out))
+    assert np.isclose(float(out.sum()), 1.0)
+
+
+def test_build_output_hardens_corrupt_values_without_crash():
+    out = _build_output(
+        regime_idx="bad",
+        regime_label=None,
+        trend_strength=float("nan"),
+        risk_level=float("inf"),
+        confidence=float("-inf"),
+        edge_score="oops",
+        probabilities={"bull": np.nan, "bear": None, "crisis": "bad"},
+        macro_probs=[np.nan, None, "bad"],
+        position_size=float("nan"),
+        expected_vol=float("nan"),
+        raw_size=float("inf"),
+        is_toxic=True,
+        garch_regime_probs=[np.nan, np.inf],
+        feed_status=None,
+        signed_position_size=float("nan"),
+        last_valid_vol="x",
+        switch_stability_ema=None,
+    )
+    assert _validate_output_schema(out) is True
+    assert out["position_size"] == 0.0
+    assert np.isclose(sum(out["macro_probs"]), 1.0)
+
+
+def test_build_output_fallback_path_never_throws_on_schema_failure(monkeypatch):
+    import advanced_regime_engine as module
+
+    monkeypatch.setattr(module, "_validate_output_schema", lambda _out: False)
+    out = module._build_output(
+        regime_idx=0,
+        regime_label="TREND",
+        trend_strength=0.5,
+        risk_level=0.2,
+        confidence=0.9,
+        edge_score=0.2,
+        probabilities={"bull": 0.8, "bear": 0.1, "crisis": 0.1},
+        macro_probs=[0.7, 0.2, 0.1],
+        position_size=0.2,
+        expected_vol=0.01,
+        raw_size=0.3,
+        is_toxic=False,
+        garch_regime_probs=[0.6, 0.4],
+        feed_status="OK",
+        last_valid_vol="not-a-number",
+        switch_stability_ema=None,
+    )
+    assert out["risk_metrics"]["feed_status"] == "SCHEMA_FAILURE"
+    assert np.isfinite(out["risk_metrics"]["last_valid_vol"])
+    assert np.isfinite(out["risk_metrics"]["switch_stability_ema"])
+    assert np.isclose(sum(out["macro_probs"]), 1.0)
 
 
 def test_load_state_corrupted_scalars_do_not_poison_engine(engine):
