@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  claude-audit:
+  audit:
     runs-on: ubuntu-latest
 
     steps:
@@ -24,12 +24,10 @@ jobs:
       - name: Run Claude Audit
         env:
           CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
-        run: |
-          echo "🚀 Running Claude Deep Audit..."
-          python scripts/claude_audit.py
+        run: python scripts/claude_audit.py
 
-      - name: Upload Audit Report
+      - name: Upload report
         uses: actions/upload-artifact@v4
         with:
-          name: claude-audit-report
+          name: claude-audit
           path: CLAUDE_AUDIT.md
