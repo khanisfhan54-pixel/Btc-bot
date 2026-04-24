@@ -1637,6 +1637,21 @@ class AlphaOrchestrator:
     # Signal fusion
     # ----------------------------------------
 
+    def _correlation_penalty(self, conviction: float, group_size: int) -> Tuple[float, bool]:
+        """Compute deterministic correlation penalty and whether gate condition is active."""
+        sanitized_group_size = max(1, int(group_size))
+        gate_active = (
+            conviction >= self.config.correlation_min_conviction
+            and sanitized_group_size >= self.config.correlation_min_group_size
+        )
+        penalty = 1.0
+        if gate_active:
+            smooth_size = 1.0 + 0.5 * float(sanitized_group_size - 1)
+            penalty = 1.0 / math.sqrt(smooth_size)
+        if not math.isfinite(penalty):
+            return 1.0, False
+        return penalty, gate_active
+
     def _fuse_signals(
         self,
         signals: List[AlphaSignal],
@@ -1742,8 +1757,6 @@ class AlphaOrchestrator:
 
             conviction = _safe_float(s.conviction, 0.0, 0.0, 1.0)
             raw_weight_contrib = eff_w * conviction * alignment * stress_attenuation
-            if raw_weight_contrib > 1e-7:
-                raw_denom += raw_weight_contrib
 
             correlation_penalty = 1.0
             if direction != 0:
@@ -1753,14 +1766,7 @@ class AlphaOrchestrator:
                     _resolve_correlation_group_id(s),
                 )
                 similar_count = max(1, int(correlation_group_sizes.get(group_key, 1)))
-                if (
-                    conviction >= self.config.correlation_min_conviction
-                    and similar_count >= self.config.correlation_min_group_size
-                ):
-                    smooth_size = 1.0 + 0.5 * float(similar_count - 1)
-                    correlation_penalty = 1.0 / math.sqrt(smooth_size)
-                if not math.isfinite(correlation_penalty):
-                    correlation_penalty = 1.0
+                correlation_penalty, _ = self._correlation_penalty(conviction, similar_count)
 
             effective_weight_contrib = raw_weight_contrib * correlation_penalty
             if effective_weight_contrib > 1e-7:
@@ -1820,6 +1826,12 @@ class AlphaOrchestrator:
 
             conviction = _safe_float(s.conviction, 0.0, 0.0, 1.0)
             raw_weight_contrib = eff_w * conviction * alignment * stress_attenuation
+            if direction != 0:
+                raw_denom += raw_weight_contrib
+                raw_weighted_sum += raw_weight_contrib * direction
+                raw_weighted_edge += raw_weight_contrib * (
+                    direction * _safe_float(s.expected_edge_bps, 0.0, 0.0, _EDGE_BPS_CLAMP)
+                )
 
             correlation_group_id = ""
             if direction != 0:
@@ -1831,14 +1843,10 @@ class AlphaOrchestrator:
 
             similar_count = 1
             correlation_penalty = 1.0
+            conviction_gate_applies = False
             if correlation_group_key is not None:
                 similar_count = max(1, int(correlation_group_sizes.get(correlation_group_key, 1)))
-                if (
-                    conviction >= self.config.correlation_min_conviction
-                    and similar_count >= self.config.correlation_min_group_size
-                ):
-                    smooth_size = 1.0 + 0.5 * float(similar_count - 1)
-                    correlation_penalty = 1.0 / math.sqrt(smooth_size)
+                correlation_penalty, conviction_gate_applies = self._correlation_penalty(conviction, similar_count)
                 if not math.isfinite(correlation_penalty):
                     correlation_penalty = 1.0
                     similar_count = 1
@@ -1854,6 +1862,7 @@ class AlphaOrchestrator:
                         "perf_multiplier": perf_mult,
                         "timeframe": _normalize_key(s.timeframe),
                         "direction": direction,
+                        "conviction": conviction,
                         "expected_edge_bps": s.expected_edge_bps,
                         "base_weight": base_w,
                         "regime_alignment_weight": alignment,
@@ -1865,6 +1874,7 @@ class AlphaOrchestrator:
                         "dominance_cap_active": False,
                         "stress_attenuation": stress_attenuation,
                         "correlation_penalty": correlation_penalty,
+                        "conviction_gate_applies": conviction_gate_applies,
                         "similar_signal_count": similar_count,
                         "correlation_group_id": correlation_group_id,
                         "correlation_group_key": (
@@ -1881,15 +1891,11 @@ class AlphaOrchestrator:
                 other_weights_sum = adjusted_total_weight - weight_contrib
                 strict_cap = (0.4 * other_weights_sum) / 0.6
                 if weight_contrib > strict_cap:
-                    weight_contrib = strict_cap
+                    weight_contrib = max(0.0, strict_cap)
                     dominance_cap_active = True
 
             denom += weight_contrib
             if direction != 0:
-                raw_weighted_sum += raw_weight_contrib * direction
-                raw_weighted_edge += raw_weight_contrib * (
-                    direction * _safe_float(s.expected_edge_bps, 0.0, 0.0, _EDGE_BPS_CLAMP)
-                )
                 weighted_sum += weight_contrib * direction
                 # FIX 5: expected_edge_bps is absolute magnitude; direction gives sign.
                 weighted_edge += weight_contrib * (
@@ -1903,6 +1909,7 @@ class AlphaOrchestrator:
                     "perf_multiplier": perf_mult,
                     "timeframe": _normalize_key(s.timeframe),
                     "direction": direction,
+                    "conviction": conviction,
                     "expected_edge_bps": s.expected_edge_bps,
                     "base_weight": base_w,
                     "regime_alignment_weight": alignment,
@@ -1914,6 +1921,7 @@ class AlphaOrchestrator:
                     "final_weight_contribution": weight_contrib,
                     "stress_attenuation": stress_attenuation,
                     "correlation_penalty": correlation_penalty,
+                    "conviction_gate_applies": conviction_gate_applies,
                     "similar_signal_count": similar_count,
                     "correlation_group_id": correlation_group_id,
                     "correlation_group_key": (
@@ -1926,9 +1934,8 @@ class AlphaOrchestrator:
 
         if denom < self.config.min_aggregate_weight:
             return 0.0, 0.0, {"error": "low_aggregate_weight", "denom": denom}
-        raw_score = weighted_sum / denom
-        if not math.isfinite(raw_score):
-            raw_score = 0.0
+        if denom < -1e-12 or raw_denom < -1e-12:
+            raise RuntimeError("Negative denominator detected in fusion")
         raw_score_unadjusted = 0.0
         if raw_denom > 1e-12:
             raw_score_unadjusted = raw_weighted_sum / raw_denom
@@ -1937,6 +1944,11 @@ class AlphaOrchestrator:
 
         correlation_groups = []
         group_adjusted_weight: Dict[Tuple[int, str, str], float] = {}
+        group_raw_weight: Dict[Tuple[int, str, str], float] = {}
+        group_conviction_sum: Dict[Tuple[int, str, str], float] = {}
+        group_signal_count: Dict[Tuple[int, str, str], int] = {}
+        group_gated_signal_count: Dict[Tuple[int, str, str], int] = {}
+        group_model_penalty_weighted_sum: Dict[Tuple[int, str, str], float] = {}
         for row in breakdown:
             direction = row.get("direction")
             timeframe_bucket = _normalize_key(row.get("timeframe", "")) or _normalize_key(
@@ -1949,27 +1961,81 @@ class AlphaOrchestrator:
             group_adjusted_weight[gk] = group_adjusted_weight.get(gk, 0.0) + _safe_float(
                 row.get("final_weight_contribution"), 0.0, 0.0
             )
+            group_raw_weight[gk] = group_raw_weight.get(gk, 0.0) + _safe_float(
+                row.get("raw_weight_contribution"), 0.0, 0.0
+            )
+            group_conviction_sum[gk] = group_conviction_sum.get(gk, 0.0) + _safe_float(
+                row.get("conviction"), 0.0, 0.0, 1.0
+            )
+            group_signal_count[gk] = group_signal_count.get(gk, 0) + 1
+            if bool(row.get("conviction_gate_applies", False)):
+                group_gated_signal_count[gk] = group_gated_signal_count.get(gk, 0) + 1
+            group_model_penalty_weighted_sum[gk] = group_model_penalty_weighted_sum.get(gk, 0.0) + (
+                _safe_float(row.get("correlation_penalty"), 1.0, 0.0, 1.0)
+                * _safe_float(row.get("raw_weight_contribution"), 0.0, 0.0)
+            )
 
         largest_group_size = 0
+        total_raw_weight = 0.0
+        total_adjusted_weight = 0.0
+        total_dominance_impact = 0.0
         for group_key in sorted(correlation_group_sizes.keys()):
             size = correlation_group_sizes[group_key]
             group_size = max(1, int(size))
             largest_group_size = max(largest_group_size, group_size)
-            penalty = 1.0
-            if group_size >= self.config.correlation_min_group_size:
-                smooth_size = 1.0 + 0.5 * float(group_size - 1)
-                penalty = 1.0 / math.sqrt(smooth_size)
-            if not math.isfinite(penalty):
-                penalty = 1.0
-                group_size = 1
+            avg_conviction = 0.0
+            sig_count = max(1, int(group_signal_count.get(group_key, group_size)))
+            if sig_count > 0:
+                avg_conviction = _safe_float(
+                    group_conviction_sum.get(group_key, 0.0) / sig_count, 0.0, 0.0, 1.0
+                )
+            gated_count = int(group_gated_signal_count.get(group_key, 0))
+            raw_group_weight = _safe_float(group_raw_weight.get(group_key, 0.0), 0.0, 0.0)
+            adjusted_group_weight = _safe_float(group_adjusted_weight.get(group_key, 0.0), 0.0, 0.0)
+            effective_attenuation = (
+                adjusted_group_weight / raw_group_weight if raw_group_weight > 1e-12 else 1.0
+            )
+            if not math.isfinite(effective_attenuation):
+                effective_attenuation = 1.0
+            any_signal_gated = gated_count > 0
+            all_signals_gated = gated_count == sig_count and sig_count > 0
+            model_penalty = (
+                group_model_penalty_weighted_sum.get(group_key, 0.0) / raw_group_weight
+                if raw_group_weight > 1e-12
+                else 1.0
+            )
+            if not math.isfinite(model_penalty):
+                model_penalty = 1.0
+            dominance_impact = model_penalty - effective_attenuation
+            if effective_attenuation > model_penalty + 1e-9:
+                raise RuntimeError("Effective attenuation exceeds model penalty")
+            total_raw_weight += raw_group_weight
+            total_adjusted_weight += adjusted_group_weight
+            total_dominance_impact += abs(dominance_impact) * raw_group_weight
             correlation_groups.append(
                 {
                     "key": [group_key[0], group_key[1], group_key[2]],
                     "size": group_size,
-                    "penalty": penalty,
-                    "adjusted_weight": _safe_float(group_adjusted_weight.get(group_key, 0.0), 0.0, 0.0),
+                    "penalty": model_penalty,
+                    "model_penalty": model_penalty,
+                    "effective_attenuation": effective_attenuation,
+                    "dominance_impact": dominance_impact,
+                    "penalty_condition": (
+                        f"conviction>={self.config.correlation_min_conviction:.3f} "
+                        f"and group_size>={self.config.correlation_min_group_size}"
+                    ),
+                    "penalty_applied": any_signal_gated,
+                    "avg_group_conviction": avg_conviction,
+                    "any_signal_gated": any_signal_gated,
+                    "all_signals_gated": all_signals_gated,
+                    "gated_signal_count": gated_count,
+                    "signal_count": sig_count,
+                    "raw_weight": raw_group_weight,
+                    "adjusted_weight": adjusted_group_weight,
                 }
             )
+
+        conviction_gate_active = any(bool(r.get("conviction_gate_applies", False)) for r in breakdown)
 
         logger.debug(
             "CORRELATION | groups=%d | largest=%d | raw_denom=%.6f | adj_denom=%.6f",
@@ -1979,18 +2045,26 @@ class AlphaOrchestrator:
             denom,
         )
 
-        attenuated_score = raw_score
-        if not math.isfinite(attenuated_score):
-            attenuated_score = 0.0
+        adjusted_score = weighted_sum / denom if denom > 1e-12 else 0.0
+        if not math.isfinite(adjusted_score):
+            adjusted_score = 0.0
 
         raw_blended_edge = 0.0
         if raw_denom > 1e-12:
             raw_blended_edge = raw_weighted_edge / raw_denom
         if not math.isfinite(raw_blended_edge):
             raw_blended_edge = 0.0
-        blended_edge = weighted_edge / denom
+        blended_edge = weighted_edge / denom if denom > 1e-12 else 0.0
         if not math.isfinite(blended_edge):
             blended_edge = 0.0
+
+        score_attenuation = 1.0
+        if abs(raw_score_unadjusted) > 1e-12:
+            score_attenuation = max(
+                0.0, min(1.0, abs(adjusted_score) / abs(raw_score_unadjusted))
+            )
+        if not math.isfinite(score_attenuation):
+            score_attenuation = 1.0
         correlation_attenuation = 1.0
         if abs(raw_blended_edge) > 1e-12:
             correlation_attenuation = max(
@@ -1998,15 +2072,60 @@ class AlphaOrchestrator:
             )
         if not math.isfinite(correlation_attenuation):
             correlation_attenuation = 1.0
+
+        if not math.isfinite(score_attenuation):
+            raise RuntimeError("Invalid score attenuation factor")
+
+        if total_raw_weight > 1e-12:
+            total_dominance_impact /= total_raw_weight
+        else:
+            total_dominance_impact = 0.0
+
         logger.debug(
-            "CORRELATION_ATTENUATION | raw_edge=%.6f | adj_edge=%.6f | factor=%.6f",
+            "CORRELATION_ATTENUATION | raw_score=%.6f | adj_score=%.6f | "
+            "raw_edge=%.6f | adj_edge=%.6f | score_factor=%.6f | edge_factor=%.6f",
+            raw_score_unadjusted,
+            adjusted_score,
             raw_blended_edge,
             blended_edge,
+            score_attenuation,
             correlation_attenuation,
+        )
+        logger.debug(
+            "FUSION_SCORE | raw=%.6f | adjusted=%.6f",
+            raw_score_unadjusted,
+            adjusted_score,
+        )
+        logger.debug(
+            "CORRELATION_GROUP_CONCENTRATION | gate_active=%s | summary=%s",
+            conviction_gate_active,
+            [
+                {
+                    "key": g["key"],
+                    "size": g["size"],
+                    "avg_conviction": g["avg_group_conviction"],
+                    "raw_weight": g["raw_weight"],
+                    "adjusted_weight": g["adjusted_weight"],
+                    "gated_signal_count": g["gated_signal_count"],
+                }
+                for g in correlation_groups
+            ],
+        )
+        logger.debug(
+            "CORRELATION_SEMANTICS | model_vs_effective=%s",
+            [
+                {
+                    "group": g["key"],
+                    "model": g["model_penalty"],
+                    "effective": g["effective_attenuation"],
+                    "impact": g["dominance_impact"],
+                }
+                for g in correlation_groups
+            ],
         )
 
         return (
-            _safe_float(attenuated_score, 0.0, -1.0, 1.0),
+            _safe_float(adjusted_score, 0.0, -1.0, 1.0),
             _safe_float(blended_edge, 0.0, -_EDGE_BPS_CLAMP, _EDGE_BPS_CLAMP),
             {
                 "breakdown": breakdown,
@@ -2015,8 +2134,19 @@ class AlphaOrchestrator:
                     "total_groups": len(correlation_groups),
                     "largest_group_size": largest_group_size,
                     "attenuation_factor": correlation_attenuation,
+                    "attenuation_mode": "score_and_edge",
+                    "score_attenuation_factor": score_attenuation,
                     "penalty_logic": "smooth_inverse_sqrt_size",
-                    "conviction_gate_active": False,
+                    "conviction_gate_active": conviction_gate_active,
+                    "total_raw_weight": _safe_float(total_raw_weight, 0.0, 0.0),
+                    "total_adjusted_weight": _safe_float(total_adjusted_weight, 0.0, 0.0),
+                    "total_dominance_impact": _safe_float(total_dominance_impact, 0.0, 0.0),
+                    "penalty_condition": (
+                        f"conviction>={self.config.correlation_min_conviction:.3f} "
+                        f"and group_size>={self.config.correlation_min_group_size}"
+                    ),
+                    "raw_score": _safe_float(raw_score_unadjusted, 0.0, -1.0, 1.0),
+                    "adjusted_score": _safe_float(adjusted_score, 0.0, -1.0, 1.0),
                     "raw_blended_edge_bps": _safe_float(
                         raw_blended_edge, 0.0, -_EDGE_BPS_CLAMP, _EDGE_BPS_CLAMP
                     ),
