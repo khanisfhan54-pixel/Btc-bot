@@ -8,6 +8,10 @@ from advanced_regime_engine import (
     MSGARCH_RiskEngine,
     NHHMM_Engine,
     SparseJumpModel,
+    _safe_array,
+    _safe_float,
+    _safe_int,
+    _safe_prob_vector,
     _build_output,
     _normalize_prob_vector,
     _validate_output_schema,
@@ -37,6 +41,12 @@ def test_update_coerces_string_return_without_crash(engine):
     out = engine.update(_md(ret="bad"))
     assert out["schema_version"] == "1.2.0"
     assert np.isfinite(out["risk_metrics"]["expected_volatility"])
+
+def test_update_with_non_dict_market_data_is_fail_safe(engine):
+    out = engine.update(None)
+    assert out["schema_version"] == "1.2.0"
+    assert np.isfinite(out["position_size"])
+    assert out["position_size"] >= 0.0
 
 
 def test_update_handles_nan_return(engine):
@@ -353,6 +363,22 @@ def test_load_state_logs_degrade_fields(engine, caplog):
     assert "STATE_LOAD_DEGRADE field=confirmed_regime_idx" in caplog.text
     assert "STATE_LOAD_DEGRADE field=loss_streak" in caplog.text
     assert "STATE_LOAD_DEGRADE field=healing_count" in caplog.text
+
+
+def test_load_state_signature_and_version_mismatch_do_not_crash(engine):
+    engine.load_state({"model_signature": "bad", "state_version": "0.0.0"})
+    out = engine.update(_md(ret=0.001, ts=1.0))
+    assert out["schema_version"] == "1.2.0"
+
+
+def test_safe_deserialization_helpers_never_raise_and_normalize():
+    assert _safe_float("x", default=1.5, min=0.0, max=2.0) == 1.5
+    assert _safe_int("x", default=3, min=0, max=5) == 3
+    vec = _safe_array([1.0, float("nan"), "bad"], shape=(3,), default=[0.0, 0.0, 0.0])
+    assert vec.shape == (3,)
+    probs = _safe_prob_vector([1.0, float("nan"), -2.0], 3)
+    assert np.isclose(float(np.sum(probs)), 1.0)
+    assert np.all(np.isfinite(probs))
 
 
 def test_load_snapshot_corruption_recovery_no_crash(engine):
