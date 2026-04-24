@@ -79,6 +79,17 @@ def test_mtf_missing_base_raises(engine):
         )
 
 
+def test_mtf_non_dict_payload_raises(engine):
+    with pytest.raises(ValueError, match="dict"):
+        engine.update(
+            {
+                "timestamp": 1.0,
+                "price": 100.0,
+                "mtf": ["not", "a", "dict"],
+            }
+        )
+
+
 def test_mtf_partial_failure_degrades_not_crash(engine):
     engine._strict_mtf_keys = False
     engine.mtf_weights = {"base": 1.0, "5m": 0.6}
@@ -121,6 +132,36 @@ def test_update_handles_extreme_returns_beyond_two_sigma_bounds(engine):
     out_lo = engine.update(_md(ret=-2.5, ts=11.0))
     assert _validate_output_schema(out_hi) is True
     assert _validate_output_schema(out_lo) is True
+
+
+def test_circuit_breaker_preserves_first_reason_and_trigger_tick(engine):
+    engine._tick_id = 42
+    engine._trigger_circuit_breaker("FIRST")
+    engine._trigger_circuit_breaker("SECOND")
+    assert engine._circuit_breaker_active is True
+    assert engine._circuit_breaker_reason == "FIRST"
+    assert engine._circuit_breaker_trigger_tick == 42
+
+
+def test_self_heal_unknown_error_always_executes_fallback_recovery(engine):
+    engine.nhhmm_prior = np.array([np.nan, np.nan, np.nan], dtype=float)
+    action = engine._self_heal("E999", {"source": "test"})
+    assert action == "SKIP_AND_DEGRADE"
+    assert np.isclose(float(np.sum(engine.nhhmm_prior)), 1.0)
+    assert np.all(np.isfinite(engine.nhhmm_prior))
+
+
+def test_load_snapshot_hash_mismatch_rolls_back_state(engine):
+    baseline = engine.serialize_state()
+    snapshot = {
+        "state_hash": "definitely_bad_hash",
+        "engine_state": baseline,
+        "_engine_rng_state": baseline["engine_rng_state"],
+        "_engine_rng_type": type(engine._rng.bit_generator).__name__,
+    }
+    engine.last_signed_position_size = 0.25
+    engine.load_snapshot(snapshot)
+    assert np.isclose(engine.last_signed_position_size, 0.25)
 
 
 def test_compute_hmm_regime_trend_score_bounded_after_scaling():
