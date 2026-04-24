@@ -92,12 +92,28 @@ def _normalize_prob_vector(values: np.ndarray, floor: float = 1e-12) -> np.ndarr
 # ==========================================
 def _validate_output_schema(output: Dict[str, Any]) -> bool:
     try:
+        if not isinstance(output, dict):
+            raise ValueError("output must be a dict")
         if "schema_version" not in output:
             raise ValueError("missing schema_version")
 
         version = str(output["schema_version"]).strip()
         if version != _OUTPUT_SCHEMA_VERSION:
             raise ValueError(f"mismatch {version} != {_OUTPUT_SCHEMA_VERSION}")
+        for key in ("regime_idx", "regime_label", "probabilities", "risk_metrics", "alpha"):
+            if key not in output:
+                raise ValueError(f"missing required key: {key}")
+        if not isinstance(output["probabilities"], dict):
+            raise ValueError("probabilities must be a dict")
+        for pkey in ("bull", "bear", "crisis"):
+            if pkey not in output["probabilities"]:
+                raise ValueError(f"missing probabilities.{pkey}")
+        if not isinstance(output["risk_metrics"], dict):
+            raise ValueError("risk_metrics must be a dict")
+        if not isinstance(output["alpha"], dict):
+            raise ValueError("alpha must be a dict")
+        if "edge_score" not in output["alpha"]:
+            raise ValueError("missing alpha.edge_score")
 
         return True
     except Exception as e:
@@ -375,6 +391,7 @@ def compute_hmm_regime(alpha: np.ndarray) -> Dict[str, Any]:
         trend_score *= 1.10
     else:
         trend_score *= 0.95
+    trend_score = float(np.clip(trend_score, 0.0, 1.0))
 
     score_map = {
         directional_label: trend_score,
@@ -738,11 +755,6 @@ class AdvancedRegimeEngine:
                     pass
             return hashlib.sha256(b"STATE_HASH_ERROR").hexdigest()
 
-    # ==========================================
-    # NEW: Safe fallback memory
-    # ==========================================
-    _last_valid_sjm_probs: np.ndarray | None = None
-
     def __init__(
         self,
         n_states=3,
@@ -835,6 +847,7 @@ class AdvancedRegimeEngine:
         self._lock = threading.RLock()
         self._regime_smoother = RegimeMarkovSmoother()
         self._regime_state_probs = np.ones(4, dtype=float) / 4.0
+        self._last_valid_sjm_probs: np.ndarray | None = None
 
         # ==========================================
         # 🚨 RISK STATE TRACKING
@@ -1029,6 +1042,29 @@ class AdvancedRegimeEngine:
         if ts_f >= 1e12:
             return ts_f / 1e3
         return ts_f
+
+    @staticmethod
+    def _coerce_finite_scalar(value: Any, *, default: float = 0.0) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return float(default)
+        if not np.isfinite(parsed):
+            return float(default)
+        return float(parsed)
+
+    def _log_state_load_issue(self, field: str, exc: Exception, value: Any = None) -> None:
+        if getattr(self, "_is_replay", False):
+            return
+        try:
+            LOGGER.error(
+                "STATE_LOAD_DEGRADE field=%s error=%s value=%s",
+                field,
+                repr(exc),
+                repr(value)[:200],
+            )
+        except Exception:
+            pass
 
     @staticmethod
     def _coerce_vector(name: str, values: Any, expected_size: int) -> np.ndarray:
@@ -1569,12 +1605,14 @@ class AdvancedRegimeEngine:
         self.range_ticks_int = int(self.range_ticks)
 
         # --- NEW: restore SJM fallback memory ---
+        self._last_valid_sjm_probs = None
         if "last_valid_sjm_probs" in state and state["last_valid_sjm_probs"] is not None:
-            self._last_valid_sjm_probs = _normalize_prob_vector(
-                np.asarray(state["last_valid_sjm_probs"], dtype=float)
-            )
-        else:
-            self._last_valid_sjm_probs = None
+            try:
+                self._last_valid_sjm_probs = _normalize_prob_vector(
+                    self._coerce_vector("last_valid_sjm_probs", state["last_valid_sjm_probs"], self.K)
+                )
+            except Exception as e:
+                self._log_state_load_issue("last_valid_sjm_probs", e, state.get("last_valid_sjm_probs"))
 
         self._range_anchor_size = float(state.get("range_anchor_size", 0.0))
         if not np.isfinite(self._range_anchor_size):
@@ -1970,18 +2008,13 @@ class AdvancedRegimeEngine:
         if mtf_data is not None and safe_nhhmm_posterior is None:
             raise RuntimeError("MTF fusion failed to produce valid posterior")
 
-        try:
-            y_t = float(y_t) if y_t is not None else None
-        except (TypeError, ValueError):
-            y_t = None
-        if y_t is not None and np.isfinite(y_t) and abs(y_t) > 2.0:
+        y_t = self._coerce_finite_scalar(y_t, default=0.0)
+        if abs(y_t) > 2.0:
             raise ValueError(
                 f"Return value {y_t:.6f} exceeds plausible fractional range "
                 f"(|r| > 2.0). Verify upstream pipeline normalises to fractional "
                 "returns before calling update()."
             )
-        if y_t is None or not np.isfinite(y_t):
-            y_t = 0.0
 
         if x_t is None:
             x_t = np.zeros(self.n_features)
@@ -2122,6 +2155,20 @@ class AdvancedRegimeEngine:
                 raise RuntimeError("MTF posterior missing after validation")
             nhhmm_posterior = safe_nhhmm_posterior
 
+        if not isinstance(nhhmm_posterior, np.ndarray):
+            nhhmm_posterior = np.asarray(nhhmm_posterior, dtype=float)
+        if nhhmm_posterior.shape != (self.K,) or not np.all(np.isfinite(nhhmm_posterior)):
+            self._warn_rate_limited(
+                key="nhhmm_non_finite",
+                message="NHHMM posterior invalid; falling back to prior",
+                cooldown_s=10.0,
+            )
+            fallback_prior = np.asarray(self.nhhmm_prior, dtype=float)
+            if fallback_prior.shape == (self.K,) and np.all(np.isfinite(fallback_prior)):
+                nhhmm_posterior = fallback_prior
+            else:
+                nhhmm_posterior = np.ones(self.K, dtype=float) / self.K
+
         self.nhhmm_prior = _normalize_prob_vector(nhhmm_posterior)
 
         nhhmm_confidence = float(np.max(nhhmm_posterior))
@@ -2139,6 +2186,10 @@ class AdvancedRegimeEngine:
             nhhmm_probs=nhhmm_posterior,
             bias_weight=effective_bias_weight,
         )
+        try:
+            sjm_probs = self._coerce_vector("sjm_probs", sjm_probs, self.K)
+        except Exception:
+            sjm_probs = np.full(self.K, np.nan, dtype=float)
         
         # ==========================================
         # FIX: STICKY SJM FALLBACK (NO REGIME COLLAPSE)
@@ -2165,6 +2216,7 @@ class AdvancedRegimeEngine:
                     sjm_state = int(np.argmax(sjm_probs))
 
         else:
+            sjm_probs = _normalize_prob_vector(sjm_probs)
             self._last_valid_sjm_probs = sjm_probs.copy()
 
         if np.isfinite(y_t):
@@ -2375,7 +2427,16 @@ class AdvancedRegimeEngine:
 
         predicted_var = self.garch_var.copy()
         self.garch_var = self.garch._garch_update(self.garch_var, y_t)
+        if self.garch_var.shape != (2,) or not np.all(np.isfinite(self.garch_var)):
+            self._warn_rate_limited(
+                key="garch_var_invalid",
+                message="GARCH variance invalid; resetting to stationary variance",
+                cooldown_s=10.0,
+            )
+            self.garch_var = self._stationary_garch_var()
         self.garch_prob = self.garch._update_regime_probs(self.garch_prob, predicted_var, y_t)
+        if self.garch_prob.shape != (2,) or not np.all(np.isfinite(self.garch_prob)):
+            self.garch_prob = np.ones(2, dtype=float) / 2.0
         self.garch_prob = _normalize_prob_vector(self.garch_prob)
 
         self._smoothed_garch_prob = (
@@ -2812,17 +2873,23 @@ class AdvancedRegimeEngine:
                     self._last_valid_sjm_probs = _normalize_prob_vector(
                         np.asarray(state.get("last_valid_sjm_probs"), dtype=float)
                     )
-                except Exception:
-                    self._last_valid_sjm_probs = np.ones(self.K, dtype=float) / self.K
+                except Exception as e:
+                    self._log_state_load_issue("snapshot.last_valid_sjm_probs", e, state.get("last_valid_sjm_probs"))
+                    self._last_valid_sjm_probs = None
             self._last_effective_trend_strength = float(
                 state.get("last_effective_trend_strength", self._last_effective_trend_strength)
             )
             self._last_edge_score = float(state.get("last_edge_score", self._last_edge_score))
             self._confirmed_regime = state.get("regime", self._confirmed_regime)
-        except Exception:
+        except Exception as e:
             if not getattr(self, "_is_replay", False):
                 try:
-                    LOGGER.error("Snapshot load failed", exc_info=True)
+                    LOGGER.error(
+                        "Snapshot load failed context_keys=%s error=%s",
+                        sorted(list(snapshot.keys())) if isinstance(snapshot, dict) else [],
+                        repr(e),
+                        exc_info=True,
+                    )
                 except Exception:
                     pass
             # Never crash live engine during replay recovery.
