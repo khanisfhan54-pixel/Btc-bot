@@ -3,155 +3,152 @@ import requests
 import json
 
 API_KEY = os.getenv("CLAUDE_API_KEY")
-API_URL = "https://api.anthropic.com/v1/messages"
 
-# Model priority (your Opus first)
-MODELS = [
-    "claude-opus-4-6",
-    "claude-3-opus-20240229",
-    "claude-3-5-sonnet-20240620"
-]
+# ===============================
+# READ FULL REPO CODE
+# ===============================
+def read_repo():
+    code = ""
+    for root, _, files in os.walk("."):
+        for f in files:
+            if f.endswith(".py"):
+                path = os.path.join(root, f)
+                try:
+                    with open(path, "r", encoding="utf-8") as file:
+                        code += f"\n\n# FILE: {path}\n\n"
+                        code += file.read()
+                except:
+                    pass
 
-MAX_CHARS_PER_CHUNK = 60000
-
-
-def get_python_files():
-    files = []
-    for root, _, filenames in os.walk("."):
-        for f in filenames:
-            if f.endswith(".py") and "venv" not in root:
-                files.append(os.path.join(root, f))
-    return files
-
-
-def read_file(path):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read()
-    except:
-        return ""
+    return code[:200000]  # prevent overflow
 
 
-def chunk_code(files):
-    chunks = []
-    current_chunk = ""
-
-    for file in files:
-        content = read_file(file)
-        block = f"\n# FILE: {file}\n{content}\n"
-
-        if len(current_chunk) + len(block) > MAX_CHARS_PER_CHUNK:
-            chunks.append(current_chunk)
-            current_chunk = block
-        else:
-            current_chunk += block
-
-    if current_chunk:
-        chunks.append(current_chunk)
-
-    return chunks
-
-
-def call_claude(prompt):
-    for model in MODELS:
-        print(f"Trying model: {model}")
-
-        response = requests.post(
-            API_URL,
-            headers={
-                "x-api-key": API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json"
-            },
-            json={
-                "model": model,
-                "max_tokens": 8000,
-                "messages": [
-                    {"role": "user", "content": prompt}
-                ]
-            }
-        )
-
-        data = response.json()
-
-        if response.status_code == 200:
-            print(f"✅ Success with {model}")
-            return data, model
-
-        if "error" in data:
-            print(f"❌ {model} failed: {data['error'].get('message')}")
-
-    return None, None
-
-
-def build_prompt(code_chunk):
+# ===============================
+# BUILD PROMPT (YOUR CORE POWER)
+# ===============================
+def build_prompt(code):
     return f"""
-You are a senior quantitative trading systems engineer.
+You are a senior quantitative engineer, production backend architect, and testing specialist.
 
-STRICT REQUIREMENTS:
-- Identify REAL bugs only (no generic advice)
-- Provide exact code fixes (diff or replacement)
-- Focus on execution, signal generation, risk logic
-- Ignore style or formatting
+Your job is NOT to suggest ideas or plans.
+Your job is to deliver COMPLETE, production-ready implementations.
 
-ALSO:
-- Suggest performance improvements
-- Suggest robustness upgrades (edge cases, failure handling)
-- Suggest architecture improvements ONLY if critical
+## CORE STANDARD (NON-NEGOTIABLE)
+- No partial solutions
+- No TODOs
+- No placeholders
+- Fix everything completely
 
-OUTPUT FORMAT:
-1. File
-2. Issue
-3. Root Cause
-4. Fix (code)
+---
 
-CODE:
-{code_chunk}
+## TASK
+
+Audit, debug, and upgrade this entire codebase.
+
+### REQUIRED OUTPUT FORMAT:
+
+# 🚨 CRITICAL BUGS
+- Exact issue
+- Why it happens
+- FULL FIXED CODE
+
+# ⚠️ LOGIC ISSUES
+- Explain flaw
+- Provide corrected implementation
+
+# ⚡ PERFORMANCE IMPROVEMENTS
+- Bottlenecks
+- Optimized code
+
+# 🧪 TEST FIXES
+- Fix failing tests completely
+
+# 🧠 FINAL PATCHED FILES
+Return FULL FILES, not snippets.
+
+---
+
+## CODEBASE:
+
+{code}
 """
 
 
-def extract_text(response_json):
+# ===============================
+# CALL CLAUDE API
+# ===============================
+def call_claude(prompt):
+    url = "https://api.anthropic.com/v1/messages"
+
+    headers = {
+        "x-api-key": API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+    }
+
+    payload = {
+        "model": "claude-opus-4-6",
+        "max_tokens": 8000,
+        "messages": [
+            {"role": "user", "content": prompt}
+        ]
+    }
+
+    response = requests.post(url, headers=headers, json=payload)
+
+    print(f"Status: {response.status_code}")
+
     try:
-        return response_json["content"][0]["text"]
+        result = response.json()
     except:
-        return json.dumps(response_json, indent=2)
+        print("❌ Failed to parse JSON")
+        print(response.text)
+        return None, "error"
+
+    return result, payload["model"]
 
 
+# ===============================
+# MAIN EXECUTION
+# ===============================
 def main():
-    print("🚀 Starting Claude audit...")
+    if not API_KEY:
+        raise ValueError("❌ CLAUDE_API_KEY not set")
 
-    files = get_python_files()
-    chunks = chunk_code(files)
+    print("🚀 Reading repo...")
+    code = read_repo()
 
-    full_report = ""
-    used_model = None
+    print("🧠 Building prompt...")
+    prompt = build_prompt(code)
 
-    for i, chunk in enumerate(chunks):
-        print(f"\n🔍 Processing chunk {i+1}/{len(chunks)}")
+    print("🤖 Calling Claude...")
+    result, model_used = call_claude(prompt)
 
-        prompt = build_prompt(chunk)
+    if result is None:
+        print("❌ No result received")
+        return
 
-        result, model = call_claude(prompt)
+    # ===============================
+    # SAFE EXTRACTION (THIS IS YOUR TRY PART)
+    # ===============================
+    try:
+        text = result["content"][0]["text"]
+        print("✅ Clean text extracted")
+    except Exception as e:
+        print("⚠️ Fallback to raw JSON:", str(e))
+        text = json.dumps(result, indent=2)
 
-        if not result:
-            print("❌ All models failed")
-            continue
+    # ===============================
+    # SAVE CLEAN REPORT
+    # ===============================
+    with open("CLAUDE_REPORT.md", "w", encoding="utf-8") as f:
+        f.write(text)
 
-        if not used_model:
-            used_model = model
-
-        text = extract_text(result)
-
-        full_report += f"\n\n# ===== CHUNK {i+1} =====\n"
-        full_report += text
-
-    with open("CLAUDE_REPORT.md", "w") as f:
-        f.write(full_report)
-
-    print("\n✅ Audit complete")
-    print(f"📄 Report saved to CLAUDE_REPORT.md")
-    print(f"🧠 Model used: {used_model}")
+    print("✅ Report saved: CLAUDE_REPORT.md")
 
 
+# ===============================
+# ENTRY POINT
+# ===============================
 if __name__ == "__main__":
     main()
