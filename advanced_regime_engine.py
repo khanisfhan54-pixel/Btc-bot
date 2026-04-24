@@ -2630,6 +2630,7 @@ class AdvancedRegimeEngine:
                 regime_scores,
                 self._confirmed_regime,
             )
+        directional_recovery_label = None
         if regime == "RANGE":
             directional_recovery = (
                 regime_scores["trend_score"] > (regime_scores["range_score"] + 0.15)
@@ -2637,7 +2638,9 @@ class AdvancedRegimeEngine:
                 and float(regime_scores.get("risk_level", 1.0)) < 0.35
             )
             if directional_recovery:
-                regime = str(regime_scores.get("directional_label", "RANGE"))
+                candidate_label = str(regime_scores.get("directional_label", "RANGE"))
+                if candidate_label in ("TREND", "BEAR"):
+                    directional_recovery_label = candidate_label
 
         # Capture base trend strength before any execution-level overrides (fixes Issue 1)
         base_trend_strength = float(regime_scores["trend_strength"])
@@ -2710,6 +2713,18 @@ class AdvancedRegimeEngine:
                 confirmed_regime = "TOXIC"
                 confirmed_regime_idx = self._confirmed_regime_idx
 
+        # Recovery is applied at confirmed-regime stage only, so hysteresis/switch
+        # controls remain authoritative and raw regime stays deterministic.
+        if directional_recovery_label is not None and confirmed_regime == "RANGE":
+            recovery_persistence_ok = self._regime_persistence >= self._REGIME_CONFIRMATION_TICKS
+            recovery_cooldown_ok = True
+            if self._last_regime_change_ts is not None and current_ts is not None:
+                elapsed_since_change = max(current_ts - float(self._last_regime_change_ts), 0.0)
+                recovery_cooldown_ok = elapsed_since_change >= self._SWITCH_COOLDOWN_SEC
+            if recovery_persistence_ok and recovery_cooldown_ok:
+                confirmed_regime = directional_recovery_label
+                confirmed_regime_idx = self.current_regime_idx
+
         # ==========================================
         # EARLY EDGE-BASED REGIME OVERRIDE
         # Prevent weak trend signals from activating directional modes
@@ -2754,7 +2769,7 @@ class AdvancedRegimeEngine:
 
             switch_strength = (
                 self._SWITCH_EDGE_WEIGHT * regime_edge
-                + self._SWITCH_CONF_WEIGHT * regime_scores["confidence"]
+                + self._SWITCH_CONF_WEIGHT * regime_scores["conviction"]
                 + self._SWITCH_VOL_WEIGHT * max(
                     0.0,
                     1.0 - min(prev_vol / max(self.garch.target_vol, 1e-8), 1.0)
@@ -2772,14 +2787,11 @@ class AdvancedRegimeEngine:
                 cooldown_ok = elapsed_since_change >= self._SWITCH_COOLDOWN_SEC
 
             persistence_ok = self._regime_persistence >= self._SWITCH_MIN_PERSISTENCE
-            confidence_ok = (
-                regime_scores["confidence"] >= 0.65
-                and regime_scores["conviction"] >= 0.20
-            )
+            conviction_ok = regime_scores["conviction"] >= 0.65
             toxic_override = confirmed_regime == "TOXIC"
 
             if not toxic_override:
-                if (not cooldown_ok or switch_strength < switch_gate) and not (persistence_ok and confidence_ok):
+                if (not cooldown_ok or switch_strength < switch_gate) and not (persistence_ok and conviction_ok):
                     confirmed_regime = prev_regime_snapshot
                     confirmed_regime_idx = self._confirmed_regime_idx
                     regime_changed = False
