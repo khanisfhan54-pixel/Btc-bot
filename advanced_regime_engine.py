@@ -1338,9 +1338,10 @@ class AdvancedRegimeEngine:
                 # ==========================================
                 # FIX: NON-BLOCKING DROP COUNTER (NO LOGGING)
                 # ==========================================
-                if not hasattr(self, "_warning_drop_count"):
-                    self._warning_drop_count = 0
-                self._warning_drop_count += 1
+                with self._warning_lock:
+                    if not hasattr(self, "_warning_drop_count"):
+                        self._warning_drop_count = 0
+                    self._warning_drop_count += 1
                 return
 
     def _warn_tf_failure(self, tf: str, exc: Exception) -> None:
@@ -1740,6 +1741,10 @@ class AdvancedRegimeEngine:
         self._shock_memory = 0.0
         self._return_ema = 0.0
         self._abs_return_ema = 0.0
+        self._last_price = None
+        self._circuit_breaker_active = False
+        self._circuit_breaker_reason = None
+        self._healing_counter = 0
         self._last_healing_action = "NONE"
         self._last_healing_error = None
         self._last_healing_context = {}
@@ -1955,6 +1960,35 @@ class AdvancedRegimeEngine:
                 },
             )
 
+        def _observe_latency() -> None:
+            if _PROM_AVAILABLE and obs_sample and not getattr(self, "_is_replay", False):
+                elapsed = time.perf_counter() - start_time
+                ENGINE_LATENCY.labels(self.engine_id).observe(elapsed)
+
+        def _build_halted_output() -> Dict[str, Any]:
+            self.last_signed_position_size = 0.0
+            return _build_output(
+                regime_idx=-1,
+                regime_label="HALTED",
+                execution_mode="circuit_breaker",
+                trend_strength=0.0,
+                risk_level=1.0,
+                confidence=0.0,
+                edge_score=0.0,
+                probabilities={"bull": 0.0, "bear": 0.0, "crisis": 1.0},
+                macro_probs=[1 / 3, 1 / 3, 1 / 3],
+                position_size=0.0,
+                signed_position_size=0.0,
+                expected_vol=self._last_valid_vol,
+                raw_size=0.0,
+                is_toxic=True,
+                garch_regime_probs=[0.5, 0.5],
+                feed_status=f"CIRCUIT_BREAKER:{self._circuit_breaker_reason}",
+                last_valid_vol=self._last_valid_vol,
+                switch_stability_ema=self._switch_stability_ema,
+                execution_side="flat",
+            )
+
         # ==========================================
         # 🚨 STEP -1: PnL TRACKING (NEW)
         # ==========================================
@@ -1998,28 +2032,8 @@ class AdvancedRegimeEngine:
                 self._self_heal()
             else:
                 self._obs_observe("circuit_breaker", "critical", {"reason": self._circuit_breaker_reason})
-                self.last_signed_position_size = 0.0
-                output = _build_output(
-                    regime_idx=-1,
-                    regime_label="HALTED",
-                    execution_mode="circuit_breaker",
-                    trend_strength=0.0,
-                    risk_level=1.0,
-                    confidence=0.0,
-                    edge_score=0.0,
-                    probabilities={"bull":0,"bear":0,"crisis":1},
-                    macro_probs=[1/3,1/3,1/3],
-                    position_size=0.0,
-                    signed_position_size=0.0,
-                    expected_vol=self._last_valid_vol,
-                    raw_size=0.0,
-                    is_toxic=True,
-                    garch_regime_probs=[0.5,0.5],
-                    feed_status=f"CIRCUIT_BREAKER:{self._circuit_breaker_reason}",
-                    last_valid_vol=self._last_valid_vol,
-                    switch_stability_ema=self._switch_stability_ema,
-                    execution_side="flat",
-                )
+                output = _build_halted_output()
+                _observe_latency()
                 if obs_sample and not getattr(self, "_is_replay", False):
                     self._replay_record("update_end", {"regime": "HALTED"})
                 return output
@@ -2318,6 +2332,7 @@ class AdvancedRegimeEngine:
             )
             if obs_sample and not getattr(self, "_is_replay", False):
                 self._replay_record("update_end", {"regime": "UNKNOWN"})
+            _observe_latency()
             return output
 
         feed_status = 'OK'
@@ -2595,7 +2610,6 @@ class AdvancedRegimeEngine:
             self.range_ticks = min(self.range_ticks, 1000.0)
 
         self.range_ticks_int = int(self.range_ticks)
-        self._prev_regime = confirmed_regime
 
         execution_mode = _map_execution_mode(confirmed_regime)
         if confirmed_regime == "TREND":
@@ -2657,12 +2671,24 @@ class AdvancedRegimeEngine:
         # ==========================================
         if abs(y_t) > self._VOL_SHOCK_MULTIPLIER * max(expected_vol, 1e-8):
             self._trigger_circuit_breaker("VOL_SHOCK")
+            self._obs_observe("circuit_breaker", "critical", {"reason": self._circuit_breaker_reason})
+            output = _build_halted_output()
+            _observe_latency()
+            if obs_sample and not getattr(self, "_is_replay", False):
+                self._replay_record("update_end", {"regime": "HALTED"})
+            return output
 
         # ==========================================
         # 🚨 STEP 2: CONFIDENCE COLLAPSE
         # ==========================================
         if regime_scores["confidence"] < self._CONFIDENCE_COLLAPSE_THRESHOLD:
             self._trigger_circuit_breaker("CONFIDENCE_COLLAPSE")
+            self._obs_observe("circuit_breaker", "critical", {"reason": self._circuit_breaker_reason})
+            output = _build_halted_output()
+            _observe_latency()
+            if obs_sample and not getattr(self, "_is_replay", False):
+                self._replay_record("update_end", {"regime": "HALTED"})
+            return output
             
         if np.isfinite(expected_vol) and expected_vol > 0.0:
             self._last_valid_vol = float(expected_vol)
@@ -2844,6 +2870,7 @@ class AdvancedRegimeEngine:
         position_size = float(np.clip(position_size, 0.0, 0.35))
         if not np.isfinite(signed_position_size):
             signed_position_size = 0.0
+        signed_position_size = float(np.clip(signed_position_size, -position_size, position_size))
         if not np.isfinite(expected_vol):
             expected_vol = self.garch.target_vol
         if not np.isfinite(raw_size):
@@ -2853,9 +2880,7 @@ class AdvancedRegimeEngine:
         rticks = self.range_ticks_int
 
         # OBS: latency tracking
-        if _PROM_AVAILABLE and obs_sample and not getattr(self, "_is_replay", False):
-            elapsed = time.perf_counter() - start_time
-            ENGINE_LATENCY.labels(self.engine_id).observe(elapsed)
+        _observe_latency()
 
         self._obs_observe(
             "update",
@@ -2905,6 +2930,8 @@ class AdvancedRegimeEngine:
         )
         if obs_sample and not getattr(self, "_is_replay", False):
             self._replay_record("update_end", {"regime": confirmed_regime})
+        if _PROM_AVAILABLE and not getattr(self, "_is_replay", False):
+            REGIME_COUNTER.labels(self.engine_id, confirmed_regime).inc()
         if self._replay_engine is not None and (self._tick_id % 100 == 0) and not getattr(self, "_is_replay", False):
             try:
                 state_blob = self.serialize_state()

@@ -1,5 +1,7 @@
 import numpy as np
 import pytest
+import threading
+import queue
 
 from advanced_regime_engine import (
     AdvancedRegimeEngine,
@@ -416,3 +418,61 @@ def test_load_snapshot_logs_structured_error(engine, caplog):
     engine.load_state = lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom"))
     engine.load_snapshot({"engine_state": {}})
     assert "Snapshot load failed context_keys=['engine_state']" in caplog.text
+
+
+def test_circuit_breaker_vol_shock_short_circuits_same_tick(engine):
+    engine._VOL_SHOCK_MULTIPLIER = 0.05
+    out = engine.update(_md(ret=0.8, ts=1.0))
+    assert out["regime_label"] == "HALTED"
+    assert out["execution_mode"] == "circuit_breaker"
+    assert out["risk_metrics"]["feed_status"] == "CIRCUIT_BREAKER:VOL_SHOCK"
+    assert engine._circuit_breaker_active is True
+
+
+def test_reset_state_clears_breaker_healing_and_price(engine):
+    engine._circuit_breaker_active = True
+    engine._circuit_breaker_reason = "TEST"
+    engine._healing_counter = 9
+    engine._last_price = 123.0
+    engine._last_valid_sjm_probs = np.array([0.2, 0.2, 0.6], dtype=float)
+    engine.reset_state()
+    assert engine._circuit_breaker_active is False
+    assert engine._circuit_breaker_reason is None
+    assert engine._healing_counter == 0
+    assert engine._last_price is None
+    assert engine._last_valid_sjm_probs is None
+
+
+def test_signed_position_is_clamped_with_corrupt_prior_state(engine):
+    engine.last_signed_position_size = 5.0
+    engine._range_anchor_size = 10.0
+    out = engine.update(_md(ret=0.001, ts=2.0))
+    assert abs(out["signed_position_size"]) <= out["position_size"] + 1e-12
+
+
+def test_last_signed_position_size_persisted_after_successful_ticks(engine):
+    out1 = engine.update(_md(ret=0.001, ts=1.0))
+    assert engine.last_signed_position_size == pytest.approx(out1["signed_position_size"])
+    out2 = engine.update(_md(ret=-0.001, ts=2.0))
+    assert engine.last_signed_position_size == pytest.approx(out2["signed_position_size"])
+
+
+def test_warning_drop_counter_thread_safe_when_queue_is_full(engine):
+    engine._shutdown_warning_worker()
+    engine._warning_queue = queue.Queue(maxsize=1)
+    engine._warning_queue.put_nowait("occupied")
+    engine._warning_drop_count = 0
+
+    n_threads = 16
+    threads = []
+    for i in range(n_threads):
+        t = threading.Thread(
+            target=engine._warn_rate_limited,
+            args=(f"drop-key-{i}", "message", 0.0),
+        )
+        threads.append(t)
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert engine._warning_drop_count == n_threads
