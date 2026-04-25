@@ -25,6 +25,7 @@ def engine():
     eng = AdvancedRegimeEngine(n_states=3, n_features=3, seed=7)
     yield eng
     eng._shutdown_warning_worker()
+    eng._shutdown_snapshot_worker()
 
 
 def test_pnl_tracking_subpaths_and_breakers(engine):
@@ -92,11 +93,11 @@ def test_single_tf_invalid_features_fallback_is_safe(engine):
 
 
 def test_warning_worker_is_bounded_and_shutdown_clean(engine):
-    before = len([t for t in threading.enumerate() if t.name == "warning_log_emit"])
+    before = len([t for t in threading.enumerate() if t.name == "warning_emit"])
     for i in range(200):
         engine._warn_rate_limited(f"warn-{i}", "x", cooldown_s=0.0)
     time.sleep(0.05)
-    after = len([t for t in threading.enumerate() if t.name == "warning_log_emit"])
+    after = len([t for t in threading.enumerate() if t.name == "warning_emit"])
     assert after == before == 0
 
     engine._shutdown_warning_worker()
@@ -204,6 +205,7 @@ def test_directional_label_validation_scope(engine):
 
 def test_snapshot_version_uses_engine_constant(monkeypatch):
     captured = {}
+    called = threading.Event()
 
     class DummyReplay:
         def record_event(self, *_a, **_k):
@@ -211,15 +213,18 @@ def test_snapshot_version_uses_engine_constant(monkeypatch):
 
         def snapshot(self, payload):
             captured["payload"] = payload
+            called.set()
 
     eng = AdvancedRegimeEngine(n_states=3, n_features=3, seed=10)
     try:
         eng._replay_engine = DummyReplay()
         eng._tick_id = 99
         eng.update(_md(ts=1.0, ret=0.001, price=100.0))
+        assert called.wait(timeout=1.0)
         assert captured["payload"]["schema_version"] == eng._STATE_VERSION
     finally:
         eng._shutdown_warning_worker()
+        eng._shutdown_snapshot_worker()
 
 
 def test_edge_sizing_single_modulation_path(engine, monkeypatch):
@@ -255,3 +260,185 @@ def test_edge_sizing_single_modulation_path(engine, monkeypatch):
     assert 0.0 <= low <= module._POSITION_SIZE_CAP
     assert 0.0 <= high <= module._POSITION_SIZE_CAP
     assert high > low
+
+
+def test_timestamp_regression_preserves_anchor(engine):
+    engine.update(_md(ts=10.0, ret=0.001, price=100.0))
+    assert engine._last_timestamp == pytest.approx(10.0)
+    dt_before = engine._last_valid_dt
+
+    engine.update(_md(ts=9.0, ret=0.001, price=100.1))
+    assert engine._last_timestamp == pytest.approx(10.0)
+    assert engine._last_valid_dt == pytest.approx(dt_before)
+
+    engine.update(_md(ts=11.0, ret=0.001, price=100.2))
+    assert engine._last_valid_dt == pytest.approx(1.0)
+
+
+def test_alpha_override_cannot_bypass_directional_edge_gate(engine, monkeypatch):
+    monkeypatch.setattr(
+        module,
+        "compute_hmm_regime",
+        lambda *_a, **_k: {
+            "regime": "RANGE",
+            "bull": 0.5,
+            "bear": 0.4,
+            "crisis": 0.1,
+            "trend_strength": 0.5,
+            "risk_level": 0.2,
+            "confidence": 0.8,
+            "conviction": 0.9,
+            "uncertainty": 0.2,
+            "directional_margin": 0.4,
+            "directional_label": "TREND",
+            "edge_score": 0.2,
+            "trend_score": 0.8,
+            "range_score": 0.2,
+            "toxic_score": 0.0,
+        },
+    )
+    monkeypatch.setattr(
+        engine.nhhmm,
+        "forward_pass_step",
+        lambda *_a, **_k: (np.array([0.85, 0.05, 0.10], dtype=float), None),
+    )
+    monkeypatch.setattr(
+        engine.sjm,
+        "online_predict",
+        lambda **_k: (0, np.array([0.4, 0.4, 0.2], dtype=float)),
+    )
+
+    out = engine.update(_md(ts=1.0, ret=0.001, price=100.0))
+    assert out["execution_side"] == "flat"
+    assert out["position_size"] == pytest.approx(0.0)
+
+
+def test_shock_memory_decays_after_moderate_move(engine):
+    engine.update(_md(ts=1.0, ret=0.01, price=100.0))
+    initial = engine._shock_memory
+    assert initial >= 0.01
+
+    for i in range(2, 12):
+        engine.update(_md(ts=float(i), ret=0.0, price=100.0))
+    assert engine._shock_memory < 0.002
+
+
+def test_range_from_flat_has_deterministic_nonzero_signed_size(engine, monkeypatch):
+    engine.last_signed_position_size = 0.0
+    engine._last_edge_score = 1.0
+    monkeypatch.setattr(
+        module,
+        "compute_hmm_regime",
+        lambda *_a, **_k: {
+            "regime": "RANGE",
+            "bull": 0.45,
+            "bear": 0.45,
+            "crisis": 0.10,
+            "trend_strength": 0.0,
+            "risk_level": 0.2,
+            "confidence": 0.7,
+            "conviction": 0.5,
+            "uncertainty": 0.3,
+            "directional_margin": 0.3,
+            "directional_label": "TREND",
+            "edge_score": 0.95,
+            "trend_score": 0.6,
+            "range_score": 0.7,
+            "toxic_score": 0.0,
+        },
+    )
+    monkeypatch.setattr(
+        engine.nhhmm,
+        "forward_pass_step",
+        lambda *_a, **_k: (np.array([0.34, 0.33, 0.33], dtype=float), None),
+    )
+    monkeypatch.setattr(
+        engine.sjm,
+        "online_predict",
+        lambda **_k: (0, np.array([0.33, 0.33, 0.34], dtype=float)),
+    )
+    out = engine.update(_md(ts=1.0, ret=0.0, price=100.0))
+    assert out["execution_side"] == "range_mean_revert"
+    assert out["signed_position_size"] != pytest.approx(0.0)
+
+
+def test_snapshot_hashing_moves_off_hot_path(monkeypatch):
+    class DummyReplay:
+        def __init__(self):
+            self.called = threading.Event()
+            self.payload = None
+
+        def record_event(self, *_a, **_k):
+            return None
+
+        def snapshot(self, payload):
+            self.payload = payload
+            self.called.set()
+
+    eng = AdvancedRegimeEngine(n_states=3, n_features=3, seed=9)
+    replay = DummyReplay()
+    eng._replay_engine = replay
+    eng._tick_id = 99
+
+    monkeypatch.setattr(eng, "_state_hash", lambda *_a, **_k: (time.sleep(0.2) or "hash"))
+    start = time.perf_counter()
+    try:
+        eng.update(_md(ts=1.0, ret=0.001, price=100.0))
+        elapsed = time.perf_counter() - start
+        assert elapsed < 0.15
+        assert replay.called.wait(timeout=1.0)
+        assert replay.payload["state_hash"] == "hash"
+    finally:
+        eng._shutdown_warning_worker()
+        eng._shutdown_snapshot_worker()
+
+
+def test_snapshot_tick_does_not_call_serialize_state(monkeypatch):
+    class DummyReplay:
+        def __init__(self):
+            self.called = threading.Event()
+
+        def record_event(self, *_a, **_k):
+            return None
+
+        def snapshot(self, payload):
+            self.payload = payload
+            self.called.set()
+
+    eng = AdvancedRegimeEngine(n_states=3, n_features=3, seed=11)
+    try:
+        replay = DummyReplay()
+        eng._replay_engine = replay
+        eng._tick_id = 99
+
+        def _fail_serialize():
+            raise AssertionError("serialize_state should not be used on update snapshot path")
+
+        monkeypatch.setattr(eng, "serialize_state", _fail_serialize)
+        out = eng.update(_md(ts=1.0, ret=0.001, price=100.0))
+        assert out["schema_version"] == module._OUTPUT_SCHEMA_VERSION
+        assert replay.called.wait(timeout=1.0)
+    finally:
+        eng._shutdown_warning_worker()
+        eng._shutdown_snapshot_worker()
+
+
+def test_load_snapshot_staging_disables_background_workers(monkeypatch):
+    init_calls = []
+    original_init = module.AdvancedRegimeEngine.__init__
+
+    def _spy_init(self, *args, **kwargs):
+        init_calls.append(bool(kwargs.get("enable_background_workers", True)))
+        return original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(module.AdvancedRegimeEngine, "__init__", _spy_init)
+
+    eng = module.AdvancedRegimeEngine(n_states=3, n_features=3, seed=21)
+    try:
+        snapshot = {"engine_state": eng.serialize_state(), "_engine_rng_state": eng._rng.bit_generator.state}
+        for _ in range(3):
+            eng.load_snapshot(snapshot)
+        assert init_calls.count(False) >= 3
+    finally:
+        eng._shutdown_warning_worker()
+        eng._shutdown_snapshot_worker()
