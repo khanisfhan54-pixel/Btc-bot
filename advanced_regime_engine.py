@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import math
 import hashlib
 import dataclasses
 import copy
@@ -104,7 +105,8 @@ def _safe_float(value: Any, default: float = 0.0, min: float | None = None, max:
 def _safe_int(value: Any, default: int = 0, min: int | None = None, max: int | None = None) -> int:
     parsed = _safe_float(value, default=float(default))
     try:
-        out = int(parsed)
+        # FIXED: 27 — use rounding not truncation for float-backed integers.
+        out = int(math.floor(parsed + 0.5)) if parsed >= 0 else -int(math.floor(abs(parsed) + 0.5))
     except Exception:
         out = int(default)
     if min is not None and out < int(min):
@@ -366,7 +368,6 @@ def _build_output(
         'execution_side': execution_side,
         'signed_position_size': safe_signed_position,
         'extended_schema': bool(extended_schema),
-        'signal_valid': bool(signal_valid),
         
         # --- NEW: forward compatibility anchor ---
         'schema_compat': {
@@ -392,13 +393,17 @@ def _build_output(
             'edge_score': safe_edge_score
         },
     }
+
+    # FIXED: 19 — honour include_signal_valid flag
+    if include_signal_valid:
+        out['signal_valid'] = bool(signal_valid)
     
     # --- HARD GUARD (fail-safe, NON-BREAKING) ---
     if not _validate_output_schema(out):
         fail_safe_probs = [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]
         fail_safe_macro_probs = _normalize_prob_vector(np.asarray(fail_safe_probs, dtype=float)).tolist()
         fail_safe_garch_probs = _normalize_prob_vector(np.asarray([0.5, 0.5], dtype=float)).tolist()
-        return {
+        fail_safe = {
             "schema_version": _OUTPUT_SCHEMA_VERSION,
             "regime_idx": -1,
             "regime_label": "UNKNOWN",
@@ -431,11 +436,13 @@ def _build_output(
                 "feed_status": {"primary": "SCHEMA_FAILURE", "flags": []},
                 "range_ticks": 0,
             },
-            "signal_valid": False,
             "alpha": {
                 "edge_score": 0.0
             }
         }
+        if include_signal_valid:
+            fail_safe["signal_valid"] = False  # FIXED: 19
+        return fail_safe
 
     return out
 
@@ -583,10 +590,11 @@ def compute_hmm_regime(
     ))
 
     # --- RANGE SCORE (SLIGHTLY WEAKENED) ---
+    # FIXED: 24 — weights now sum to 1.0 (was 0.85)
     range_score_raw = (
-        0.35 * range_from_balance
-        + 0.30 * range_from_low_vol
-        + 0.20 * range_from_low_drift
+        0.40 * range_from_balance
+        + 0.35 * range_from_low_vol
+        + 0.25 * range_from_low_drift
     )
     trend_pressure = 0.40 * directional_strength + 0.20 * float(
         np.clip((directional_confidence - 0.5) / 0.5, 0.0, 1.0)
@@ -1349,8 +1357,6 @@ class AdvancedRegimeEngine:
                 except Exception:
                     warnings.warn(msg, RuntimeWarning, stacklevel=2)
 
-        self._obs_counter = 0
-        self._OBS_SAMPLE_RATE = 5  # update metrics every N ticks
         self._tick_id = 0
         self._confidence_collapse_streak = 0
         self._strict_replay = True
@@ -1401,7 +1407,8 @@ class AdvancedRegimeEngine:
                 return bool(controller.should_sample())
             except Exception as exc:
                 self._warn_rate_limited("obs_should_sample_failure", f"Observability sample fallback: {exc}", cooldown_s=30.0)
-        return (int(self._rng.integers(0, self._OBS_SAMPLE_RATE)) == 0)
+        # FIXED: 28 — removed dead _OBS_SAMPLE_RATE state; keep 1-in-5 fallback sampling.
+        return (int(self._rng.integers(0, 5)) == 0)
 
     def _obs_should_emit_warning(self, key: str, cooldown_s: float) -> bool:
         controller = getattr(self, "_obs_controller", None)
@@ -2593,15 +2600,7 @@ class AdvancedRegimeEngine:
         if not isinstance(state, dict):
             self._log_state_load_issue("state", TypeError("state must be dict"), type(state).__name__)
             return
-        expected_hash = state.get("state_hash", None)
-        if expected_hash is not None:
-            hash_payload = dict(state)
-            hash_payload.pop("state_hash", None)
-            hash_payload.pop("_checksum", None)
-            actual_hash = self._state_hash(hash_payload)
-            if str(expected_hash) != str(actual_hash):
-                self._log_state_load_issue("state_hash", ValueError("state hash mismatch"), expected_hash)
-                return
+        # FIXED: 16 — hash validation is handled by public callers (e.g., load_state/load_snapshot).
         validated_rng_state = None
         rng_state = state.get("engine_rng_state", None)
         if rng_state is not None and getattr(self, "_rng", None) is not None:
@@ -2987,7 +2986,6 @@ class AdvancedRegimeEngine:
 
         start_time = time.perf_counter()
         self._tick_id = int(getattr(self, "_tick_id", 0)) + 1
-        self._obs_counter += 1
         valid_tf_count = 0
         expected_weighted_tf_count = 0
         total_candidate_tfs = 0
@@ -3040,6 +3038,7 @@ class AdvancedRegimeEngine:
         current_ts = self._normalize_timestamp(market_data.get("timestamp", None))
         def _halt_if_breaker_after_heal() -> Dict[str, Any] | None:
             if self._circuit_breaker_active:
+                self._update_timestamp_anchor(current_ts)  # FIXED: NEW-A
                 output = _build_halted_output()
                 _observe_latency()
                 if obs_sample and not getattr(self, "_is_replay", False):
@@ -3059,6 +3058,7 @@ class AdvancedRegimeEngine:
                     return halted
             else:
                 self._obs_observe("circuit_breaker", "critical", {"reason": self._circuit_breaker_reason})
+                self._update_timestamp_anchor(current_ts)  # FIXED: NEW-A
                 output = _build_halted_output()
                 _observe_latency()
                 if obs_sample and not getattr(self, "_is_replay", False):
@@ -3117,6 +3117,7 @@ class AdvancedRegimeEngine:
         if abs(y_preview) > pre_shock_threshold:
             self.last_signed_position_size = 0.0
             self._trigger_circuit_breaker("VOL_SHOCK")
+            self._update_timestamp_anchor(current_ts)  # FIXED: NEW-A
             output = _build_halted_output()
             _observe_latency()
             if obs_sample and not getattr(self, "_is_replay", False):
@@ -3167,17 +3168,18 @@ class AdvancedRegimeEngine:
                                     cooldown_s=30.0,
                                 )
                                 self._obs_observe("pnl_tick_order_violation", "high", {"reason": stale_reason})
-                            self._warn_rate_limited(
-                                key="pnl_timestamp_policy_blocked",
-                                message=(
-                                    "PnL tracking requires timestamp anchors but feed is timestamp-less or mixed; "
-                                    "PnL update skipped and feed marked degraded."
-                                ),
-                                cooldown_s=30.0,
-                            )
+                            else:  # FIXED: 17 — only emit generic warning for non-TOV reasons
+                                self._warn_rate_limited(
+                                    key="pnl_timestamp_policy_blocked",
+                                    message=(
+                                        "PnL tracking requires timestamp anchors but feed is timestamp-less or mixed; "
+                                        "PnL update skipped and feed marked degraded."
+                                    ),
+                                    cooldown_s=30.0,
+                                )
+                                self._obs_observe("pnl_timestamp_policy_blocked", "high", {"reason": stale_reason})
                             if "PNL_TIMESTAMP_POLICY_BLOCKED" not in feed_status_annotations:
                                 feed_status_annotations.append("PNL_TIMESTAMP_POLICY_BLOCKED")
-                            self._obs_observe("pnl_timestamp_policy_blocked", "high", {"reason": stale_reason})
 
                         pnl_ret = None
                         if np.isfinite(prev_price) and abs(prev_price) > 1e-12 and not stale_price and policy_allows_pnl:
@@ -3391,6 +3393,7 @@ class AdvancedRegimeEngine:
                     signal_valid=False,
                 )
                 _observe_latency()
+                self._update_timestamp_anchor(current_ts)  # FIXED: NEW-A
                 return output
 
             fused_probs = np.zeros(self.K)
@@ -3485,6 +3488,7 @@ class AdvancedRegimeEngine:
             # FIX 2: SAFE FALLBACK (NO UNDEFINED VARS)
             # ==========================================
             if expected_weighted_tf_count == 0:
+                mtf_partial_survival = True  # FIXED: 20 — base-only is degraded
                 try:
                     x_safe = _coerce_1d_vector(
                         x_t,
@@ -3576,6 +3580,7 @@ class AdvancedRegimeEngine:
                     signal_valid=False,
                 )
                 _observe_latency()
+                self._update_timestamp_anchor(current_ts)  # FIXED: NEW-A
                 return output
 
         # ==========================================
@@ -3607,6 +3612,7 @@ class AdvancedRegimeEngine:
             self.last_signed_position_size = 0.0
             self._trigger_circuit_breaker("VOL_SHOCK")
             self._obs_observe("circuit_breaker", "critical", {"reason": self._circuit_breaker_reason})
+            self._update_timestamp_anchor(current_ts)  # FIXED: NEW-A
             output = _build_halted_output()
             _observe_latency()
             if obs_sample and not getattr(self, "_is_replay", False):
@@ -4113,6 +4119,14 @@ class AdvancedRegimeEngine:
                     confirmed_regime = prev_regime_snapshot
                     confirmed_regime_idx = self._confirmed_regime_idx
                     regime_changed = False
+
+        # FIXED: NEW-B — passive decay prevents stale EMA during long stable regimes.
+        if not regime_changed:
+            self._switch_stability_ema = float(np.clip(
+                0.995 * self._switch_stability_ema + 0.005 * 0.5,
+                1e-6,
+                1.0,
+            ))
 
         self._prev_raw_regime = regime
         self._confirmed_regime = confirmed_regime
