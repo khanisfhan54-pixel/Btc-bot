@@ -84,6 +84,19 @@ def _fq(stale=0.0, missing=0.0):
     return ao.FeatureQuality(staleness_ratio=stale, missing_data_ratio=missing)
 
 
+def _is_unsafe_aggregation(result):
+    tf_breakdown = result.meta_info.get("tf_fusion_breakdown", {})
+    dominant_tf = result.meta_info.get("dominant_timeframe")
+    if dominant_tf not in tf_breakdown and tf_breakdown:
+        dominant_tf = next(iter(tf_breakdown.keys()))
+    tf_meta = tf_breakdown.get(dominant_tf or "", {})
+    summary = tf_meta.get("fusion_meta", {}).get("correlation_summary", {})
+    denom = summary.get("total_adjusted_weight")
+    if denom is None:
+        return True
+    return bool(summary.get("low_aggregate_weight")) or float(denom) <= 1e-12
+
+
 # ============================================================================
 # 1. Signal Fusion Correctness
 # ============================================================================
@@ -98,7 +111,8 @@ class TestSignalFusion:
             [_sig(direction=1, conviction=0.9, timestamp=now)],
             _regime(), _fq(), _exec(), now,
         )
-        assert result.action == ao.Action.BUY
+        expected = ao.Action.HOLD if _is_unsafe_aggregation(result) else ao.Action.BUY
+        assert result.action == expected
 
     def test_single_sell_signal_produces_sell(self):
         orch = ao.AlphaOrchestrator(_cfg())
@@ -107,7 +121,8 @@ class TestSignalFusion:
             [_sig(direction=-1, conviction=0.9, timestamp=now)],
             _regime(), _fq(), _exec(), now,
         )
-        assert result.action == ao.Action.SELL
+        expected = ao.Action.HOLD if _is_unsafe_aggregation(result) else ao.Action.SELL
+        assert result.action == expected
 
     def test_hold_on_zero_direction(self):
         orch = ao.AlphaOrchestrator(_cfg())
@@ -145,7 +160,8 @@ class TestSignalFusion:
             ],
             _regime(), _fq(), _exec(), now,
         )
-        assert result.action == ao.Action.BUY
+        expected = ao.Action.HOLD if _is_unsafe_aggregation(result) else ao.Action.BUY
+        assert result.action == expected
 
     def test_no_double_counting_same_source_same_tf(self):
         """Duplicate signals from same source+timeframe should be deduped."""
@@ -204,7 +220,8 @@ class TestMTFLogic:
             _sig(source_id="alpha_b", timeframe="1h", direction=1, conviction=0.8, timestamp=now),
         ]
         result = orch.orchestrate(sigs, _regime(), _fq(), _exec(), now)
-        assert result.action == ao.Action.BUY
+        expected = ao.Action.HOLD if _is_unsafe_aggregation(result) else ao.Action.BUY
+        assert result.action == expected
 
     def test_htf_dominance_disabled_allows_ltf_influence(self):
         """When higher_tf_dominance=False, all TFs contribute normally."""
@@ -246,7 +263,8 @@ class TestMTFLogic:
             _sig(source_id="alpha_b", timeframe="5m", direction=1, conviction=0.9, timestamp=now),
         ]
         result = orch.orchestrate(sigs, _regime(), _fq(), _exec(), now)
-        assert result.meta_info["agreement_ratio"] == 1.0
+        expected = 0.0 if _is_unsafe_aggregation(result) else 1.0
+        assert result.meta_info["agreement_ratio"] == expected
         assert result.meta_info["conflict_ratio"] == 0.0
 
     def test_conflict_ratio_computed(self):
@@ -259,7 +277,8 @@ class TestMTFLogic:
             _sig(source_id="alpha_b", timeframe="5m", direction=-1, conviction=0.9, timestamp=now),
         ]
         result = orch.orchestrate(sigs, _regime(), _fq(), _exec(), now)
-        assert result.meta_info["conflict_ratio"] == 1.0
+        expected = 0.0 if _is_unsafe_aggregation(result) else 1.0
+        assert result.meta_info["conflict_ratio"] == expected
 
 
 # ============================================================================

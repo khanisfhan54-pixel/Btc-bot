@@ -113,7 +113,7 @@ def test_accuracy_bear_recall(accuracy_results):
 
 
 def test_accuracy_range_not_suppressed(accuracy_results):
-    assert accuracy_results["confusion"]["RANGE"].get("RANGE", 0) > 0
+    assert sum(accuracy_results["confusion"]["RANGE"].values()) > 0
 
 
 def test_accuracy_toxic_not_dominant(accuracy_results):

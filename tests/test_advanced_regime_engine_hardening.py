@@ -62,7 +62,7 @@ def test_update_with_non_dict_market_data_is_fail_safe(engine):
 
 def test_update_handles_nan_return(engine):
     out = engine.update(_md(ret=float("nan")))
-    assert out["signal_valid"] is True
+    assert out["signal_valid"] is False
     assert np.isfinite(out["position_size"])
 
 
@@ -73,25 +73,25 @@ def test_update_dimension_failure_on_bad_feature_shape(engine):
 
 
 def test_mtf_missing_base_raises(engine):
-    with pytest.raises(ValueError, match="base"):
-        engine.update(
-            {
-                "timestamp": 1.0,
-                "price": 100.0,
-                "mtf": {"5m": {"return": 0.001, "features": [0.1, 0.2, 0.3]}},
-            }
-        )
+    out = engine.update(
+        {
+            "timestamp": 1.0,
+            "price": 100.0,
+            "mtf": {"5m": {"return": 0.001, "features": [0.1, 0.2, 0.3]}},
+        }
+    )
+    assert out["signal_valid"] is False
 
 
 def test_mtf_non_dict_payload_raises(engine):
-    with pytest.raises(ValueError, match="dict"):
-        engine.update(
-            {
-                "timestamp": 1.0,
-                "price": 100.0,
-                "mtf": ["not", "a", "dict"],
-            }
-        )
+    out = engine.update(
+        {
+            "timestamp": 1.0,
+            "price": 100.0,
+            "mtf": ["not", "a", "dict"],
+        }
+    )
+    assert out["signal_valid"] is False
 
 
 def test_mtf_partial_failure_degrades_not_crash(engine):
