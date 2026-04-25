@@ -285,7 +285,8 @@ def _build_output(
     raw_size: float,
     is_toxic: bool,
     garch_regime_probs: List[float],
-    feed_status: str,
+    feed_status: Any,
+    engine_status: str = "OK",
     signed_position_size: float = 0.0,
     last_valid_vol: float = 0.0,
     switch_stability_ema: float = 1.0,
@@ -340,6 +341,16 @@ def _build_output(
         safe_float(garch_regime_probs[i] if isinstance(garch_regime_probs, list) and len(garch_regime_probs) > i else 0.5, default=0.5, min=0.0)
         for i in range(2)
     ], dtype=float)).tolist()
+    if isinstance(feed_status, dict):
+        primary_status = str(feed_status.get("primary", "UNKNOWN"))
+        raw_flags = feed_status.get("flags", [])
+        if not isinstance(raw_flags, list):
+            raw_flags = []
+        status_flags = [str(v)[:64] for v in raw_flags[:8]]
+    else:
+        primary_status = str(feed_status or "UNKNOWN")
+        status_flags = []
+
     out = {
         'schema_version': _OUTPUT_SCHEMA_VERSION,
         'regime_idx': safe_regime_idx,
@@ -370,7 +381,8 @@ def _build_output(
             'switch_stability_ema': safe_switch_stability,
             'toxic_penalty_applied': bool(is_toxic),
             'garch_regime_probs': safe_garch_probs,
-            'feed_status': str(feed_status or "UNKNOWN"),
+            'feed_status': {"primary": primary_status, "flags": status_flags},
+            'engine_status': str(engine_status or "UNKNOWN"),
             'range_ticks': int(safe_float(range_ticks, default=0.0, min=0.0, max=1e9)),
         },
         # ==========================================
@@ -416,7 +428,7 @@ def _build_output(
                 "switch_stability_ema": safe_switch_stability,
                 "toxic_penalty_applied": True,
                 "garch_regime_probs": fail_safe_garch_probs,
-                "feed_status": "SCHEMA_FAILURE",
+                "feed_status": {"primary": "SCHEMA_FAILURE", "flags": []},
                 "range_ticks": 0,
             },
             "signal_valid": False,
@@ -908,6 +920,8 @@ class AdvancedRegimeEngine:
     _VOL_SHOCK_MULTIPLIER = 3.5
     _CONFIDENCE_COLLAPSE_THRESHOLD = 0.35
     _CONFIDENCE_COLLAPSE_MIN_STREAK = 3
+    _CONF_COLLAPSE_WARMUP_UPDATES: int = 20
+    _CONF_COLLAPSE_WARMUP_SECONDS: float = 60.0
     _HEALING_COOLDOWN_TICKS = 20
 
     _EWM_ALPHA: float = 0.15
@@ -944,6 +958,7 @@ class AdvancedRegimeEngine:
     _MAX_POSITION_SIZE: float = _POSITION_SIZE_CAP
     _MIN_EQUITY_FLOOR: float = 1e-6
     _MAX_PRICE_STALENESS_SEC: float = 300.0
+    _MAX_PRICE_STALENESS_TICKS: int = 5
     _PRICE_RETURN_MISMATCH_TOLERANCE: float = 1e-3
     _CANONICAL_RETURN_MISMATCH_TOLERANCE: float = 1e-12
     _DIRECTION_SWITCH_GAP: float = 0.02
@@ -956,6 +971,13 @@ class AdvancedRegimeEngine:
     }
     _VALID_REGIME_LABELS: set[str] = {"TREND", "RANGE", "BEAR", "TOXIC"}
     _VALID_DIRECTIONAL_LABELS: set[str] = {"TREND", "BEAR"}
+    _VALID_DETERMINISM_STATUS: set[str] = {"OK", "RNG_RESTORE_FAILED", "OK_WITH_HISTORY"}
+    _VALID_PNL_MODES: set[str] = {"TIMESTAMP", "TICK"}
+    _SHOCK_STARTUP_MULTIPLIER: float = 2.25
+    _SHOCK_STARTUP_VOL_FLOOR_MULT: float = 0.85
+    _SHOCK_WARMUP_TICKS: int = 32
+    _SHOCK_WARMUP_SECONDS: float = 120.0
+    _RETURN_EMA_BASE_DECAY: float = 0.92
 
     def _json_default(self, obj: Any):
         """
@@ -1031,6 +1053,22 @@ class AdvancedRegimeEngine:
         except Exception:
             return "UNSUPPORTED_RNG"
 
+    def _validate_rng_state_payload(self, rng_state: Any) -> Dict[str, Any]:
+        if not isinstance(rng_state, dict):
+            raise ValueError("rng state must be a dict")
+        if getattr(self, "_rng", None) is None:
+            raise ValueError("engine rng is unavailable")
+        candidate_state = copy.deepcopy(dict(rng_state))
+        probe_a = np.random.Generator(type(self._rng.bit_generator)())
+        probe_b = np.random.Generator(type(self._rng.bit_generator)())
+        probe_a.bit_generator.state = copy.deepcopy(candidate_state)
+        probe_b.bit_generator.state = copy.deepcopy(candidate_state)
+        a_sample = probe_a.integers(0, np.iinfo(np.uint64).max, size=8, dtype=np.uint64)
+        b_sample = probe_b.integers(0, np.iinfo(np.uint64).max, size=8, dtype=np.uint64)
+        if not np.array_equal(a_sample, b_sample):
+            raise ValueError("rng reproducibility probe mismatch")
+        return candidate_state
+
     def _state_hash(self, state: Dict[str, Any]) -> str:
         try:
             canonical = self._deep_sort(self._canonicalize(state))
@@ -1066,6 +1104,12 @@ class AdvancedRegimeEngine:
         strict_mtf_keys: bool = True,
         mtf_weights: Dict[str, float] = None,
         sjm_reserved_feature_indices: tuple[int, int] | None = None,
+        allow_timestamp_free_pnl: bool = True,
+        max_price_staleness_ticks: int = _MAX_PRICE_STALENESS_TICKS,
+        shock_warmup_ticks: int = _SHOCK_WARMUP_TICKS,
+        shock_warmup_seconds: float = _SHOCK_WARMUP_SECONDS,
+        shock_startup_multiplier: float = _SHOCK_STARTUP_MULTIPLIER,
+        shock_startup_vol_floor_mult: float = _SHOCK_STARTUP_VOL_FLOOR_MULT,
         seed: int | None = 7,
         engine_id: str | None = None,
         enable_background_workers: bool = True,
@@ -1110,6 +1154,12 @@ class AdvancedRegimeEngine:
             'regime_prob_floor': self.garch._REGIME_PROB_FLOOR,
             'schema_version': _OUTPUT_SCHEMA_VERSION,
             'seed': self._rng_seed,
+            'allow_timestamp_free_pnl': bool(allow_timestamp_free_pnl),
+            'max_price_staleness_ticks': int(max_price_staleness_ticks),
+            'shock_warmup_ticks': int(shock_warmup_ticks),
+            'shock_warmup_seconds': float(shock_warmup_seconds),
+            'shock_startup_multiplier': float(shock_startup_multiplier),
+            'shock_startup_vol_floor_mult': float(shock_startup_vol_floor_mult),
         }
 
         for k in range(len(self.garch.alpha)):
@@ -1137,6 +1187,10 @@ class AdvancedRegimeEngine:
         # --- NEW: PnL tracking ---
         self._last_price = None
         self._last_price_timestamp = None
+        self._last_price_tick_id = None
+        self._pnl_mode = None
+        self._allow_timestamp_free_pnl = bool(allow_timestamp_free_pnl)
+        self._max_price_staleness_ticks = max(int(max_price_staleness_ticks), 1)
         self._last_effective_trend_strength = 0.0
         self._last_edge_score = 0.0
         self._last_regime_change_ts = None
@@ -1154,6 +1208,15 @@ class AdvancedRegimeEngine:
         self._last_timestamp = None
         self._DECAY_LAMBDA = 0.5
         self._last_valid_dt = 1.0
+        self._return_ema_base_decay = float(np.clip(self._RETURN_EMA_BASE_DECAY, 1e-6, 0.999999))
+        self._valid_return_count = 0
+        self._first_valid_return_ts = None
+        self._posterior_update_count = 0
+        self._first_posterior_ts = None
+        self._shock_warmup_ticks = max(int(shock_warmup_ticks), 1)
+        self._shock_warmup_seconds = max(float(shock_warmup_seconds), 1.0)
+        self._shock_startup_multiplier = float(np.clip(shock_startup_multiplier, 1.0, self._VOL_SHOCK_MULTIPLIER))
+        self._shock_startup_vol_floor_mult = float(np.clip(shock_startup_vol_floor_mult, 0.1, 1.5))
         self._MAX_DT = 60.0
         self._regime_persistence = 0
         self._REGIME_CONFIRMATION_TICKS = 2
@@ -1190,6 +1253,8 @@ class AdvancedRegimeEngine:
         self._warning_counts: Dict[str, int] = {}
         self._warning_lock = threading.RLock()
         self._last_health = "OK"
+        self._determinism_status = "OK"
+        self._determinism_had_failure = False
         self._warning_drop_count = 0
         self._warning_drop_alerted = False
         self._warning_backend_failure_count = 0
@@ -1528,6 +1593,126 @@ class AdvancedRegimeEngine:
     def _update_timestamp_anchor(self, current_ts: float | None) -> None:
         if current_ts is not None:
             self._last_timestamp = float(current_ts)
+
+    def _set_price_anchor(self, price: float, timestamp: float | None, tick_id: int) -> tuple[bool, str]:
+        """Atomically set price anchor components used by PnL reconciliation."""
+        inferred_mode = "TIMESTAMP" if timestamp is not None else "TICK"
+        current_mode = getattr(self, "_pnl_mode", None)
+        if current_mode is None:
+            self._pnl_mode = inferred_mode
+        elif current_mode != inferred_mode:
+            return False, f"PNL_MODE_SWITCH:{current_mode}->{inferred_mode}"
+        self._last_price = float(price)
+        self._last_price_timestamp = None if timestamp is None else float(timestamp)
+        self._last_price_tick_id = int(tick_id)
+        return True, "OK"
+
+    def _record_valid_return(self, current_ts: float | None) -> None:
+        self._valid_return_count = int(getattr(self, "_valid_return_count", 0)) + 1
+        if self._first_valid_return_ts is None and current_ts is not None:
+            self._first_valid_return_ts = float(current_ts)
+
+    def _record_posterior_update(self, current_ts: float | None) -> None:
+        self._posterior_update_count = int(getattr(self, "_posterior_update_count", 0)) + 1
+        if self._first_posterior_ts is None and current_ts is not None:
+            self._first_posterior_ts = float(current_ts)
+
+    def _is_confidence_collapse_warmup(self, current_ts: float | None) -> bool:
+        count_progress = float(np.clip(
+            float(getattr(self, "_posterior_update_count", 0))
+            / max(float(self._CONF_COLLAPSE_WARMUP_UPDATES), 1.0),
+            0.0,
+            1.0,
+        ))
+        time_progress = 0.0
+        if self._first_posterior_ts is not None and current_ts is not None:
+            elapsed = max(float(current_ts) - float(self._first_posterior_ts), 0.0)
+            time_progress = float(np.clip(
+                elapsed / max(float(self._CONF_COLLAPSE_WARMUP_SECONDS), 1.0),
+                0.0,
+                1.0,
+            ))
+        blended_progress = count_progress
+        if self._first_posterior_ts is not None and current_ts is not None:
+            blended_progress = 0.7 * count_progress + 0.3 * time_progress
+        blended_progress = float(np.clip(blended_progress, 0.0, 1.0))
+        return blended_progress < 1.0
+
+    def _normalize_determinism_status(self, raw_status: Any) -> str:
+        candidate = str(raw_status).strip().upper() if raw_status is not None else "OK"
+        if candidate in self._VALID_DETERMINISM_STATUS:
+            return candidate
+        return "OK"
+
+    def _mark_determinism_failure(self) -> None:
+        self._determinism_status = "RNG_RESTORE_FAILED"
+        self._determinism_had_failure = True
+
+    def _mark_determinism_success(self) -> None:
+        self._determinism_status = "OK_WITH_HISTORY" if getattr(self, "_determinism_had_failure", False) else "OK"
+
+    def _pnl_staleness_policy(self, current_ts: float | None) -> tuple[bool, bool, str]:
+        """
+        Returns (policy_allows_pnl, stale_price, reason).
+        Deterministic policy:
+        - Mode is locked on first anchor (TIMESTAMP or TICK) and cannot switch mid-run.
+        - TIMESTAMP mode requires valid timestamp gap.
+        - TICK mode requires deterministic tick-gap freshness.
+        - If timestamp-free mode is disabled and timestamp gap cannot be evaluated, block PnL explicitly.
+        """
+        mode = getattr(self, "_pnl_mode", None)
+        if mode not in ("TIMESTAMP", "TICK"):
+            return False, True, "PNL_MODE_INVALID"
+        last_ts = self._last_price_timestamp
+        if mode == "TIMESTAMP" and current_ts is not None and last_ts is not None:
+            stale_gap = float(current_ts - last_ts)
+            stale = stale_gap < 0.0 or stale_gap > self._MAX_PRICE_STALENESS_SEC
+            return True, stale, "TIMESTAMP_GAP"
+        if mode == "TIMESTAMP":
+            return False, True, "PNL_MODE_CONFLICT"
+        prev_anchor_tick = self._last_price_tick_id
+        if prev_anchor_tick is None:
+            return True, True, "TICK_ANCHOR_MISSING"
+        if int(self._tick_id) <= int(prev_anchor_tick):
+            return False, True, "TICK_ORDER_VIOLATION"
+        tick_gap = int(self._tick_id - prev_anchor_tick)
+        stale = tick_gap <= 0 or tick_gap > self._max_price_staleness_ticks
+        return True, stale, "TICK_GAP"
+
+    def _warmup_progress(self, current_ts: float | None) -> float:
+        tick_progress = float(np.clip(
+            float(getattr(self, "_valid_return_count", 0)) / max(float(self._shock_warmup_ticks), 1.0),
+            0.0,
+            1.0,
+        ))
+        time_progress = 0.0
+        first_ts = getattr(self, "_first_valid_return_ts", None)
+        if first_ts is not None and current_ts is not None:
+            elapsed = max(float(current_ts) - float(first_ts), 0.0)
+            time_progress = float(np.clip(elapsed / max(float(self._shock_warmup_seconds), 1.0), 0.0, 1.0))
+        return max(tick_progress, time_progress)
+
+    def _shock_threshold(self, baseline_vol: float, current_ts: float | None) -> tuple[float, float]:
+        warmup = self._warmup_progress(current_ts)
+        floor_mult = (
+            self._shock_startup_vol_floor_mult
+            + (1.5 - self._shock_startup_vol_floor_mult) * warmup
+        )
+        shock_vol_basis = max(
+            float(baseline_vol),
+            float(getattr(self, "_last_valid_vol", self.garch.target_vol)),
+            float(self.garch.target_vol) * float(floor_mult),
+            1e-8,
+        )
+        shock_multiplier = (
+            self._shock_startup_multiplier
+            + (self._VOL_SHOCK_MULTIPLIER - self._shock_startup_multiplier) * warmup
+        )
+        return float(shock_multiplier * shock_vol_basis), float(shock_vol_basis)
+
+    def _ema_decay(self, dt: float) -> float:
+        dt_safe = float(np.clip(dt, 0.0, self._MAX_DT))
+        return float(np.clip(self._return_ema_base_decay ** dt_safe, 1e-9, 1.0))
 
     def _resolve_canonical_return(
         self,
@@ -2246,6 +2431,10 @@ class AdvancedRegimeEngine:
             "last_signed_position_size": float(self.last_signed_position_size),
             "last_price": None if self._last_price is None else float(self._last_price),
             "last_price_timestamp": None if self._last_price_timestamp is None else float(self._last_price_timestamp),
+            "last_price_tick_id": None if self._last_price_tick_id is None else int(self._last_price_tick_id),
+            "pnl_mode": self._pnl_mode,
+            "allow_timestamp_free_pnl": bool(self._allow_timestamp_free_pnl),
+            "max_price_staleness_ticks": int(self._max_price_staleness_ticks),
             "in_range": bool(self._in_range),
             "prev_regime": self._prev_regime,
             "prev_raw_regime": self._prev_raw_regime,
@@ -2277,6 +2466,18 @@ class AdvancedRegimeEngine:
             "shock_memory": float(self._shock_memory),
             "return_ema": float(self._return_ema),
             "abs_return_ema": float(self._abs_return_ema),
+            "valid_return_count": int(getattr(self, "_valid_return_count", 0)),
+            "first_valid_return_ts": (
+                None if self._first_valid_return_ts is None else float(self._first_valid_return_ts)
+            ),
+            "posterior_update_count": int(getattr(self, "_posterior_update_count", 0)),
+            "first_posterior_ts": (
+                None if self._first_posterior_ts is None else float(self._first_posterior_ts)
+            ),
+            "shock_warmup_ticks": int(self._shock_warmup_ticks),
+            "shock_warmup_seconds": float(self._shock_warmup_seconds),
+            "shock_startup_multiplier": float(self._shock_startup_multiplier),
+            "shock_startup_vol_floor_mult": float(self._shock_startup_vol_floor_mult),
             "prev_directional_label": getattr(self, "_prev_directional_label", None),
             "rng_seed": self._rng_seed,
             "engine_rng_state": (
@@ -2292,6 +2493,8 @@ class AdvancedRegimeEngine:
                 if getattr(self, "_rng", None) is not None else None
             ),
             "confidence_collapse_streak": int(getattr(self, "_confidence_collapse_streak", 0)),
+            "determinism_status": str(getattr(self, "_determinism_status", "OK")),
+            "determinism_had_failure": bool(getattr(self, "_determinism_had_failure", False)),
             # Explicitly mark deprecated field as False to avoid confusion in external systems
             "emit_extended_schema": False,
         }
@@ -2369,6 +2572,11 @@ class AdvancedRegimeEngine:
         self._loss_streak = 0
         self._last_price = None
         self._last_price_timestamp = None
+        self._last_price_tick_id = None
+        self._valid_return_count = 0
+        self._first_valid_return_ts = None
+        self._posterior_update_count = 0
+        self._first_posterior_ts = None
         self._circuit_breaker_active = False
         self._circuit_breaker_reason = None
         self._circuit_breaker_trigger_tick = -1
@@ -2378,12 +2586,31 @@ class AdvancedRegimeEngine:
         self._last_healing_context = {}
         self._healing_count = 0
         self._confidence_collapse_streak = 0
+        self._determinism_status = "OK"
+        self._determinism_had_failure = False
 
-    @_synchronized
-    def load_state(self, state: Dict[str, Any]) -> None:
+    def _load_state_inplace(self, state: Dict[str, Any]) -> None:
         if not isinstance(state, dict):
             self._log_state_load_issue("state", TypeError("state must be dict"), type(state).__name__)
             return
+        expected_hash = state.get("state_hash", None)
+        if expected_hash is not None:
+            hash_payload = dict(state)
+            hash_payload.pop("state_hash", None)
+            hash_payload.pop("_checksum", None)
+            actual_hash = self._state_hash(hash_payload)
+            if str(expected_hash) != str(actual_hash):
+                self._log_state_load_issue("state_hash", ValueError("state hash mismatch"), expected_hash)
+                return
+        validated_rng_state = None
+        rng_state = state.get("engine_rng_state", None)
+        if rng_state is not None and getattr(self, "_rng", None) is not None:
+            try:
+                validated_rng_state = self._validate_rng_state_payload(rng_state)
+            except Exception as exc:
+                self._mark_determinism_failure()
+                self._log_state_load_issue("engine_rng_state", exc, "invalid_rng_state")
+                return
 
         expected_signature = f"AdvancedRegimeEngine|v={self._STATE_VERSION}|schema={_OUTPUT_SCHEMA_VERSION}|n_states={self.K}|n_features={self.n_features}"
         incoming_signature = state.get("model_signature")
@@ -2441,6 +2668,17 @@ class AdvancedRegimeEngine:
             max_value=1.0,
         )
         self._in_range = bool(state.get("in_range", False))
+        self._allow_timestamp_free_pnl = bool(state.get("allow_timestamp_free_pnl", self._allow_timestamp_free_pnl))
+        self._max_price_staleness_ticks = _safe_int(
+            state.get("max_price_staleness_ticks", self._max_price_staleness_ticks),
+            default=self._max_price_staleness_ticks,
+            min=1,
+        )
+        incoming_pnl_mode = state.get("pnl_mode", None)
+        self._pnl_mode = None if incoming_pnl_mode is None else str(incoming_pnl_mode).upper()
+        if self._pnl_mode not in (None, "TIMESTAMP", "TICK"):
+            self._log_state_load_issue("pnl_mode", ValueError("invalid pnl_mode"), incoming_pnl_mode)
+            self._pnl_mode = None
         last_price = state.get("last_price", None)
         self._last_price = None
         if last_price is not None:
@@ -2450,19 +2688,32 @@ class AdvancedRegimeEngine:
             else:
                 self._log_state_load_issue("last_price", ValueError("non-finite last_price"), last_price)
         self._last_price_timestamp = self._normalize_timestamp(state.get("last_price_timestamp", None))
+        self._last_price_tick_id = None
+        if state.get("last_price_tick_id", None) is not None:
+            self._last_price_tick_id = _safe_int(state.get("last_price_tick_id"), default=-1, min=-1)
+            if self._last_price_tick_id < 0:
+                self._last_price_tick_id = None
         if state.get("last_price_timestamp", None) is not None and self._last_price_timestamp is None:
             self._log_state_load_issue(
                 "last_price_timestamp",
                 ValueError("invalid timestamp"),
                 state.get("last_price_timestamp"),
             )
-        if self._last_price is not None and self._last_price_timestamp is None:
+        if (
+            self._last_price is not None
+            and self._last_price_timestamp is None
+            and (not self._allow_timestamp_free_pnl or self._last_price_tick_id is None)
+        ):
             self._log_state_load_issue(
                 "last_price",
-                ValueError("last_price provided without valid last_price_timestamp"),
+                ValueError("last_price provided without valid anchor policy"),
                 self._last_price,
             )
             self._last_price = None
+        if self._last_price is None:
+            self._pnl_mode = None
+        elif self._pnl_mode is None:
+            self._pnl_mode = "TIMESTAMP" if self._last_price_timestamp is not None else "TICK"
 
         self._last_effective_trend_strength = self._state_scalar(
             state,
@@ -2603,12 +2854,122 @@ class AdvancedRegimeEngine:
         self._return_ema = self._state_scalar(state, "return_ema", default=0.0)
         self._abs_return_ema = self._state_scalar(state, "abs_return_ema", default=0.0, min_value=0.0)
         self._confidence_collapse_streak = _safe_int(state.get("confidence_collapse_streak", 0), default=0, min=0)
-        rng_state = state.get("engine_rng_state", None)
-        if isinstance(rng_state, dict) and getattr(self, "_rng", None) is not None:
+        self._valid_return_count = _safe_int(state.get("valid_return_count", 0), default=0, min=0)
+        self._first_valid_return_ts = self._normalize_timestamp(state.get("first_valid_return_ts", None))
+        self._posterior_update_count = _safe_int(state.get("posterior_update_count", 0), default=0, min=0)
+        self._first_posterior_ts = self._normalize_timestamp(state.get("first_posterior_ts", None))
+        self._shock_warmup_ticks = _safe_int(
+            state.get("shock_warmup_ticks", self._shock_warmup_ticks),
+            default=self._shock_warmup_ticks,
+            min=1,
+        )
+        self._shock_warmup_seconds = self._state_scalar(
+            state,
+            "shock_warmup_seconds",
+            default=self._shock_warmup_seconds,
+            min_value=1.0,
+        )
+        self._shock_startup_multiplier = self._state_scalar(
+            state,
+            "shock_startup_multiplier",
+            default=self._shock_startup_multiplier,
+            min_value=1.0,
+            max_value=self._VOL_SHOCK_MULTIPLIER,
+        )
+        self._shock_startup_vol_floor_mult = self._state_scalar(
+            state,
+            "shock_startup_vol_floor_mult",
+            default=self._shock_startup_vol_floor_mult,
+            min_value=0.1,
+            max_value=1.5,
+        )
+        if validated_rng_state is not None and getattr(self, "_rng", None) is not None:
+            self._rng.bit_generator.state = validated_rng_state
+        incoming_det_status = self._normalize_determinism_status(state.get("determinism_status", "OK"))
+        prior_had_failure = bool(getattr(self, "_determinism_had_failure", False))
+        self._determinism_had_failure = bool(_safe_int(state.get("determinism_had_failure", 0), default=0, min=0, max=1))
+        if incoming_det_status in ("RNG_RESTORE_FAILED", "OK_WITH_HISTORY"):
+            self._determinism_had_failure = True
+        self._determinism_had_failure = bool(self._determinism_had_failure or prior_had_failure)
+        restore_attempted = validated_rng_state is not None
+        if restore_attempted:
+            self._mark_determinism_success()
+        elif incoming_det_status == "RNG_RESTORE_FAILED":
+            # Preserve historical failure marker only; do not mark current load as failed.
+            self._determinism_had_failure = True
+            self._determinism_status = "OK_WITH_HISTORY"
+
+    @_synchronized
+    def load_state(self, state: Dict[str, Any]) -> None:
+        """
+        Atomic state load:
+        1) hydrate staging engine
+        2) fully validate/apply on staging
+        3) commit materialized state to self in one swap
+        """
+        if not isinstance(state, dict):
+            self._log_state_load_issue("state", TypeError("state must be dict"), type(state).__name__)
+            return
+        expected_hash = state.get("state_hash", None)
+        if expected_hash is not None:
+            hash_payload = dict(state)
+            hash_payload.pop("state_hash", None)
+            hash_payload.pop("_checksum", None)
+            if str(expected_hash) != str(self._state_hash(hash_payload)):
+                self._log_state_load_issue("state_hash", ValueError("state hash mismatch"), expected_hash)
+                return
+        incoming_rng_state = state.get("engine_rng_state", None)
+        if incoming_rng_state is not None and getattr(self, "_rng", None) is not None:
             try:
-                self._rng.bit_generator.state = dict(rng_state)
+                self._validate_rng_state_payload(incoming_rng_state)
             except Exception as exc:
+                self._mark_determinism_failure()
                 self._log_state_load_issue("engine_rng_state", exc, "invalid_rng_state")
+                return
+        staging = AdvancedRegimeEngine(
+            n_states=int(self._init_params.get("n_states", self.K)),
+            n_features=int(self._init_params.get("n_features", self.n_features)),
+            target_vol=float(self._init_params.get("target_vol", self.garch.target_vol)),
+            allow_igarch=bool(self._allow_igarch),
+            regime_prob_floor=float(self.garch._REGIME_PROB_FLOOR),
+            emit_extended_schema=bool(self._emit_extended_schema),
+            strict_mtf_keys=bool(self._strict_mtf_keys),
+            mtf_weights=copy.deepcopy(self.mtf_weights),
+            sjm_reserved_feature_indices=self._sjm_reserved_feature_indices,
+            allow_timestamp_free_pnl=bool(self._allow_timestamp_free_pnl),
+            max_price_staleness_ticks=int(self._max_price_staleness_ticks),
+            shock_warmup_ticks=int(self._shock_warmup_ticks),
+            shock_warmup_seconds=float(self._shock_warmup_seconds),
+            shock_startup_multiplier=float(self._shock_startup_multiplier),
+            shock_startup_vol_floor_mult=float(self._shock_startup_vol_floor_mult),
+            seed=self._rng_seed,
+            engine_id=self.engine_id,
+            enable_background_workers=False,
+        )
+        try:
+            staging._is_replay = True
+            staging._determinism_status = str(getattr(self, "_determinism_status", "OK"))
+            staging._determinism_had_failure = bool(getattr(self, "_determinism_had_failure", False))
+            staging._load_state_inplace(copy.deepcopy(state))
+            if str(getattr(staging, "_determinism_status", "OK")) == "RNG_RESTORE_FAILED":
+                self._mark_determinism_failure()
+                return
+            committed_state = staging.serialize_state()
+            committed_rng_state = (
+                copy.deepcopy(staging._rng.bit_generator.state)
+                if getattr(staging, "_rng", None) is not None else None
+            )
+        except Exception as exc:
+            self._log_state_load_issue("state_atomic", exc, "atomic_stage_failure")
+            return
+        finally:
+            staging._shutdown_warning_worker()
+            staging._shutdown_snapshot_worker()
+
+        # Commit in one shot (no validation failures expected after staging).
+        self._load_state_inplace(committed_state)
+        if committed_rng_state is not None and getattr(self, "_rng", None) is not None:
+            self._rng.bit_generator.state = committed_rng_state
 
     @_synchronized
     def update(self, market_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -2665,6 +3026,7 @@ class AdvancedRegimeEngine:
                 is_toxic=True,
                 garch_regime_probs=[0.5, 0.5],
                 feed_status=f"CIRCUIT_BREAKER:{self._circuit_breaker_reason}",
+                engine_status=str(getattr(self, "_determinism_status", "OK")),
                 last_valid_vol=self._last_valid_vol,
                 switch_stability_ema=self._switch_stability_ema,
                 execution_side="flat",
@@ -2732,6 +3094,7 @@ class AdvancedRegimeEngine:
                 is_toxic=True,
                 garch_regime_probs=self.garch_prob.tolist(),
                 feed_status='INVALID_RETURN_INPUT',
+                engine_status=str(getattr(self, "_determinism_status", "OK")),
                 last_valid_vol=float(getattr(self, "_last_valid_vol", self.garch.target_vol)),
                 switch_stability_ema=float(getattr(self, "_switch_stability_ema", 1.0)),
                 execution_side='flat',
@@ -2745,16 +3108,12 @@ class AdvancedRegimeEngine:
         # 🚨 STEP -1: PRE-SHOCK GATE + PnL TRACKING
         # ==========================================
         y_preview = float(canonical_return)
+        self._record_valid_return(current_ts)
         pre_shock_baseline_vol = float(
             np.sqrt(np.dot(self._smoothed_garch_prob, np.clip(self.garch_var, 1e-8, None)))
         )
-        shock_vol_basis = max(
-            pre_shock_baseline_vol,
-            float(getattr(self, "_last_valid_vol", self.garch.target_vol)),
-            float(self.garch.target_vol) * 1.5,
-            1e-8,
-        )
-        pre_shock_threshold = self._VOL_SHOCK_MULTIPLIER * shock_vol_basis
+        pre_shock_threshold, shock_vol_basis = self._shock_threshold(pre_shock_baseline_vol, current_ts)
+        feed_status_annotations: list[str] = []
         if abs(y_preview) > pre_shock_threshold:
             self.last_signed_position_size = 0.0
             self._trigger_circuit_breaker("VOL_SHOCK")
@@ -2784,15 +3143,10 @@ class AdvancedRegimeEngine:
                     if self._last_price is not None:
                         prev_price = float(self._last_price)
                         stale_price = True
+                        policy_allows_pnl = True
+                        stale_reason = "UNKNOWN"
                         try:
-                            stale_gap = None
-                            if current_ts is not None and self._last_price_timestamp is not None:
-                                stale_gap = float(current_ts - self._last_price_timestamp)
-                            stale_price = (
-                                stale_gap is None
-                                or stale_gap < 0.0
-                                or stale_gap > self._MAX_PRICE_STALENESS_SEC
-                            )
+                            policy_allows_pnl, stale_price, stale_reason = self._pnl_staleness_policy(current_ts)
                         except (TypeError, ValueError) as exc:
                             self._warn_rate_limited(
                                 key="pnl_stale_price_check_failure",
@@ -2800,9 +3154,33 @@ class AdvancedRegimeEngine:
                                 cooldown_s=15.0,
                             )
                             stale_price = True
+                            policy_allows_pnl = False
+                            stale_reason = "STALE_CHECK_ERROR"
+                        if not policy_allows_pnl:
+                            if stale_reason == "TICK_ORDER_VIOLATION":
+                                self._warn_rate_limited(
+                                    key="pnl_tick_order_violation",
+                                    message=(
+                                        "PnL anchor tick ordering violated (non-monotonic tick id); "
+                                        "PnL update blocked and feed degraded."
+                                    ),
+                                    cooldown_s=30.0,
+                                )
+                                self._obs_observe("pnl_tick_order_violation", "high", {"reason": stale_reason})
+                            self._warn_rate_limited(
+                                key="pnl_timestamp_policy_blocked",
+                                message=(
+                                    "PnL tracking requires timestamp anchors but feed is timestamp-less or mixed; "
+                                    "PnL update skipped and feed marked degraded."
+                                ),
+                                cooldown_s=30.0,
+                            )
+                            if "PNL_TIMESTAMP_POLICY_BLOCKED" not in feed_status_annotations:
+                                feed_status_annotations.append("PNL_TIMESTAMP_POLICY_BLOCKED")
+                            self._obs_observe("pnl_timestamp_policy_blocked", "high", {"reason": stale_reason})
 
                         pnl_ret = None
-                        if np.isfinite(prev_price) and abs(prev_price) > 1e-12 and not stale_price:
+                        if np.isfinite(prev_price) and abs(prev_price) > 1e-12 and not stale_price and policy_allows_pnl:
                             try:
                                 frac_ret = float((parsed_price - prev_price) / prev_price)
                             except (TypeError, ValueError, ZeroDivisionError) as exc:
@@ -2834,13 +3212,13 @@ class AdvancedRegimeEngine:
                                                 "high",
                                                 {"delta": mismatch, "tolerance": self._PRICE_RETURN_MISMATCH_TOLERANCE},
                                             )
-                                            try:
-                                                self._last_price = float(parsed_price)
-                                                self._last_price_timestamp = current_ts
-                                            except Exception as exc:
+                                            anchor_ok, anchor_reason = self._set_price_anchor(
+                                                float(parsed_price), current_ts, int(self._tick_id)
+                                            )
+                                            if not anchor_ok:
                                                 self._warn_rate_limited(
-                                                    key="pnl_last_price_state_failure",
-                                                    message=f"Last-price state mutation failed: {exc}",
+                                                    key="pnl_anchor_mode_conflict",
+                                                    message=f"Last-price anchor rejected: {anchor_reason}",
                                                     cooldown_s=15.0,
                                                 )
                                             self.last_signed_position_size = 0.0
@@ -2862,6 +3240,7 @@ class AdvancedRegimeEngine:
                                                 is_toxic=True,
                                                 garch_regime_probs=self.garch_prob.tolist(),
                                                 feed_status='PRICE_RETURN_MISMATCH',
+                                                engine_status=str(getattr(self, "_determinism_status", "OK")),
                                                 last_valid_vol=float(getattr(self, "_last_valid_vol", self.garch.target_vol)),
                                                 switch_stability_ema=float(getattr(self, "_switch_stability_ema", 1.0)),
                                                 execution_side='flat',
@@ -2931,15 +3310,17 @@ class AdvancedRegimeEngine:
                         cooldown_s=15.0,
                     )
 
-                try:
-                    self._last_price = float(parsed_price)
-                    self._last_price_timestamp = current_ts
-                except Exception as exc:
-                    self._warn_rate_limited(
-                        key="pnl_last_price_state_failure",
-                        message=f"Last-price state mutation failed: {exc}",
-                        cooldown_s=15.0,
-                    )
+                update_anchor = True
+                if self._last_price is not None and stale_reason in {"TICK_ORDER_VIOLATION", "PNL_MODE_CONFLICT", "PNL_MODE_INVALID"}:
+                    update_anchor = False
+                if update_anchor:
+                    anchor_ok, anchor_reason = self._set_price_anchor(float(parsed_price), current_ts, int(self._tick_id))
+                    if not anchor_ok:
+                        self._warn_rate_limited(
+                            key="pnl_anchor_mode_conflict",
+                            message=f"Last-price anchor rejected: {anchor_reason}",
+                            cooldown_s=15.0,
+                        )
         if self._circuit_breaker_active:
             output = _build_halted_output()
             _observe_latency()
@@ -2973,7 +3354,44 @@ class AdvancedRegimeEngine:
                 raise ValueError("MTF payload base timeframe must be a dict")
 
             y_t = canonical_return
-            x_t = base_tf.get("features", np.zeros(self.n_features))
+            x_t = base_tf.get("features", None)
+            if x_t is None:
+                self._warn_rate_limited(
+                    key="mtf_base_features_missing",
+                    message="MTF base timeframe is missing features; emitting fail-safe output.",
+                    cooldown_s=30.0,
+                )
+                self._obs_observe("mtf_base_features_missing", "high", {"source": "update"})
+                self.last_signed_position_size = 0.0
+                output = _build_output(
+                    regime_idx=-1,
+                    regime_label="UNKNOWN",
+                    execution_mode="fail_safe",
+                    trend_strength=float(getattr(self, "_last_effective_trend_strength", 0.0)),
+                    risk_level=1.0,
+                    confidence=0.0,
+                    conviction=0.0,
+                    edge_score=0.0,
+                    probabilities={'bull': 0.0, 'bear': 0.0, 'crisis': 1.0},
+                    macro_probs=self.nhhmm_prior.tolist(),
+                    position_size=0.0,
+                    signed_position_size=0.0,
+                    expected_vol=float(getattr(self, "_last_valid_vol", self.garch.target_vol)),
+                    raw_size=0.0,
+                    is_toxic=True,
+                    garch_regime_probs=self.garch_prob.tolist(),
+                    feed_status="MTF_BASE_FEATURES_MISSING",
+                    engine_status=str(getattr(self, "_determinism_status", "OK")),
+                    last_valid_vol=float(getattr(self, "_last_valid_vol", self.garch.target_vol)),
+                    switch_stability_ema=float(getattr(self, "_switch_stability_ema", 1.0)),
+                    execution_side="flat",
+                    extended_schema=self._emit_extended_schema,
+                    range_ticks=self.range_ticks_int,
+                    include_signal_valid=True,
+                    signal_valid=False,
+                )
+                _observe_latency()
+                return output
 
             fused_probs = np.zeros(self.K)
             total_weight = 0.0
@@ -3184,7 +3602,7 @@ class AdvancedRegimeEngine:
             self._obs_observe("return_out_of_bounds", "medium", {"source": "update"})
             y_t = float(np.clip(y_t, -2.0, 2.0))
 
-        final_shock_threshold = self._VOL_SHOCK_MULTIPLIER * shock_vol_basis
+        final_shock_threshold, shock_vol_basis = self._shock_threshold(pre_shock_baseline_vol, current_ts)
         if abs(y_t) > final_shock_threshold:
             self.last_signed_position_size = 0.0
             self._trigger_circuit_breaker("VOL_SHOCK")
@@ -3196,7 +3614,41 @@ class AdvancedRegimeEngine:
             return output
 
         if x_t is None:
-            x_t = np.zeros(self.n_features)
+            self._warn_rate_limited(
+                key="features_missing_after_validation",
+                message="Features missing after validation; emitting fail-safe output.",
+                cooldown_s=30.0,
+            )
+            self.last_signed_position_size = 0.0
+            output = _build_output(
+                regime_idx=-1,
+                regime_label="UNKNOWN",
+                execution_mode="fail_safe",
+                trend_strength=float(getattr(self, "_last_effective_trend_strength", 0.0)),
+                risk_level=1.0,
+                confidence=0.0,
+                conviction=0.0,
+                edge_score=0.0,
+                probabilities={'bull': 0.0, 'bear': 0.0, 'crisis': 1.0},
+                macro_probs=self.nhhmm_prior.tolist(),
+                position_size=0.0,
+                signed_position_size=0.0,
+                expected_vol=float(getattr(self, "_last_valid_vol", self.garch.target_vol)),
+                raw_size=0.0,
+                is_toxic=True,
+                garch_regime_probs=self.garch_prob.tolist(),
+                feed_status="FEATURES_MISSING_AFTER_VALIDATION",
+                engine_status=str(getattr(self, "_determinism_status", "OK")),
+                last_valid_vol=float(getattr(self, "_last_valid_vol", self.garch.target_vol)),
+                switch_stability_ema=float(getattr(self, "_switch_stability_ema", 1.0)),
+                execution_side="flat",
+                extended_schema=self._emit_extended_schema,
+                range_ticks=self.range_ticks_int,
+                include_signal_valid=True,
+                signal_valid=False,
+            )
+            _observe_latency()
+            return output
         raw_x_size = -1
         try:
             raw_x_size = int(np.ravel(np.asarray(x_t, dtype=float)).size)
@@ -3327,6 +3779,7 @@ class AdvancedRegimeEngine:
                 is_toxic=True,
                 garch_regime_probs=self.garch_prob.tolist(),
                 feed_status=feed_status,
+                engine_status=str(getattr(self, "_determinism_status", "OK")),
                 last_valid_vol=float(getattr(self, "_last_valid_vol", self.garch.target_vol)),
                 switch_stability_ema=float(getattr(self, "_switch_stability_ema", 1.0)),
                 execution_side='flat',
@@ -3354,10 +3807,22 @@ class AdvancedRegimeEngine:
                     ),
                     cooldown_s=60.0,
                 )
+        if use_fused_macro_only:
+            feed_status = "MTF_FUSED_BASE_FEATURE_INVALID_MACRO_ONLY"
+            if "MACRO_ONLY_FALLBACK" not in feed_status_annotations:
+                feed_status_annotations.append("MACRO_ONLY_FALLBACK")
+
+        feed_status_flags = []
+        if feed_status_annotations:
+            for token in feed_status_annotations:
+                token_s = str(token).strip()
+                if token_s and token_s not in feed_status_flags:
+                    feed_status_flags.append(token_s)
+        feed_status_payload = {"primary": str(feed_status), "flags": feed_status_flags}
 
         # OBS: feed tracking
         if _PROM_AVAILABLE and obs_sample and not getattr(self, "_is_replay", False):
-            ENGINE_FEED_STATUS.labels(self.engine_id, feed_status).inc()
+            ENGINE_FEED_STATUS.labels(self.engine_id, str(feed_status)).inc()
 
         # Only compute if not already from MTF
         if mtf_data is None:
@@ -3392,12 +3857,14 @@ class AdvancedRegimeEngine:
                 nhhmm_posterior = np.ones(self.K, dtype=float) / self.K
 
         self.nhhmm_prior = _normalize_prob_vector(nhhmm_posterior)
+        self._record_posterior_update(current_ts)
 
         nhhmm_confidence = float(np.max(nhhmm_posterior))
         effective_bias_weight = float(np.clip(nhhmm_confidence, 0.0, 1.0))
         if use_fused_macro_only:
             sjm_probs = _normalize_prob_vector(np.asarray(nhhmm_posterior, dtype=float))
             sjm_state = int(np.argmax(sjm_probs))
+            self._obs_observe("macro_only_fallback", "medium", {"reason": "base_feature_invalid"})
         else:
             sjm_x_t = np.asarray(x_t, dtype=float).copy()
             if np.isfinite(y_t) and self._sjm_reserved_feature_indices is not None:
@@ -3419,7 +3886,7 @@ class AdvancedRegimeEngine:
         # ==========================================
         # FIX: STICKY SJM FALLBACK (NO REGIME COLLAPSE)
         # ==========================================
-        if not np.all(np.isfinite(sjm_probs)):
+        if not use_fused_macro_only and not np.all(np.isfinite(sjm_probs)):
             self._warn_rate_limited(
                 key="sjm_non_finite",
                 message=f"SJM produced non-finite probs, using last valid state",
@@ -3443,11 +3910,11 @@ class AdvancedRegimeEngine:
                     sjm_probs = np.ones(self.K) / self.K
                     sjm_state = int(np.argmax(sjm_probs))
 
-        else:
+        elif not use_fused_macro_only:
             sjm_probs = _normalize_prob_vector(sjm_probs)
             self._last_valid_sjm_probs = sjm_probs.copy()
 
-        if np.isfinite(y_t):
+        if (not use_fused_macro_only) and np.isfinite(y_t):
             shock_decay = float(np.clip(self._SHOCK_MEMORY_DECAY, 0.0, 0.999))
             prev_shock_memory = float(getattr(self, "_shock_memory", 0.0))
             self._shock_memory = max(abs(float(y_t)), shock_decay * prev_shock_memory)
@@ -3669,7 +4136,7 @@ class AdvancedRegimeEngine:
                 self._in_range = False
 
         if confirmed_regime == "RANGE":
-            self.range_ticks += 1.0
+            self.range_ticks += max(float(decay_dt), 0.0)
             self.range_ticks = min(self.range_ticks, 1_000_000.0)
 
         self.range_ticks_int = int(self.range_ticks)
@@ -3700,6 +4167,18 @@ class AdvancedRegimeEngine:
             regime_scores["conviction"] < 0.05
             and regime_scores["confidence"] < self._CONFIDENCE_COLLAPSE_THRESHOLD
         )
+        if self._is_confidence_collapse_warmup(current_ts):
+            if collapse_signal:
+                self._obs_observe(
+                    "confidence_collapse_warmup_suppressed",
+                    "medium",
+                    {
+                        "posterior_updates": int(getattr(self, "_posterior_update_count", 0)),
+                        "first_posterior_ts": self._first_posterior_ts,
+                    },
+                )
+            collapse_signal = False
+            self._confidence_collapse_streak = 0
         if collapse_signal:
             self._confidence_collapse_streak = int(getattr(self, "_confidence_collapse_streak", 0)) + 1
         else:
@@ -3759,8 +4238,16 @@ class AdvancedRegimeEngine:
             expected_vol = float(max(self._last_valid_vol, self._LAST_VALID_VOL_FLOOR))
             self._last_valid_vol = float(expected_vol)
 
-        self._return_ema = 0.92 * float(getattr(self, "_return_ema", 0.0)) + 0.08 * float(y_t)
-        self._abs_return_ema = 0.92 * float(getattr(self, "_abs_return_ema", 0.0)) + 0.08 * abs(float(y_t))
+        ema_decay = self._ema_decay(decay_dt)
+        ema_alpha = 1.0 - ema_decay
+        self._return_ema = (
+            ema_decay * float(getattr(self, "_return_ema", 0.0))
+            + ema_alpha * float(y_t)
+        )
+        self._abs_return_ema = (
+            ema_decay * float(getattr(self, "_abs_return_ema", 0.0))
+            + ema_alpha * abs(float(y_t))
+        )
 
         low_vol_range_gate = (
             expected_vol < (0.75 * self.garch.target_vol)
@@ -3973,7 +4460,7 @@ class AdvancedRegimeEngine:
         self._obs_observe(
             "update",
             {"OK": "low", "DEGRADED": "medium", "RISK": "high", "FAIL": "critical"}.get(self._last_health, "low"),
-            {"feed_status": feed_status, "regime": confirmed_regime},
+            {"feed_status": str(feed_status), "regime": confirmed_regime, "feed_flags": feed_status_flags},
         )
 
         # Keep regime label and returned index semantically aligned.
@@ -4002,9 +4489,10 @@ class AdvancedRegimeEngine:
             expected_vol=expected_vol,
             raw_size=raw_size,
             is_toxic=is_toxic,
-            garch_regime_probs=self.garch_prob.tolist(),
-            feed_status=feed_status,
-            last_valid_vol=float(self._last_valid_vol),
+                garch_regime_probs=self.garch_prob.tolist(),
+                feed_status=feed_status_payload,
+                engine_status=str(getattr(self, "_determinism_status", "OK")),
+                last_valid_vol=float(self._last_valid_vol),
             switch_stability_ema=float(self._switch_stability_ema),
             execution_side=final_execution_side,
             extended_schema=self._emit_extended_schema,
@@ -4076,18 +4564,10 @@ class AdvancedRegimeEngine:
             validated_rng_state = None
             if incoming_rng_state is not None and getattr(self, "_rng", None) is not None:
                 try:
-                    candidate_rng_state = copy.deepcopy(dict(incoming_rng_state))
-                    probe_rng = np.random.default_rng(self._rng_seed)
-                    if type(probe_rng.bit_generator).__name__ != type(self._rng.bit_generator).__name__:
-                        raise ValueError("snapshot RNG probe mismatch")
-                    probe_rng.bit_generator.state = candidate_rng_state
-                    validated_rng_state = candidate_rng_state
+                    validated_rng_state = self._validate_rng_state_payload(incoming_rng_state)
                 except Exception as exc:
-                    self._warn_rate_limited(
-                        key="snapshot_rng_state_invalid",
-                        message=f"Snapshot RNG state invalid; preserving current RNG state. error={exc}",
-                        cooldown_s=30.0,
-                    )
+                    self._mark_determinism_failure()
+                    raise ValueError(f"snapshot RNG state invalid: {exc}") from exc
 
             # Validate-then-swap: hydrate a staging engine first.
             staging = AdvancedRegimeEngine(
@@ -4100,13 +4580,19 @@ class AdvancedRegimeEngine:
                 strict_mtf_keys=bool(self._strict_mtf_keys),
                 mtf_weights=copy.deepcopy(self.mtf_weights),
                 sjm_reserved_feature_indices=self._sjm_reserved_feature_indices,
+                allow_timestamp_free_pnl=bool(self._allow_timestamp_free_pnl),
+                max_price_staleness_ticks=int(self._max_price_staleness_ticks),
+                shock_warmup_ticks=int(self._shock_warmup_ticks),
+                shock_warmup_seconds=float(self._shock_warmup_seconds),
+                shock_startup_multiplier=float(self._shock_startup_multiplier),
+                shock_startup_vol_floor_mult=float(self._shock_startup_vol_floor_mult),
                 seed=self._rng_seed,
                 engine_id=self.engine_id,
                 enable_background_workers=False,
             )
             try:
                 staging._is_replay = True
-                staging.load_state(copy.deepcopy(engine_state))
+                staging._load_state_inplace(copy.deepcopy(engine_state))
                 if validated_rng_state is not None and getattr(staging, "_rng", None) is not None:
                     staging._rng.bit_generator.state = validated_rng_state
                 committed_state = staging.serialize_state()
@@ -4114,15 +4600,81 @@ class AdvancedRegimeEngine:
                     copy.deepcopy(staging._rng.bit_generator.state)
                     if getattr(staging, "_rng", None) is not None else None
                 )
+                # Deterministic replay probe: same restored state must produce identical next output.
+                probe_input = {
+                    "return": 0.0,
+                    "features": np.zeros(self.n_features, dtype=float).tolist(),
+                }
+                verifier_a = AdvancedRegimeEngine(
+                    n_states=int(self._init_params.get("n_states", self.K)),
+                    n_features=int(self._init_params.get("n_features", self.n_features)),
+                    target_vol=float(self._init_params.get("target_vol", self.garch.target_vol)),
+                    allow_igarch=bool(self._allow_igarch),
+                    regime_prob_floor=float(self.garch._REGIME_PROB_FLOOR),
+                    emit_extended_schema=bool(self._emit_extended_schema),
+                    strict_mtf_keys=bool(self._strict_mtf_keys),
+                    mtf_weights=copy.deepcopy(self.mtf_weights),
+                    sjm_reserved_feature_indices=self._sjm_reserved_feature_indices,
+                    allow_timestamp_free_pnl=bool(self._allow_timestamp_free_pnl),
+                    max_price_staleness_ticks=int(self._max_price_staleness_ticks),
+                    shock_warmup_ticks=int(self._shock_warmup_ticks),
+                    shock_warmup_seconds=float(self._shock_warmup_seconds),
+                    shock_startup_multiplier=float(self._shock_startup_multiplier),
+                    shock_startup_vol_floor_mult=float(self._shock_startup_vol_floor_mult),
+                    seed=self._rng_seed,
+                    engine_id=self.engine_id,
+                    enable_background_workers=False,
+                )
+                verifier_b = AdvancedRegimeEngine(
+                    n_states=int(self._init_params.get("n_states", self.K)),
+                    n_features=int(self._init_params.get("n_features", self.n_features)),
+                    target_vol=float(self._init_params.get("target_vol", self.garch.target_vol)),
+                    allow_igarch=bool(self._allow_igarch),
+                    regime_prob_floor=float(self.garch._REGIME_PROB_FLOOR),
+                    emit_extended_schema=bool(self._emit_extended_schema),
+                    strict_mtf_keys=bool(self._strict_mtf_keys),
+                    mtf_weights=copy.deepcopy(self.mtf_weights),
+                    sjm_reserved_feature_indices=self._sjm_reserved_feature_indices,
+                    allow_timestamp_free_pnl=bool(self._allow_timestamp_free_pnl),
+                    max_price_staleness_ticks=int(self._max_price_staleness_ticks),
+                    shock_warmup_ticks=int(self._shock_warmup_ticks),
+                    shock_warmup_seconds=float(self._shock_warmup_seconds),
+                    shock_startup_multiplier=float(self._shock_startup_multiplier),
+                    shock_startup_vol_floor_mult=float(self._shock_startup_vol_floor_mult),
+                    seed=self._rng_seed,
+                    engine_id=self.engine_id,
+                    enable_background_workers=False,
+                )
+                try:
+                    verifier_a._is_replay = True
+                    verifier_b._is_replay = True
+                    verifier_a._load_state_inplace(copy.deepcopy(committed_state))
+                    verifier_b._load_state_inplace(copy.deepcopy(committed_state))
+                    if committed_rng_state is not None and getattr(verifier_a, "_rng", None) is not None:
+                        verifier_a._rng.bit_generator.state = copy.deepcopy(committed_rng_state)
+                    if committed_rng_state is not None and getattr(verifier_b, "_rng", None) is not None:
+                        verifier_b._rng.bit_generator.state = copy.deepcopy(committed_rng_state)
+                    out_a = verifier_a.update(copy.deepcopy(probe_input))
+                    out_b = verifier_b.update(copy.deepcopy(probe_input))
+                    if self._state_hash(out_a) != self._state_hash(out_b):
+                        raise ValueError("snapshot deterministic replay probe mismatch")
+                finally:
+                    verifier_a._shutdown_warning_worker()
+                    verifier_a._shutdown_snapshot_worker()
+                    verifier_b._shutdown_warning_worker()
+                    verifier_b._shutdown_snapshot_worker()
             finally:
                 staging._shutdown_warning_worker()
                 staging._shutdown_snapshot_worker()
 
-            self.load_state(committed_state)
+            self._load_state_inplace(committed_state)
             if committed_rng_state is not None and getattr(self, "_rng", None) is not None:
                 self._rng.bit_generator.state = committed_rng_state
+            self._mark_determinism_success()
             return
         except Exception as e:
+            if "RNG" in str(e).upper():
+                self._mark_determinism_failure()
             if not getattr(self, "_is_replay", False):
                 try:
                     LOGGER.error(
@@ -4232,6 +4784,12 @@ class AdvancedRegimeEngine:
             self._last_valid_sjm_probs = np.ones(self.K) / self.K
             self._last_price = None
             self._last_price_timestamp = None
+            self._last_price_tick_id = None
+            self._pnl_mode = None
+            self._valid_return_count = 0
+            self._first_valid_return_ts = None
+            self._posterior_update_count = 0
+            self._first_posterior_ts = None
 
             # Reset breaker
             self._circuit_breaker_active = False
