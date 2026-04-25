@@ -69,16 +69,16 @@ def _coerce_1d_vector(values: Any, expected_size: int, *, name: str) -> np.ndarr
     """
     try:
         arr = np.asarray(values, dtype=float)
-    except Exception:
-        return np.full(int(expected_size), np.nan, dtype=float)
+    except Exception as exc:
+        raise ValueError(f"{name} is not numeric/coercible") from exc
     if arr.ndim == 0:
         arr = arr.reshape(1)
     else:
         arr = np.ravel(arr)
     if arr.shape != (expected_size,):
-        return np.full(int(expected_size), np.nan, dtype=float)
+        raise ValueError(f"{name} has shape {arr.shape}, expected {(expected_size,)}")
     if not np.all(np.isfinite(arr)):
-        return np.full(int(expected_size), np.nan, dtype=float)
+        raise ValueError(f"{name} contains non-finite values")
     return arr
 
 def safe_float(value: Any, default: float = 0.0, min: float | None = None, max: float | None = None) -> float:
@@ -481,10 +481,15 @@ class RegimeMarkovSmoother:
         range_mass = float(np.clip(scores.get("range_score", 0.0), 0.0, 1.0))
         toxic_mass = float(np.clip(scores.get("toxic_score", 0.0), 0.0, 1.0))
 
-        # Preserve directional asymmetry from model probabilities directly
-        # without forcing bull/bear to partition a fixed trend_mass budget.
-        trend_prob = trend_mass * bull
-        bear_prob = trend_mass * bear
+        # Symmetric blend prevents structural suppression of directional evidence.
+        # Both TREND and BEAR receive evidence on the same [0, 1] scale used by
+        # RANGE/TOXIC, while retaining directionality from bull/bear probabilities.
+        dir_total = float(np.clip(bull + bear, 1e-12, 2.0))
+        bull_share = bull / dir_total
+        bear_share = bear / dir_total
+        blend_w = 0.25
+        trend_prob = float(np.clip((1.0 - blend_w) * trend_mass + blend_w * bull_share, 0.0, 1.0))
+        bear_prob = float(np.clip((1.0 - blend_w) * trend_mass + blend_w * bear_share, 0.0, 1.0))
         return self._normalize(np.array([trend_prob, range_mass, bear_prob, toxic_mass], dtype=float))
 
     def update(self, scores: Dict[str, Any], prev_regime: str | None) -> tuple[str, np.ndarray]:
@@ -548,7 +553,7 @@ def compute_hmm_regime(
     range_from_low_vol = float(np.clip(1.0 - crisis, 0.0, 1.0))
     range_from_low_drift = float(np.clip(1.0 - directional_confidence, 0.0, 1.0))
 
-    # --- TREND SCORE (BOOSTED) ---
+    # --- Directional score (bounded, symmetric between TREND and BEAR) ---
     trend_score = float(np.clip(
         (1.0 - 0.45 * crisis) * (0.85 * directional_confidence + 0.45 * directional_strength),
         0.0,
@@ -568,7 +573,7 @@ def compute_hmm_regime(
         + 0.30 * range_from_low_vol
         + 0.20 * range_from_low_drift
     )
-    trend_pressure = 0.55 * directional_strength + 0.35 * float(
+    trend_pressure = 0.40 * directional_strength + 0.20 * float(
         np.clip((directional_confidence - 0.5) / 0.5, 0.0, 1.0)
     )
 
@@ -591,18 +596,14 @@ def compute_hmm_regime(
         elif prev_directional_label == "BEAR" and direction_gap < switch_gap:
             directional_label = "BEAR"
 
-    # Small directional bias toward TREND (alpha capture preference)
-    if directional_label == "TREND":
-        trend_score *= 1.10
-    else:
-        trend_score *= 0.95
-    trend_score = float(np.clip(trend_score, 0.0, 1.0))
-
-    trend_score_trend = trend_score if directional_label == "TREND" else trend_score * 0.95
-    trend_score_bear = trend_score if directional_label == "BEAR" else trend_score * 0.95
+    directional_mass = float(np.clip(bull + bear, 1e-12, 2.0))
+    bull_share = float(np.clip(bull / directional_mass, 0.0, 1.0))
+    bear_share = float(np.clip(bear / directional_mass, 0.0, 1.0))
+    trend_score_trend = float(np.clip(trend_score * bull_share, 0.0, 1.0))
+    trend_score_bear = float(np.clip(trend_score * bear_share, 0.0, 1.0))
     score_map = {
-        "TREND": float(np.clip(trend_score_trend, 0.0, 1.0)),
-        "BEAR": float(np.clip(trend_score_bear, 0.0, 1.0)),
+        "TREND": trend_score_trend,
+        "BEAR": trend_score_bear,
         "RANGE": range_score,
         "TOXIC": toxic_score,
     }
@@ -715,6 +716,7 @@ class SparseJumpModel:
         self._score_scale = 2.5
         self.weights = None
         self.means = None
+        self._default_params_initialized = False
         
     def load_weights(self, means: np.ndarray, weights: np.ndarray):
         """Inject pre-trained centroids for live inference."""
@@ -751,29 +753,41 @@ class SparseJumpModel:
 
         n_feat = x_t.size
 
-        # --- Dimension guard (resolves CRITICAL-6) ---
+        # Default fallback must be symmetric across feature dimensions to avoid
+        # startup classification bias when pre-trained centroids are unavailable.
         if self.means is None:
             self.means = np.zeros((self.K, n_feat), dtype=float)
-            if n_feat > 0:
-                if n_feat == 1:
-                    self.means[0, 0] = 0.01
-                else:
-                    self.means[0, 0] = 0.0030
-                if self.K > 1:
-                    self.means[1, 0] = -0.01 if n_feat == 1 else -0.0030
-                if self.K > 2:
-                    crisis_idx = 0 if n_feat == 1 else min(2, n_feat - 1)
-                    self.means[2, crisis_idx] = 0.05
-            self.weights = np.ones(n_feat) / np.sqrt(n_feat)
+            self.weights = np.ones(n_feat, dtype=float) / np.sqrt(max(n_feat, 1))
+            self._default_params_initialized = True
+            LOGGER.warning(
+                "SparseJumpModel fallback initialized with symmetric zero centroids; "
+                "load_weights() is recommended for production inference."
+            )
         elif self.means.shape[1] != n_feat:
             raise ValueError(
                 f"SJM feature dimension mismatch: expected {self.means.shape[1]}, "
                 f"got {n_feat}. Check upstream feature pipeline."
             )
+        if self.weights is None:
+            self.weights = np.ones(n_feat, dtype=float) / np.sqrt(max(n_feat, 1))
+            LOGGER.warning(
+                "SparseJumpModel weights were missing at inference time; "
+                "applied deterministic uniform fallback weights."
+            )
+        elif self.weights.shape != (n_feat,):
+            raise ValueError(
+                f"SJM weights shape mismatch: expected {(n_feat,)}, got {self.weights.shape}. "
+                "Check model load path."
+            )
         try:
             nhhmm_probs = _normalize_prob_vector(np.asarray(nhhmm_probs, dtype=float))
         except Exception:
             nhhmm_probs = np.ones(self.K, dtype=float) / self.K
+        if self._default_params_initialized:
+            # Safe fallback mode: reduce overconfidence when model centroids are
+            # not explicitly loaded, while preserving deterministic behavior.
+            uniform = np.ones(self.K, dtype=float) / self.K
+            nhhmm_probs = _normalize_prob_vector(0.5 * nhhmm_probs + 0.5 * uniform)
 
         weighted_x = x_t * self.weights  # (n_feat,)
 
@@ -3533,25 +3547,6 @@ class AdvancedRegimeEngine:
             try:
                 state_blob = self.serialize_state()
                 normalized_rng = self._normalize_rng_state(self._rng)
-
-                # HARD ASSERT: dual-state consistency
-                runtime_map = {
-                    "garch_prob": "garch_prob",
-                    "nhhmm_prior": "nhhmm_prior",
-                    "garch_var": "garch_var",
-                    "smoothed_garch_prob": "_smoothed_garch_prob",
-                }
-                for k, runtime_attr in runtime_map.items():
-                    if k in state_blob:
-                        try:
-                            if not np.allclose(
-                                np.asarray(state_blob[k], dtype=float),
-                                np.asarray(getattr(self, runtime_attr), dtype=float),
-                                atol=1e-12,
-                            ):
-                                LOGGER.critical("CRITICAL SNAPSHOT MISMATCH: %s", k)
-                        except Exception as exc:
-                            self._warn_rate_limited("snapshot_consistency_check_failure", f"Snapshot consistency check failed for {k}: {exc}", cooldown_s=30.0)
 
                 snapshot_payload = {
                     "engine_state": state_blob,
