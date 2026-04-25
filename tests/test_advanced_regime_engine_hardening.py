@@ -5,6 +5,9 @@ import queue
 import warnings
 import os
 import sys
+import gc
+import time
+import weakref
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import advanced_regime_engine as module
@@ -115,7 +118,7 @@ def test_sjm_non_finite_falls_back_to_last_valid(engine):
         return 0, np.array([np.nan, np.nan, np.nan], dtype=float)
 
     engine.sjm.online_predict = bad_predict
-    out = engine.update(_md(ret=0.002, ts=2.0))
+    out = engine.update(_md(ret=0.002, ts=2.0) | {"price": 100.1 * (1.0 + 0.002)})
     assert out["signal_valid"] is True
     assert np.allclose(engine._last_valid_sjm_probs, cached)
 
@@ -585,13 +588,15 @@ def test_warning_drop_counter_thread_safe_when_queue_is_full(engine):
 
 
 def test_breaker_reason_and_healing_counter_not_overwritten_same_tick(engine):
+    engine._VOL_SHOCK_MULTIPLIER = 100.0
     engine._last_price = 100.0
+    engine._last_price_timestamp = 0.0
     engine.last_signed_position_size = 1.0
     engine._loss_streak = engine._MAX_CONSECUTIVE_LOSSES - 1
-    out = engine.update(_md(ret=0.0, ts=1.0) | {"price": 80.0})
+    out = engine.update(_md(ret=-0.2, ts=1.0) | {"price": 80.0})
     assert out["regime_label"] == "HALTED"
     assert engine._circuit_breaker_reason == "MAX_DRAWDOWN"
-    assert engine._healing_counter == 1
+    assert engine._healing_counter == 0
 
 
 def test_self_heal_fallback_mapping_without_errors_module(engine):
@@ -680,6 +685,7 @@ def test_conviction_metric_and_boundary_hysteresis():
 
 def test_last_price_persisted_via_get_state_load_state(engine):
     engine._last_price = 123.45
+    engine._last_price_timestamp = 12.0
     state = engine.get_state()
     restored = AdvancedRegimeEngine(n_states=3, n_features=3, seed=7)
     try:
@@ -691,8 +697,9 @@ def test_last_price_persisted_via_get_state_load_state(engine):
 
 def test_negative_equity_clamped_and_breaker_tripped(engine):
     engine._last_price = 100.0
+    engine._last_price_timestamp = 0.0
     engine.last_signed_position_size = 1.0
-    engine.update(_md(ret=0.0, ts=1.0) | {"price": 0.0})
+    engine.update(_md(ret=-1.0, ts=1.0) | {"price": 0.0})
     assert engine._equity >= engine._MIN_EQUITY_FLOOR
     assert engine._circuit_breaker_active is True
 
@@ -724,6 +731,7 @@ def test_sjm_feature_injection_does_not_overwrite_small_vectors(monkeypatch, n_f
 
 def test_load_snapshot_is_atomic_on_failure(engine):
     engine._last_price = 222.0
+    engine._last_price_timestamp = 20.0
     before = engine.serialize_state()
     bad_snapshot = {"engine_state": before, "last_price": float("nan")}
     engine.load_snapshot(bad_snapshot)
@@ -735,3 +743,204 @@ def test_position_size_cap_single_source_of_truth(engine):
     out = engine.update(_md(ret=0.001, ts=1.0))
     assert module.AdvancedRegimeEngine._MAX_POSITION_SIZE == _POSITION_SIZE_CAP
     assert out["position_size"] <= _POSITION_SIZE_CAP
+
+
+def test_vol_shock_pre_gate_keeps_model_state_atomic(engine):
+    engine.nhhmm_prior = np.array([0.2, 0.3, 0.5], dtype=float)
+    engine._shock_memory = 0.11
+    engine.current_regime_idx = 1
+    engine.garch_var = np.array([1e-4, 1.5e-4], dtype=float)
+    engine.garch_prob = np.array([0.6, 0.4], dtype=float)
+    engine._smoothed_garch_prob = np.array([0.7, 0.3], dtype=float)
+    engine._VOL_SHOCK_MULTIPLIER = 2.0
+
+    before = {
+        "nhhmm_prior": engine.nhhmm_prior.copy(),
+        "shock_memory": float(engine._shock_memory),
+        "current_regime_idx": int(engine.current_regime_idx),
+        "garch_var": engine.garch_var.copy(),
+        "garch_prob": engine.garch_prob.copy(),
+        "smoothed_garch_prob": engine._smoothed_garch_prob.copy(),
+    }
+    out = engine.update(
+        {
+            "timestamp": 2.0,
+            "return": 0.0,
+            "price": 100.0,
+            "mtf": {
+                "base": {"return": 0.25, "features": [0.1, 0.2, 0.3]},
+            },
+        }
+    )
+    assert out["regime_label"] == "HALTED"
+    assert engine._circuit_breaker_reason == "VOL_SHOCK"
+    assert np.allclose(engine.nhhmm_prior, before["nhhmm_prior"])
+    assert engine._shock_memory == pytest.approx(before["shock_memory"])
+    assert engine.current_regime_idx == before["current_regime_idx"]
+    assert np.allclose(engine.garch_var, before["garch_var"])
+    assert np.allclose(engine.garch_prob, before["garch_prob"])
+    assert np.allclose(engine._smoothed_garch_prob, before["smoothed_garch_prob"])
+
+
+def test_price_return_mismatch_emits_fail_safe_without_pnl_state_contamination(engine):
+    engine._last_price = 100.0
+    engine._last_price_timestamp = 1.0
+    engine.last_signed_position_size = 1.0
+    engine._equity = 1.0
+    engine._loss_streak = 2
+    out = engine.update(_md(ret=0.0, ts=2.0) | {"price": 110.0})
+    assert out["execution_mode"] == "fail_safe"
+    assert out["risk_metrics"]["feed_status"] == "PRICE_RETURN_MISMATCH"
+    assert out["signal_valid"] is False
+    assert engine._equity == pytest.approx(1.0)
+    assert engine._loss_streak == 2
+    assert engine._last_price == pytest.approx(100.0)
+    assert engine._circuit_breaker_active is False
+
+
+def test_breaker_cooldown_initialization_consistent_across_trigger_paths(engine):
+    engine._VOL_SHOCK_MULTIPLIER = 0.05
+    out_shock = engine.update(_md(ret=0.8, ts=1.0))
+    assert out_shock["regime_label"] == "HALTED"
+    assert engine._circuit_breaker_reason == "VOL_SHOCK"
+    assert engine._healing_counter == 0
+
+    engine.reset_state()
+    engine._VOL_SHOCK_MULTIPLIER = 100.0
+    engine._last_price = 100.0
+    engine._last_price_timestamp = 1.0
+    engine.last_signed_position_size = 1.0
+    out_dd = engine.update(_md(ret=-0.2, ts=2.0) | {"price": 80.0})
+    assert out_dd["regime_label"] == "HALTED"
+    assert engine._circuit_breaker_reason == "MAX_DRAWDOWN"
+    assert engine._healing_counter == 0
+
+    engine.reset_state()
+    engine._VOL_SHOCK_MULTIPLIER = 100.0
+    engine._MAX_DRAWDOWN = 1.0
+    engine._MAX_CONSECUTIVE_LOSSES = 2
+    engine._last_price = 100.0
+    engine._last_price_timestamp = 1.0
+    engine.last_signed_position_size = 1.0
+    engine._loss_streak = 1
+    out_streak = engine.update(_md(ret=-0.01, ts=2.0) | {"price": 99.0})
+    assert out_streak["regime_label"] == "HALTED"
+    assert engine._circuit_breaker_reason == "LOSS_STREAK"
+    assert engine._healing_counter == 0
+
+
+def test_warning_worker_does_not_keep_engine_alive_strongly():
+    eng = AdvancedRegimeEngine(n_states=3, n_features=3, seed=99)
+    worker = eng._warning_worker
+    stop_event = eng._warning_stop_event
+    eng_ref = weakref.ref(eng)
+    del eng
+    for _ in range(20):
+        gc.collect()
+        if eng_ref() is None:
+            break
+        time.sleep(0.05)
+    assert eng_ref() is None
+    if worker is not None:
+        worker.join(timeout=1.0)
+    assert stop_event.is_set() or (worker is not None and not worker.is_alive())
+
+
+def test_invalid_timestamp_does_not_erase_last_regime_change_anchor(engine, monkeypatch):
+    engine._regime_smoother = None
+    engine._confirmed_regime = "RANGE"
+    engine._prev_regime = "RANGE"
+    engine._prev_raw_regime = "RANGE"
+    engine._confirmed_regime_idx = 0
+    engine.current_regime_idx = 0
+    engine._regime_persistence = engine._REGIME_CONFIRMATION_TICKS + 2
+    engine._last_regime_change_ts = 123.45
+
+    monkeypatch.setattr(
+        module,
+        "compute_hmm_regime",
+        lambda *_a, **_k: {
+            "regime": "TREND",
+            "bull": 0.8,
+            "bear": 0.1,
+            "crisis": 0.1,
+            "trend_strength": 0.6,
+            "risk_level": 0.2,
+            "confidence": 0.9,
+            "conviction": 0.9,
+            "uncertainty": 0.1,
+            "directional_margin": 0.6,
+            "directional_label": "TREND",
+            "edge_score": 0.95,
+            "trend_score": 0.9,
+            "range_score": 0.1,
+            "toxic_score": 0.0,
+        },
+    )
+    engine.update({"timestamp": None, "return": 0.001, "features": [0.1, 0.2, 0.3], "price": 100.0})
+    assert engine._last_regime_change_ts == pytest.approx(123.45)
+
+
+def test_final_execution_side_drives_signed_size_consistently(engine, monkeypatch):
+    engine._regime_smoother = None
+    monkeypatch.setattr(
+        module,
+        "compute_hmm_regime",
+        lambda *_a, **_k: {
+            "regime": "TREND",
+            "bull": 0.8,
+            "bear": 0.1,
+            "crisis": 0.1,
+            "trend_strength": 0.6,
+            "risk_level": 0.2,
+            "confidence": 0.9,
+            "conviction": 0.9,
+            "uncertainty": 0.1,
+            "directional_margin": 0.6,
+            "directional_label": "TREND",
+            "edge_score": 0.2,
+            "trend_score": 0.9,
+            "range_score": 0.1,
+            "toxic_score": 0.0,
+        },
+    )
+    out = engine.update(_md(ret=0.001, ts=1.0))
+    assert out["execution_side"] == "flat"
+    assert out["position_size"] == 0.0
+    assert out["signed_position_size"] == 0.0
+
+
+def test_full_self_heal_resets_last_price_reference(engine):
+    engine._last_price = 50.0
+    engine._last_price_timestamp = 1.0
+    engine.last_signed_position_size = 1.0
+    engine._equity = 1.0
+    action = engine._self_heal()
+    assert action == "RESET_FULL"
+    assert engine._last_price is None
+    assert engine._last_price_timestamp is None
+    engine.update(_md(ret=0.001, ts=2.0) | {"price": 100.0})
+    assert engine._equity == pytest.approx(1.0)
+
+
+def test_signal_valid_present_in_all_output_paths(engine):
+    out_normal = engine.update(_md(ret=0.001, ts=1.0))
+    out_fail_safe = engine.update({"timestamp": 2.0, "price": 100.0})
+    engine._trigger_circuit_breaker("MANUAL")
+    out_breaker = engine.update(_md(ret=0.001, ts=3.0))
+    engine.reset_state()
+    out_degraded = engine.update(_md(ret=0.001, features=[0.1, 0.2], ts=4.0))
+    engine.reset_state()
+    engine.mtf_weights = {"base": 1.0, "5m": 0.5}
+    out_mtf_fallback = engine.update(
+        {
+            "timestamp": 5.0,
+            "price": 100.0,
+            "mtf": {
+                "base": {"return": 0.001, "features": [0.1, 0.2, 0.3]},
+                "5m": {"return": "bad", "features": [0.1, 0.2, 0.3]},
+            },
+        }
+    )
+    for out in (out_normal, out_fail_safe, out_breaker, out_degraded, out_mtf_fallback):
+        assert "signal_valid" in out

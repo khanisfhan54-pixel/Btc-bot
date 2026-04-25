@@ -354,7 +354,7 @@ def _build_output(
         'execution_side': execution_side,
         'signed_position_size': safe_signed_position,
         'extended_schema': bool(extended_schema),
-        **({'signal_valid': bool(signal_valid)} if include_signal_valid else {}),
+        'signal_valid': bool(signal_valid),
         
         # --- NEW: forward compatibility anchor ---
         'schema_compat': {
@@ -918,6 +918,7 @@ class AdvancedRegimeEngine:
     _MAX_POSITION_SIZE: float = _POSITION_SIZE_CAP
     _MIN_EQUITY_FLOOR: float = 1e-6
     _MAX_PRICE_STALENESS_SEC: float = 300.0
+    _PRICE_RETURN_MISMATCH_TOLERANCE: float = 5e-4
     _DIRECTION_SWITCH_GAP: float = 0.02
     _SJM_RESERVED_RETURN_IDX: int = 0
     _SJM_RESERVED_ABS_RETURN_IDX: int = 2
@@ -1181,8 +1182,10 @@ class AdvancedRegimeEngine:
         # ==========================================
         self._warning_queue: "queue.Queue[str]" = queue.Queue(maxsize=10000)
         self._warning_stop_event = threading.Event()
+        self_weakref = weakref.ref(self)
         self._warning_worker = threading.Thread(
-            target=self._warning_emitter_loop,
+            target=AdvancedRegimeEngine._warning_emitter_loop,
+            args=(self_weakref, self._warning_stop_event, self._warning_queue),
             daemon=True,
             name=f"{self.engine_id}_warning_worker"
         )
@@ -1366,6 +1369,18 @@ class AdvancedRegimeEngine:
         # Timestamp normalization is intentionally strict: seconds only.
         return ts_f
 
+    def _set_regime_change_timestamp(self, current_ts: float | None) -> None:
+        ts_norm = self._normalize_timestamp(current_ts)
+        if ts_norm is None:
+            self._warn_rate_limited(
+                key="invalid_regime_change_timestamp",
+                message="Regime change timestamp missing/invalid; preserving previous cooldown anchor.",
+                cooldown_s=30.0,
+            )
+            self._obs_observe("regime_change_timestamp_invalid", "medium", {"timestamp": current_ts})
+            return
+        self._last_regime_change_ts = float(ts_norm)
+
     def _validate_regime_label(self, value: Any, field: str) -> str | None:
         if value is None:
             return None
@@ -1471,30 +1486,37 @@ class AdvancedRegimeEngine:
         t.start()
         return bool(done.wait(timeout=max(float(timeout_s), 0.01)))
 
-    def _warning_emitter_loop(self) -> None:
+    @staticmethod
+    def _warning_emitter_loop(
+        engine_ref: "weakref.ReferenceType[AdvancedRegimeEngine]",
+        stop_event: threading.Event,
+        warning_queue: "queue.Queue[str]",
+    ) -> None:
         """
         Dedicated background thread for warning emission.
         Ensures logging I/O never blocks trading execution threads.
         """
         while True:
-            if self._warning_stop_event.is_set() and self._warning_queue.empty():
+            if stop_event.is_set() and warning_queue.empty():
                 break
 
             try:
-                msg = self._warning_queue.get(timeout=0.5)
+                msg = warning_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
 
             if msg is None:
-                if self._warning_stop_event.is_set() and self._warning_queue.empty():
+                if stop_event.is_set() and warning_queue.empty():
                     break
                 continue
 
+            engine = engine_ref()
             try:
-                emitted = self._emit_warning_with_timeout(msg, timeout_s=1.0)
+                emitted = AdvancedRegimeEngine._emit_warning_with_timeout(msg, timeout_s=1.0)
                 if not emitted:
-                    with self._warning_lock:
-                        self._warning_backend_failure_count = int(getattr(self, "_warning_backend_failure_count", 0)) + 1
+                    if engine is not None:
+                        with engine._warning_lock:
+                            engine._warning_backend_failure_count = int(getattr(engine, "_warning_backend_failure_count", 0)) + 1
                     try:
                         warnings.warn(
                             "LOGGER.warning timeout in background worker; message emission skipped.",
@@ -1504,8 +1526,9 @@ class AdvancedRegimeEngine:
                     except Exception:
                         pass
             except Exception:
-                with self._warning_lock:
-                    self._warning_backend_failure_count = int(getattr(self, "_warning_backend_failure_count", 0)) + 1
+                if engine is not None:
+                    with engine._warning_lock:
+                        engine._warning_backend_failure_count = int(getattr(engine, "_warning_backend_failure_count", 0)) + 1
                 try:
                     warnings.warn(msg, RuntimeWarning, stacklevel=3)
                 except Exception:
@@ -2078,6 +2101,13 @@ class AdvancedRegimeEngine:
                 ValueError("invalid timestamp"),
                 state.get("last_price_timestamp"),
             )
+        if self._last_price is not None and self._last_price_timestamp is None:
+            self._log_state_load_issue(
+                "last_price",
+                ValueError("last_price provided without valid last_price_timestamp"),
+                self._last_price,
+            )
+            self._last_price = None
 
         self._last_effective_trend_strength = self._state_scalar(
             state,
@@ -2318,10 +2348,20 @@ class AdvancedRegimeEngine:
                 return output
 
         # ==========================================
-        # 🚨 STEP -1: PnL TRACKING
+        # 🚨 STEP -1: PRE-SHOCK GATE + PnL TRACKING
         # ==========================================
         y_preview = self._coerce_finite_scalar(market_data.get("return", 0.0), default=0.0)
-        if abs(y_preview) > self._VOL_SHOCK_MULTIPLIER * max(float(getattr(self, "_last_valid_vol", self.garch.target_vol)), 1e-8):
+        pre_shock_baseline_vol = float(
+            np.sqrt(np.dot(self._smoothed_garch_prob, np.clip(self.garch_var, 1e-8, None)))
+        )
+        shock_vol_basis = max(
+            pre_shock_baseline_vol,
+            float(getattr(self, "_last_valid_vol", self.garch.target_vol)),
+            float(self.garch.target_vol) * 1.5,
+            1e-8,
+        )
+        pre_shock_threshold = self._VOL_SHOCK_MULTIPLIER * shock_vol_basis
+        if abs(y_preview) > pre_shock_threshold:
             self.last_signed_position_size = 0.0
             self._trigger_circuit_breaker("VOL_SHOCK")
             output = _build_halted_output()
@@ -2331,6 +2371,7 @@ class AdvancedRegimeEngine:
             return output
 
         price = market_data.get("price", None)
+        observed_return = market_data.get("return", None)
         if price is not None:
             try:
                 price = float(price)
@@ -2343,7 +2384,63 @@ class AdvancedRegimeEngine:
                         stale_price = stale_gap is not None and stale_gap > self._MAX_PRICE_STALENESS_SEC
                         if np.isfinite(prev_price) and abs(prev_price) > 1e-12 and not stale_price:
                             frac_ret = (price - prev_price) / prev_price
-                            pnl = frac_ret * self.last_signed_position_size
+                            has_return = False
+                            return_value = 0.0
+                            try:
+                                return_value = float(observed_return) if observed_return is not None else 0.0
+                                has_return = observed_return is not None and np.isfinite(return_value)
+                            except (TypeError, ValueError):
+                                has_return = False
+                            if has_return:
+                                mismatch = abs(float(return_value) - float(frac_ret))
+                                if mismatch > self._PRICE_RETURN_MISMATCH_TOLERANCE:
+                                    self._warn_rate_limited(
+                                        key="price_return_mismatch",
+                                        message=(
+                                            f"Price/return mismatch detected (|Δ|={mismatch:.6f} > "
+                                            f"{self._PRICE_RETURN_MISMATCH_TOLERANCE:.6f}); "
+                                            "degrading to fail-safe output and freezing risk-state mutation."
+                                        ),
+                                        cooldown_s=15.0,
+                                    )
+                                    self._obs_observe(
+                                        "price_return_mismatch",
+                                        "high",
+                                        {"delta": mismatch, "tolerance": self._PRICE_RETURN_MISMATCH_TOLERANCE},
+                                    )
+                                    self.last_signed_position_size = 0.0
+                                    output = _build_output(
+                                        regime_idx=-1,
+                                        regime_label="UNKNOWN",
+                                        execution_mode="fail_safe",
+                                        trend_strength=float(getattr(self, "_last_effective_trend_strength", 0.0)),
+                                        risk_level=1.0,
+                                        confidence=0.0,
+                                        conviction=0.0,
+                                        edge_score=0.0,
+                                        probabilities={'bull': 0.0, 'bear': 0.0, 'crisis': 1.0},
+                                        macro_probs=self.nhhmm_prior.tolist(),
+                                        position_size=0.0,
+                                        signed_position_size=0.0,
+                                        expected_vol=float(getattr(self, "_last_valid_vol", self.garch.target_vol)),
+                                        raw_size=0.0,
+                                        is_toxic=True,
+                                        garch_regime_probs=self.garch_prob.tolist(),
+                                        feed_status='PRICE_RETURN_MISMATCH',
+                                        last_valid_vol=float(getattr(self, "_last_valid_vol", self.garch.target_vol)),
+                                        switch_stability_ema=float(getattr(self, "_switch_stability_ema", 1.0)),
+                                        execution_side='flat',
+                                        extended_schema=self._emit_extended_schema,
+                                        range_ticks=self.range_ticks_int,
+                                        include_signal_valid=True,
+                                        signal_valid=False,
+                                    )
+                                    _observe_latency()
+                                    return output
+                                pnl_ret = float(return_value)
+                            else:
+                                pnl_ret = float(frac_ret)
+                            pnl = pnl_ret * self.last_signed_position_size
                             if np.isfinite(pnl):
                                 self._equity += pnl
                                 if self._equity < self._MIN_EQUITY_FLOOR:
@@ -2381,7 +2478,6 @@ class AdvancedRegimeEngine:
                 )
                 self._obs_observe("pnl_tracking_failure", "medium", {"reason": "price_parse_error"})
         if self._circuit_breaker_active:
-            self._healing_counter = max(int(getattr(self, "_healing_counter", 0)), 1)
             output = _build_halted_output()
             _observe_latency()
             if obs_sample and not getattr(self, "_is_replay", False):
@@ -2647,6 +2743,17 @@ class AdvancedRegimeEngine:
             )
             self._obs_observe("return_out_of_bounds", "medium", {"source": "update"})
             y_t = float(np.clip(y_t, -2.0, 2.0))
+
+        final_shock_threshold = self._VOL_SHOCK_MULTIPLIER * shock_vol_basis
+        if abs(y_t) > final_shock_threshold:
+            self.last_signed_position_size = 0.0
+            self._trigger_circuit_breaker("VOL_SHOCK")
+            self._obs_observe("circuit_breaker", "critical", {"reason": self._circuit_breaker_reason})
+            output = _build_halted_output()
+            _observe_latency()
+            if obs_sample and not getattr(self, "_is_replay", False):
+                self._replay_record("update_end", {"regime": "HALTED"})
+            return output
 
         if x_t is None:
             x_t = np.zeros(self.n_features)
@@ -3071,7 +3178,7 @@ class AdvancedRegimeEngine:
         self._confirmed_regime_idx = confirmed_regime_idx
 
         if regime_changed:
-            self._last_regime_change_ts = current_ts
+            self._set_regime_change_timestamp(current_ts)
 
         self._prev_regime = confirmed_regime
 
@@ -3114,9 +3221,6 @@ class AdvancedRegimeEngine:
             elif alpha_bias < -0.2 and confirmed_regime in ("BEAR", "RANGE"):
                 execution_side = "short"
 
-        garch_var_snapshot = np.copy(self.garch_var)
-        garch_prob_snapshot = np.copy(self.garch_prob)
-        smoothed_garch_snapshot = np.copy(self._smoothed_garch_prob)
         predicted_var = np.copy(self.garch_var)
         self.garch_var = self.garch._garch_update(self.garch_var, y_t)
         if self.garch_var.shape != (2,) or not np.all(np.isfinite(self.garch_var)):
@@ -3150,22 +3254,6 @@ class AdvancedRegimeEngine:
         expected_vol = np.sqrt(expected_var)
         expected_vol = min(expected_vol, 0.20)
         
-        # ==========================================
-        # 🚨 STEP 1: VOLATILITY SHOCK DETECTOR
-        # ==========================================
-        if abs(y_t) > self._VOL_SHOCK_MULTIPLIER * max(expected_vol, 1e-8):
-            self.garch_var = garch_var_snapshot
-            self.garch_prob = garch_prob_snapshot
-            self._smoothed_garch_prob = smoothed_garch_snapshot
-            self.last_signed_position_size = 0.0
-            self._trigger_circuit_breaker("VOL_SHOCK")
-            self._obs_observe("circuit_breaker", "critical", {"reason": self._circuit_breaker_reason})
-            output = _build_halted_output()
-            _observe_latency()
-            if obs_sample and not getattr(self, "_is_replay", False):
-                self._replay_record("update_end", {"regime": "HALTED"})
-            return output
-
         # ==========================================
         # 🚨 STEP 2: CONFIDENCE COLLAPSE
         # ==========================================
@@ -3303,12 +3391,8 @@ class AdvancedRegimeEngine:
 
         position_size = float(np.clip(position_size * edge_scaled, 0.0, self._MAX_POSITION_SIZE))
 
-        signed_position_size = self.last_signed_position_size
-        if confirmed_regime == "TREND":
-            signed_position_size = position_size
-        elif confirmed_regime == "BEAR":
-            signed_position_size = -position_size
-        elif confirmed_regime == "RANGE":
+        range_signed_size = 0.0
+        if confirmed_regime == "RANGE":
             prior_sign = np.sign(self.last_signed_position_size)
 
             if self._range_anchor_size < self._MIN_SIGNED_TRADE_SIZE:
@@ -3335,20 +3419,18 @@ class AdvancedRegimeEngine:
             if not np.isfinite(decay):
                 decay = 0.1
 
-            signed_position_size = float(
+            range_signed_size = float(
                 prior_sign * min(anchor_size, position_size) * decay
             )
-            if not np.isfinite(signed_position_size):
-                signed_position_size = 0.0
+            if not np.isfinite(range_signed_size):
+                range_signed_size = 0.0
 
             dynamic_min = max(
                 self._MIN_SIGNED_TRADE_SIZE,
                 0.1 * position_size
             )
-            if abs(signed_position_size) < dynamic_min:
-                signed_position_size = 0.0
-        elif confirmed_regime == "TOXIC":
-            signed_position_size = 0.0
+            if abs(range_signed_size) < dynamic_min:
+                range_signed_size = 0.0
 
         # Final telemetry hygiene
         if not np.isfinite(position_size):
@@ -3361,10 +3443,31 @@ class AdvancedRegimeEngine:
         if np.isfinite(effective_trend_strength):
             self._last_effective_trend_strength = float(effective_trend_strength)
 
-        # --- FIX: persist edge state for next-tick hysteresis and state restore ---
-        self._last_regime_change_ts = current_ts if regime_changed else self._last_regime_change_ts
+        # Final execution guard (single-source execution intent).
+        if confirmed_regime in ("TREND", "BEAR") and edge_score < self._EDGE_MIN_DIRECTIONAL_CONFIDENCE:
+            execution_side = "flat"
+        final_execution_side = execution_side
 
         position_size = float(np.clip(position_size, 0.0, self._MAX_POSITION_SIZE))
+        if final_execution_side == "flat":
+            position_size = 0.0
+            signed_position_size = 0.0
+        elif final_execution_side == "long":
+            signed_position_size = abs(position_size)
+        elif final_execution_side == "short":
+            signed_position_size = -abs(position_size)
+        elif final_execution_side == "range_mean_revert":
+            signed_position_size = float(np.clip(range_signed_size, -position_size, position_size))
+        else:
+            self._warn_rate_limited(
+                key="invalid_execution_side",
+                message=f"Invalid execution_side='{final_execution_side}' resolved to flat.",
+                cooldown_s=30.0,
+            )
+            final_execution_side = "flat"
+            position_size = 0.0
+            signed_position_size = 0.0
+
         if not np.isfinite(signed_position_size):
             signed_position_size = 0.0
         signed_position_size = float(np.clip(signed_position_size, -position_size, position_size))
@@ -3385,10 +3488,6 @@ class AdvancedRegimeEngine:
             {"feed_status": feed_status, "regime": confirmed_regime},
         )
         self._obs_counter += 1
-
-        # Final execution guard (redundant safety layer)
-        if confirmed_regime in ("TREND", "BEAR") and edge_score < self._EDGE_MIN_DIRECTIONAL_CONFIDENCE:
-            execution_side = "flat"
 
         # Keep regime label and returned index semantically aligned.
         # RANGE and TOXIC do not map cleanly to the 3-state SJM index space.
@@ -3420,7 +3519,7 @@ class AdvancedRegimeEngine:
             feed_status=feed_status,
             last_valid_vol=float(self._last_valid_vol),
             switch_stability_ema=float(self._switch_stability_ema),
-            execution_side=execution_side,
+            execution_side=final_execution_side,
             extended_schema=self._emit_extended_schema,
             range_ticks=rticks,
             include_signal_valid=True,
@@ -3673,6 +3772,7 @@ class AdvancedRegimeEngine:
             self._last_timestamp = None
             self._last_valid_dt = 1.0
             self._last_valid_sjm_probs = np.ones(self.K) / self.K
+            self._last_price = None
             self._last_price_timestamp = None
 
             # Reset breaker
