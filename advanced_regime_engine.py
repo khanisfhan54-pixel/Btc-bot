@@ -479,6 +479,7 @@ class RegimeMarkovSmoother:
         bull = float(np.clip(scores.get("bull", 0.5), 0.0, 1.0))
         bear = float(np.clip(scores.get("bear", 0.5), 0.0, 1.0))
         trend_mass = float(np.clip(scores.get("trend_score", 0.0), 0.0, 1.0))
+        bear_mass = float(np.clip(scores.get("bear_score", scores.get("bear_trend_score", 0.0)), 0.0, 1.0))
         range_mass = float(np.clip(scores.get("range_score", 0.0), 0.0, 1.0))
         toxic_mass = float(np.clip(scores.get("toxic_score", 0.0), 0.0, 1.0))
 
@@ -490,7 +491,8 @@ class RegimeMarkovSmoother:
         bear_share = bear / dir_total
         blend_w = 0.25
         trend_prob = float(np.clip((1.0 - blend_w) * trend_mass + blend_w * bull_share, 0.0, 1.0))
-        bear_prob = float(np.clip((1.0 - blend_w) * trend_mass + blend_w * bear_share, 0.0, 1.0))
+        bear_core = bear_mass if bear_mass > 0.0 else trend_mass
+        bear_prob = float(np.clip((1.0 - blend_w) * bear_core + blend_w * bear_share, 0.0, 1.0))
         return self._normalize(np.array([trend_prob, range_mass, bear_prob, toxic_mass], dtype=float))
 
     def update(self, scores: Dict[str, Any], prev_regime: str | None) -> tuple[str, np.ndarray]:
@@ -608,7 +610,10 @@ def compute_hmm_regime(
         "RANGE": range_score,
         "TOXIC": toxic_score,
     }
-    regime = max(score_map, key=score_map.get)
+    max_score = max(score_map.values())
+    tied_labels = [label for label, score in score_map.items() if abs(score - max_score) <= 1e-12]
+    tie_priority = {"RANGE": 0, "TOXIC": 1, "TREND": 2, "BEAR": 3}
+    regime = sorted(tied_labels, key=lambda label: tie_priority.get(label, 99))[0]
 
     entropy = float(-np.sum(alpha_safe * np.log(np.clip(alpha_safe, 1e-12, None))))
     max_entropy = float(np.log(alpha_safe.size))
@@ -629,6 +634,7 @@ def compute_hmm_regime(
         "directional_label": directional_label,
         "edge_score": edge_score,
         "trend_score": trend_score,
+        "bear_score": trend_score_bear,
         "range_score": range_score,
         "toxic_score": toxic_score,
     }
@@ -906,6 +912,7 @@ class AdvancedRegimeEngine:
 
     _EWM_ALPHA: float = 0.15
     _RANGE_SIGNED_DECAY: float = 0.25
+    _RANGE_SIGNED_DECAY_LAMBDA: float = 0.0001
     _MIN_SIGNED_TRADE_SIZE: float = 0.01
     _MIN_POSITION_SIZE: float = 0.01
     _RANGE_NEUTRALIZE_VOL: float = 0.018
@@ -1597,13 +1604,30 @@ class AdvancedRegimeEngine:
     # ==========================================
     # NEW: Async Warning Emitter Loop
     # ==========================================
+    def _increment_warning_backend_failure_count(self) -> None:
+        with self._warning_lock:
+            self._warning_backend_failure_count = int(
+                getattr(self, "_warning_backend_failure_count", 0)
+            ) + 1
+
+    def _get_warning_backend_failure_count(self) -> int:
+        with self._warning_lock:
+            return int(getattr(self, "_warning_backend_failure_count", 0))
+
     @staticmethod
     def _emit_warning_with_timeout(message: str, timeout_s: float = 1.0) -> bool:
-        # Single worker-thread emission: never spawn per-warning threads.
-        # timeout_s is kept for API compatibility with existing callsites.
-        _ = timeout_s
-        LOGGER.warning(message)
-        return True
+        completed = threading.Event()
+
+        def _emit() -> None:
+            try:
+                LOGGER.warning(message)
+            finally:
+                completed.set()
+
+        t = threading.Thread(target=_emit, daemon=True, name="warning_emit")
+        t.start()
+        t.join(timeout=max(float(timeout_s), 0.0))
+        return bool(completed.is_set())
 
     @staticmethod
     def _warning_emitter_loop(
@@ -1634,8 +1658,7 @@ class AdvancedRegimeEngine:
                 emitted = AdvancedRegimeEngine._emit_warning_with_timeout(msg, timeout_s=1.0)
                 if not emitted:
                     if engine is not None:
-                        with engine._warning_lock:
-                            engine._warning_backend_failure_count = int(getattr(engine, "_warning_backend_failure_count", 0)) + 1
+                        engine._increment_warning_backend_failure_count()
                     try:
                         warnings.warn(
                             "LOGGER.warning timeout in background worker; message emission skipped.",
@@ -1646,8 +1669,7 @@ class AdvancedRegimeEngine:
                         pass
             except Exception:
                 if engine is not None:
-                    with engine._warning_lock:
-                        engine._warning_backend_failure_count = int(getattr(engine, "_warning_backend_failure_count", 0)) + 1
+                    engine._increment_warning_backend_failure_count()
                 try:
                     warnings.warn(msg, RuntimeWarning, stacklevel=3)
                 except Exception:
@@ -2453,11 +2475,11 @@ class AdvancedRegimeEngine:
 
             if self._healing_counter > self._HEALING_COOLDOWN_TICKS:
                 self._self_heal()
-                output = _build_halted_output()
-                _observe_latency()
-                if obs_sample and not getattr(self, "_is_replay", False):
-                    self._replay_record("update_end", {"regime": "HALTED_HEALING"})
-                return output
+                halted = _halt_if_breaker_after_heal()
+                if halted is not None:
+                    if obs_sample and not getattr(self, "_is_replay", False):
+                        self._replay_record("update_end", {"regime": "HALTED_HEALING"})
+                    return halted
             else:
                 self._obs_observe("circuit_breaker", "critical", {"reason": self._circuit_breaker_reason})
                 output = _build_halted_output()
@@ -2546,12 +2568,16 @@ class AdvancedRegimeEngine:
                 try:
                     if self._last_price is not None:
                         prev_price = float(self._last_price)
-                        stale_price = False
+                        stale_price = True
                         try:
                             stale_gap = None
                             if current_ts is not None and self._last_price_timestamp is not None:
                                 stale_gap = float(current_ts - self._last_price_timestamp)
-                            stale_price = stale_gap is not None and stale_gap > self._MAX_PRICE_STALENESS_SEC
+                            stale_price = (
+                                stale_gap is None
+                                or stale_gap < 0.0
+                                or stale_gap > self._MAX_PRICE_STALENESS_SEC
+                            )
                         except (TypeError, ValueError) as exc:
                             self._warn_rate_limited(
                                 key="pnl_stale_price_check_failure",
@@ -3001,11 +3027,13 @@ class AdvancedRegimeEngine:
             mtf_degradation_reasons["telemetry_partial_survival"] += 1
 
         # --- FIX #2: If execution features fail, still preserve macro posterior ---
-        if (is_dim_fail or n_corrupt > 0) and mtf_data is not None:
-            if safe_nhhmm_posterior is not None:
-                self.nhhmm_prior = _normalize_prob_vector(safe_nhhmm_posterior)
+        use_fused_macro_only = False
+        if (is_dim_fail or n_corrupt > 0) and mtf_data is not None and safe_nhhmm_posterior is not None:
+            self.nhhmm_prior = _normalize_prob_vector(safe_nhhmm_posterior)
+            use_fused_macro_only = True
+            feed_status = "MTF_FUSED_BASE_FEATURE_INVALID"
 
-        if is_dim_fail or n_corrupt > 0:
+        if (is_dim_fail or n_corrupt > 0) and not use_fused_macro_only:
             if mtf_data is None:
                 self._warn_rate_limited(
                     key="single_tf_nhhmm_failure",
@@ -3084,8 +3112,9 @@ class AdvancedRegimeEngine:
             _observe_latency()
             return output
 
-        feed_status = 'OK'
-        if mtf_partial_survival:
+        if not use_fused_macro_only:
+            feed_status = 'OK'
+        if mtf_partial_survival and not use_fused_macro_only:
             feed_status = 'MTF_PARTIAL_SURVIVAL'
             if mtf_degradation_reasons:
                 self._warn_rate_limited(
@@ -3138,22 +3167,26 @@ class AdvancedRegimeEngine:
 
         nhhmm_confidence = float(np.max(nhhmm_posterior))
         effective_bias_weight = float(np.clip(nhhmm_confidence, 0.0, 1.0))
-        sjm_x_t = np.asarray(x_t, dtype=float).copy()
-        if np.isfinite(y_t) and self._sjm_reserved_feature_indices is not None:
-            ret_idx, abs_idx = self._sjm_reserved_feature_indices
-            sjm_x_t[ret_idx] = float(y_t)
-            sjm_x_t[abs_idx] = abs(float(y_t))
-        sjm_state, sjm_probs = self.sjm.online_predict(
-            x_t=sjm_x_t,
-            expected_n_features=self.n_features,
-            prev_state=self.current_regime_idx,
-            nhhmm_probs=nhhmm_posterior,
-            bias_weight=effective_bias_weight,
-        )
-        try:
-            sjm_probs = self._coerce_vector("sjm_probs", sjm_probs, self.K)
-        except Exception:
-            sjm_probs = np.full(self.K, np.nan, dtype=float)
+        if use_fused_macro_only:
+            sjm_probs = _normalize_prob_vector(np.asarray(nhhmm_posterior, dtype=float))
+            sjm_state = int(np.argmax(sjm_probs))
+        else:
+            sjm_x_t = np.asarray(x_t, dtype=float).copy()
+            if np.isfinite(y_t) and self._sjm_reserved_feature_indices is not None:
+                ret_idx, abs_idx = self._sjm_reserved_feature_indices
+                sjm_x_t[ret_idx] = float(y_t)
+                sjm_x_t[abs_idx] = abs(float(y_t))
+            sjm_state, sjm_probs = self.sjm.online_predict(
+                x_t=sjm_x_t,
+                expected_n_features=self.n_features,
+                prev_state=self.current_regime_idx,
+                nhhmm_probs=nhhmm_posterior,
+                bias_weight=effective_bias_weight,
+            )
+            try:
+                sjm_probs = self._coerce_vector("sjm_probs", sjm_probs, self.K)
+            except Exception:
+                sjm_probs = np.full(self.K, np.nan, dtype=float)
         
         # ==========================================
         # FIX: STICKY SJM FALLBACK (NO REGIME COLLAPSE)
@@ -3402,8 +3435,8 @@ class AdvancedRegimeEngine:
                 self._in_range = False
 
         if confirmed_regime == "RANGE":
-            self.range_ticks += time_delta
-            self.range_ticks = min(self.range_ticks, 1000.0)
+            self.range_ticks += 1.0
+            self.range_ticks = min(self.range_ticks, 1_000_000.0)
 
         self.range_ticks_int = int(self.range_ticks)
 
@@ -3622,7 +3655,7 @@ class AdvancedRegimeEngine:
                 vol_ratio = 1.0
 
             decay = self._RANGE_SIGNED_DECAY / (1.0 + vol_ratio)
-            decay *= float(max(np.exp(-0.15 * self.range_ticks), 1e-3))
+            decay *= float(max(np.exp(-self._RANGE_SIGNED_DECAY_LAMBDA * self.range_ticks), 1e-3))
             decay = max(decay, self._RANGE_DECAY_FLOOR_K)
             if not np.isfinite(decay):
                 decay = 0.1
@@ -4027,7 +4060,21 @@ class AdvancedRegimeEngine:
             action = "RESET_NUMERICAL"
 
         elif category == "state":
+            preserved_equity = max(float(getattr(self, "_equity", 1.0)), self._MIN_EQUITY_FLOOR)
+            preserved_equity_peak = max(float(getattr(self, "_equity_peak", preserved_equity)), preserved_equity)
+            preserved_cumulative_drawdown = max(
+                float(getattr(self, "_cumulative_drawdown", 0.0)),
+                float(getattr(self, "_drawdown", 0.0)),
+            )
             self.reset_state()
+            self._equity = preserved_equity
+            self._equity_peak = preserved_equity_peak
+            self._drawdown = float(np.clip(
+                (self._equity_peak - self._equity) / max(self._equity_peak, self._MIN_EQUITY_FLOOR),
+                0.0,
+                1.0,
+            ))
+            self._cumulative_drawdown = max(preserved_cumulative_drawdown, self._drawdown)
             action = "RESET_STATE"
 
         elif category == "smoothing":
@@ -4053,7 +4100,9 @@ class AdvancedRegimeEngine:
             # Deterministic fallback: always execute a safe degradation path.
             self.nhhmm_prior = _normalize_prob_vector(self.nhhmm_prior)
             self.garch_prob = _safe_prob_vector(self.garch_prob, 2)
-            self._smoothed_garch_prob = _safe_prob_vector(self._smoothed_garch_prob, 2)
+            self._smoothed_garch_prob = _normalize_prob_vector(
+                _safe_prob_vector(self._smoothed_garch_prob, 2)
+            )
             self._confidence_collapse_streak = 0
             action = "SKIP_AND_DEGRADE"
 
