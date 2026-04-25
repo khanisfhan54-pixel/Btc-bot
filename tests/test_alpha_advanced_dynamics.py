@@ -15,15 +15,9 @@ from alpha_orchestration import (
     FeatureQuality,
     ExecutionState,
 )
+from tests.action_expectations import is_unsafe_aggregation_meta
 
 
-def _is_unsafe_aggregation(out, timeframe="1m"):
-    tf_meta = out.meta_info.get("tf_fusion_breakdown", {}).get(timeframe, {})
-    summary = tf_meta.get("fusion_meta", {}).get("correlation_summary", {})
-    denom = summary.get("total_adjusted_weight")
-    if denom is None:
-        return True
-    return bool(summary.get("low_aggregate_weight")) or float(denom) <= 1e-12
 
 
 @pytest.fixture
@@ -118,7 +112,7 @@ def test_double_penalty_detection(orchestrator, regime_ctx, fq, exec_state):
     out = orchestrator.orchestrate(signals, regime_ctx, fq, exec_state, current_time=ts)
     rows = out.meta_info["per_signal_breakdown"]
     w = rows[0]["final_weight_contribution"]
-    if _is_unsafe_aggregation(out):
+    if is_unsafe_aggregation_meta(out.meta_info):
         assert out.action.name == "HOLD"
         assert w == 0.0
     else:
@@ -194,7 +188,7 @@ def test_unrelated_sources_not_over_penalized(orchestrator, regime_ctx, fq, exec
     ]
     out = orchestrator.orchestrate(signals, regime_ctx, fq, exec_state, current_time=ts)
     summary = out.meta_info["tf_fusion_breakdown"]["1m"]["fusion_meta"]["correlation_summary"]
-    if _is_unsafe_aggregation(out):
+    if is_unsafe_aggregation_meta(out.meta_info):
         assert summary["edge_attenuation_factor"] == pytest.approx(0.0, rel=1e-7)
         assert out.expected_edge_bps == 0.0
     else:
@@ -249,7 +243,7 @@ def test_low_conviction_not_boosted(orchestrator, regime_ctx, fq, exec_state):
     out_strong = orchestrator.orchestrate(strong, regime_ctx, fq, exec_state, current_time=ts)
     weak_w = out_weak.meta_info["per_signal_breakdown"][0]["final_weight_contribution"]
     strong_w = out_strong.meta_info["per_signal_breakdown"][0]["final_weight_contribution"]
-    if _is_unsafe_aggregation(out_weak) and _is_unsafe_aggregation(out_strong):
+    if is_unsafe_aggregation_meta(out_weak.meta_info) and is_unsafe_aggregation_meta(out_strong.meta_info):
         assert weak_w == 0.0
         assert strong_w == 0.0
     else:
@@ -280,7 +274,7 @@ def test_single_signal_baseline(orchestrator, regime_ctx, fq, exec_state):
         {"source_id": "alpha_good", "direction": 1, "conviction": 1.0, "expected_edge_bps": 50, "timestamp": ts, "timeframe": "1m"}
     ]
     out = orchestrator.orchestrate(signals, regime_ctx, fq, exec_state, current_time=ts)
-    if _is_unsafe_aggregation(out):
+    if is_unsafe_aggregation_meta(out.meta_info):
         assert out.action.name == "HOLD"
         assert out.net_conviction == 0.0
         assert out.expected_edge_bps == 0.0
@@ -296,7 +290,7 @@ def test_cross_tf_safe(orchestrator, regime_ctx, fq, exec_state):
         {"source_id": "alpha_v2", "direction": 1, "conviction": 1.0, "expected_edge_bps": 50, "timestamp": ts, "timeframe": "1h"},
     ]
     out = orchestrator.orchestrate(signals, regime_ctx, fq, exec_state, current_time=ts)
-    if _is_unsafe_aggregation(out):
+    if is_unsafe_aggregation_meta(out.meta_info):
         assert out.action.name == "HOLD"
         assert out.net_conviction == 0.0
     else:
@@ -392,13 +386,13 @@ def test_non_correlated_signals_do_not_suppress_edge(orchestrator, regime_ctx, f
     ]
     out = orchestrator.orchestrate(signals, regime_ctx, fq, exec_state, current_time=ts)
     summary = out.meta_info["tf_fusion_breakdown"]["1m"]["fusion_meta"]["correlation_summary"]
-    if _is_unsafe_aggregation(out):
+    if is_unsafe_aggregation_meta(out.meta_info):
         assert summary["edge_attenuation_factor"] == pytest.approx(0.0, rel=1e-8)
     else:
         assert summary["edge_attenuation_factor"] == pytest.approx(1.0, rel=1e-8)
     assert isinstance(summary["groups"], list)
     assert all("size" in g and "key" in g for g in summary["groups"])
-    if _is_unsafe_aggregation(out):
+    if is_unsafe_aggregation_meta(out.meta_info):
         assert out.expected_edge_bps == 0.0
     else:
         assert out.expected_edge_bps == pytest.approx(50.0, rel=1e-6)

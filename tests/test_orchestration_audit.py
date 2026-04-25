@@ -11,6 +11,7 @@ import alpha_orchestrator as ao
 import feature_engine as fe
 import signal_engine as se
 import alpha_liquidity_sweep_predictor as alpha_pred
+from tests.action_expectations import expected_action_from_meta, is_unsafe_aggregation_meta
 
 
 # ============================================================================
@@ -71,18 +72,6 @@ def _make_regime(name="normal", vol=0.3, liq=0.8):
 def _make_fq(stale=0.0, missing=0.0):
     return ao.FeatureQuality(staleness_ratio=stale, missing_data_ratio=missing)
 
-
-def _is_unsafe_aggregation(out):
-    tf_breakdown = out.meta_info.get("tf_fusion_breakdown", {})
-    dominant_tf = out.meta_info.get("dominant_timeframe")
-    if dominant_tf not in tf_breakdown and tf_breakdown:
-        dominant_tf = next(iter(tf_breakdown.keys()))
-    tf_meta = tf_breakdown.get(dominant_tf or "", {})
-    summary = tf_meta.get("fusion_meta", {}).get("correlation_summary", {})
-    denom = summary.get("total_adjusted_weight")
-    if denom is None:
-        return True
-    return bool(summary.get("low_aggregate_weight")) or float(denom) <= 1e-12
 
 
 # ============================================================================
@@ -294,9 +283,9 @@ class TestSignalFusion:
                              timeframe="1m")]
         out = orch.orchestrate(sigs, _make_regime(), _make_fq(),
                                _make_exec_state(), current_time=now)
-        expected = ao.Action.HOLD if _is_unsafe_aggregation(out) else ao.Action.BUY
+        expected = ao.Action[expected_action_from_meta(out.meta_info)]
         assert out.action == expected
-        if _is_unsafe_aggregation(out):
+        if is_unsafe_aggregation_meta(out.meta_info):
             assert out.net_conviction == 0.0
             assert out.expected_edge_bps == 0.0
         else:
@@ -337,9 +326,9 @@ class TestSignalFusion:
         ]
         out = orch.orchestrate(sigs, _make_regime(), _make_fq(),
                                _make_exec_state(), current_time=now)
-        expected = ao.Action.HOLD if _is_unsafe_aggregation(out) else ao.Action.BUY
+        expected = ao.Action[expected_action_from_meta(out.meta_info)]
         assert out.action == expected
-        if _is_unsafe_aggregation(out):
+        if is_unsafe_aggregation_meta(out.meta_info):
             assert out.expected_edge_bps == 0.0
         else:
             assert out.expected_edge_bps > 0.0
@@ -415,14 +404,14 @@ class TestMultiTimeframe:
         ]
         out = orch.orchestrate(sigs, _make_regime(), _make_fq(),
                                _make_exec_state(), current_time=now)
-        expected = ao.Action.HOLD if _is_unsafe_aggregation(out) else ao.Action.BUY
+        expected = ao.Action[expected_action_from_meta(out.meta_info)]
         assert out.action == expected
         mtf = out.meta_info["mtf_metrics"]
-        if _is_unsafe_aggregation(out):
+        if is_unsafe_aggregation_meta(out.meta_info):
             assert mtf.get("dominant") in (None, "1h")
         else:
             assert mtf.get("dominant") == "1h"
-        if _is_unsafe_aggregation(out):
+        if is_unsafe_aggregation_meta(out.meta_info):
             assert mtf.get("htf_excluded_tfs", []) in ([], ["1m"])
         else:
             assert "1m" in mtf.get("htf_excluded_tfs", [])
@@ -448,11 +437,11 @@ class TestMultiTimeframe:
         ]
         out = orch.orchestrate(aligned, _make_regime(), _make_fq(),
                                _make_exec_state(), current_time=now)
-        expected = ao.Action.HOLD if _is_unsafe_aggregation(out) else ao.Action.BUY
+        expected = ao.Action[expected_action_from_meta(out.meta_info)]
         assert out.action == expected
         mtf = out.meta_info["mtf_metrics"]
         assert mtf["is_mtf"] is True
-        if _is_unsafe_aggregation(out):
+        if is_unsafe_aggregation_meta(out.meta_info):
             assert out.meta_info["agreement_ratio"] == 0.0
         else:
             assert out.meta_info["agreement_ratio"] > 0.99
@@ -922,12 +911,12 @@ class TestEdgeConvention:
             sell_sig, _make_regime(), _make_fq(), _make_exec_state(),
             current_time=now,
         )
-        if _is_unsafe_aggregation(buy_out):
+        if is_unsafe_aggregation_meta(buy_out.meta_info):
             assert buy_out.expected_edge_bps == 0.0
             assert buy_out.action == ao.Action.HOLD
         else:
             assert buy_out.expected_edge_bps > 0
-        if _is_unsafe_aggregation(sell_out):
+        if is_unsafe_aggregation_meta(sell_out.meta_info):
             assert sell_out.expected_edge_bps == 0.0
             assert sell_out.action == ao.Action.HOLD
         else:
