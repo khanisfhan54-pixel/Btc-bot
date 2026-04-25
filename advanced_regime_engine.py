@@ -491,7 +491,7 @@ class RegimeMarkovSmoother:
         bear_share = bear / dir_total
         blend_w = 0.25
         trend_prob = float(np.clip((1.0 - blend_w) * trend_mass + blend_w * bull_share, 0.0, 1.0))
-        bear_core = bear_mass if bear_mass > 0.0 else trend_mass
+        bear_core = bear_mass
         bear_prob = float(np.clip((1.0 - blend_w) * bear_core + blend_w * bear_share, 0.0, 1.0))
         return self._normalize(np.array([trend_prob, range_mass, bear_prob, toxic_mass], dtype=float))
 
@@ -558,7 +558,7 @@ def compute_hmm_regime(
 
     # --- Directional score (bounded, symmetric between TREND and BEAR) ---
     trend_score = float(np.clip(
-        (1.0 - 0.45 * crisis) * (0.85 * directional_confidence + 0.45 * directional_strength),
+        (1.0 - 0.45 * crisis) * (0.65 * directional_confidence + 0.35 * directional_strength),
         0.0,
         1.0,
     ))
@@ -941,7 +941,7 @@ class AdvancedRegimeEngine:
     _MAX_POSITION_SIZE: float = _POSITION_SIZE_CAP
     _MIN_EQUITY_FLOOR: float = 1e-6
     _MAX_PRICE_STALENESS_SEC: float = 300.0
-    _PRICE_RETURN_MISMATCH_TOLERANCE: float = 5e-4
+    _PRICE_RETURN_MISMATCH_TOLERANCE: float = 1e-3
     _CANONICAL_RETURN_MISMATCH_TOLERANCE: float = 1e-12
     _DIRECTION_SWITCH_GAP: float = 0.02
     _SJM_RESERVED_RETURN_IDX: int = 0
@@ -1640,6 +1640,17 @@ class AdvancedRegimeEngine:
         Ensures logging I/O never blocks trading execution threads.
         """
         while True:
+            engine = engine_ref()
+            if engine is None:
+                # Engine is already gone: drain and discard queued warnings without
+                # spawning emitter threads or touching logging backends.
+                while not warning_queue.empty():
+                    try:
+                        warning_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                break
+
             if stop_event.is_set() and warning_queue.empty():
                 break
 
@@ -1653,12 +1664,10 @@ class AdvancedRegimeEngine:
                     break
                 continue
 
-            engine = engine_ref()
             try:
                 emitted = AdvancedRegimeEngine._emit_warning_with_timeout(msg, timeout_s=1.0)
                 if not emitted:
-                    if engine is not None:
-                        engine._increment_warning_backend_failure_count()
+                    engine._increment_warning_backend_failure_count()
                     try:
                         warnings.warn(
                             "LOGGER.warning timeout in background worker; message emission skipped.",
@@ -1668,12 +1677,12 @@ class AdvancedRegimeEngine:
                     except Exception:
                         pass
             except Exception:
-                if engine is not None:
-                    engine._increment_warning_backend_failure_count()
+                engine._increment_warning_backend_failure_count()
                 try:
                     warnings.warn(msg, RuntimeWarning, stacklevel=3)
                 except Exception:
                     pass
+
 
     def _warn_rate_limited(self, key: str, message: str, cooldown_s: float = 30.0) -> None:
         """
@@ -1683,9 +1692,10 @@ class AdvancedRegimeEngine:
         """
         if getattr(self, "_is_replay", False):
             return
-        emit = False
+
+        now = time.monotonic()
+        eligible = False
         with self._warning_lock:
-            now = time.monotonic()
             self._warning_counts[key] = self._warning_counts.get(key, 0) + 1
 
             if key not in self._warning_first_seen:
@@ -1694,10 +1704,7 @@ class AdvancedRegimeEngine:
                 self._warning_first_seen.move_to_end(key)
 
             last_emitted = self._warning_last_emitted.get(key)
-            if last_emitted is None or (now - last_emitted) >= cooldown_s:
-                self._warning_last_emitted[key] = now
-                self._warning_last_emitted.move_to_end(key)
-                emit = True
+            eligible = bool(last_emitted is None or (now - last_emitted) >= cooldown_s)
 
             if len(self._warning_counts) >= self._WARNING_CACHE_LIMIT:
                 target_size = self._WARNING_CACHE_TRIM_TO
@@ -1708,28 +1715,43 @@ class AdvancedRegimeEngine:
                         self._warning_last_emitted.pop(old_key, None)
                         self._warning_first_seen.pop(old_key, None)
 
-        if emit and not self._obs_should_emit_warning(key, cooldown_s):
+        if not eligible:
             return
 
-        if emit:
-            try:
-                self._warning_queue.put_nowait(message)
-            except queue.Full:
-                with self._warning_lock:
-                    self._warning_drop_count = int(getattr(self, "_warning_drop_count", 0)) + 1
-                    should_alert = not bool(getattr(self, "_warning_drop_alerted", False))
-                    self._warning_drop_alerted = True
-                self._last_health = "DEGRADED"
-                if should_alert:
-                    try:
-                        warnings.warn(
-                            "Warning queue saturated; dropping warning messages.",
-                            RuntimeWarning,
-                            stacklevel=2,
-                        )
-                    except Exception:
-                        pass
-                return
+        if not self._obs_should_emit_warning(key, cooldown_s):
+            return
+
+        emit = False
+        with self._warning_lock:
+            now = time.monotonic()
+            last_emitted = self._warning_last_emitted.get(key)
+            if last_emitted is None or (now - last_emitted) >= cooldown_s:
+                self._warning_last_emitted[key] = now
+                self._warning_last_emitted.move_to_end(key)
+                emit = True
+
+        if not emit:
+            return
+
+        try:
+            self._warning_queue.put_nowait(message)
+        except queue.Full:
+            with self._warning_lock:
+                self._warning_drop_count = int(getattr(self, "_warning_drop_count", 0)) + 1
+                should_alert = not bool(getattr(self, "_warning_drop_alerted", False))
+                self._warning_drop_alerted = True
+            self._last_health = "DEGRADED"
+            if should_alert:
+                try:
+                    warnings.warn(
+                        "Warning queue saturated; dropping warning messages.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                except Exception:
+                    pass
+            return
+
 
     def _warn_tf_failure(self, tf: str, exc: Exception) -> None:
         """
@@ -2412,6 +2434,7 @@ class AdvancedRegimeEngine:
 
         start_time = time.perf_counter()
         self._tick_id = int(getattr(self, "_tick_id", 0)) + 1
+        self._obs_counter += 1
         valid_tf_count = 0
         expected_weighted_tf_count = 0
         total_candidate_tfs = 0
@@ -2619,6 +2642,15 @@ class AdvancedRegimeEngine:
                                                 "high",
                                                 {"delta": mismatch, "tolerance": self._PRICE_RETURN_MISMATCH_TOLERANCE},
                                             )
+                                            try:
+                                                self._last_price = float(parsed_price)
+                                                self._last_price_timestamp = current_ts
+                                            except Exception as exc:
+                                                self._warn_rate_limited(
+                                                    key="pnl_last_price_state_failure",
+                                                    message=f"Last-price state mutation failed: {exc}",
+                                                    cooldown_s=15.0,
+                                                )
                                             self.last_signed_position_size = 0.0
                                             output = _build_output(
                                                 regime_idx=-1,
@@ -3078,7 +3110,6 @@ class AdvancedRegimeEngine:
                     ENGINE_HEALTH.labels(self.engine_id).set(0)
 
             self._obs_observe("data_failure", "high", {"feed_status": feed_status})
-            self._obs_counter += 1  # PRODUCTION HARDENING: prevent rate-limit bypass on outage
 
             output = _build_output(
                 # expose MTF degradation state without changing schema shape
@@ -3728,7 +3759,6 @@ class AdvancedRegimeEngine:
             {"OK": "low", "DEGRADED": "medium", "RISK": "high", "FAIL": "critical"}.get(self._last_health, "low"),
             {"feed_status": feed_status, "regime": confirmed_regime},
         )
-        self._obs_counter += 1
 
         # Keep regime label and returned index semantically aligned.
         # RANGE and TOXIC do not map cleanly to the 3-state SJM index space.
@@ -3827,12 +3857,6 @@ class AdvancedRegimeEngine:
     # ==========================================
     @_synchronized
     def load_snapshot(self, snapshot: Dict[str, Any]) -> None:
-        prior_state = copy.deepcopy(self.serialize_state())
-        prior_rng_state = (
-            copy.deepcopy(self._rng.bit_generator.state)
-            if getattr(self, "_rng", None) is not None else None
-        )
-        rollback_ok = False
         try:
             incoming = snapshot if isinstance(snapshot, dict) else {}
             state = incoming.get("state", incoming)
@@ -3876,35 +3900,53 @@ class AdvancedRegimeEngine:
                 if type(self._rng.bit_generator).__name__ != state["_engine_rng_type"]:
                     raise ValueError("snapshot RNG type mismatch")
 
-            self.load_state(engine_state)
+            # Validate incoming RNG payload before mutating self.
+            validated_rng_state = None
             if incoming_rng_state is not None and getattr(self, "_rng", None) is not None:
-                self._rng.bit_generator.state = copy.deepcopy(dict(incoming_rng_state))
+                candidate_rng_state = copy.deepcopy(dict(incoming_rng_state))
+                probe_rng = np.random.default_rng(self._rng_seed)
+                if type(probe_rng.bit_generator).__name__ != type(self._rng.bit_generator).__name__:
+                    raise ValueError("snapshot RNG probe mismatch")
+                probe_rng.bit_generator.state = candidate_rng_state
+                validated_rng_state = candidate_rng_state
+
+            # Validate-then-swap: hydrate a staging engine first.
+            staging = AdvancedRegimeEngine(
+                n_states=int(self._init_params.get("n_states", self.K)),
+                n_features=int(self._init_params.get("n_features", self.n_features)),
+                target_vol=float(self._init_params.get("target_vol", self.garch.target_vol)),
+                allow_igarch=bool(self._allow_igarch),
+                regime_prob_floor=float(self.garch._REGIME_PROB_FLOOR),
+                emit_extended_schema=bool(self._emit_extended_schema),
+                strict_mtf_keys=bool(self._strict_mtf_keys),
+                mtf_weights=copy.deepcopy(self.mtf_weights),
+                sjm_reserved_feature_indices=self._sjm_reserved_feature_indices,
+                seed=self._rng_seed,
+                engine_id=self.engine_id,
+            )
+            try:
+                staging._is_replay = True
+                staging.load_state(copy.deepcopy(engine_state))
+                if validated_rng_state is not None and getattr(staging, "_rng", None) is not None:
+                    staging._rng.bit_generator.state = validated_rng_state
+                committed_state = staging.serialize_state()
+                committed_rng_state = (
+                    copy.deepcopy(staging._rng.bit_generator.state)
+                    if getattr(staging, "_rng", None) is not None else None
+                )
+            finally:
+                staging._shutdown_warning_worker()
+
+            self.load_state(committed_state)
+            if committed_rng_state is not None and getattr(self, "_rng", None) is not None:
+                self._rng.bit_generator.state = committed_rng_state
             return
         except Exception as e:
-            try:
-                self.load_state(copy.deepcopy(prior_state))
-                if prior_rng_state is not None and getattr(self, "_rng", None) is not None:
-                    self._rng.bit_generator.state = copy.deepcopy(prior_rng_state)
-                current_hash = self._state_hash(self.serialize_state())
-                rollback_hash = self._state_hash(copy.deepcopy(prior_state))
-                rollback_ok = bool(current_hash == rollback_hash)
-            except Exception:
-                rollback_ok = False
-
-            if not rollback_ok:
-                try:
-                    self.reset_state()
-                    if getattr(self, "_rng", None) is not None:
-                        self._rng = np.random.default_rng(self._rng_seed)
-                except Exception:
-                    pass
-
             if not getattr(self, "_is_replay", False):
                 try:
                     LOGGER.error(
-                        "Snapshot load failed context_keys=%s rollback_ok=%s error=%s",
+                        "Snapshot load failed context_keys=%s error=%s",
                         sorted(list(snapshot.keys())) if isinstance(snapshot, dict) else [],
-                        rollback_ok,
                         repr(e),
                         exc_info=True,
                     )
@@ -4042,12 +4084,10 @@ class AdvancedRegimeEngine:
                 )
 
         if category == "numerical":
-            if (
-                self._last_valid_sjm_probs is None
-                or not np.all(np.isfinite(np.asarray(self._last_valid_sjm_probs, dtype=float)))
-                or np.asarray(self._last_valid_sjm_probs, dtype=float).shape != (self.K,)
-            ):
-                self._last_valid_sjm_probs = np.ones(self.K, dtype=float) / self.K
+            self.garch_var = self._stationary_garch_var()
+            self.garch_prob = np.ones(2, dtype=float) / 2.0
+            self._smoothed_garch_prob = np.ones(2, dtype=float) / 2.0
+            self._last_valid_sjm_probs = None
             smooth_len = int(np.size(self._smoothed_garch_prob))
             if smooth_len <= 0:
                 self._smoothed_garch_prob = np.ones(2, dtype=float) / 2.0
@@ -4091,7 +4131,11 @@ class AdvancedRegimeEngine:
             action = "SOFT_REBALANCE"
 
         elif category == "input":
-            action = "SKIP_AND_DEGRADE"
+            self.nhhmm_prior = np.ones(self.K, dtype=float) / self.K
+            self.last_signed_position_size = 0.0
+            if not np.all(np.isfinite(self.nhhmm_prior)) or self.nhhmm_prior.shape != (self.K,):
+                self.nhhmm_prior = np.ones(self.K, dtype=float) / self.K
+            action = "RESET_INPUT"
 
         elif category == "risk":
             self._trigger_circuit_breaker(str(err_code))
@@ -4117,3 +4161,5 @@ class AdvancedRegimeEngine:
 
         self._last_healing_action = action
         return action
+
+#### END OF MODULE: RECOVERY COMPLETE ####
