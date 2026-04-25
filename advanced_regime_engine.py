@@ -852,7 +852,7 @@ class MSGARCH_RiskEngine:
     ) -> np.ndarray:
         current_var = np.asarray(current_var, dtype=float)
         current_var = np.where(np.isfinite(current_var), current_var, self.target_vol ** 2)
-        current_var = np.clip(current_var, 1e-8, self._VAR_CEIL)
+        current_var = np.clip(current_var, 1e-8, None)
         return_t = safe_float(return_t, default=0.0, min=-2.0, max=2.0)
         new_var = (
             self.omega
@@ -933,6 +933,7 @@ class AdvancedRegimeEngine:
     _MIN_EQUITY_FLOOR: float = 1e-6
     _MAX_PRICE_STALENESS_SEC: float = 300.0
     _PRICE_RETURN_MISMATCH_TOLERANCE: float = 5e-4
+    _CANONICAL_RETURN_MISMATCH_TOLERANCE: float = 1e-12
     _DIRECTION_SWITCH_GAP: float = 0.02
     _SJM_RESERVED_RETURN_IDX: int = 0
     _SJM_RESERVED_ABS_RETURN_IDX: int = 2
@@ -1051,6 +1052,7 @@ class AdvancedRegimeEngine:
         emit_extended_schema: bool = False,
         strict_mtf_keys: bool = True,
         mtf_weights: Dict[str, float] = None,
+        sjm_reserved_feature_indices: tuple[int, int] | None = None,
         seed: int | None = 7,
         engine_id: str | None = None,
     ):
@@ -1071,9 +1073,14 @@ class AdvancedRegimeEngine:
         self.K = n_states
         self.n_features = n_features
 
-        # --- NEW: Multi-timeframe weights ---
-        # Example: {"1m": 0.5, "5m": 0.3, "15m": 0.2}
-        self.mtf_weights = mtf_weights or {"base": 1.0}
+        # --- Multi-timeframe weights ---
+        # Contract: "base" is anchor-only and is not part of weighted fusion.
+        # Weights map only non-base timeframe keys to positive finite weights.
+        self.mtf_weights = self._normalize_mtf_weights(mtf_weights)
+
+        self._sjm_reserved_feature_indices = self._validate_sjm_reserved_feature_indices(
+            sjm_reserved_feature_indices
+        )
 
         self.nhhmm = NHHMM_Engine(n_states=n_states, n_features=n_features)
         self.sjm = SparseJumpModel(n_states=n_states)
@@ -1406,6 +1413,99 @@ class AdvancedRegimeEngine:
     @staticmethod
     def _coerce_finite_scalar(value: Any, *, default: float = 0.0) -> float:
         return _safe_float(value, default=float(default))
+
+    def _normalize_mtf_weights(self, mtf_weights: Dict[str, float] | None) -> Dict[str, float]:
+        if mtf_weights is None:
+            return {}
+        if not isinstance(mtf_weights, dict):
+            raise ValueError("mtf_weights must be a dict of timeframe -> positive weight")
+        normalized: Dict[str, float] = {}
+        for key, raw_weight in mtf_weights.items():
+            tf = str(key)
+            if tf == "base":
+                try:
+                    LOGGER.warning("Ignoring mtf_weights['base']; base is anchor-only and not a fusion candidate.")
+                except Exception:
+                    pass
+                continue
+            weight = _safe_float(raw_weight, default=np.nan)
+            if not np.isfinite(weight) or weight <= 0.0:
+                try:
+                    LOGGER.warning("Ignoring non-positive/invalid MTF weight for '%s': %r", tf, raw_weight)
+                except Exception:
+                    pass
+                continue
+            normalized[tf] = float(weight)
+        return normalized
+
+    def _validate_sjm_reserved_feature_indices(
+        self,
+        value: tuple[int, int] | None,
+    ) -> tuple[int, int] | None:
+        if value is None:
+            return None
+        if not isinstance(value, tuple) or len(value) != 2:
+            raise ValueError("sjm_reserved_feature_indices must be a tuple (return_idx, abs_return_idx)")
+        ret_idx = int(value[0])
+        abs_idx = int(value[1])
+        if ret_idx == abs_idx:
+            raise ValueError("sjm_reserved_feature_indices must reference two distinct indices")
+        if not (0 <= ret_idx < self.n_features) or not (0 <= abs_idx < self.n_features):
+            raise ValueError(
+                f"sjm_reserved_feature_indices out of bounds for n_features={self.n_features}: {value}"
+            )
+        return ret_idx, abs_idx
+
+    @staticmethod
+    def _parse_strict_return(value: Any) -> tuple[bool, float, str]:
+        try:
+            parsed = float(value)
+        except Exception:
+            return False, 0.0, "non_numeric"
+        if not np.isfinite(parsed):
+            return False, 0.0, "non_finite"
+        return True, float(parsed), ""
+
+    def _update_timestamp_anchor(self, current_ts: float | None) -> None:
+        if current_ts is not None:
+            self._last_timestamp = float(current_ts)
+
+    def _resolve_canonical_return(
+        self,
+        market_data: Dict[str, Any],
+        mtf_data: Any,
+    ) -> tuple[bool, float, str]:
+        if mtf_data is not None:
+            if not isinstance(mtf_data, dict):
+                return False, 0.0, "mtf_not_dict"
+            base_payload = mtf_data.get("base", None)
+            if not isinstance(base_payload, dict):
+                return False, 0.0, "mtf_base_missing_or_invalid"
+            ok, base_ret, reason = self._parse_strict_return(base_payload.get("return", None))
+            if not ok:
+                return False, 0.0, f"mtf_base_return_{reason}"
+            top_ret = market_data.get("return", None)
+            if top_ret is not None:
+                top_ok, top_val, _ = self._parse_strict_return(top_ret)
+                if top_ok and abs(top_val - base_ret) > self._CANONICAL_RETURN_MISMATCH_TOLERANCE:
+                    self._warn_rate_limited(
+                        key="mtf_top_level_return_mismatch",
+                        message=(
+                            f"Top-level return ({top_val:.12g}) differs from mtf.base return "
+                            f"({base_ret:.12g}); using mtf.base as canonical return."
+                        ),
+                        cooldown_s=30.0,
+                    )
+                    self._obs_observe(
+                        "mtf_top_level_return_mismatch",
+                        "medium",
+                        {"top_return": top_val, "base_return": base_ret},
+                    )
+            return True, float(base_ret), "mtf_base"
+        ok, single_ret, reason = self._parse_strict_return(market_data.get("return", None))
+        if not ok:
+            return False, 0.0, f"single_return_{reason}"
+        return True, float(single_ret), "single"
 
     def _log_state_load_issue(self, field: str, exc: Exception, value: Any = None) -> None:
         if getattr(self, "_is_replay", False):
@@ -2361,10 +2461,48 @@ class AdvancedRegimeEngine:
                     self._replay_record("update_end", {"regime": "HALTED"})
                 return output
 
+        mtf_data = market_data.get("mtf", None)
+        canonical_ok, canonical_return, canonical_source = self._resolve_canonical_return(market_data, mtf_data)
+        if not canonical_ok:
+            self._warn_rate_limited(
+                key="invalid_canonical_return",
+                message=f"Invalid canonical return input ({canonical_source}); emitting fail-safe output.",
+                cooldown_s=30.0,
+            )
+            self._obs_observe("invalid_canonical_return", "high", {"reason": canonical_source})
+            self.last_signed_position_size = 0.0
+            self._update_timestamp_anchor(current_ts)
+            output = _build_output(
+                regime_idx=-1,
+                regime_label="UNKNOWN",
+                execution_mode="fail_safe",
+                trend_strength=float(getattr(self, "_last_effective_trend_strength", 0.0)),
+                risk_level=1.0,
+                confidence=0.0,
+                conviction=0.0,
+                edge_score=0.0,
+                probabilities={'bull': 0.0, 'bear': 0.0, 'crisis': 1.0},
+                macro_probs=self.nhhmm_prior.tolist(),
+                position_size=0.0,
+                signed_position_size=0.0,
+                expected_vol=float(getattr(self, "_last_valid_vol", self.garch.target_vol)),
+                raw_size=0.0,
+                is_toxic=True,
+                garch_regime_probs=self.garch_prob.tolist(),
+                feed_status='INVALID_RETURN_INPUT',
+                last_valid_vol=float(getattr(self, "_last_valid_vol", self.garch.target_vol)),
+                switch_stability_ema=float(getattr(self, "_switch_stability_ema", 1.0)),
+                execution_side='flat',
+                include_signal_valid=True,
+                signal_valid=False,
+            )
+            _observe_latency()
+            return output
+
         # ==========================================
         # 🚨 STEP -1: PRE-SHOCK GATE + PnL TRACKING
         # ==========================================
-        y_preview = self._coerce_finite_scalar(market_data.get("return", 0.0), default=0.0)
+        y_preview = float(canonical_return)
         pre_shock_baseline_vol = float(
             np.sqrt(np.dot(self._smoothed_garch_prob, np.clip(self.garch_var, 1e-8, None)))
         )
@@ -2449,6 +2587,7 @@ class AdvancedRegimeEngine:
                                         include_signal_valid=True,
                                         signal_valid=False,
                                     )
+                                    self._update_timestamp_anchor(current_ts)
                                     _observe_latency()
                                     return output
                                 pnl_ret = float(return_value)
@@ -2506,8 +2645,6 @@ class AdvancedRegimeEngine:
         nhhmm_posterior = None
         safe_nhhmm_posterior = None
         
-        mtf_data = market_data.get("mtf", None)
-
         mtf_partial_survival = False
         mtf_degradation_reasons = Counter()
 
@@ -2525,43 +2662,8 @@ class AdvancedRegimeEngine:
             if not isinstance(base_tf, dict):
                 raise ValueError("MTF payload base timeframe must be a dict")
 
-            y_t = base_tf.get("return", 0.0)
+            y_t = canonical_return
             x_t = base_tf.get("features", np.zeros(self.n_features))
-            try:
-                y_base = float(y_t) if y_t is not None else np.nan
-            except (TypeError, ValueError):
-                y_base = np.nan
-            if not np.isfinite(y_base):
-                self._self_heal("E130", {"source": "base_tf_return_invalid"})
-                halted = _halt_if_breaker_after_heal()
-                if halted is not None:
-                    return halted
-                self.last_signed_position_size = 0.0
-                output = _build_output(
-                    regime_idx=-1,
-                    regime_label="UNKNOWN",
-                    execution_mode="fail_safe",
-                    trend_strength=float(getattr(self, "_last_effective_trend_strength", 0.0)),
-                    risk_level=1.0,
-                    confidence=0.0,
-                    conviction=0.0,
-                    edge_score=0.0,
-                    probabilities={'bull': 0.0, 'bear': 0.0, 'crisis': 1.0},
-                    macro_probs=self.nhhmm_prior.tolist(),
-                    position_size=0.0,
-                    expected_vol=float(getattr(self, "_last_valid_vol", self.garch.target_vol)),
-                    raw_size=0.0,
-                    is_toxic=True,
-                    garch_regime_probs=self.garch_prob.tolist(),
-                    feed_status='BASE_RETURN_INVALID',
-                    last_valid_vol=float(getattr(self, "_last_valid_vol", self.garch.target_vol)),
-                    switch_stability_ema=float(getattr(self, "_switch_stability_ema", 1.0)),
-                    execution_side='flat',
-                    include_signal_valid=True,
-                    signal_valid=False,
-                )
-                _observe_latency()
-                return output
 
             fused_probs = np.zeros(self.K)
             total_weight = 0.0
@@ -2654,7 +2756,21 @@ class AdvancedRegimeEngine:
             # ==========================================
             # FIX 2: SAFE FALLBACK (NO UNDEFINED VARS)
             # ==========================================
-            if total_weight <= 0 or valid_tf_count == 0:
+            if expected_weighted_tf_count == 0:
+                try:
+                    x_safe = _coerce_1d_vector(
+                        x_t,
+                        expected_size=self.n_features,
+                        name="base x_t",
+                    )
+                    nhhmm_posterior, _ = self.nhhmm.forward_pass_step(
+                        float(y_t), x_safe, self.nhhmm_prior
+                    )
+                    mtf_degradation_reasons["base_only_anchor"] += 1
+                except Exception:
+                    nhhmm_posterior = np.ones(self.K) / self.K
+                    mtf_degradation_reasons["base_only_forward_failure"] += 1
+            elif total_weight <= 0 or valid_tf_count == 0:
                 self._warn_rate_limited(
                     key="mtf_total_failure",
                     message="MTF fusion failed, falling back to SAFE base timeframe",
@@ -2698,9 +2814,9 @@ class AdvancedRegimeEngine:
             # ==========================================
             # ORIGINAL SINGLE-TF PATH (UNCHANGED)
             # ==========================================
-            y_t = market_data.get('return', None)
+            y_t = canonical_return
             x_t = market_data.get('features', None)
-            if y_t is None or x_t is None:
+            if x_t is None:
                 self._warn_rate_limited(
                     key="single_tf_missing_data",
                     message="Single-TF update missing required return/features payload; emitting fail-safe output.",
@@ -2745,7 +2861,7 @@ class AdvancedRegimeEngine:
         if mtf_data is not None and safe_nhhmm_posterior is None:
             raise RuntimeError("MTF fusion failed to produce valid posterior")
 
-        y_t = self._coerce_finite_scalar(y_t, default=0.0)
+        y_t = float(canonical_return)
         if abs(y_t) > 2.0:
             self._warn_rate_limited(
                 key="return_out_of_bounds",
@@ -2800,7 +2916,7 @@ class AdvancedRegimeEngine:
                     key="timestamp_regression",
                     message=(
                         f"Timestamp regression detected (current={current_ts}, last={self._last_timestamp}); "
-                        "using last_valid_dt to avoid decay discontinuity."
+                        "using last_valid_dt and accepting regressed timestamp as new anchor."
                     ),
                     cooldown_s=30.0,
                 )
@@ -2810,8 +2926,7 @@ class AdvancedRegimeEngine:
         decay_dt = max(time_delta, 0.0)
         if time_delta > 0:
             self._last_valid_dt = time_delta
-        if current_ts is not None and (self._last_timestamp is None or current_ts > self._last_timestamp):
-            self._last_timestamp = current_ts
+        self._update_timestamp_anchor(current_ts)
 
         is_dim_fail = feature_coerce_failed or (x_t.ndim != 1) or (x_t.shape[0] != self.n_features)
         n_corrupt = 0 if is_dim_fail else int(np.sum(~np.isfinite(x_t)))
@@ -2949,10 +3064,10 @@ class AdvancedRegimeEngine:
         nhhmm_confidence = float(np.max(nhhmm_posterior))
         effective_bias_weight = float(np.clip(nhhmm_confidence, 0.0, 1.0))
         sjm_x_t = np.asarray(x_t, dtype=float).copy()
-        if np.isfinite(y_t):
-            if sjm_x_t.size > self._SJM_RESERVED_ABS_RETURN_IDX:
-                sjm_x_t[self._SJM_RESERVED_RETURN_IDX] = float(y_t)
-                sjm_x_t[self._SJM_RESERVED_ABS_RETURN_IDX] = abs(float(y_t))
+        if np.isfinite(y_t) and self._sjm_reserved_feature_indices is not None:
+            ret_idx, abs_idx = self._sjm_reserved_feature_indices
+            sjm_x_t[ret_idx] = float(y_t)
+            sjm_x_t[abs_idx] = abs(float(y_t))
         sjm_state, sjm_probs = self.sjm.online_predict(
             x_t=sjm_x_t,
             expected_n_features=self.n_features,
