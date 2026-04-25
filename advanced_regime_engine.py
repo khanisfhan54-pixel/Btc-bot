@@ -931,6 +931,9 @@ class AdvancedRegimeEngine:
     _SWITCH_EDGE_WEIGHT: float = 0.48
     _LAST_VALID_VOL_FLOOR: float = 1e-8
     _VOL_MEMORY_DECAY: float = 0.98
+    _SHOCK_MEMORY_DECAY: float = 0.75
+    _SHOCK_INTENSITY_VOL_MULT: float = 3.0
+    _SNAPSHOT_QUEUE_MAXSIZE: int = 256
     _STATE_VERSION: str = "1.2.0"
     _WARNING_CACHE_LIMIT: int = 1024
     _WARNING_CACHE_TRIM_TO: int = 768
@@ -1065,6 +1068,7 @@ class AdvancedRegimeEngine:
         sjm_reserved_feature_indices: tuple[int, int] | None = None,
         seed: int | None = 7,
         engine_id: str | None = None,
+        enable_background_workers: bool = True,
     ):
         if n_states != 3:
             raise ValueError(
@@ -1189,6 +1193,7 @@ class AdvancedRegimeEngine:
         self._warning_drop_count = 0
         self._warning_drop_alerted = False
         self._warning_backend_failure_count = 0
+        self._background_workers_enabled = bool(enable_background_workers)
 
         if engine_id is not None:
             self.engine_id = str(engine_id)
@@ -1214,24 +1219,53 @@ class AdvancedRegimeEngine:
         self._warning_queue: "queue.Queue[str]" = queue.Queue(maxsize=10000)
         self._warning_stop_event = threading.Event()
         self_weakref = weakref.ref(self)
-        self._warning_worker = threading.Thread(
-            target=AdvancedRegimeEngine._warning_emitter_loop,
-            args=(self_weakref, self._warning_stop_event, self._warning_queue),
-            daemon=True,
-            name=f"{self.engine_id}_warning_worker"
+        self._warning_worker = None
+        self._warning_finalizer = None
+        if self._background_workers_enabled:
+            self._warning_worker = threading.Thread(
+                target=AdvancedRegimeEngine._warning_emitter_loop,
+                args=(self_weakref, self._warning_stop_event, self._warning_queue),
+                daemon=True,
+                name=f"{self.engine_id}_warning_worker"
+            )
+            try:
+                self._warning_worker.start()
+            except Exception:
+                # degrade gracefully: engine remains usable even if async warning thread fails
+                self._warning_worker = None
+            self._warning_finalizer = weakref.finalize(
+                self,
+                AdvancedRegimeEngine._shutdown_worker,
+                self._warning_stop_event,
+                self._warning_queue,
+                self._warning_worker,
+            )
+        self._snapshot_queue: "queue.Queue[Dict[str, Any] | None]" = queue.Queue(
+            maxsize=int(self._SNAPSHOT_QUEUE_MAXSIZE)
         )
-        try:
-            self._warning_worker.start()
-        except Exception:
-            # degrade gracefully: engine remains usable even if async warning thread fails
-            self._warning_worker = None
-        self._warning_finalizer = weakref.finalize(
-            self,
-            AdvancedRegimeEngine._shutdown_worker,
-            self._warning_stop_event,
-            self._warning_queue,
-            self._warning_worker,
-        )
+        self._snapshot_stop_event = threading.Event()
+        self._snapshot_drop_count = 0
+        self._snapshot_backend_failure_count = 0
+        self._snapshot_worker = None
+        self._snapshot_finalizer = None
+        if self._background_workers_enabled:
+            self._snapshot_worker = threading.Thread(
+                target=AdvancedRegimeEngine._snapshot_emitter_loop,
+                args=(self_weakref, self._snapshot_stop_event, self._snapshot_queue),
+                daemon=True,
+                name=f"{self.engine_id}_snapshot_worker"
+            )
+            try:
+                self._snapshot_worker.start()
+            except Exception:
+                self._snapshot_worker = None
+            self._snapshot_finalizer = weakref.finalize(
+                self,
+                AdvancedRegimeEngine._shutdown_worker,
+                self._snapshot_stop_event,
+                self._snapshot_queue,
+                self._snapshot_worker,
+            )
 
         self._errors_module_available = True
         try:
@@ -1364,6 +1398,13 @@ class AdvancedRegimeEngine:
             getattr(self, "_warning_stop_event", None),
             getattr(self, "_warning_queue", None),
             getattr(self, "_warning_worker", None),
+        )
+
+    def _shutdown_snapshot_worker(self) -> None:
+        AdvancedRegimeEngine._shutdown_worker(
+            getattr(self, "_snapshot_stop_event", None),
+            getattr(self, "_snapshot_queue", None),
+            getattr(self, "_snapshot_worker", None),
         )
 
     @staticmethod
@@ -1616,18 +1657,12 @@ class AdvancedRegimeEngine:
 
     @staticmethod
     def _emit_warning_with_timeout(message: str, timeout_s: float = 1.0) -> bool:
-        completed = threading.Event()
-
-        def _emit() -> None:
-            try:
-                LOGGER.warning(message)
-            finally:
-                completed.set()
-
-        t = threading.Thread(target=_emit, daemon=True, name="warning_emit")
-        t.start()
-        t.join(timeout=max(float(timeout_s), 0.0))
-        return bool(completed.is_set())
+        # Timeout parameter retained for API compatibility. Warning emission is
+        # now single-threaded in the dedicated worker to prevent unbounded
+        # per-warning thread creation under log-backend stalls.
+        _ = timeout_s
+        LOGGER.warning(message)
+        return True
 
     @staticmethod
     def _warning_emitter_loop(
@@ -1682,6 +1717,133 @@ class AdvancedRegimeEngine:
                     warnings.warn(msg, RuntimeWarning, stacklevel=3)
                 except Exception:
                     pass
+
+    @staticmethod
+    def _snapshot_emitter_loop(
+        engine_ref: "weakref.ReferenceType[AdvancedRegimeEngine]",
+        stop_event: threading.Event,
+        snapshot_queue: "queue.Queue[Dict[str, Any] | None]",
+    ) -> None:
+        while True:
+            engine = engine_ref()
+            if engine is None:
+                while not snapshot_queue.empty():
+                    try:
+                        snapshot_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                break
+
+            if stop_event.is_set() and snapshot_queue.empty():
+                break
+
+            try:
+                snapshot_payload = snapshot_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            if snapshot_payload is None:
+                if stop_event.is_set() and snapshot_queue.empty():
+                    break
+                continue
+
+            try:
+                replay_engine = getattr(engine, "_replay_engine", None)
+                if replay_engine is None:
+                    continue
+                materialized_payload = engine._materialize_snapshot_payload(snapshot_payload)
+                hash_payload = dict(materialized_payload)
+                hash_payload.pop("state_hash", None)
+                hash_payload.pop("_checksum", None)
+                materialized_payload["state_hash"] = engine._state_hash(hash_payload)
+                replay_engine.snapshot(materialized_payload)
+            except Exception as exc:
+                engine._snapshot_backend_failure_count = int(
+                    getattr(engine, "_snapshot_backend_failure_count", 0)
+                ) + 1
+                engine._warn_rate_limited(
+                    "snapshot_emit_failure",
+                    f"Snapshot emission failed: {exc}",
+                    cooldown_s=30.0,
+                )
+
+    def _enqueue_snapshot(self, snapshot_payload: Dict[str, Any]) -> None:
+        try:
+            self._snapshot_queue.put_nowait(snapshot_payload)
+        except queue.Full:
+            self._snapshot_drop_count = int(getattr(self, "_snapshot_drop_count", 0)) + 1
+            self._warn_rate_limited(
+                "snapshot_queue_saturated",
+                "Snapshot queue saturated; dropping snapshot payload.",
+                cooldown_s=30.0,
+            )
+
+    def _capture_snapshot_payload_unlocked(self, regime: str) -> Dict[str, Any]:
+        return {
+            "regime": str(regime),
+            "state_raw": self._capture_state_raw_unlocked(),
+        }
+
+    def _materialize_snapshot_payload(self, snapshot_payload: Dict[str, Any]) -> Dict[str, Any]:
+        raw_state = snapshot_payload.get("state_raw", {})
+        if not isinstance(raw_state, dict):
+            raise ValueError("snapshot payload missing state_raw")
+        engine_state = self._materialize_state_from_raw(raw_state)
+        garch_prob = np.asarray(raw_state.get("garch_prob", np.ones(2) / 2.0), dtype=float)
+        nhhmm_prior = np.asarray(raw_state.get("nhhmm_prior", np.ones(self.K) / self.K), dtype=float)
+        smoothed_garch_prob = np.asarray(raw_state.get("smoothed_garch_prob", np.ones(2) / 2.0), dtype=float)
+        regime_state_probs = np.asarray(raw_state.get("regime_state_probs", np.ones(4) / 4.0), dtype=float)
+        last_valid_sjm_probs = raw_state.get("last_valid_sjm_probs", None)
+        garch_var = np.asarray(raw_state.get("garch_var", self._stationary_garch_var()), dtype=float)
+        rng_state = raw_state.get("engine_rng_state", None)
+        rng_type = raw_state.get("engine_rng_type", None)
+        rng_module = raw_state.get("engine_rng_module", None)
+        normalized_rng = None
+        if rng_state is not None:
+            normalized_rng = {
+                "bit_generator": rng_type,
+                "bit_generator_module": rng_module,
+                "numpy_version": np.__version__,
+                "internal_state": self._canonicalize(rng_state),
+            }
+        return {
+            "engine_state": engine_state,
+            "regime": str(snapshot_payload.get("regime", "UNKNOWN")),
+            "equity": float(raw_state.get("equity", self._equity)),
+            "drawdown": float(raw_state.get("drawdown", self._drawdown)),
+            "loss_streak": int(raw_state.get("loss_streak", self._loss_streak)),
+            "garch_prob": garch_prob.tolist(),
+            "nhhmm_prior": nhhmm_prior.tolist(),
+            "smoothed_garch_prob": smoothed_garch_prob.tolist(),
+            "regime_state_probs": regime_state_probs.tolist(),
+            "last_valid_sjm_probs": (
+                None
+                if last_valid_sjm_probs is None
+                else np.asarray(last_valid_sjm_probs, dtype=float).tolist()
+            ),
+            "last_effective_trend_strength": float(raw_state.get("last_effective_trend_strength", 0.0)),
+            "last_edge_score": float(raw_state.get("last_edge_score", 0.0)),
+            "garch_var": garch_var.tolist(),
+            "last_valid_vol": float(raw_state.get("last_valid_vol", self._last_valid_vol)),
+            "switch_stability_ema": float(raw_state.get("switch_stability_ema", self._switch_stability_ema)),
+            "last_timestamp": raw_state.get("last_timestamp", None),
+            "last_valid_dt": float(raw_state.get("last_valid_dt", self._last_valid_dt)),
+            "range_ticks": float(raw_state.get("range_ticks", self.range_ticks)),
+            "range_ticks_int": int(raw_state.get("range_ticks_int", self.range_ticks_int)),
+            "in_range": bool(raw_state.get("in_range", self._in_range)),
+            "range_anchor_size": float(raw_state.get("range_anchor_size", self._range_anchor_size)),
+            "prev_raw_regime": raw_state.get("prev_raw_regime", self._prev_raw_regime),
+            "last_regime_change_ts": raw_state.get("last_regime_change_ts", self._last_regime_change_ts),
+            "shock_memory": float(raw_state.get("shock_memory", self._shock_memory)),
+            "return_ema": float(raw_state.get("return_ema", self._return_ema)),
+            "abs_return_ema": float(raw_state.get("abs_return_ema", self._abs_return_ema)),
+            "last_price": raw_state.get("last_price", self._last_price),
+            "_rng_state": None,
+            "_engine_rng_state": rng_state,
+            "_engine_rng_type": rng_type,
+            "schema_version": self._STATE_VERSION,
+            "rng": normalized_rng,
+        }
 
 
     def _warn_rate_limited(self, key: str, message: str, cooldown_s: float = 30.0) -> None:
@@ -2061,17 +2223,15 @@ class AdvancedRegimeEngine:
             "annotations": annotations,
         }
 
-    def _get_state_unlocked(self) -> Dict[str, Any]:
+    def _capture_state_raw_unlocked(self) -> Dict[str, Any]:
         return {
             "state_version": self._STATE_VERSION,
             "model_signature": f"AdvancedRegimeEngine|v={self._STATE_VERSION}|schema={_OUTPUT_SCHEMA_VERSION}|n_states={self.K}|n_features={self.n_features}",
-            
-            # --- NEW: persist SJM fallback memory ---
             "last_valid_sjm_probs": (
-                self._last_valid_sjm_probs.tolist()
-                if self._last_valid_sjm_probs is not None else None
+                None
+                if self._last_valid_sjm_probs is None
+                else np.asarray(self._last_valid_sjm_probs, dtype=float).copy()
             ),
-            
             "last_timestamp": None if self._last_timestamp is None else float(self._last_timestamp),
             "last_valid_dt": float(self._last_valid_dt),
             "current_regime_idx": None if self.current_regime_idx is None else int(self.current_regime_idx),
@@ -2081,6 +2241,7 @@ class AdvancedRegimeEngine:
             "switch_stability_ema": float(self._switch_stability_ema),
             "last_regime_change_ts": None if self._last_regime_change_ts is None else float(self._last_regime_change_ts),
             "range_ticks": float(self.range_ticks),
+            "range_ticks_int": int(self.range_ticks_int),
             "range_anchor_size": float(self._range_anchor_size),
             "last_signed_position_size": float(self.last_signed_position_size),
             "last_price": None if self._last_price is None else float(self._last_price),
@@ -2091,16 +2252,16 @@ class AdvancedRegimeEngine:
             "confirmed_regime": self._confirmed_regime,
             "confirmed_regime_idx": None if self._confirmed_regime_idx is None else int(self._confirmed_regime_idx),
             "regime_persistence": int(self._regime_persistence),
-            "nhhmm_prior": self.nhhmm_prior.astype(float).tolist(),
-            "garch_prob": self.garch_prob.astype(float).tolist(),
-            "smoothed_garch_prob": self._smoothed_garch_prob.astype(float).tolist(),
-            "regime_state_probs": self._regime_state_probs.astype(float).tolist(),
+            "nhhmm_prior": np.asarray(self.nhhmm_prior, dtype=float).copy(),
+            "garch_prob": np.asarray(self.garch_prob, dtype=float).copy(),
+            "smoothed_garch_prob": np.asarray(self._smoothed_garch_prob, dtype=float).copy(),
+            "regime_state_probs": np.asarray(self._regime_state_probs, dtype=float).copy(),
             "regime_smoother_prev_probs": (
-                self._regime_smoother.prev_probs.astype(float).tolist()
+                np.asarray(self._regime_smoother.prev_probs, dtype=float).copy()
                 if getattr(self, "_regime_smoother", None) is not None
-                else self._regime_state_probs.astype(float).tolist()
+                else np.asarray(self._regime_state_probs, dtype=float).copy()
             ),
-            "garch_var": self.garch_var.astype(float).tolist(),
+            "garch_var": np.asarray(self.garch_var, dtype=float).copy(),
             "circuit_breaker_active": bool(self._circuit_breaker_active),
             "circuit_breaker_reason": self._circuit_breaker_reason,
             "circuit_breaker_trigger_tick": int(getattr(self, "_circuit_breaker_trigger_tick", -1)),
@@ -2122,10 +2283,41 @@ class AdvancedRegimeEngine:
                 dict(self._rng.bit_generator.state)
                 if getattr(self, "_rng", None) is not None else None
             ),
+            "engine_rng_type": (
+                type(self._rng.bit_generator).__name__
+                if getattr(self, "_rng", None) is not None else None
+            ),
+            "engine_rng_module": (
+                type(self._rng.bit_generator).__module__
+                if getattr(self, "_rng", None) is not None else None
+            ),
             "confidence_collapse_streak": int(getattr(self, "_confidence_collapse_streak", 0)),
             # Explicitly mark deprecated field as False to avoid confusion in external systems
             "emit_extended_schema": False,
         }
+
+    @staticmethod
+    def _materialize_state_from_raw(raw_state: Dict[str, Any]) -> Dict[str, Any]:
+        out = dict(raw_state)
+        out.pop("engine_rng_type", None)
+        out.pop("engine_rng_module", None)
+        for key in (
+            "last_valid_sjm_probs",
+            "nhhmm_prior",
+            "garch_prob",
+            "smoothed_garch_prob",
+            "regime_state_probs",
+            "regime_smoother_prev_probs",
+            "garch_var",
+        ):
+            arr = out.get(key, None)
+            if arr is None:
+                continue
+            out[key] = np.asarray(arr, dtype=float).tolist()
+        return out
+
+    def _get_state_unlocked(self) -> Dict[str, Any]:
+        return self._materialize_state_from_raw(self._capture_state_raw_unlocked())
 
     @_synchronized
     def get_state(self) -> Dict[str, Any]:
@@ -3025,8 +3217,11 @@ class AdvancedRegimeEngine:
         if not np.all(np.isfinite(self.garch_var)):
             self.garch_var = self._stationary_garch_var()
 
+        anchor_advanced = False
         if self._last_timestamp is None or current_ts is None:
             time_delta = self._last_valid_dt
+            if current_ts is not None:
+                anchor_advanced = True
         else:
             raw_dt = current_ts - self._last_timestamp
             if raw_dt < 0.0:
@@ -3034,17 +3229,19 @@ class AdvancedRegimeEngine:
                     key="timestamp_regression",
                     message=(
                         f"Timestamp regression detected (current={current_ts}, last={self._last_timestamp}); "
-                        "using last_valid_dt and accepting regressed timestamp as new anchor."
+                        "using last_valid_dt and preserving previous timestamp anchor."
                     ),
                     cooldown_s=30.0,
                 )
                 time_delta = float(self._last_valid_dt)
             else:
                 time_delta = min(raw_dt, self._MAX_DT)
+                anchor_advanced = True
         decay_dt = max(time_delta, 0.0)
         if time_delta > 0:
             self._last_valid_dt = time_delta
-        self._update_timestamp_anchor(current_ts)
+        if anchor_advanced:
+            self._update_timestamp_anchor(current_ts)
 
         is_dim_fail = feature_coerce_failed or (x_t.ndim != 1) or (x_t.shape[0] != self.n_features)
         n_corrupt = 0 if is_dim_fail else int(np.sum(~np.isfinite(x_t)))
@@ -3251,14 +3448,20 @@ class AdvancedRegimeEngine:
             self._last_valid_sjm_probs = sjm_probs.copy()
 
         if np.isfinite(y_t):
-            self._shock_memory = max(abs(float(y_t)), 0.90 * float(getattr(self, "_shock_memory", 0.0)))
-            shock_intensity = float(np.clip(self._shock_memory / 0.02, 0.0, 1.0))
+            shock_decay = float(np.clip(self._SHOCK_MEMORY_DECAY, 0.0, 0.999))
+            prev_shock_memory = float(getattr(self, "_shock_memory", 0.0))
+            self._shock_memory = max(abs(float(y_t)), shock_decay * prev_shock_memory)
+            shock_scale = max(
+                float(self.garch.target_vol) * float(self._SHOCK_INTENSITY_VOL_MULT),
+                0.01,
+            )
+            shock_intensity = float(np.clip(self._shock_memory / shock_scale, 0.0, 1.0))
             if self.K >= 3:
                 sjm_probs = np.asarray(sjm_probs, dtype=float).copy()
-                non_crisis_scale = max(1.0 - 0.8 * shock_intensity, 0.1)
+                non_crisis_scale = max(1.0 - 0.45 * shock_intensity, 0.4)
                 sjm_probs[0] *= non_crisis_scale
                 sjm_probs[1] *= non_crisis_scale
-                sjm_probs[2] *= (0.2 + 1.8 * shock_intensity)
+                sjm_probs[2] *= (1.0 + 0.9 * shock_intensity)
                 sjm_probs = _normalize_prob_vector(sjm_probs)
                 sjm_state = int(np.argmax(sjm_probs))
             
@@ -3675,7 +3878,15 @@ class AdvancedRegimeEngine:
                 if abs(base_trend_strength) > 0.1:
                     prior_sign = np.sign(base_trend_strength)
                 else:
-                    prior_sign = 0.0
+                    directional_label = str(regime_scores.get("directional_label", ""))
+                    if directional_label == "TREND":
+                        prior_sign = 1.0
+                    elif directional_label == "BEAR":
+                        prior_sign = -1.0
+                    elif abs(alpha_bias) > 1e-12:
+                        prior_sign = float(np.sign(alpha_bias))
+                    else:
+                        prior_sign = 1.0
 
             anchor_size = max(self._range_anchor_size, 1e-8)
             if anchor_size < self._MIN_SIGNED_TRADE_SIZE:
@@ -3702,7 +3913,12 @@ class AdvancedRegimeEngine:
                 0.1 * position_size
             )
             if abs(range_signed_size) < dynamic_min:
-                range_signed_size = 0.0
+                if position_size >= self._MIN_SIGNED_TRADE_SIZE:
+                    range_signed_size = float(
+                        np.sign(prior_sign) * min(dynamic_min, position_size)
+                    )
+                else:
+                    range_signed_size = 0.0
 
         # Final telemetry hygiene
         if not np.isfinite(position_size):
@@ -3716,7 +3932,7 @@ class AdvancedRegimeEngine:
             self._last_effective_trend_strength = float(effective_trend_strength)
 
         # Final execution guard (single-source execution intent).
-        if confirmed_regime in ("TREND", "BEAR") and edge_score < self._EDGE_MIN_DIRECTIONAL_CONFIDENCE:
+        if execution_side in ("long", "short") and edge_score < self._EDGE_MIN_DIRECTIONAL_CONFIDENCE:
             execution_side = "flat"
         final_execution_side = execution_side
 
@@ -3802,52 +4018,8 @@ class AdvancedRegimeEngine:
             REGIME_COUNTER.labels(self.engine_id, confirmed_regime).inc()
         if self._replay_engine is not None and (self._tick_id % 100 == 0) and not getattr(self, "_is_replay", False):
             try:
-                state_blob = self.serialize_state()
-                normalized_rng = self._normalize_rng_state(self._rng)
-
-                snapshot_payload = {
-                    "engine_state": state_blob,
-                    "regime": confirmed_regime,
-                    "equity": self._equity,
-                    "drawdown": self._drawdown,
-                    "loss_streak": self._loss_streak,
-                    "garch_prob": self.garch_prob.tolist(),
-                    "nhhmm_prior": self.nhhmm_prior.tolist(),
-                    "smoothed_garch_prob": self._smoothed_garch_prob.tolist(),
-                    "regime_state_probs": self._regime_state_probs.tolist(),
-                    "last_valid_sjm_probs": (
-                        self._last_valid_sjm_probs.tolist()
-                        if isinstance(self._last_valid_sjm_probs, np.ndarray)
-                        else None
-                    ),
-                    "last_effective_trend_strength": float(self._last_effective_trend_strength),
-                    "last_edge_score": float(self._last_edge_score),
-                    "garch_var": self.garch_var.tolist(),
-                    "last_valid_vol": float(self._last_valid_vol),
-                    "switch_stability_ema": float(self._switch_stability_ema),
-                    "last_timestamp": self._last_timestamp,
-                    "last_valid_dt": float(self._last_valid_dt),
-                    "range_ticks": float(self.range_ticks),
-                    "range_ticks_int": int(self.range_ticks_int),
-                    "in_range": bool(self._in_range),
-                    "range_anchor_size": float(self._range_anchor_size),
-                    "prev_raw_regime": self._prev_raw_regime,
-                    "last_regime_change_ts": self._last_regime_change_ts,
-                    "shock_memory": self._shock_memory,
-                    "return_ema": self._return_ema,
-                    "abs_return_ema": self._abs_return_ema,
-                    "last_price": self._last_price,
-                    "_rng_state": None,
-                    "_engine_rng_state": getattr(self._rng, "bit_generator", None).state if getattr(self, "_rng", None) is not None else None,
-                    "_engine_rng_type": type(self._rng.bit_generator).__name__ if getattr(self, "_rng", None) is not None else None,
-                    "schema_version": self._STATE_VERSION,
-                    "rng": normalized_rng,
-                }
-                hash_payload = dict(snapshot_payload)
-                hash_payload.pop("state_hash", None)
-                hash_payload.pop("_checksum", None)
-                snapshot_payload["state_hash"] = self._state_hash(hash_payload)
-                self._replay_engine.snapshot(snapshot_payload)
+                snapshot_payload = self._capture_snapshot_payload_unlocked(confirmed_regime)
+                self._enqueue_snapshot(snapshot_payload)
             except Exception as exc:
                 self._warn_rate_limited("snapshot_emit_failure", f"Snapshot emission failed: {exc}", cooldown_s=30.0)
         return output
@@ -3903,12 +4075,19 @@ class AdvancedRegimeEngine:
             # Validate incoming RNG payload before mutating self.
             validated_rng_state = None
             if incoming_rng_state is not None and getattr(self, "_rng", None) is not None:
-                candidate_rng_state = copy.deepcopy(dict(incoming_rng_state))
-                probe_rng = np.random.default_rng(self._rng_seed)
-                if type(probe_rng.bit_generator).__name__ != type(self._rng.bit_generator).__name__:
-                    raise ValueError("snapshot RNG probe mismatch")
-                probe_rng.bit_generator.state = candidate_rng_state
-                validated_rng_state = candidate_rng_state
+                try:
+                    candidate_rng_state = copy.deepcopy(dict(incoming_rng_state))
+                    probe_rng = np.random.default_rng(self._rng_seed)
+                    if type(probe_rng.bit_generator).__name__ != type(self._rng.bit_generator).__name__:
+                        raise ValueError("snapshot RNG probe mismatch")
+                    probe_rng.bit_generator.state = candidate_rng_state
+                    validated_rng_state = candidate_rng_state
+                except Exception as exc:
+                    self._warn_rate_limited(
+                        key="snapshot_rng_state_invalid",
+                        message=f"Snapshot RNG state invalid; preserving current RNG state. error={exc}",
+                        cooldown_s=30.0,
+                    )
 
             # Validate-then-swap: hydrate a staging engine first.
             staging = AdvancedRegimeEngine(
@@ -3923,6 +4102,7 @@ class AdvancedRegimeEngine:
                 sjm_reserved_feature_indices=self._sjm_reserved_feature_indices,
                 seed=self._rng_seed,
                 engine_id=self.engine_id,
+                enable_background_workers=False,
             )
             try:
                 staging._is_replay = True
@@ -3936,6 +4116,7 @@ class AdvancedRegimeEngine:
                 )
             finally:
                 staging._shutdown_warning_worker()
+                staging._shutdown_snapshot_worker()
 
             self.load_state(committed_state)
             if committed_rng_state is not None and getattr(self, "_rng", None) is not None:

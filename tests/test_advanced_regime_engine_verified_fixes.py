@@ -140,14 +140,14 @@ def test_mtf_canonical_return_used_for_gating_not_top_level_return():
     eng._shutdown_warning_worker()
 
 
-def test_timestamp_regression_updates_anchor_and_avoids_stale_future_delta():
+def test_timestamp_regression_preserves_anchor_and_avoids_future_delta_corruption():
     eng = AdvancedRegimeEngine(n_states=3, n_features=3, seed=7)
     eng.update(_single_tf(ts=100.0, ret=0.001, price=100.0))
     eng.update(_single_tf(ts=90.0, ret=0.001, price=100.1))
-    assert eng._last_timestamp == 90.0
+    assert eng._last_timestamp == 100.0
 
-    eng.update(_single_tf(ts=95.0, ret=0.001, price=100.2))
-    assert eng._last_timestamp == 95.0
+    eng.update(_single_tf(ts=105.0, ret=0.001, price=100.2))
+    assert eng._last_timestamp == 105.0
     assert eng._last_valid_dt == 5.0
     eng._shutdown_warning_worker()
 
