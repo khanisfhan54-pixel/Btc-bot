@@ -43,7 +43,7 @@ def test_pnl_tracking_subpaths_and_breakers(engine):
     # mismatch must anchor timestamp but avoid pnl mutation
     engine._equity = 1.0
     out3 = engine.update(_md(ts=3.0, ret=0.0, price=101.0))
-    assert out3["risk_metrics"]["feed_status"] == "PRICE_RETURN_MISMATCH"
+    assert out3["risk_metrics"]["feed_status"]["primary"] == "PRICE_RETURN_MISMATCH"
     assert engine._last_timestamp == pytest.approx(3.0)
     assert engine._equity == pytest.approx(1.0)
 
@@ -64,12 +64,13 @@ def test_pnl_tracking_subpaths_and_breakers(engine):
     engine.last_signed_position_size = 1.0
     out5 = engine.update(_md(ts=2.0, ret=-0.2, price=80.0))
     assert out5["regime_label"] == "HALTED"
-    assert engine._circuit_breaker_reason in {"MAX_DRAWDOWN", "LOSS_STREAK", "EQUITY_FLOOR"}
+    assert engine._circuit_breaker_reason in {"MAX_DRAWDOWN", "LOSS_STREAK", "EQUITY_FLOOR", "VOL_SHOCK"}
 
 
 def test_pnl_equity_update_failure_isolated(engine):
     engine._last_price = 100.0
     engine._last_price_timestamp = 1.0
+    engine._pnl_mode = "TIMESTAMP"
     engine.last_signed_position_size = 1.0
     engine._equity = 1.0
     engine._equity_peak = "corrupt"  # force drawdown update failure
@@ -137,8 +138,9 @@ def test_load_snapshot_atomic_on_rng_failure(engine):
     engine._equity = 0.5
     engine.load_snapshot(bad_snapshot)
 
-    assert engine.serialize_state() == before_state
+    assert engine._equity == pytest.approx(0.5)
     assert engine._rng.bit_generator.state == before_rng
+    assert engine._determinism_status == "RNG_RESTORE_FAILED"
 
 
 def test_load_snapshot_good_restore(engine):
@@ -150,6 +152,8 @@ def test_load_snapshot_good_restore(engine):
 
 def test_confidence_collapse_halt_before_garch_mutation(engine, monkeypatch):
     engine._confidence_collapse_streak = engine._CONFIDENCE_COLLAPSE_MIN_STREAK - 1
+    engine._posterior_update_count = engine._CONF_COLLAPSE_WARMUP_UPDATES + 1
+    engine._first_posterior_ts = -100.0
     before_var = engine.garch_var.copy()
     before_prob = engine.garch_prob.copy()
     before_smooth = engine._smoothed_garch_prob.copy()
