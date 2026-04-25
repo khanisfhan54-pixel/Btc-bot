@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import hashlib
 import dataclasses
+import copy
 from scipy.special import softmax
 import weakref
 try:
@@ -734,6 +735,7 @@ class SparseJumpModel:
             raise ValueError("SJM weights contain non-finite values.")
         self.means = means_arr
         self.weights = weights_arr
+        self._default_params_initialized = False
 
     def online_predict(
         self,
@@ -943,6 +945,7 @@ class AdvancedRegimeEngine:
         "E200": "numerical",
     }
     _VALID_REGIME_LABELS: set[str] = {"TREND", "RANGE", "BEAR", "TOXIC"}
+    _VALID_DIRECTIONAL_LABELS: set[str] = {"TREND", "BEAR"}
 
     def _json_default(self, obj: Any):
         """
@@ -1410,6 +1413,14 @@ class AdvancedRegimeEngine:
         self._log_state_load_issue(field, ValueError(f"invalid label: {value}"), value)
         return None
 
+    def _validate_directional_label(self, value: Any, field: str) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, str) and value in self._VALID_DIRECTIONAL_LABELS:
+            return value
+        self._log_state_load_issue(field, ValueError(f"invalid directional label: {value}"), value)
+        return None
+
     @staticmethod
     def _coerce_finite_scalar(value: Any, *, default: float = 0.0) -> float:
         return _safe_float(value, default=float(default))
@@ -1588,17 +1599,11 @@ class AdvancedRegimeEngine:
     # ==========================================
     @staticmethod
     def _emit_warning_with_timeout(message: str, timeout_s: float = 1.0) -> bool:
-        done = threading.Event()
-
-        def _emit() -> None:
-            try:
-                LOGGER.warning(message)
-            finally:
-                done.set()
-
-        t = threading.Thread(target=_emit, daemon=True, name="warning_log_emit")
-        t.start()
-        return bool(done.wait(timeout=max(float(timeout_s), 0.01)))
+        # Single worker-thread emission: never spawn per-warning threads.
+        # timeout_s is kept for API compatibility with existing callsites.
+        _ = timeout_s
+        LOGGER.warning(message)
+        return True
 
     @staticmethod
     def _warning_emitter_loop(
@@ -2245,7 +2250,7 @@ class AdvancedRegimeEngine:
 
         self._prev_regime = self._validate_regime_label(state.get("prev_regime", None), "prev_regime")
         raw_directional_label = state.get("prev_directional_label", None)
-        self._prev_directional_label = self._validate_regime_label(raw_directional_label, "prev_directional_label")
+        self._prev_directional_label = self._validate_directional_label(raw_directional_label, "prev_directional_label")
         self._prev_raw_regime = self._validate_regime_label(state.get("prev_raw_regime", None), "prev_raw_regime")
         self._confirmed_regime = self._validate_regime_label(state.get("confirmed_regime", None), "confirmed_regime")
 
@@ -2526,110 +2531,165 @@ class AdvancedRegimeEngine:
         observed_return = market_data.get("return", None)
         if price is not None:
             try:
-                price = float(price)
-                if np.isfinite(price):
-                    if self._last_price is not None:
-                        prev_price = float(self._last_price)
-                        stale_gap = None
-                        if current_ts is not None and self._last_price_timestamp is not None:
-                            stale_gap = float(current_ts - self._last_price_timestamp)
-                        stale_price = stale_gap is not None and stale_gap > self._MAX_PRICE_STALENESS_SEC
-                        if np.isfinite(prev_price) and abs(prev_price) > 1e-12 and not stale_price:
-                            frac_ret = (price - prev_price) / prev_price
-                            has_return = False
-                            return_value = 0.0
-                            try:
-                                return_value = float(observed_return) if observed_return is not None else 0.0
-                                has_return = observed_return is not None and np.isfinite(return_value)
-                            except (TypeError, ValueError):
-                                has_return = False
-                            if has_return:
-                                mismatch = abs(float(return_value) - float(frac_ret))
-                                if mismatch > self._PRICE_RETURN_MISMATCH_TOLERANCE:
-                                    self._warn_rate_limited(
-                                        key="price_return_mismatch",
-                                        message=(
-                                            f"Price/return mismatch detected (|Δ|={mismatch:.6f} > "
-                                            f"{self._PRICE_RETURN_MISMATCH_TOLERANCE:.6f}); "
-                                            "degrading to fail-safe output and freezing risk-state mutation."
-                                        ),
-                                        cooldown_s=15.0,
-                                    )
-                                    self._obs_observe(
-                                        "price_return_mismatch",
-                                        "high",
-                                        {"delta": mismatch, "tolerance": self._PRICE_RETURN_MISMATCH_TOLERANCE},
-                                    )
-                                    self.last_signed_position_size = 0.0
-                                    output = _build_output(
-                                        regime_idx=-1,
-                                        regime_label="UNKNOWN",
-                                        execution_mode="fail_safe",
-                                        trend_strength=float(getattr(self, "_last_effective_trend_strength", 0.0)),
-                                        risk_level=1.0,
-                                        confidence=0.0,
-                                        conviction=0.0,
-                                        edge_score=0.0,
-                                        probabilities={'bull': 0.0, 'bear': 0.0, 'crisis': 1.0},
-                                        macro_probs=self.nhhmm_prior.tolist(),
-                                        position_size=0.0,
-                                        signed_position_size=0.0,
-                                        expected_vol=float(getattr(self, "_last_valid_vol", self.garch.target_vol)),
-                                        raw_size=0.0,
-                                        is_toxic=True,
-                                        garch_regime_probs=self.garch_prob.tolist(),
-                                        feed_status='PRICE_RETURN_MISMATCH',
-                                        last_valid_vol=float(getattr(self, "_last_valid_vol", self.garch.target_vol)),
-                                        switch_stability_ema=float(getattr(self, "_switch_stability_ema", 1.0)),
-                                        execution_side='flat',
-                                        extended_schema=self._emit_extended_schema,
-                                        range_ticks=self.range_ticks_int,
-                                        include_signal_valid=True,
-                                        signal_valid=False,
-                                    )
-                                    self._update_timestamp_anchor(current_ts)
-                                    _observe_latency()
-                                    return output
-                                pnl_ret = float(return_value)
-                            else:
-                                pnl_ret = float(frac_ret)
-                            pnl = pnl_ret * self.last_signed_position_size
-                            if np.isfinite(pnl):
-                                self._equity += pnl
-                                if self._equity < self._MIN_EQUITY_FLOOR:
-                                    self._equity = self._MIN_EQUITY_FLOOR
-                                    self._trigger_circuit_breaker("EQUITY_FLOOR")
-
-                                if pnl < -1e-6:
-                                    self._loss_streak += 1
-                                elif pnl > 1e-6:
-                                    self._loss_streak = 0
-
-                                self._equity_peak = max(self._equity_peak, self._equity)
-                                self._drawdown = float(np.clip(
-                                    (self._equity_peak - self._equity) / max(self._equity_peak, 1e-8),
-                                    0.0,
-                                    1.0,
-                                ))
-                                self._cumulative_drawdown = max(
-                                    float(getattr(self, "_cumulative_drawdown", 0.0)),
-                                    float(self._drawdown),
-                                )
-                                breaker_triggered = self._circuit_breaker_active
-                                if (not breaker_triggered) and self._drawdown > self._MAX_DRAWDOWN:
-                                    self._trigger_circuit_breaker("MAX_DRAWDOWN")
-                                    breaker_triggered = True
-                                if (not breaker_triggered) and self._loss_streak >= self._MAX_CONSECUTIVE_LOSSES:
-                                    self._trigger_circuit_breaker("LOSS_STREAK")
-                    self._last_price = price
-                    self._last_price_timestamp = current_ts
-            except Exception as exc:
+                parsed_price = float(price)
+                if not np.isfinite(parsed_price):
+                    raise ValueError("price is non-finite")
+            except (TypeError, ValueError) as exc:
                 self._warn_rate_limited(
-                    key="pnl_tracking_failure",
-                    message=f"PnL tracking degraded due to price parse error: {exc}",
+                    key="pnl_price_parse_failure",
+                    message=f"PnL tracking skipped due to invalid price input: {exc}",
                     cooldown_s=15.0,
                 )
-                self._obs_observe("pnl_tracking_failure", "medium", {"reason": "price_parse_error"})
+                self._obs_observe("pnl_price_parse_failure", "medium", {"reason": type(exc).__name__})
+                parsed_price = None
+            if parsed_price is not None:
+                try:
+                    if self._last_price is not None:
+                        prev_price = float(self._last_price)
+                        stale_price = False
+                        try:
+                            stale_gap = None
+                            if current_ts is not None and self._last_price_timestamp is not None:
+                                stale_gap = float(current_ts - self._last_price_timestamp)
+                            stale_price = stale_gap is not None and stale_gap > self._MAX_PRICE_STALENESS_SEC
+                        except (TypeError, ValueError) as exc:
+                            self._warn_rate_limited(
+                                key="pnl_stale_price_check_failure",
+                                message=f"Stale-price check failed; treating tick as stale-safe: {exc}",
+                                cooldown_s=15.0,
+                            )
+                            stale_price = True
+
+                        pnl_ret = None
+                        if np.isfinite(prev_price) and abs(prev_price) > 1e-12 and not stale_price:
+                            try:
+                                frac_ret = float((parsed_price - prev_price) / prev_price)
+                            except (TypeError, ValueError, ZeroDivisionError) as exc:
+                                self._warn_rate_limited(
+                                    key="pnl_return_reconciliation_failure",
+                                    message=f"PnL return reconciliation failed: {exc}",
+                                    cooldown_s=15.0,
+                                )
+                                frac_ret = None
+
+                            if frac_ret is not None:
+                                pnl_ret = float(frac_ret)
+                                if observed_return is not None:
+                                    has_return, return_value, _ = self._parse_strict_return(observed_return)
+                                    if has_return:
+                                        mismatch = abs(float(return_value) - float(frac_ret))
+                                        if mismatch > self._PRICE_RETURN_MISMATCH_TOLERANCE:
+                                            self._warn_rate_limited(
+                                                key="price_return_mismatch",
+                                                message=(
+                                                    f"Price/return mismatch detected (|Δ|={mismatch:.6f} > "
+                                                    f"{self._PRICE_RETURN_MISMATCH_TOLERANCE:.6f}); "
+                                                    "degrading to fail-safe output and freezing risk-state mutation."
+                                                ),
+                                                cooldown_s=15.0,
+                                            )
+                                            self._obs_observe(
+                                                "price_return_mismatch",
+                                                "high",
+                                                {"delta": mismatch, "tolerance": self._PRICE_RETURN_MISMATCH_TOLERANCE},
+                                            )
+                                            self.last_signed_position_size = 0.0
+                                            output = _build_output(
+                                                regime_idx=-1,
+                                                regime_label="UNKNOWN",
+                                                execution_mode="fail_safe",
+                                                trend_strength=float(getattr(self, "_last_effective_trend_strength", 0.0)),
+                                                risk_level=1.0,
+                                                confidence=0.0,
+                                                conviction=0.0,
+                                                edge_score=0.0,
+                                                probabilities={'bull': 0.0, 'bear': 0.0, 'crisis': 1.0},
+                                                macro_probs=self.nhhmm_prior.tolist(),
+                                                position_size=0.0,
+                                                signed_position_size=0.0,
+                                                expected_vol=float(getattr(self, "_last_valid_vol", self.garch.target_vol)),
+                                                raw_size=0.0,
+                                                is_toxic=True,
+                                                garch_regime_probs=self.garch_prob.tolist(),
+                                                feed_status='PRICE_RETURN_MISMATCH',
+                                                last_valid_vol=float(getattr(self, "_last_valid_vol", self.garch.target_vol)),
+                                                switch_stability_ema=float(getattr(self, "_switch_stability_ema", 1.0)),
+                                                execution_side='flat',
+                                                extended_schema=self._emit_extended_schema,
+                                                range_ticks=self.range_ticks_int,
+                                                include_signal_valid=True,
+                                                signal_valid=False,
+                                            )
+                                            self._update_timestamp_anchor(current_ts)
+                                            _observe_latency()
+                                            return output
+                                        pnl_ret = float(return_value)
+
+                        if pnl_ret is not None:
+                            try:
+                                pnl = float(pnl_ret) * float(self.last_signed_position_size)
+                                if not np.isfinite(pnl):
+                                    raise ValueError("non-finite pnl")
+                            except (TypeError, ValueError) as exc:
+                                self._warn_rate_limited(
+                                    key="pnl_calculation_failure",
+                                    message=f"PnL calculation failed for tick: {exc}",
+                                    cooldown_s=15.0,
+                                )
+                            else:
+                                try:
+                                    next_equity = float(self._equity) + float(pnl)
+                                    if next_equity < self._MIN_EQUITY_FLOOR:
+                                        next_equity = self._MIN_EQUITY_FLOOR
+                                        self._trigger_circuit_breaker("EQUITY_FLOOR")
+                                    next_loss_streak = int(self._loss_streak)
+                                    if pnl < -1e-6:
+                                        next_loss_streak += 1
+                                    elif pnl > 1e-6:
+                                        next_loss_streak = 0
+                                    next_equity_peak = max(float(self._equity_peak), float(next_equity))
+                                    next_drawdown = float(np.clip(
+                                        (next_equity_peak - next_equity) / max(next_equity_peak, 1e-8),
+                                        0.0,
+                                        1.0,
+                                    ))
+                                    next_cumulative_drawdown = max(
+                                        float(getattr(self, "_cumulative_drawdown", 0.0)),
+                                        float(next_drawdown),
+                                    )
+                                    self._equity = float(next_equity)
+                                    self._loss_streak = int(next_loss_streak)
+                                    self._equity_peak = float(next_equity_peak)
+                                    self._drawdown = float(next_drawdown)
+                                    self._cumulative_drawdown = float(next_cumulative_drawdown)
+                                    breaker_triggered = self._circuit_breaker_active
+                                    if (not breaker_triggered) and self._drawdown > self._MAX_DRAWDOWN:
+                                        self._trigger_circuit_breaker("MAX_DRAWDOWN")
+                                        breaker_triggered = True
+                                    if (not breaker_triggered) and self._loss_streak >= self._MAX_CONSECUTIVE_LOSSES:
+                                        self._trigger_circuit_breaker("LOSS_STREAK")
+                                except Exception as exc:
+                                    self._warn_rate_limited(
+                                        key="pnl_equity_update_failure",
+                                        message=f"PnL equity-state update failed: {exc}",
+                                        cooldown_s=15.0,
+                                    )
+                except Exception as exc:
+                    self._warn_rate_limited(
+                        key="pnl_tracking_outer_guard",
+                        message=f"PnL tracking outer-guard activated: {exc}",
+                        cooldown_s=15.0,
+                    )
+
+                try:
+                    self._last_price = float(parsed_price)
+                    self._last_price_timestamp = current_ts
+                except Exception as exc:
+                    self._warn_rate_limited(
+                        key="pnl_last_price_state_failure",
+                        message=f"Last-price state mutation failed: {exc}",
+                        cooldown_s=15.0,
+                    )
         if self._circuit_breaker_active:
             output = _build_halted_output()
             _observe_latency()
@@ -2946,6 +3006,13 @@ class AdvancedRegimeEngine:
                 self.nhhmm_prior = _normalize_prob_vector(safe_nhhmm_posterior)
 
         if is_dim_fail or n_corrupt > 0:
+            if mtf_data is None:
+                self._warn_rate_limited(
+                    key="single_tf_nhhmm_failure",
+                    message="Single-TF features invalid; using deterministic uniform posterior fallback.",
+                    cooldown_s=15.0,
+                )
+                self.nhhmm_prior = np.ones(self.K, dtype=float) / self.K
             self._self_heal(
                 "E120" if is_dim_fail else "E200",
                 {
@@ -3037,9 +3104,17 @@ class AdvancedRegimeEngine:
 
         # Only compute if not already from MTF
         if mtf_data is None:
-            nhhmm_posterior, _ = self.nhhmm.forward_pass_step(
-                y_t, x_t, self.nhhmm_prior
-            )
+            try:
+                nhhmm_posterior, _ = self.nhhmm.forward_pass_step(
+                    y_t, x_t, self.nhhmm_prior
+                )
+            except Exception as exc:
+                self._warn_rate_limited(
+                    key="single_tf_nhhmm_failure",
+                    message=f"Single-TF NHHMM forward pass failed; using uniform posterior. error={exc}",
+                    cooldown_s=15.0,
+                )
+                nhhmm_posterior = np.ones(self.K, dtype=float) / self.K
         else:
             if safe_nhhmm_posterior is None:
                 raise RuntimeError("MTF posterior missing after validation")
@@ -3129,7 +3204,10 @@ class AdvancedRegimeEngine:
             prev_directional_label=getattr(self, "_prev_directional_label", None),
             direction_switch_gap=self._DIRECTION_SWITCH_GAP,
         )
-        self._prev_directional_label = regime_scores.get("directional_label")
+        self._prev_directional_label = self._validate_directional_label(
+            regime_scores.get("directional_label"),
+            "prev_directional_label_runtime",
+        )
         regime = regime_scores["regime"]
         if getattr(self, "_regime_smoother", None) is not None:
             regime, self._regime_state_probs = self._regime_smoother.update(
@@ -3258,10 +3336,10 @@ class AdvancedRegimeEngine:
         # FIX: PRE-COMPUTE SHOCK (used in switch filter)
         # Must be defined BEFORE regime_changed block
         # ==========================================
-        baseline_vol = float(
+        pre_update_baseline_vol = float(
             np.sqrt(np.dot(self._smoothed_garch_prob, np.clip(self.garch_var, 1e-8, None)))
         )
-        shock_threshold_pre = max(2.2 * baseline_vol, 0.008)
+        shock_threshold_pre = max(2.2 * pre_update_baseline_vol, 0.008)
         shock_pre = abs(y_t) > shock_threshold_pre
 
         regime_changed = prev_regime_snapshot is not None and confirmed_regime != prev_regime_snapshot
@@ -3350,42 +3428,7 @@ class AdvancedRegimeEngine:
             elif alpha_bias < -0.2 and confirmed_regime in ("BEAR", "RANGE"):
                 execution_side = "short"
 
-        predicted_var = np.copy(self.garch_var)
-        self.garch_var = self.garch._garch_update(self.garch_var, y_t)
-        if self.garch_var.shape != (2,) or not np.all(np.isfinite(self.garch_var)):
-            self._warn_rate_limited(
-                key="garch_var_invalid",
-                message="GARCH variance invalid; resetting to stationary variance",
-                cooldown_s=10.0,
-            )
-            self.garch_var = self._stationary_garch_var()
-        self.garch_prob = self.garch._update_regime_probs(self.garch_prob, predicted_var, y_t)
-        if self.garch_prob.shape != (2,) or not np.all(np.isfinite(self.garch_prob)):
-            self.garch_prob = np.ones(2, dtype=float) / 2.0
-        self.garch_prob = _normalize_prob_vector(self.garch_prob)
-
-        self._smoothed_garch_prob = (
-            self._EWM_ALPHA * self.garch_prob
-            + (1.0 - self._EWM_ALPHA) * self._smoothed_garch_prob
-        )
-        self._smoothed_garch_prob = _normalize_prob_vector(self._smoothed_garch_prob)
-
-        # FIX #2: HYBRID VOL ESTIMATION with adaptive spike response
-        vol_spike = abs(y_t) > (2.0 * max(baseline_vol, 1e-8))
-        if vol_spike:
-            effective_prob = self.garch_prob
-        else:
-            effective_prob = 0.6 * self.garch_prob + 0.4 * self._smoothed_garch_prob
-        effective_prob = _normalize_prob_vector(effective_prob)
-
-        expected_var = float(np.dot(effective_prob, self.garch_var))
-        expected_var = max(expected_var, 1e-8)
-        expected_vol = np.sqrt(expected_var)
-        expected_vol = min(expected_vol, 0.20)
-        
-        # ==========================================
-        # 🚨 STEP 2: CONFIDENCE COLLAPSE
-        # ==========================================
+        # Confidence-collapse halt must happen before risk-state mutation.
         collapse_signal = (
             regime_scores["conviction"] < 0.05
             and regime_scores["confidence"] < self._CONFIDENCE_COLLAPSE_THRESHOLD
@@ -3406,7 +3449,43 @@ class AdvancedRegimeEngine:
             if obs_sample and not getattr(self, "_is_replay", False):
                 self._replay_record("update_end", {"regime": "HALTED"})
             return output
-            
+
+        predicted_var = np.copy(self.garch_var)
+        self.garch_var = self.garch._garch_update(self.garch_var, y_t)
+        if self.garch_var.shape != (2,) or not np.all(np.isfinite(self.garch_var)):
+            self._warn_rate_limited(
+                key="garch_var_invalid",
+                message="GARCH variance invalid; resetting to stationary variance",
+                cooldown_s=10.0,
+            )
+            self.garch_var = self._stationary_garch_var()
+        self.garch_prob = self.garch._update_regime_probs(self.garch_prob, predicted_var, y_t)
+        if self.garch_prob.shape != (2,) or not np.all(np.isfinite(self.garch_prob)):
+            self.garch_prob = np.ones(2, dtype=float) / 2.0
+        self.garch_prob = _normalize_prob_vector(self.garch_prob)
+
+        self._smoothed_garch_prob = (
+            self._EWM_ALPHA * self.garch_prob
+            + (1.0 - self._EWM_ALPHA) * self._smoothed_garch_prob
+        )
+        self._smoothed_garch_prob = _normalize_prob_vector(self._smoothed_garch_prob)
+        post_update_baseline_vol = float(
+            np.sqrt(np.dot(self._smoothed_garch_prob, np.clip(self.garch_var, 1e-8, None)))
+        )
+
+        # FIX #2: HYBRID VOL ESTIMATION with adaptive spike response
+        vol_spike = abs(y_t) > (2.0 * max(post_update_baseline_vol, 1e-8))
+        if vol_spike:
+            effective_prob = self.garch_prob
+        else:
+            effective_prob = 0.6 * self.garch_prob + 0.4 * self._smoothed_garch_prob
+        effective_prob = _normalize_prob_vector(effective_prob)
+
+        expected_var = float(np.dot(effective_prob, self.garch_var))
+        expected_var = max(expected_var, 1e-8)
+        expected_vol = np.sqrt(expected_var)
+        expected_vol = min(expected_vol, 0.20)
+        
         if np.isfinite(expected_vol) and expected_vol > 0.0:
             self._last_valid_vol = float(expected_vol)
         else:
@@ -3429,10 +3508,10 @@ class AdvancedRegimeEngine:
             low_vol_regime_soft_penalty = 0.18
 
         # ==========================================
-        # EDGE-ADJUSTED VOL TARGETING
+        # VOL TARGETING
         # ==========================================
-        edge_vol_boost = 0.5 + 0.5 * regime_edge
-        effective_target_vol = self.garch.target_vol * edge_vol_boost
+        # Keep edge modulation in one place (edge_scaled below); target vol remains purely risk-driven.
+        effective_target_vol = float(self.garch.target_vol)
 
         # Edge score adjustment after volatility is known.
         vol_ratio = expected_vol / max(self.garch.target_vol, 1e-8)
@@ -3472,7 +3551,7 @@ class AdvancedRegimeEngine:
             ENGINE_POSITION.labels(self.engine_id).set(position_size)
 
         # FIX #4: MORE RESPONSIVE SHOCK DETECTION
-        shock_threshold = max(2.2 * baseline_vol, 0.008)
+        shock_threshold = max(2.2 * post_update_baseline_vol, 0.008)
         shock_post = abs(y_t) > shock_threshold
 
         is_toxic = (
@@ -3698,7 +3777,7 @@ class AdvancedRegimeEngine:
                     "_rng_state": None,
                     "_engine_rng_state": getattr(self._rng, "bit_generator", None).state if getattr(self, "_rng", None) is not None else None,
                     "_engine_rng_type": type(self._rng.bit_generator).__name__ if getattr(self, "_rng", None) is not None else None,
-                    "schema_version": "2.3",
+                    "schema_version": self._STATE_VERSION,
                     "rng": normalized_rng,
                 }
                 hash_payload = dict(snapshot_payload)
@@ -3715,20 +3794,18 @@ class AdvancedRegimeEngine:
     # ==========================================
     @_synchronized
     def load_snapshot(self, snapshot: Dict[str, Any]) -> None:
-        prior_state = self.serialize_state()
+        prior_state = copy.deepcopy(self.serialize_state())
         prior_rng_state = (
-            dict(self._rng.bit_generator.state)
+            copy.deepcopy(self._rng.bit_generator.state)
             if getattr(self, "_rng", None) is not None else None
         )
+        rollback_ok = False
         try:
             incoming = snapshot if isinstance(snapshot, dict) else {}
             state = incoming.get("state", incoming)
             if not isinstance(state, dict):
                 raise ValueError("snapshot state must be a dict")
 
-            # ==========================================
-            # SNAPSHOT INTEGRITY CHECK
-            # ==========================================
             expected_hash = state.get("state_hash")
             if expected_hash:
                 hash_payload = dict(state)
@@ -3755,36 +3832,51 @@ class AdvancedRegimeEngine:
                 raise ValueError("snapshot model signature mismatch")
             if incoming_version is not None and incoming_version != self._STATE_VERSION:
                 raise ValueError("snapshot state version mismatch")
-            self.load_state(engine_state)
 
-            if "_engine_rng_state" in state and getattr(self, "_rng", None) is not None:
-                self._rng.bit_generator.state = dict(state["_engine_rng_state"])
-            if "engine_rng_state" in engine_state and getattr(self, "_rng", None) is not None:
-                self._rng.bit_generator.state = dict(engine_state["engine_rng_state"])
+            incoming_rng_state = None
+            if "_engine_rng_state" in state:
+                incoming_rng_state = state["_engine_rng_state"]
+            elif "engine_rng_state" in engine_state:
+                incoming_rng_state = engine_state["engine_rng_state"]
+
             if "_engine_rng_type" in state and getattr(self, "_rng", None) is not None:
                 if type(self._rng.bit_generator).__name__ != state["_engine_rng_type"]:
                     raise ValueError("snapshot RNG type mismatch")
+
+            self.load_state(engine_state)
+            if incoming_rng_state is not None and getattr(self, "_rng", None) is not None:
+                self._rng.bit_generator.state = copy.deepcopy(dict(incoming_rng_state))
+            return
         except Exception as e:
             try:
-                self.load_state(prior_state)
+                self.load_state(copy.deepcopy(prior_state))
+                if prior_rng_state is not None and getattr(self, "_rng", None) is not None:
+                    self._rng.bit_generator.state = copy.deepcopy(prior_rng_state)
+                current_hash = self._state_hash(self.serialize_state())
+                rollback_hash = self._state_hash(copy.deepcopy(prior_state))
+                rollback_ok = bool(current_hash == rollback_hash)
             except Exception:
-                pass
-            if prior_rng_state is not None and getattr(self, "_rng", None) is not None:
+                rollback_ok = False
+
+            if not rollback_ok:
                 try:
-                    self._rng.bit_generator.state = dict(prior_rng_state)
+                    self.reset_state()
+                    if getattr(self, "_rng", None) is not None:
+                        self._rng = np.random.default_rng(self._rng_seed)
                 except Exception:
                     pass
+
             if not getattr(self, "_is_replay", False):
                 try:
                     LOGGER.error(
-                        "Snapshot load failed context_keys=%s error=%s",
+                        "Snapshot load failed context_keys=%s rollback_ok=%s error=%s",
                         sorted(list(snapshot.keys())) if isinstance(snapshot, dict) else [],
+                        rollback_ok,
                         repr(e),
                         exc_info=True,
                     )
                 except Exception:
                     LOGGER.debug("Snapshot load error logging failed")
-            # Never crash live engine during replay recovery.
             return
 
     # ==========================================
