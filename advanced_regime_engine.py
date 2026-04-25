@@ -40,6 +40,15 @@ except ImportError:
 LOGGER = logging.getLogger(__name__)
 _OUTPUT_SCHEMA_VERSION = "1.2.0"
 _POSITION_SIZE_CAP = 0.35
+_VALID_ENGINE_STATUS = frozenset({
+    "OK", "DEGRADED", "HEALING", "HEALING_COMPLETE", "SCHEMA_FAILURE",
+    "NO_FEATURES", "CIRCUIT_BREAKER", "WARMUP", "TOXIC_HALT",
+    "OK_WITH_HISTORY", "RNG_RESTORE_FAILED", "UNKNOWN",
+})
+_VALID_EXECUTION_MODE = frozenset({"LIVE", "PAPER", "BACKTEST", "HALTED", "trend_follow", "risk_off_or_short_bias", "flat_or_hedge", "range_mean_revert", "fail_safe", "circuit_breaker"})
+_VALID_EXECUTION_SIDE = frozenset({"long", "short", "flat", "range_mean_revert"})
+_PROMETHEUS_ENGINE_ID_LIMIT = 50
+_prometheus_engine_ids: set[str] = set()
 
 # ==========================================
 # Observability (Prometheus Metrics)
@@ -82,7 +91,7 @@ def _coerce_1d_vector(values: Any, expected_size: int, *, name: str) -> np.ndarr
         raise ValueError(f"{name} contains non-finite values")
     return arr
 
-def safe_float(value: Any, default: float = 0.0, min: float | None = None, max: float | None = None) -> float:
+def _safe_float(value: Any, default: float = 0.0, min: float | None = None, max: float | None = None) -> float:
     """Best-effort scalar coercion for schema/output hardening."""
     try:
         parsed = float(value)
@@ -96,9 +105,8 @@ def safe_float(value: Any, default: float = 0.0, min: float | None = None, max: 
         parsed = float(max)
     return float(parsed)
 
-def _safe_float(value: Any, default: float = 0.0, min: float | None = None, max: float | None = None) -> float:
-    """Crash-proof scalar parser for state/input hydration."""
-    return safe_float(value, default=default, min=min, max=max)
+# Backward-compatible alias; prefer _safe_float internally.
+safe_float = _safe_float
 
 
 def _safe_int(value: Any, default: int = 0, min: int | None = None, max: int | None = None) -> int:
@@ -183,6 +191,12 @@ def _validate_output_schema(output: Dict[str, Any]) -> bool:
         for key in ("regime_idx", "regime_label", "probabilities", "risk_metrics", "alpha", "conviction"):
             if key not in output:
                 raise ValueError(f"missing required key: {key}")
+        if output.get("engine_status", output.get("risk_metrics", {}).get("engine_status")) not in _VALID_ENGINE_STATUS:
+            raise ValueError(f"Invalid engine_status: {output.get('engine_status', output.get('risk_metrics', {}).get('engine_status'))}")
+        if output.get("execution_mode") not in _VALID_EXECUTION_MODE:
+            raise ValueError(f"Invalid execution_mode: {output.get('execution_mode')}")
+        if output.get("execution_side") not in _VALID_EXECUTION_SIDE:
+            raise ValueError(f"Invalid execution_side: {output.get('execution_side')}")
         if not isinstance(output["probabilities"], dict):
             raise ValueError("probabilities must be a dict")
         for pkey in ("bull", "bear", "crisis"):
@@ -198,6 +212,8 @@ def _validate_output_schema(output: Dict[str, Any]) -> bool:
             raise ValueError(f"invalid probabilities sum={prob_sum}")
         if not isinstance(output["risk_metrics"], dict):
             raise ValueError("risk_metrics must be a dict")
+        if "engine_status" not in output["risk_metrics"]:
+            raise ValueError("missing risk_metrics.engine_status")
         for rk in ("expected_volatility", "raw_leverage", "last_valid_vol", "switch_stability_ema"):
             if rk not in output["risk_metrics"]:
                 raise ValueError(f"missing risk_metrics.{rk}")
@@ -365,8 +381,8 @@ def _build_output(
         'execution_mode': execution_mode,
         'execution_side': execution_side,
         'signed_position_size': safe_signed_position,
-        'extended_schema': bool(extended_schema),
         'signal_valid': bool(signal_valid),
+        'engine_status': str(engine_status or "UNKNOWN"),
         
         # --- NEW: forward compatibility anchor ---
         'schema_compat': {
@@ -416,11 +432,11 @@ def _build_output(
             "execution_mode": "fail_safe",
             "execution_side": "flat",
             "signed_position_size": 0.0,
-            "extended_schema": False,
             "schema_compat": {
                 "version": _OUTPUT_SCHEMA_VERSION,
                 "backward_compatible": True
             },
+            "engine_status": "SCHEMA_FAILURE",
             "risk_metrics": {
                 "expected_volatility": 0.0,
                 "raw_leverage": 0.0,
@@ -430,6 +446,7 @@ def _build_output(
                 "garch_regime_probs": fail_safe_garch_probs,
                 "feed_status": {"primary": "SCHEMA_FAILURE", "flags": []},
                 "range_ticks": 0,
+                "engine_status": "SCHEMA_FAILURE",
             },
             "signal_valid": False,
             "alpha": {
@@ -533,6 +550,8 @@ def compute_hmm_regime(
     *,
     prev_directional_label: str | None = None,
     direction_switch_gap: float = 0.02,
+    last_signed_return: float = 0.0,
+    return_score_map: bool = False,
 ) -> Dict[str, Any]:
     """
     Converts real-time filtered probabilities (alpha) into bounded regime scores.
@@ -616,15 +635,31 @@ def compute_hmm_regime(
     bear_share = float(np.clip(bear / directional_mass, 0.0, 1.0))
     trend_score_trend = float(np.clip(trend_score * bull_share, 0.0, 1.0))
     trend_score_bear = float(np.clip(trend_score * bear_share, 0.0, 1.0))
+    if bull_share > bear_share:
+        directional_label_winner = "TREND"
+    elif bear_share > bull_share:
+        directional_label_winner = "BEAR"
+    else:
+        directional_label_winner = "TREND" if float(last_signed_return) >= 0.0 else "BEAR"
     score_map = {
-        "TREND": trend_score_trend,
-        "BEAR": trend_score_bear,
+        "TREND": trend_score if directional_label_winner == "TREND" else 0.0,
+        "BEAR": trend_score if directional_label_winner == "BEAR" else 0.0,
         "RANGE": range_score,
         "TOXIC": toxic_score,
     }
+    for score_key, score_val in score_map.items():
+        if score_val < 0.0:
+            LOGGER.warning("compute_hmm_regime: negative score detected key=%s value=%.6f action=clamp_to_zero", score_key, score_val)
+            score_map[score_key] = 0.0
+    score_sum = float(sum(score_map.values()))
+    if not np.isfinite(score_sum) or score_sum <= 0.0:
+        LOGGER.error("compute_hmm_regime: invalid score sum=%.6f using uniform fallback", score_sum)
+        score_map = {"TREND": 0.25, "BEAR": 0.25, "RANGE": 0.25, "TOXIC": 0.25}
+    elif abs(score_sum - 1.0) > 0.25:
+        LOGGER.warning("compute_hmm_regime: score sum out-of-band sum=%.6f", score_sum)
     max_score = max(score_map.values())
     tied_labels = [label for label, score in score_map.items() if abs(score - max_score) <= 1e-12]
-    tie_priority = {"RANGE": 0, "TOXIC": 1, "TREND": 2, "BEAR": 3}
+    tie_priority = {"TOXIC": 0, "TREND": 1, "BEAR": 2, "RANGE": 3}
     regime = sorted(tied_labels, key=lambda label: tie_priority.get(label, 99))[0]
 
     entropy = float(-np.sum(alpha_safe * np.log(np.clip(alpha_safe, 1e-12, None))))
@@ -632,7 +667,7 @@ def compute_hmm_regime(
     uncertainty = float(np.clip(entropy / max(max_entropy, 1e-12), 0.0, 1.0))
     conviction = float(np.clip(1.0 - uncertainty, 0.0, 1.0))
 
-    return {
+    out = {
         "regime": regime,
         "bull": bull,
         "bear": bear,
@@ -649,7 +684,17 @@ def compute_hmm_regime(
         "bear_score": trend_score_bear,
         "range_score": range_score,
         "toxic_score": toxic_score,
+        "score_map": dict(score_map),
+        "metadata": {
+            "trend_score_trend": trend_score_trend,
+            "trend_score_bear": trend_score_bear,
+            "directional_label_winner": directional_label_winner,
+            "score_sum": score_sum,
+        },
     }
+    if return_score_map:
+        return dict(score_map)
+    return out
 
 # ==========================================
 # 1. NHHMM (Predictive Macro Engine)
@@ -679,6 +724,10 @@ class NHHMM_Engine:
         if not (np.all(np.isfinite(beta_arr)) and np.all(np.isfinite(mu_arr)) and np.all(np.isfinite(sigma_arr))):
             raise ValueError("NHHMM weights contain non-finite values.")
         self.beta = beta_arr
+        if np.any(np.abs(self.beta) > 50.0):
+            LOGGER.warning(
+                "load_weights: beta contains values with |β| > 50. This may cause logit saturation. Consider re-normalizing features."
+            )
         self.mu = mu_arr
         self.sigma = np.clip(np.abs(sigma_arr), 1e-8, None)
 
@@ -690,9 +739,19 @@ class NHHMM_Engine:
                 f"NHHMM input validation failed: {e}. "
                 "Upstream feature pipeline produced invalid data."
             ) from e
-        logits = np.einsum('ijk,k->ij', self.beta, x_t)
+        x_t_safe = np.clip(x_t, -10.0, 10.0)
+        beta_safe = np.clip(self.beta, -5.0, 5.0)
+        logits = np.einsum('ijk,k->ij', beta_safe, x_t_safe)
         logits[:, 0] = 0.0  # Identifiability: pin reference category column
-        return softmax(logits, axis=1)
+        logits = np.clip(logits, -20.0, 20.0)
+        p_t = softmax(logits, axis=1)
+        p_t = np.clip(p_t, 1e-6, None)
+        row_sums = p_t.sum(axis=1, keepdims=True)
+        p_t = p_t / np.clip(row_sums, 1e-12, None)
+        if not np.all(np.isfinite(p_t)):
+            LOGGER.error("_compute_transition_matrix: non-finite output after clipping. Falling back to uniform transition matrix.")
+            p_t = np.full((self.K, self.K), 1.0 / self.K)
+        return p_t
 
     def forward_pass_step(
         self, y_t: float, x_t: np.ndarray, prior_prob: np.ndarray
@@ -806,6 +865,10 @@ class SparseJumpModel:
         if self._default_params_initialized:
             # Safe fallback mode: reduce overconfidence when model centroids are
             # not explicitly loaded, while preserving deterministic behavior.
+            if bool(getattr(self, "_just_restored", False)):
+                LOGGER.warning(
+                    "sjm: using zero-centroid fallback after state restore — classifications are uniform-dampened."
+                )
             uniform = np.ones(self.K, dtype=float) / self.K
             nhhmm_probs = _normalize_prob_vector(0.5 * nhhmm_probs + 0.5 * uniform)
 
@@ -978,6 +1041,7 @@ class AdvancedRegimeEngine:
     _SHOCK_WARMUP_TICKS: int = 32
     _SHOCK_WARMUP_SECONDS: float = 120.0
     _RETURN_EMA_BASE_DECAY: float = 0.92
+    _MAX_EMA_GAP_DT: float = 10.0
 
     def _json_default(self, obj: Any):
         """
@@ -1059,14 +1123,21 @@ class AdvancedRegimeEngine:
         if getattr(self, "_rng", None) is None:
             raise ValueError("engine rng is unavailable")
         candidate_state = copy.deepcopy(dict(rng_state))
-        probe_a = np.random.Generator(type(self._rng.bit_generator)())
-        probe_b = np.random.Generator(type(self._rng.bit_generator)())
-        probe_a.bit_generator.state = copy.deepcopy(candidate_state)
-        probe_b.bit_generator.state = copy.deepcopy(candidate_state)
-        a_sample = probe_a.integers(0, np.iinfo(np.uint64).max, size=8, dtype=np.uint64)
-        b_sample = probe_b.integers(0, np.iinfo(np.uint64).max, size=8, dtype=np.uint64)
-        if not np.array_equal(a_sample, b_sample):
-            raise ValueError("rng reproducibility probe mismatch")
+        try:
+            probe_a = np.random.Generator(type(self._rng.bit_generator)())
+            probe_b = np.random.Generator(type(self._rng.bit_generator)())
+            probe_a.bit_generator.state = copy.deepcopy(candidate_state)
+            probe_b.bit_generator.state = copy.deepcopy(candidate_state)
+            a_sample = probe_a.integers(0, np.iinfo(np.uint64).max, size=8, dtype=np.uint64)
+            b_sample = probe_b.integers(0, np.iinfo(np.uint64).max, size=8, dtype=np.uint64)
+            if not np.array_equal(a_sample, b_sample):
+                raise ValueError("rng reproducibility probe mismatch")
+        except (ValueError, TypeError) as exc:
+            LOGGER.warning(
+                "rng_state validation failed (%s). Non-default BitGenerator may be in use.",
+                exc,
+            )
+            raise
         return candidate_state
 
     def _state_hash(self, state: Dict[str, Any]) -> str:
@@ -1277,6 +1348,18 @@ class AdvancedRegimeEngine:
             )
             stable_hash = hashlib.sha256(stable_source.encode("utf-8")).hexdigest()[:16]
             self.engine_id = f"engine_{stable_hash}"
+        effective_engine_id = self.engine_id
+        if self.engine_id not in _prometheus_engine_ids:
+            if len(_prometheus_engine_ids) >= _PROMETHEUS_ENGINE_ID_LIMIT:
+                LOGGER.warning(
+                    "prometheus: engine_id cardinality limit reached (%d). Metrics for engine '%s' will use 'overflow' label.",
+                    _PROMETHEUS_ENGINE_ID_LIMIT,
+                    self.engine_id,
+                )
+                effective_engine_id = "overflow"
+            else:
+                _prometheus_engine_ids.add(self.engine_id)
+        self._metrics_engine_id = effective_engine_id
 
         # ==========================================
         # NEW: Async Warning Queue (Non-blocking I/O)
@@ -1352,6 +1435,11 @@ class AdvancedRegimeEngine:
         self._obs_counter = 0
         self._OBS_SAMPLE_RATE = 5  # update metrics every N ticks
         self._tick_id = 0
+        self._engine_status = "OK"
+        self._health_status = "OK"
+        self._last_heal_ts = None
+        self._just_restored = False
+        self._last_signed_return = 0.0
         self._confidence_collapse_streak = 0
         self._strict_replay = True
         self._fsm_error = None
@@ -1711,8 +1799,16 @@ class AdvancedRegimeEngine:
         return float(shock_multiplier * shock_vol_basis), float(shock_vol_basis)
 
     def _ema_decay(self, dt: float) -> float:
-        dt_safe = float(np.clip(dt, 0.0, self._MAX_DT))
-        return float(np.clip(self._return_ema_base_decay ** dt_safe, 1e-9, 1.0))
+        dt_safe = float(np.clip(dt, 0.0, self._MAX_EMA_GAP_DT))
+        decay = float(np.clip(self._return_ema_base_decay ** dt_safe, 1e-9, 1.0))
+        if float(dt) > self._MAX_EMA_GAP_DT:
+            LOGGER.debug(
+                "_ema_decay: dt=%.1fs capped to %.1fs, decay=%.4f",
+                float(dt),
+                self._MAX_EMA_GAP_DT,
+                decay,
+            )
+        return decay
 
     def _resolve_canonical_return(
         self,
@@ -1892,14 +1988,14 @@ class AdvancedRegimeEngine:
                         warnings.warn(
                             "LOGGER.warning timeout in background worker; message emission skipped.",
                             RuntimeWarning,
-                            stacklevel=3,
+                            stacklevel=1,
                         )
                     except Exception:
                         pass
             except Exception:
                 engine._increment_warning_backend_failure_count()
                 try:
-                    warnings.warn(msg, RuntimeWarning, stacklevel=3)
+                    warnings.warn(msg, RuntimeWarning, stacklevel=1)
                 except Exception:
                     pass
 
@@ -1973,16 +2069,20 @@ class AdvancedRegimeEngine:
         raw_state = snapshot_payload.get("state_raw", {})
         if not isinstance(raw_state, dict):
             raise ValueError("snapshot payload missing state_raw")
+        def _raw_get(key: str, default: Any) -> Any:
+            if key not in raw_state:
+                LOGGER.warning("materialize_payload: '%s' missing from snapshot, using fallback default.", key)
+            return raw_state.get(key, default)
         engine_state = self._materialize_state_from_raw(raw_state)
-        garch_prob = np.asarray(raw_state.get("garch_prob", np.ones(2) / 2.0), dtype=float)
-        nhhmm_prior = np.asarray(raw_state.get("nhhmm_prior", np.ones(self.K) / self.K), dtype=float)
-        smoothed_garch_prob = np.asarray(raw_state.get("smoothed_garch_prob", np.ones(2) / 2.0), dtype=float)
-        regime_state_probs = np.asarray(raw_state.get("regime_state_probs", np.ones(4) / 4.0), dtype=float)
-        last_valid_sjm_probs = raw_state.get("last_valid_sjm_probs", None)
-        garch_var = np.asarray(raw_state.get("garch_var", self._stationary_garch_var()), dtype=float)
-        rng_state = raw_state.get("engine_rng_state", None)
-        rng_type = raw_state.get("engine_rng_type", None)
-        rng_module = raw_state.get("engine_rng_module", None)
+        garch_prob = np.asarray(_raw_get("garch_prob", np.ones(2) / 2.0), dtype=float)
+        nhhmm_prior = np.asarray(_raw_get("nhhmm_prior", np.ones(self.K) / self.K), dtype=float)
+        smoothed_garch_prob = np.asarray(_raw_get("smoothed_garch_prob", np.ones(2) / 2.0), dtype=float)
+        regime_state_probs = np.asarray(_raw_get("regime_state_probs", np.ones(4) / 4.0), dtype=float)
+        last_valid_sjm_probs = _raw_get("last_valid_sjm_probs", None)
+        garch_var = np.asarray(_raw_get("garch_var", np.array([self.garch.target_vol ** 2] * 2)), dtype=float)
+        rng_state = _raw_get("engine_rng_state", None)
+        rng_type = _raw_get("engine_rng_type", None)
+        rng_module = _raw_get("engine_rng_module", None)
         normalized_rng = None
         if rng_state is not None:
             normalized_rng = {
@@ -1994,9 +2094,9 @@ class AdvancedRegimeEngine:
         return {
             "engine_state": engine_state,
             "regime": str(snapshot_payload.get("regime", "UNKNOWN")),
-            "equity": float(raw_state.get("equity", self._equity)),
-            "drawdown": float(raw_state.get("drawdown", self._drawdown)),
-            "loss_streak": int(raw_state.get("loss_streak", self._loss_streak)),
+            "equity": float(_raw_get("equity", 0.0)),
+            "drawdown": float(_raw_get("drawdown", 0.0)),
+            "loss_streak": int(_raw_get("loss_streak", 0)),
             "garch_prob": garch_prob.tolist(),
             "nhhmm_prior": nhhmm_prior.tolist(),
             "smoothed_garch_prob": smoothed_garch_prob.tolist(),
@@ -2006,23 +2106,23 @@ class AdvancedRegimeEngine:
                 if last_valid_sjm_probs is None
                 else np.asarray(last_valid_sjm_probs, dtype=float).tolist()
             ),
-            "last_effective_trend_strength": float(raw_state.get("last_effective_trend_strength", 0.0)),
-            "last_edge_score": float(raw_state.get("last_edge_score", 0.0)),
+            "last_effective_trend_strength": float(_raw_get("last_effective_trend_strength", 0.0)),
+            "last_edge_score": float(_raw_get("last_edge_score", 0.0)),
             "garch_var": garch_var.tolist(),
-            "last_valid_vol": float(raw_state.get("last_valid_vol", self._last_valid_vol)),
-            "switch_stability_ema": float(raw_state.get("switch_stability_ema", self._switch_stability_ema)),
-            "last_timestamp": raw_state.get("last_timestamp", None),
-            "last_valid_dt": float(raw_state.get("last_valid_dt", self._last_valid_dt)),
-            "range_ticks": float(raw_state.get("range_ticks", self.range_ticks)),
-            "range_ticks_int": int(raw_state.get("range_ticks_int", self.range_ticks_int)),
-            "in_range": bool(raw_state.get("in_range", self._in_range)),
-            "range_anchor_size": float(raw_state.get("range_anchor_size", self._range_anchor_size)),
-            "prev_raw_regime": raw_state.get("prev_raw_regime", self._prev_raw_regime),
-            "last_regime_change_ts": raw_state.get("last_regime_change_ts", self._last_regime_change_ts),
-            "shock_memory": float(raw_state.get("shock_memory", self._shock_memory)),
-            "return_ema": float(raw_state.get("return_ema", self._return_ema)),
-            "abs_return_ema": float(raw_state.get("abs_return_ema", self._abs_return_ema)),
-            "last_price": raw_state.get("last_price", self._last_price),
+            "last_valid_vol": float(_raw_get("last_valid_vol", 0.0)),
+            "switch_stability_ema": float(_raw_get("switch_stability_ema", 1.0)),
+            "last_timestamp": _raw_get("last_timestamp", None),
+            "last_valid_dt": float(_raw_get("last_valid_dt", 1.0)),
+            "range_ticks": float(_raw_get("range_ticks", 0.0)),
+            "range_ticks_int": int(_raw_get("range_ticks_int", 0)),
+            "in_range": bool(_raw_get("in_range", False)),
+            "range_anchor_size": float(_raw_get("range_anchor_size", 0.0)),
+            "prev_raw_regime": _raw_get("prev_raw_regime", None),
+            "last_regime_change_ts": _raw_get("last_regime_change_ts", None),
+            "shock_memory": float(_raw_get("shock_memory", 0.0)),
+            "return_ema": float(_raw_get("return_ema", 0.0)),
+            "abs_return_ema": float(_raw_get("abs_return_ema", 0.0)),
+            "last_price": _raw_get("last_price", None),
             "_rng_state": None,
             "_engine_rng_state": rng_state,
             "_engine_rng_type": rng_type,
@@ -2031,17 +2131,17 @@ class AdvancedRegimeEngine:
         }
 
 
-    def _warn_rate_limited(self, key: str, message: str, cooldown_s: float = 30.0) -> None:
+    def _warn_rate_limited(self, key: str, message: str, cooldown_s: float = 30.0) -> bool:
         """
         Emit repeated operational warnings at a controlled rate.
         The event is always counted internally, but the Python warning is only
         emitted once per cooldown window for the same key.
         """
         if getattr(self, "_is_replay", False):
-            return
+            return False
 
         now = time.monotonic()
-        eligible = False
+        should_emit = False
         with self._warning_lock:
             self._warning_counts[key] = self._warning_counts.get(key, 0) + 1
 
@@ -2051,7 +2151,10 @@ class AdvancedRegimeEngine:
                 self._warning_first_seen.move_to_end(key)
 
             last_emitted = self._warning_last_emitted.get(key)
-            eligible = bool(last_emitted is None or (now - last_emitted) >= cooldown_s)
+            should_emit = bool(last_emitted is None or (now - last_emitted) >= cooldown_s)
+            if should_emit:
+                self._warning_last_emitted[key] = now
+                self._warning_last_emitted.move_to_end(key)
 
             if len(self._warning_counts) >= self._WARNING_CACHE_LIMIT:
                 target_size = self._WARNING_CACHE_TRIM_TO
@@ -2062,23 +2165,11 @@ class AdvancedRegimeEngine:
                         self._warning_last_emitted.pop(old_key, None)
                         self._warning_first_seen.pop(old_key, None)
 
-        if not eligible:
-            return
+        if not should_emit:
+            return False
 
         if not self._obs_should_emit_warning(key, cooldown_s):
-            return
-
-        emit = False
-        with self._warning_lock:
-            now = time.monotonic()
-            last_emitted = self._warning_last_emitted.get(key)
-            if last_emitted is None or (now - last_emitted) >= cooldown_s:
-                self._warning_last_emitted[key] = now
-                self._warning_last_emitted.move_to_end(key)
-                emit = True
-
-        if not emit:
-            return
+            return False
 
         try:
             self._warning_queue.put_nowait(message)
@@ -2097,7 +2188,8 @@ class AdvancedRegimeEngine:
                     )
                 except Exception:
                     pass
-            return
+            return False
+        return True
 
 
     def _warn_tf_failure(self, tf: str, exc: Exception) -> None:
@@ -2409,7 +2501,7 @@ class AdvancedRegimeEngine:
         }
 
     def _capture_state_raw_unlocked(self) -> Dict[str, Any]:
-        return {
+        raw = {
             "state_version": self._STATE_VERSION,
             "model_signature": f"AdvancedRegimeEngine|v={self._STATE_VERSION}|schema={_OUTPUT_SCHEMA_VERSION}|n_states={self.K}|n_features={self.n_features}",
             "last_valid_sjm_probs": (
@@ -2462,7 +2554,7 @@ class AdvancedRegimeEngine:
             "healing_count": int(getattr(self, "_healing_count", 0)),
             "last_healing_action": str(getattr(self, "_last_healing_action", "NONE")),
             "last_healing_error": getattr(self, "_last_healing_error", None),
-            "last_healing_context": dict(getattr(self, "_last_healing_context", {})),
+            "last_healing_context": copy.deepcopy(getattr(self, "_last_healing_context", {})),
             "shock_memory": float(self._shock_memory),
             "return_ema": float(self._return_ema),
             "abs_return_ema": float(self._abs_return_ema),
@@ -2495,9 +2587,34 @@ class AdvancedRegimeEngine:
             "confidence_collapse_streak": int(getattr(self, "_confidence_collapse_streak", 0)),
             "determinism_status": str(getattr(self, "_determinism_status", "OK")),
             "determinism_had_failure": bool(getattr(self, "_determinism_had_failure", False)),
+            "engine_status": str(getattr(self, "_engine_status", "OK")),
+            "tick_id": int(getattr(self, "_tick_id", 0)),
             # Explicitly mark deprecated field as False to avoid confusion in external systems
             "emit_extended_schema": False,
         }
+        try:
+            raw["nhhmm_beta"] = self.nhhmm.beta.tolist()
+            raw["nhhmm_mu"] = self.nhhmm.mu.tolist()
+            raw["nhhmm_sigma"] = self.nhhmm.sigma.tolist()
+            for key in ("nhhmm_beta", "nhhmm_mu", "nhhmm_sigma"):
+                arr = np.asarray(raw[key], dtype=float)
+                if not np.all(np.isfinite(arr)):
+                    LOGGER.warning("capture_state: non-finite values in %s, zeroing for safety", key)
+                    raw[key] = np.zeros_like(arr).tolist()
+        except Exception as exc:
+            LOGGER.error("capture_state: failed to serialize nhhmm params: %s", exc)
+            raw["nhhmm_beta"] = raw["nhhmm_mu"] = raw["nhhmm_sigma"] = None
+        try:
+            raw["sjm_means"] = self.sjm.means.tolist() if self.sjm.means is not None else None
+            raw["sjm_weights"] = self.sjm.weights.tolist() if self.sjm.weights is not None else None
+            raw["sjm_score_scale"] = float(getattr(self.sjm, "_score_scale", 1.0))
+            raw["sjm_default_params_initialized"] = bool(getattr(self.sjm, "_default_params_initialized", False))
+        except Exception as exc:
+            LOGGER.error("capture_state: failed to serialize sjm params: %s", exc)
+            raw["sjm_means"] = raw["sjm_weights"] = None
+            raw["sjm_score_scale"] = 1.0
+            raw["sjm_default_params_initialized"] = False
+        return raw
 
     @staticmethod
     def _materialize_state_from_raw(raw_state: Dict[str, Any]) -> Dict[str, Any]:
@@ -2531,6 +2648,10 @@ class AdvancedRegimeEngine:
         return self._get_state_unlocked()
 
     @_synchronized
+    def save_state(self) -> Dict[str, Any]:
+        return self._get_state_unlocked()
+
+    @_synchronized
     def reset_state(self) -> None:
         self.nhhmm_prior = np.ones(self.K, dtype=float) / self.K
         self.current_regime_idx = None
@@ -2561,6 +2682,7 @@ class AdvancedRegimeEngine:
         self._regime_state_probs = np.ones(4, dtype=float) / 4.0
         if getattr(self, "_regime_smoother", None) is not None:
             self._regime_smoother.reset()
+            self._regime_smoother.prev_probs = self._regime_state_probs.copy()
         self.garch_var = self._stationary_garch_var()
         self._shock_memory = 0.0
         self._return_ema = 0.0
@@ -2693,6 +2815,16 @@ class AdvancedRegimeEngine:
             self._last_price_tick_id = _safe_int(state.get("last_price_tick_id"), default=-1, min=-1)
             if self._last_price_tick_id < 0:
                 self._last_price_tick_id = None
+        restored_tick_id = state.get("tick_id", None)
+        if restored_tick_id is not None:
+            self._tick_id = int(_safe_int(restored_tick_id, default=int(getattr(self, "_tick_id", 0)), min=0))
+        else:
+            LOGGER.warning(
+                "load_state: 'tick_id' absent from snapshot. Inferring from _last_price_tick_id to avoid TICK_ORDER_VIOLATION."
+            )
+        if self._last_price_tick_id is not None and int(self._tick_id) <= int(self._last_price_tick_id):
+            self._tick_id = int(self._last_price_tick_id) + 1
+            LOGGER.info("load_state: advanced _tick_id to %d to clear anchor.", self._tick_id)
         if state.get("last_price_timestamp", None) is not None and self._last_price_timestamp is None:
             self._log_state_load_issue(
                 "last_price_timestamp",
@@ -2779,29 +2911,141 @@ class AdvancedRegimeEngine:
             normalize_probabilities=True,
         )
 
-        smoother_key = "regime_smoother_prev_probs"
-        if smoother_key in state and state[smoother_key] is not None:
-            synced_probs = self._state_vector(
-                state,
-                smoother_key,
-                4,
-                fallback=np.ones(4, dtype=float) / 4.0,
-                normalize_probabilities=True,
-            )
-        elif "regime_state_probs" in state and state["regime_state_probs"] is not None:
-            synced_probs = self._state_vector(
-                state,
-                "regime_state_probs",
-                4,
-                fallback=np.ones(4, dtype=float) / 4.0,
-                normalize_probabilities=True,
-            )
+        smoother_probs = state.get("regime_smoother_prev_probs")
+        state_probs = state.get("regime_state_probs")
+        if smoother_probs is not None:
+            authoritative_probs = np.asarray(smoother_probs, dtype=np.float64)
+        elif state_probs is not None:
+            LOGGER.warning("load_state: falling back to regime_state_probs (smoother probs absent).")
+            authoritative_probs = np.asarray(state_probs, dtype=np.float64)
         else:
-            synced_probs = np.ones(4, dtype=float) / 4.0
-        self._regime_state_probs = np.asarray(synced_probs, dtype=float)
+            LOGGER.error("load_state: neither smoother nor state probs found. Using uniform prior.")
+            authoritative_probs = np.ones(4, dtype=np.float64) / 4.0
+        if not np.all(np.isfinite(authoritative_probs)):
+            authoritative_probs = np.ones(4, dtype=np.float64) / 4.0
+        authoritative_probs = _normalize_prob_vector(authoritative_probs)
+        self._regime_state_probs = authoritative_probs.copy()
         if getattr(self, "_regime_smoother", None) is not None:
-            self._regime_smoother.set_prev_probs(self._regime_state_probs)
-            self._regime_state_probs = np.asarray(self._regime_smoother.prev_probs, dtype=float).copy()
+            self._regime_smoother.prev_probs = authoritative_probs.copy()
+
+        self._engine_status = str(state.get("engine_status", "OK"))
+        # ── Restore NHHMM model parameters ──────────────────────────────────────
+        # Track per-parameter success with a set.
+        # "Fully restored" requires ALL THREE keys to succeed.
+        # A single boolean would latch on the first success and mask later failures.
+        _nhhmm_restored_keys: set[str] = set()
+        _nhhmm_required_keys: frozenset[str] = frozenset(
+            {"nhhmm_beta", "nhhmm_mu", "nhhmm_sigma"}
+        )
+
+        for key, attr, shape_ref in [
+            ("nhhmm_beta",  "beta",  (self.nhhmm.K, self.nhhmm.K, self.nhhmm.n_features)),
+            ("nhhmm_mu",    "mu",    (self.nhhmm.K,)),
+            ("nhhmm_sigma", "sigma", (self.nhhmm.K,)),
+        ]:
+            raw_val = state.get(key)
+
+            if raw_val is None:
+                LOGGER.warning(
+                    "load_state: '%s' absent from snapshot — "
+                    "parameter will retain default value. "
+                    "This key is REQUIRED for coherent regime inference.",
+                    key,
+                )
+                self._engine_status = "DEGRADED"
+                continue
+
+            try:
+                arr = np.asarray(raw_val, dtype=np.float64)
+            except (TypeError, ValueError) as exc:
+                LOGGER.error(
+                    "load_state: cannot coerce '%s' to ndarray: %s — "
+                    "parameter will retain default value.",
+                    key, exc,
+                )
+                self._engine_status = "DEGRADED"
+                continue
+
+            if arr.shape != shape_ref:
+                LOGGER.error(
+                    "load_state: shape mismatch for '%s': "
+                    "got %s, expected %s — "
+                    "parameter will retain default value. "
+                    "Snapshot may be from a different model architecture.",
+                    key, arr.shape, shape_ref,
+                )
+                self._engine_status = "DEGRADED"
+                continue
+
+            if not np.all(np.isfinite(arr)):
+                n_bad = int(np.sum(~np.isfinite(arr)))
+                LOGGER.error(
+                    "load_state: '%s' contains %d non-finite value(s) — "
+                    "parameter will retain default value.",
+                    key, n_bad,
+                )
+                self._engine_status = "DEGRADED"
+                continue
+
+            # All checks passed for this parameter — safe to apply.
+            setattr(self.nhhmm, attr, arr)
+            _nhhmm_restored_keys.add(key)
+            LOGGER.debug(
+                "load_state: '%s' restored successfully (shape=%s).",
+                key, arr.shape,
+            )
+
+        # ── Authoritative restoration status ─────────────────────────────────────
+        _nhhmm_fully_restored: bool = (_nhhmm_restored_keys == _nhhmm_required_keys)
+        _nhhmm_missing: frozenset[str] = _nhhmm_required_keys - _nhhmm_restored_keys
+
+        if not _nhhmm_fully_restored:
+            LOGGER.critical(
+                "load_state: NHHMM parameter restore INCOMPLETE. "
+                "Restored: %s. Failed/missing: %s. "
+                "Regime posteriors will be INCOHERENT — emission distribution "
+                "is using default parameters, not trained values. "
+                "Engine requires retrain or a valid snapshot before live trading.",
+                sorted(_nhhmm_restored_keys),
+                sorted(_nhhmm_missing),
+            )
+            # Ensure engine_status is DEGRADED regardless of what earlier
+            # restore steps may have set it to.
+            self._engine_status = "DEGRADED"
+        else:
+            LOGGER.info(
+                "load_state: all NHHMM parameters restored successfully "
+                "(beta shape=%s, mu shape=%s, sigma shape=%s).",
+                self.nhhmm.beta.shape,
+                self.nhhmm.mu.shape,
+                self.nhhmm.sigma.shape,
+            )
+
+        sjm_means_raw = state.get("sjm_means")
+        sjm_weights_raw = state.get("sjm_weights")
+        if sjm_means_raw is not None and sjm_weights_raw is not None:
+            try:
+                m = np.asarray(sjm_means_raw, dtype=np.float64)
+                w = np.asarray(sjm_weights_raw, dtype=np.float64)
+                if self.sjm.means is None or self.sjm.weights is None:
+                    self.sjm.means = np.zeros_like(m)
+                    self.sjm.weights = np.ones_like(w)
+                if m.shape == self.sjm.means.shape and w.shape == self.sjm.weights.shape:
+                    if np.all(np.isfinite(m)) and np.all(np.isfinite(w)):
+                        self.sjm.means = m
+                        self.sjm.weights = w
+                    else:
+                        LOGGER.error("load_state: non-finite SJM params, keeping defaults.")
+                else:
+                    LOGGER.error("load_state: SJM shape mismatch means=%s weights=%s, keeping defaults.", m.shape, w.shape)
+            except (TypeError, ValueError) as exc:
+                LOGGER.error("load_state: SJM params restore failed: %s", exc)
+        else:
+            LOGGER.warning("load_state: SJM params absent from snapshot.")
+        self.sjm._score_scale = float(state.get("sjm_score_scale", 1.0))
+        self.sjm._default_params_initialized = bool(state.get("sjm_default_params_initialized", False))
+        self.sjm._just_restored = True
+        self._just_restored = True
 
         self.garch_var = self._state_vector(
             state,
@@ -2946,6 +3190,13 @@ class AdvancedRegimeEngine:
             engine_id=self.engine_id,
             enable_background_workers=False,
         )
+        _staging_warnings: List[tuple[str, str]] = []
+        original_warn = staging._warn_rate_limited
+        def _accumulating_warn(key, message, level="WARNING", **kwargs):
+            _ = key, kwargs
+            _staging_warnings.append((str(level), str(message)))
+            return True
+        staging._warn_rate_limited = _accumulating_warn
         try:
             staging._is_replay = True
             staging._determinism_status = str(getattr(self, "_determinism_status", "OK"))
@@ -2963,6 +3214,7 @@ class AdvancedRegimeEngine:
             self._log_state_load_issue("state_atomic", exc, "atomic_stage_failure")
             return
         finally:
+            staging._warn_rate_limited = original_warn
             staging._shutdown_warning_worker()
             staging._shutdown_snapshot_worker()
 
@@ -2970,6 +3222,10 @@ class AdvancedRegimeEngine:
         self._load_state_inplace(committed_state)
         if committed_rng_state is not None and getattr(self, "_rng", None) is not None:
             self._rng.bit_generator.state = committed_rng_state
+        for level, message in _staging_warnings:
+            LOGGER.log(getattr(logging, level, logging.WARNING), "[state_load] %s", message)
+        if _staging_warnings:
+            LOGGER.info("load_state: replayed %d staging warnings to live engine.", len(_staging_warnings))
 
     @_synchronized
     def update(self, market_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -3004,7 +3260,7 @@ class AdvancedRegimeEngine:
         def _observe_latency() -> None:
             if _PROM_AVAILABLE and obs_sample and not getattr(self, "_is_replay", False):
                 elapsed = time.perf_counter() - start_time
-                ENGINE_LATENCY.labels(self.engine_id).observe(elapsed)
+                ENGINE_LATENCY.labels(self._metrics_engine_id).observe(elapsed)
 
         def _build_halted_output() -> Dict[str, Any]:
             self.last_signed_position_size = 0.0
@@ -3123,6 +3379,9 @@ class AdvancedRegimeEngine:
                 self._replay_record("update_end", {"regime": "HALTED"})
             return output
 
+        stale_reason: str = "NO_PREV_PRICE"
+        stale_price: bool = True
+        policy_allows_pnl: bool = False
         price = market_data.get("price", None)
         observed_return = market_data.get("return", None)
         if price is not None:
@@ -3363,6 +3622,7 @@ class AdvancedRegimeEngine:
                 )
                 self._obs_observe("mtf_base_features_missing", "high", {"source": "update"})
                 self.last_signed_position_size = 0.0
+                LOGGER.debug("update: x_t=None, zeroing last_signed_position_size (tick=%d)", self._tick_id)
                 output = _build_output(
                     regime_idx=-1,
                     regime_label="UNKNOWN",
@@ -3381,7 +3641,7 @@ class AdvancedRegimeEngine:
                     is_toxic=True,
                     garch_regime_probs=self.garch_prob.tolist(),
                     feed_status="MTF_BASE_FEATURES_MISSING",
-                    engine_status=str(getattr(self, "_determinism_status", "OK")),
+                    engine_status="NO_FEATURES",
                     last_valid_vol=float(getattr(self, "_last_valid_vol", self.garch.target_vol)),
                     switch_stability_ema=float(getattr(self, "_switch_stability_ema", 1.0)),
                     execution_side="flat",
@@ -3466,7 +3726,7 @@ class AdvancedRegimeEngine:
             if _PROM_AVAILABLE and not getattr(self, "_is_replay", False):
                 for k, v in mtf_degradation_reasons.items():
                     if v > 0:
-                        MTF_DEGRADATION.labels(self.engine_id, k).inc(v)
+                        MTF_DEGRADATION.labels(self._metrics_engine_id, k).inc(v)
 
             expected_weighted_tf_count = total_candidate_tfs
             if expected_weighted_tf_count > 1 and valid_tf_count == 1:
@@ -3550,6 +3810,8 @@ class AdvancedRegimeEngine:
                     message="Single-TF update missing required return/features payload; emitting fail-safe output.",
                     cooldown_s=30.0,
                 )
+                self.last_signed_position_size = 0.0
+                LOGGER.debug("update: x_t=None, zeroing last_signed_position_size (tick=%d)", self._tick_id)
                 output = _build_output(
                     regime_idx=-1,
                     regime_label="UNKNOWN",
@@ -3562,6 +3824,7 @@ class AdvancedRegimeEngine:
                     probabilities={'bull': 0.0, 'bear': 0.0, 'crisis': 1.0},
                     macro_probs=self.nhhmm_prior.tolist(),
                     position_size=0.0,
+                    signed_position_size=0.0,
                     expected_vol=float(getattr(self, "_last_valid_vol", self.garch.target_vol)),
                     raw_size=0.0,
                     is_toxic=True,
@@ -3620,6 +3883,7 @@ class AdvancedRegimeEngine:
                 cooldown_s=30.0,
             )
             self.last_signed_position_size = 0.0
+            LOGGER.debug("update: x_t=None, zeroing last_signed_position_size (tick=%d)", self._tick_id)
             output = _build_output(
                 regime_idx=-1,
                 regime_label="UNKNOWN",
@@ -3638,7 +3902,7 @@ class AdvancedRegimeEngine:
                 is_toxic=True,
                 garch_regime_probs=self.garch_prob.tolist(),
                 feed_status="FEATURES_MISSING_AFTER_VALIDATION",
-                engine_status=str(getattr(self, "_determinism_status", "OK")),
+                engine_status="NO_FEATURES",
                 last_valid_vol=float(getattr(self, "_last_valid_vol", self.garch.target_vol)),
                 switch_stability_ema=float(getattr(self, "_switch_stability_ema", 1.0)),
                 execution_side="flat",
@@ -3755,8 +4019,8 @@ class AdvancedRegimeEngine:
             
             if _PROM_AVAILABLE:
                 if obs_sample and not getattr(self, "_is_replay", False):
-                    ENGINE_FEED_STATUS.labels(self.engine_id, feed_status).inc()
-                    ENGINE_HEALTH.labels(self.engine_id).set(0)
+                    ENGINE_FEED_STATUS.labels(self._metrics_engine_id, feed_status).inc()
+                    ENGINE_HEALTH.labels(self._metrics_engine_id).set(0)
 
             self._obs_observe("data_failure", "high", {"feed_status": feed_status})
 
@@ -3822,7 +4086,7 @@ class AdvancedRegimeEngine:
 
         # OBS: feed tracking
         if _PROM_AVAILABLE and obs_sample and not getattr(self, "_is_replay", False):
-            ENGINE_FEED_STATUS.labels(self.engine_id, str(feed_status)).inc()
+            ENGINE_FEED_STATUS.labels(self._metrics_engine_id, str(feed_status)).inc()
 
         # Only compute if not already from MTF
         if mtf_data is None:
@@ -3937,6 +4201,7 @@ class AdvancedRegimeEngine:
             sjm_probs,
             prev_directional_label=getattr(self, "_prev_directional_label", None),
             direction_switch_gap=self._DIRECTION_SWITCH_GAP,
+            last_signed_return=float(getattr(self, "_last_signed_return", 0.0)),
         )
         self._prev_directional_label = self._validate_directional_label(
             regime_scores.get("directional_label"),
@@ -4156,11 +4421,23 @@ class AdvancedRegimeEngine:
             alpha_conf > 0.65
             and abs(alpha_bias) > 0.2
             and abs(base_trend_strength) > 0.15
+            and confirmed_regime in ("TREND", "BEAR")
         ):
-            if alpha_bias > 0.2 and confirmed_regime in ("TREND", "RANGE"):
+            if alpha_bias > 0.2 and confirmed_regime == "TREND":
                 execution_side = "long"
-            elif alpha_bias < -0.2 and confirmed_regime in ("BEAR", "RANGE"):
+            elif alpha_bias < -0.2 and confirmed_regime == "BEAR":
                 execution_side = "short"
+        elif (
+            alpha_conf > 0.65
+            and abs(alpha_bias) > 0.2
+            and abs(base_trend_strength) > 0.15
+            and confirmed_regime == "RANGE"
+        ):
+            LOGGER.debug(
+                "update: alpha override suppressed in RANGE regime (alpha_bias=%.3f, alpha_conf=%.3f) — using range sizing.",
+                alpha_bias,
+                alpha_conf,
+            )
 
         # Confidence-collapse halt must happen before risk-state mutation.
         collapse_signal = (
@@ -4279,9 +4556,9 @@ class AdvancedRegimeEngine:
         self._last_edge_score = edge_score
         
         if _PROM_AVAILABLE and obs_sample and not getattr(self, "_is_replay", False):
-            ENGINE_VOL.labels(self.engine_id).set(expected_vol)
-            ENGINE_CONFIDENCE.labels(self.engine_id).set(regime_scores["conviction"])
-            ENGINE_RISK.labels(self.engine_id).set(regime_scores["risk_level"])
+            ENGINE_VOL.labels(self._metrics_engine_id).set(expected_vol)
+            ENGINE_CONFIDENCE.labels(self._metrics_engine_id).set(regime_scores["conviction"])
+            ENGINE_RISK.labels(self._metrics_engine_id).set(regime_scores["risk_level"])
             
         if not np.isfinite(expected_vol):
             expected_vol = self.garch.target_vol
@@ -4302,7 +4579,7 @@ class AdvancedRegimeEngine:
             position_size *= 0.25
 
         if _PROM_AVAILABLE and obs_sample and not getattr(self, "_is_replay", False):
-            ENGINE_POSITION.labels(self.engine_id).set(position_size)
+            ENGINE_POSITION.labels(self._metrics_engine_id).set(position_size)
 
         # FIX #4: MORE RESPONSIVE SHOCK DETECTION
         shock_threshold = max(2.2 * post_update_baseline_vol, 0.008)
@@ -4330,7 +4607,7 @@ class AdvancedRegimeEngine:
         self._last_health = health
 
         if _PROM_AVAILABLE and obs_sample and not getattr(self, "_is_replay", False):
-            ENGINE_HEALTH.labels(self.engine_id).set(1 if health == "OK" else 0)
+            ENGINE_HEALTH.labels(self._metrics_engine_id).set(1 if health == "OK" else 0)
 
         if is_toxic:
             position_size = float(np.clip(position_size * 0.1, 0.0, 0.1 * self._MAX_POSITION_SIZE))
@@ -4452,6 +4729,10 @@ class AdvancedRegimeEngine:
             raw_size = 0.0
 
         self.last_signed_position_size = signed_position_size
+        self._last_signed_return = float(y_t)
+        if getattr(self, "_just_restored", False):
+            self._just_restored = False
+            self.sjm._just_restored = False
         rticks = self.range_ticks_int
 
         # OBS: latency tracking
@@ -4503,7 +4784,7 @@ class AdvancedRegimeEngine:
         if obs_sample and not getattr(self, "_is_replay", False):
             self._replay_record("update_end", {"regime": confirmed_regime})
         if _PROM_AVAILABLE and not getattr(self, "_is_replay", False):
-            REGIME_COUNTER.labels(self.engine_id, confirmed_regime).inc()
+            REGIME_COUNTER.labels(self._metrics_engine_id, confirmed_regime).inc()
         if self._replay_engine is not None and (self._tick_id % 100 == 0) and not getattr(self, "_is_replay", False):
             try:
                 snapshot_payload = self._capture_snapshot_payload_unlocked(confirmed_regime)
@@ -4733,6 +5014,10 @@ class AdvancedRegimeEngine:
                 LOGGER.warning("[SELF HEALING INITIATED]")
         except Exception:
             self._warn_rate_limited("self_heal_log_failure", "Self-healing logging failed", cooldown_s=30.0)
+        _preserved_valid_return_count = int(getattr(self, "_valid_return_count", 0))
+        _preserved_first_valid_return_ts = getattr(self, "_first_valid_return_ts", None)
+        _preserved_posterior_update_count = int(getattr(self, "_posterior_update_count", 0))
+        _preserved_first_posterior_ts = getattr(self, "_first_posterior_ts", None)
 
         # Legacy breaker recovery path: keep existing behavior intact.
         if error_code is None:
@@ -4786,10 +5071,10 @@ class AdvancedRegimeEngine:
             self._last_price_timestamp = None
             self._last_price_tick_id = None
             self._pnl_mode = None
-            self._valid_return_count = 0
-            self._first_valid_return_ts = None
-            self._posterior_update_count = 0
-            self._first_posterior_ts = None
+            self._valid_return_count = _preserved_valid_return_count
+            self._first_valid_return_ts = _preserved_first_valid_return_ts
+            self._posterior_update_count = _preserved_posterior_update_count
+            self._first_posterior_ts = _preserved_first_posterior_ts
 
             # Reset breaker
             self._circuit_breaker_active = False
@@ -4798,6 +5083,13 @@ class AdvancedRegimeEngine:
             self._healing_counter = 0
             self._confidence_collapse_streak = 0
             self._last_healing_action = "RESET_FULL"
+            self._health_status = "HEALING_COMPLETE"
+            self._last_heal_ts = time.time()
+            LOGGER.info(
+                "_self_heal: warmup state preserved (valid_returns=%d, posteriors=%d) after recovery.",
+                _preserved_valid_return_count,
+                _preserved_posterior_update_count,
+            )
             if not getattr(self, "_is_replay", False):
                 self._replay_record("self_heal", {"error": error_code, "action": "RESET_FULL"})
             return self._last_healing_action
