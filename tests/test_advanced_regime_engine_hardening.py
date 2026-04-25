@@ -16,6 +16,7 @@ from advanced_regime_engine import (
     AdvancedRegimeEngine,
     MSGARCH_RiskEngine,
     NHHMM_Engine,
+    RegimeMarkovSmoother,
     SparseJumpModel,
     _safe_array,
     _safe_float,
@@ -479,6 +480,93 @@ def test_model_components_normal_flow():
     new_prob = garch._update_regime_probs(np.array([0.5, 0.5]), np.array([1e-4, 2e-4]), 0.001)
     assert np.all(np.isfinite(new_var))
     assert np.isclose(float(np.sum(new_prob)), 1.0)
+
+
+def test_regime_markov_smoother_directional_evidence_is_symmetric_and_not_suppressed():
+    smoother = RegimeMarkovSmoother()
+    scores = {"bull": 0.9, "bear": 0.1, "trend_score": 0.2, "range_score": 0.2, "toxic_score": 0.2}
+    evidence = smoother._scores_to_evidence(scores)
+    assert np.isclose(float(np.sum(evidence)), 1.0)
+    assert evidence[smoother.state_to_idx["TREND"]] > 0.35
+    assert evidence[smoother.state_to_idx["BEAR"]] > 0.10
+
+    mirrored = smoother._scores_to_evidence(
+        {"bull": 0.1, "bear": 0.9, "trend_score": 0.2, "range_score": 0.2, "toxic_score": 0.2}
+    )
+    assert np.isclose(
+        evidence[smoother.state_to_idx["TREND"]],
+        mirrored[smoother.state_to_idx["BEAR"]],
+    )
+    assert np.isclose(
+        evidence[smoother.state_to_idx["BEAR"]],
+        mirrored[smoother.state_to_idx["TREND"]],
+    )
+
+
+def test_compute_hmm_regime_ambiguous_direction_prefers_range_without_trend_boost():
+    scores = compute_hmm_regime(np.array([0.52, 0.48, 0.0], dtype=float))
+    assert scores["directional_label"] == "TREND"
+    assert scores["regime"] == "RANGE"
+    assert scores["range_score"] > scores["trend_score"]
+
+    mirrored = compute_hmm_regime(np.array([0.48, 0.52, 0.0], dtype=float))
+    assert mirrored["directional_label"] == "BEAR"
+    assert mirrored["regime"] == "RANGE"
+    assert np.isclose(scores["trend_score"], mirrored["trend_score"])
+    assert np.isclose(scores["directional_margin"], mirrored["directional_margin"])
+
+
+class _ReplayCapture:
+    def __init__(self):
+        self.payloads = []
+
+    def snapshot(self, payload):
+        self.payloads.append(payload)
+
+
+def test_snapshot_path_no_tautological_consistency_loop():
+    eng = AdvancedRegimeEngine(n_states=3, n_features=3, seed=7)
+    replay = _ReplayCapture()
+    warn_keys = []
+    try:
+        eng._replay_engine = replay
+        eng._tick_id = 99
+        eng._warn_rate_limited = lambda key, *_a, **_k: warn_keys.append(key)
+        eng.update(_md(ret=0.001, ts=1.0))
+        assert len(replay.payloads) == 1
+        assert "snapshot_consistency_check_failure" not in warn_keys
+    finally:
+        eng._shutdown_warning_worker()
+
+
+@pytest.mark.parametrize("n_features", [1, 2])
+def test_sjm_default_initialization_is_symmetric_across_feature_dims(n_features):
+    sjm = SparseJumpModel(n_states=3)
+    state, probs = sjm.online_predict(
+        x_t=np.zeros(n_features, dtype=float),
+        expected_n_features=n_features,
+        prev_state=None,
+        nhhmm_probs=np.array([1 / 3, 1 / 3, 1 / 3], dtype=float),
+    )
+    assert state in {0, 1, 2}
+    assert sjm.means.shape == (3, n_features)
+    assert np.allclose(sjm.means, 0.0)
+    assert np.allclose(sjm.weights, np.ones(n_features, dtype=float) / np.sqrt(n_features))
+    assert np.allclose(probs, np.ones(3, dtype=float) / 3.0)
+
+
+def test_sjm_missing_weights_uses_deterministic_uniform_fallback():
+    sjm = SparseJumpModel(n_states=3)
+    sjm.means = np.zeros((3, 2), dtype=float)
+    sjm.weights = None
+    _, probs = sjm.online_predict(
+        x_t=np.array([0.1, -0.2], dtype=float),
+        expected_n_features=2,
+        prev_state=1,
+        nhhmm_probs=np.array([0.4, 0.4, 0.2], dtype=float),
+    )
+    assert np.allclose(sjm.weights, np.array([1 / np.sqrt(2), 1 / np.sqrt(2)], dtype=float))
+    assert np.isclose(float(np.sum(probs)), 1.0)
 
 
 def test_deterministic_state_hash_regression():
