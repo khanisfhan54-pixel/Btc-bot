@@ -31,9 +31,13 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 from alpha_liquidity_sweep_predictor import LiquiditySweepAlpha, predict_sweep
+from trading_utils import safe_float, clamp, validate_alpha
 
 logger = logging.getLogger(__name__)
 _LIQUIDITY_SWEEP_ALPHA = LiquiditySweepAlpha()
+_ALPHA_STATE: Dict[str, Dict[str, Any]] = {}
+_ALPHA_STATE_LOCK = threading.Lock()
+_LIQUIDITY_UPDATE_LOCK = threading.RLock()
 
 
 def _debug_import_integrity() -> None:
@@ -48,7 +52,10 @@ except Exception:
 
 try:
     import websocket
-except Exception:
+    _WEBSOCKET_AVAILABLE = True
+except ImportError as e:
+    logger.critical("[LIQUIDATION_MONITOR] websocket-client package not installed: %s. LiquidationMonitor is PERMANENTLY DISABLED. Install with: pip install websocket-client", e)
+    _WEBSOCKET_AVAILABLE = False
     websocket = None  # type: ignore
 
 _META_FILTER_CLS = None
@@ -247,17 +254,17 @@ def _sigmoid(x: float) -> float:
         return 0.5
 
 
-def compute_sma(values: Any, period: int = 14) -> float:
+def compute_sma(values: Any, period: int = 14) -> float | None:
     try:
         vals = [float(v) for v in (values or []) if v is not None]
-        if not vals:
-            return 0.0
         if period <= 0:
             period = len(vals)
+        if len(vals) < period:
+            return None
         window = vals[-period:]
-        return sum(window) / max(len(window), 1)
+        return sum(window) / float(period)
     except Exception:
-        return 0.0
+        return None
 
 
 def compute_sma_signal(values: Any, fast: int = 10, slow: int = 30) -> Dict[str, Any]:
@@ -267,6 +274,8 @@ def compute_sma_signal(values: Any, fast: int = 10, slow: int = 30) -> Dict[str,
             return {"signal": "NEUTRAL", "sma_fast": 0.0, "sma_slow": 0.0, "bias": 0.0}
         sma_fast = compute_sma(vals, fast)
         sma_slow = compute_sma(vals, slow)
+        if sma_fast is None or sma_slow is None:
+            return {"signal": "NEUTRAL", "sma_fast": 0.0, "sma_slow": 0.0, "bias": 0.0}
         bias = 0.0
         signal = "NEUTRAL"
         if sma_fast > sma_slow:
@@ -3557,9 +3566,10 @@ def run_all_engines(
                 for v in [_safe_float(r[3], float("nan"))]
                 if math.isfinite(v)
             ]
-            _LIQUIDITY_SWEEP_ALPHA.update_liquidity_pools(recent_highs, recent_lows)
-            alpha_raw = _LIQUIDITY_SWEEP_ALPHA.get_signal(
-                {
+            with _LIQUIDITY_UPDATE_LOCK:
+                _LIQUIDITY_SWEEP_ALPHA.update_liquidity_pools(recent_highs, recent_lows)
+                alpha_raw = _LIQUIDITY_SWEEP_ALPHA.get_signal(
+                    {
                     "price": price,
                     "close_price": _safe_float(primary_1m[-1][4], price) if primary_1m else price,
                     "prev_book": orderbook_snapshots[-2] if orderbook_snapshots and len(orderbook_snapshots) >= 2 else orderbook,
@@ -3628,9 +3638,8 @@ def run_all_engines(
             alpha_direction = "NEUTRAL"
             alpha_confidence = 0.5
         _alpha_symbol = (symbol or "BTC/USDT").replace("/", "").upper()
-        if not hasattr(run_all_engines, "_alpha_state"):
-            run_all_engines._alpha_state = {}
-        _alpha_st = run_all_engines._alpha_state.setdefault(_alpha_symbol, {})
+        with _ALPHA_STATE_LOCK:
+            _alpha_st = _ALPHA_STATE.setdefault(_alpha_symbol, {})
         prev_alpha_direction = _alpha_st.get("direction", "NEUTRAL")
         prev_alpha_conf = _clamp(_safe_float(_alpha_st.get("confidence", 0.5), 0.5), 0.0, 1.0)
         flip_threshold = 0.55 if prev_alpha_direction == "NEUTRAL" else 0.65
@@ -3677,7 +3686,9 @@ def run_all_engines(
         _raw_signal_ts = _safe_float(alpha_raw.get("timestamp", now_ts), now_ts)
         age = max(0.0, now_ts - _raw_signal_ts)
         decay = math.exp(-age / 3.0)
+        pre_attenuation_conf = alpha_payload["confidence"]
         alpha_payload["confidence"] *= decay
+        logger.debug("[ALPHA] post_decay_confidence=%.4f", alpha_payload["confidence"])
 
         p_up = alpha_payload.get("prob_above", 0.5)
         p_dn = alpha_payload.get("prob_below", 0.5)
@@ -3687,12 +3698,14 @@ def run_all_engines(
         )
         entropy_norm = entropy_raw / math.log(2.0)
         alpha_payload["confidence"] *= (1.0 - 0.4 * entropy_norm)
+        logger.debug("[ALPHA] post_entropy_confidence=%.4f", alpha_payload["confidence"])
         alpha_payload["confidence"] = _clamp(alpha_payload["confidence"], 0.0, 1.0)
 
         micro = alpha_payload.get("micro_prob", 0.5)
         macro = alpha_payload.get("macro_prob", 0.5)
         if abs(micro - macro) > 0.4:
             alpha_payload["confidence"] *= 0.7
+        logger.debug("[ALPHA] post_micro_macro_confidence=%.4f", alpha_payload["confidence"])
         alpha_payload["confidence"] = _clamp(alpha_payload["confidence"], 0.0, 1.0)
 
         prev_conf = prev_alpha_conf
@@ -3702,17 +3715,22 @@ def run_all_engines(
             alpha_payload["confidence"] *= 1.05
         else:
             alpha_payload["confidence"] *= 0.95
+        logger.debug("[ALPHA] post_temporal_delta_confidence=%.4f", alpha_payload["confidence"])
 
         vol_factor = _clamp(atr_for_alpha / max(price, 1e-8), 0.5, 2.0)
         alpha_payload["confidence"] *= (0.75 + 0.25 * vol_factor)
+        logger.debug("[ALPHA] post_vol_factor_confidence=%.4f", alpha_payload["confidence"])
         alpha_payload["confidence"] = _clamp(alpha_payload["confidence"], 0.0, 1.0)
 
         # Keep weak-but-valid signals alive after stacked penalties.
-        alpha_payload["confidence"] = max(alpha_payload["confidence"], 0.05)
+        alpha_payload["confidence"] = max(alpha_payload["confidence"], pre_attenuation_conf * 0.5)
 
         # Final temporal smoothing for stable downstream consumption.
         alpha_payload["confidence"] = 0.7 * prev_conf + 0.3 * alpha_payload["confidence"]
+        logger.debug("[ALPHA] post_smoothing_confidence=%.4f", alpha_payload["confidence"])
         alpha_payload["confidence"] = _clamp(alpha_payload["confidence"], 0.0, 1.0)
+        if pre_attenuation_conf > 0.6 and alpha_payload["confidence"] < 0.6:
+            logger.warning("[ALPHA] Signal attenuated below threshold by compound factors — check individual factor magnitudes")
 
         alpha_prob_above = _clamp(_safe_float(alpha_payload.get("prob_above", 0.5), 0.5), 0.0, 1.0)
         alpha_prob_below = _clamp(_safe_float(alpha_payload.get("prob_below", 0.5), 0.5), 0.0, 1.0)

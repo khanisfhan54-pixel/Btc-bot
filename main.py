@@ -12,11 +12,14 @@ import numbers
 import random
 import logging
 import statistics
+import numpy as np
 import threading
 import uuid
 from collections import deque
 from datetime import datetime, timezone
+from dataclasses import dataclass
 from typing import Any, Deque, Dict, List, Optional, Tuple
+from trading_utils import safe_float, clamp, validate_alpha
 
 try:
     from dotenv import load_dotenv
@@ -36,13 +39,24 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 BINANCE_API_KEY = os.environ.get("BINANCE_API_KEY", "")
 BINANCE_SECRET = os.environ.get("BINANCE_SECRET", "")
 DRY_RUN = os.environ.get("DRY_RUN", "1") == "1"
+SIGNAL_ONLY_MODE = os.environ.get("SIGNAL_ONLY_MODE", "true").strip().lower() == "true"
 
 # ADDED: safety layer for live execution
-LIVE_TRADING = False
+LIVE_TRADING = os.environ.get("LIVE_TRADING", "false").strip().lower() == "true"
 
 SYMBOL = "BTC/USDT"
 TRADE_LOG_PATH = os.path.join(os.path.dirname(__file__), "trade_log.json")
 BACKTEST_RESULT_PATH = os.path.join(os.path.dirname(__file__), "backtest_result.json")
+BACKTEST_SEED = int(os.environ.get("BACKTEST_SEED", "42"))
+_LOG_TRADE_LOCK = threading.Lock()
+RISK_PERCENT_PER_TRADE = float(os.environ.get("RISK_PERCENT_PER_TRADE", "0.5"))
+EXCHANGE_MIN_NOTIONAL_USD = float(os.environ.get("EXCHANGE_MIN_NOTIONAL_USD", "10.0"))
+EXCHANGE_MAX_NOTIONAL_USD = float(os.environ.get("EXCHANGE_MAX_NOTIONAL_USD", "100000.0"))
+MAX_REGIME_STALENESS_SECONDS = float(os.environ.get("MAX_REGIME_STALENESS_SECONDS", "300"))
+MAX_FEATURE_STALENESS_SECONDS = float(os.environ.get("MAX_FEATURE_STALENESS_SECONDS", "60"))
+BACKTEST_RISK_PCT = float(os.environ.get("BACKTEST_RISK_PCT", "0.005"))
+RECONCILIATION_BLOCK_SECONDS = int(os.environ.get("RECONCILIATION_BLOCK_SECONDS", "300"))
+_reconciliation_blocks: Dict[str, float] = {}
 
 try:
     from feature_engine import FeatureEngine
@@ -132,8 +146,14 @@ try:
     from impact_decay import ImpactDecay
     from position_manager import PositionManager
     from trade_lifecycle_manager import TradeLifecycleManager
+except ImportError as _new_module_import_err:
+    logger.critical("[BOOT] Critical module import failed: %s — HALTING", _new_module_import_err, exc_info=True)
+    raise
 except Exception as _new_module_import_err:
-    logger.warning("New module import failed (using stubs): %s", _new_module_import_err)
+    logger.critical("[BOOT] Critical module import failed: %s — HALTING", _new_module_import_err, exc_info=True)
+    raise
+
+if False:
 
     class QueueFillModel:
         def enrich(self, fp):
@@ -253,18 +273,9 @@ except Exception as _ptq_err:
 
 try:
     from capital_allocator import CapitalAllocator
-except Exception as _ca_err:
-    logger.warning("capital_allocator import failed: %s", _ca_err)
-
-    class CapitalAllocator:
-        def allocate(self, **kwargs):
-            return {
-                "capital_scale": 1.0,
-                "risk_per_trade": 0.0,
-                "max_exposure": _safe_float(kwargs.get("account_equity", 0.0)),
-                "allow_trading": True,
-                "reason": "fallback_allocator",
-            }
+except ImportError as _ca_err:
+    logger.critical("[BOOT] Critical module import failed: %s — HALTING", _ca_err, exc_info=True)
+    raise
 
 engine           = ExecutionEngine()
 feature_engine   = FeatureEngine()
@@ -279,11 +290,15 @@ trade_lifecycle  = TradeLifecycleManager()
 capital_allocator = CapitalAllocator()
 SIGNAL_PIPELINE_CONFIG: Dict[str, Any] = {
     "enable_regime_engine": True,
-    "signal_only_mode": True,
+    "signal_only_mode": SIGNAL_ONLY_MODE,
     "regime_update_frequency_sec": 1.0,
 }
 _last_regime_update_ts = 0.0
+_regime_context_timestamp: float = 0.0
 _last_regime_context: Dict[str, Any] = {"regime": "UNKNOWN", "confidence": 0.0, "features": {}}
+_prev_close: Optional[float] = None
+_last_valid_features: Optional[dict] = None
+_last_valid_features_ts: float = 0.0
 regime_engine = None
 if AdvancedRegimeEngine is not None:
     try:
@@ -292,6 +307,12 @@ if AdvancedRegimeEngine is not None:
         logger.warning("AdvancedRegimeEngine init failed; continuing without it: %s", _regime_init_err)
         regime_engine = None
 alpha_predictor = LiquiditySweepAlpha() if LiquiditySweepAlpha is not None else None
+try:
+    from alpha_orchestrator import AlphaOrchestrator, OrchestratorConfig
+except Exception as _ao_exc:
+    logger.critical("alpha_orchestrator import failed: %s", _ao_exc)
+    raise
+alpha_orchestrator = AlphaOrchestrator(OrchestratorConfig(signal_weights={"signal_engine": 1.0}))
 
 try:
     from engine import (
@@ -1158,14 +1179,17 @@ def determine_signal(
 
 
 def log_trade(entry: dict) -> None:
-    try:
-        with open(TRADE_LOG_PATH, "r") as f:
-            trades = json.load(f)
-    except Exception:
-        trades = []
-    trades.append(entry)
-    with open(TRADE_LOG_PATH, "w") as f:
-        json.dump(trades, f, indent=2)
+    with _LOG_TRADE_LOCK:
+        tmp_path = TRADE_LOG_PATH + ".tmp"
+        try:
+            with open(TRADE_LOG_PATH, "r", encoding="utf-8") as f:
+                trades = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            trades = []
+        trades.append(entry)
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(trades, f, indent=2)
+        os.replace(tmp_path, TRADE_LOG_PATH)
     logger.info("Trade logged: %s", json.dumps(entry))
 
 
@@ -1336,6 +1360,8 @@ def _format_execution_message(
     correlation_id: str = "",
 ) -> str:
     cid = (correlation_id or "")[:12]
+    if _reconciliation_blocks.get(SYMBOL, 0.0) > time.time():
+        return {"executed": False, "reason": "reconciliation_block_active", "correlation_id": correlation_id or ""}
     lines = [title]
     lines.append(f"CID: {cid or 'n/a'}")
     lines.append(f"Side: {signal}")
@@ -1349,6 +1375,19 @@ def _format_execution_message(
         lines.append(f"Order ID: {order_id}")
     return "\n".join(lines)
 
+
+def _compute_atr_sl_tp(candles: list, current_price: float) -> tuple[Optional[float], Optional[float]]:
+    if len(candles) < 15:
+        logger.warning("[EXECUTION] Insufficient candles (%d) for ATR — skipping trade", len(candles))
+        return None, None
+    highs = [float(c[2]) for c in candles[-14:]]
+    lows = [float(c[3]) for c in candles[-14:]]
+    closes = [float(c[4]) for c in candles[-15:-1]]
+    true_ranges = [max(h - l, abs(h - c), abs(l - c)) for h, l, c in zip(highs, lows, closes)]
+    atr = sum(true_ranges) / len(true_ranges)
+    sl_pct = max(0.003, min(0.015, atr / max(current_price, 1e-9)))
+    tp_pct = sl_pct * 2.0
+    return sl_pct, tp_pct
 
 def _execute_liquidity_trade(
     execution_signal: str,
@@ -1369,6 +1408,8 @@ def _execute_liquidity_trade(
     """
     market_data: Optional[Dict[str, Any]] = None
     cid = (correlation_id or "")[:12]
+    if _reconciliation_blocks.get(SYMBOL, 0.0) > time.time():
+        return {"executed": False, "reason": "reconciliation_block_active", "correlation_id": correlation_id or ""}
     def _seed_val(v):
         if v is None:
             return "NA"
@@ -1397,7 +1438,16 @@ def _execute_liquidity_trade(
             sl_price, tp_price = calculate_liquidity_sl_tp(execution_signal, price, market_data)
         except Exception as exc:
             logger.warning("calculate_liquidity_sl_tp failed: %s", exc)
-            return {"executed": False, "reason": f"sl_tp_error:{exc}", "trade_id": deterministic_trade_id, "correlation_id": correlation_id or ""}
+            atr_sl_tp = _compute_atr_sl_tp(candles_by_tf.get("1h", []), price)
+            if atr_sl_tp[0] is None:
+                return {"executed": False, "reason": "no_sl_tp_available", "trade_id": deterministic_trade_id, "correlation_id": correlation_id or ""}
+            sl_pct, tp_pct = atr_sl_tp
+            if execution_signal == "LONG":
+                sl_price = price * (1.0 - sl_pct)
+                tp_price = price * (1.0 + tp_pct)
+            else:
+                sl_price = price * (1.0 + sl_pct)
+                tp_price = price * (1.0 - tp_pct)
 
     try:
         if sl_price is None or tp_price is None:
@@ -1411,7 +1461,7 @@ def _execute_liquidity_trade(
         if position_size is None or _safe_float(position_size) <= 0:
             balance = _safe_float(engine.get_balance(), 0.0)
             position_size = calculate_position_size(
-                balance, risk_percent=1, stop_loss_distance=stop_loss_distance
+                balance, risk_percent=RISK_PERCENT_PER_TRADE, stop_loss_distance=stop_loss_distance
             )
 
         pre_msg = _format_execution_message(
@@ -1425,6 +1475,10 @@ def _execute_liquidity_trade(
 
         if position_size is None or _safe_float(position_size) <= 0:
             return {"executed": False, "reason": "invalid_position_size", "trade_id": deterministic_trade_id, "correlation_id": correlation_id or ""}
+        position_size_usd = _safe_float(position_size) * _safe_float(price)
+        if not (EXCHANGE_MIN_NOTIONAL_USD <= position_size_usd <= EXCHANGE_MAX_NOTIONAL_USD):
+            logger.warning("[EXECUTION] Position size %.2f USD out of exchange bounds [%.2f, %.2f] — skipping trade. cid=%s", position_size_usd, EXCHANGE_MIN_NOTIONAL_USD, EXCHANGE_MAX_NOTIONAL_USD, cid)
+            return {"executed": False, "reason": "position_size_out_of_bounds", "correlation_id": correlation_id or ""}
 
         if not LIVE_TRADING:
             print(
@@ -1513,16 +1567,33 @@ def _execute_liquidity_trade(
         }
 
 
+
+
+def _validate_exchange_symbol_format(exchange: Any, symbol: str) -> bool:
+    try:
+        markets = exchange.load_markets() if hasattr(exchange, "load_markets") else getattr(exchange, "markets", {}) or {}
+    except Exception as exc:
+        raise RuntimeError(f"[EXCHANGE] Failed to load markets for {getattr(exchange, 'id', 'unknown')}: {exc}") from exc
+    if not markets:
+        raise RuntimeError(f"[EXCHANGE] Empty market list for {getattr(exchange, 'id', 'unknown')} — cannot validate symbol {symbol}")
+    if symbol not in markets:
+        raise ValueError(f"Symbol {symbol} is not valid for exchange {getattr(exchange, 'id', 'unknown')}")
+    return True
+
 def run_analysis_cycle(
     exchange,
     liq_monitor: Optional[LiquidationMonitor] = None,
     data_exchange: Any = None,
     data_symbol: str = SYMBOL,
 ) -> dict:
-    global _last_regime_update_ts, _last_regime_context
+    global _last_regime_update_ts, _last_regime_context, _regime_context_timestamp, _prev_close, _last_valid_features, _last_valid_features_ts
     result: Dict[str, Any] = {}
     _dex = data_exchange if data_exchange is not None else exchange
     _dsym = data_symbol
+    if hasattr(_dex, "id") and hasattr(exchange, "id") and _dex.id != exchange.id:
+        logger.warning("[EXCHANGE] Data exchange (%s) differs from execution exchange (%s). Ensure symbol formats are compatible.", _dex.id, exchange.id)
+    _validate_exchange_symbol_format(_dex, _dsym)
+    _validate_exchange_symbol_format(exchange, SYMBOL)
     try:
         candles_by_tf = _fetch_multi_tf(_dex, _dsym)
         orderbook = fetch_orderbook(_dex, _dsym)
@@ -1543,6 +1614,15 @@ def run_analysis_cycle(
         current_price = _safe_float(
             orderbook.get("bids", [[0]])[0][0] if orderbook.get("bids") else 0.0
         )
+
+    log_return: Optional[float] = None
+    if _prev_close is not None and _prev_close > 0.0 and current_price > 0.0:
+        raw_lr = float(np.log(current_price / _prev_close))
+        if np.isfinite(raw_lr):
+            log_return = raw_lr
+        else:
+            logger.warning("[REGIME] log_return is non-finite (prev=%.4f, curr=%.4f) — skipping regime update this tick", _prev_close, current_price)
+    _prev_close = current_price
 
     open_interest = _fetch_open_interest(exchange)
     funding_rate = _fetch_funding_rate(exchange)
@@ -1589,16 +1669,27 @@ def run_analysis_cycle(
     )
     if should_update_regime:
         try:
-            reg_out = regime_engine.update(
-                {
-                    "price": current_price,
+            if log_return is None:
+                logger.info("[REGIME] Skipping regime update on first tick (no prev_close yet)")
+                reg_out = {}
+            else:
+                feature_vector = np.array([
+                    float(feat_dict.get("imbalance", 0.0)) if "feat_dict" in locals() else 0.0,
+                    float(feat_dict.get("bid_vol", 0.0)) if "feat_dict" in locals() else 0.0,
+                    float(feat_dict.get("ask_vol", 0.0)) if "feat_dict" in locals() else 0.0,
+                    float(feat_dict.get("trade_count", 0.0)) if "feat_dict" in locals() else 0.0,
+                ], dtype=float)
+                feature_vector = np.where(np.isfinite(feature_vector), feature_vector, 0.0)
+                regime_input = {
+                    "return": log_return,
+                    "features": feature_vector,
+                    "price": float(current_price),
+                    "volume": float(candles_by_tf.get("1m", [[0,0,0,0,0,0]])[-1][5]) if candles_by_tf.get("1m") else 0.0,
                     "orderbook": orderbook,
-                    "trades": trades,
-                    "candles": candles_by_tf,
-                    "open_interest": open_interest,
-                    "funding_rate": funding_rate,
+                    "open_interest": float(open_interest) if np.isfinite(float(open_interest)) else 0.0,
+                    "funding_rate": float(funding_rate) if np.isfinite(float(funding_rate)) else 0.0,
                 }
-            ) or {}
+                reg_out = regime_engine.update(regime_input) or {}
             r_metrics = reg_out.get("risk_metrics", {}) if isinstance(reg_out, dict) else {}
             if not isinstance(r_metrics, dict):
                 r_metrics = {}
@@ -1620,9 +1711,14 @@ def run_analysis_cycle(
             }
             _last_regime_context = dict(regime_context)
             _last_regime_update_ts = now_ts
+            _regime_context_timestamp = time.time()
         except Exception as _re_exc:
             logger.warning("[REGIME] update failed, keeping prior context: %s", _re_exc)
             regime_context = dict(_last_regime_context)
+            staleness = time.time() - _regime_context_timestamp
+            if staleness > MAX_REGIME_STALENESS_SECONDS:
+                logger.critical("[REGIME] Context is %.0fs stale (limit %.0fs) — forcing STALE_FALLBACK HALT. No new trades will be opened.", staleness, MAX_REGIME_STALENESS_SECONDS)
+                regime_context = {"regime": "STALE_FALLBACK", "confidence": 0.0, "position_size": 0.0, "signal_valid": False, "execution_mode": "halt", "features": {}}
 
     try:
         snapshot = {
@@ -1631,13 +1727,33 @@ def run_analysis_cycle(
             "timestamp": time.time(),
         }
         features = feature_engine.update(snapshot, trades, regime_context=regime_context)
+        _last_valid_features = dict(features)
+        _last_valid_features_ts = time.time()
     except TypeError:
-        features = feature_engine.update(snapshot, trades)
+        try:
+            features = feature_engine.update(snapshot, trades)
+            _last_valid_features = dict(features)
+            _last_valid_features_ts = time.time()
+        except Exception as _fe_exc:
+            logger.warning("[FEATURE] Feature engine failed: %s", _fe_exc, exc_info=True)
+            features = None
+    except Exception as _fe_exc:
+        logger.warning("[FEATURE] Feature engine failed: %s", _fe_exc, exc_info=True)
+        features = None
+
+    if features is None:
+        feature_staleness = time.time() - _last_valid_features_ts
+        if _last_valid_features is None or feature_staleness > MAX_FEATURE_STALENESS_SECONDS:
+            logger.warning("[FEATURE] No valid features available (staleness=%.1fs, limit=%.1fs) — skipping signal generation", feature_staleness, MAX_FEATURE_STALENESS_SECONDS)
+            return {"signal_output": {"signal": "HOLD", "confidence": 0.0, "reason": "no_features"}}
+        logger.warning("[FEATURE] Using stale features (%.1fs old) after engine failure", feature_staleness)
+        features = dict(_last_valid_features)
     features = fill_model.enrich(features)
     features = tox_filter.enrich(features)
 
     # Normalize to a single raw feature dict for all downstream modules
     feat_dict: Dict[str, Any] = features.get("features", features) if isinstance(features, dict) else {}
+    feat_dict["candles"] = candles_by_tf.get("1h", [])
 
     # Update impact decay using raw features
     impact_status = impact_tracker.update(current_price, feat_dict)
@@ -1742,7 +1858,8 @@ def run_analysis_cycle(
                 out[k] = str(v)
         return out
 
-    if SIGNAL_PIPELINE_CONFIG.get("signal_only_mode", True):
+    if SIGNAL_PIPELINE_CONFIG.get("signal_only_mode", SIGNAL_ONLY_MODE):
+        logger.warning("[CYCLE] signal_only_mode=True — execution layer is DISABLED")
         signal_value = str(predictor_signal.get("action", "HOLD")).upper()
         if signal_value not in ("BUY", "SELL", "HOLD"):
             signal_value = "HOLD"
@@ -2071,12 +2188,19 @@ def run_analysis_cycle(
 
     institutional = engines_out.get("composite", {}) or {}
 
+    assert len(feat_dict.get("candles", [])) > 0, "Candles must be non-empty before calling signal_engine"
     try:
         signal_output = signal_engine.generate(feat_dict)
     except Exception as _signal_exc:
         logger.warning("[SIGNAL_ENGINE] generate failed, forcing HOLD: %s", _signal_exc)
         signal_output = {"signal": "HOLD", "confidence": 0.0, "reason": f"signal_error:{_signal_exc}"}
     result["signal_engine_output"] = signal_output
+    try:
+        fused_signal = alpha_orchestrator.orchestrate(signal_output, regime_context, engines_out.get("alpha", {}))
+    except Exception as _orch_exc:
+        logger.warning("[ORCHESTRATOR] orchestrate failed, using raw signal: %s", _orch_exc, exc_info=True)
+        fused_signal = signal_output
+    signal_output = fused_signal if isinstance(fused_signal, dict) else signal_output
     logger.info("[SIGNAL] %s", signal_output)
 
     learning_params: Dict[str, Any] = {}
@@ -2508,7 +2632,10 @@ def run_analysis_cycle(
 def run_live() -> None:
     print("BTCUSDT Institutional Signal Bot Started")
     logger.info("Mode: %s", "DRY RUN" if DRY_RUN else "LIVE")
-    logger.info("LIVE_TRADING: %s", LIVE_TRADING)
+    logger.info(f"[BOOT] LIVE_TRADING resolved to: {LIVE_TRADING}")
+    logger.info(f"[BOOT] SIGNAL_ONLY_MODE resolved to: {SIGNAL_ONLY_MODE}")
+    if LIVE_TRADING and (not BINANCE_API_KEY.strip() or not BINANCE_SECRET.strip()):
+        raise RuntimeError("LIVE_TRADING=True but exchange credentials are not configured")
     try:
         exchange = get_exchange()
     except Exception as exc:
@@ -2550,6 +2677,18 @@ def _compute_sharpe(returns: List[float]) -> float:
     except Exception:
         return 0.0
 
+
+
+
+@dataclass
+class BacktestCostModel:
+    taker_fee_bps: float = 5.0
+    slippage_bps: float = 5.0
+    spread_bps: float = 3.0
+
+    @property
+    def round_trip_cost_pct(self) -> float:
+        return (self.taker_fee_bps + self.slippage_bps + self.spread_bps) * 2 / 10_000
 
 def _generate_backtest_candles(
     n: int = 500,
@@ -2672,11 +2811,22 @@ def run_backtest(
         "min_signal_every": 30,
     }
     msd = MarketStateDetector()
+    rng = random.Random(BACKTEST_SEED)
+    cost_model = BacktestCostModel(
+        taker_fee_bps=float(os.environ.get("BACKTEST_FEE_BPS", "5.0")),
+        slippage_bps=float(os.environ.get("BACKTEST_SLIPPAGE_BPS", "5.0")),
+        spread_bps=float(os.environ.get("BACKTEST_SPREAD_BPS", "3.0")),
+    )
 
-    for i in range(slow_sma + 1, len(ohlcv_all)):
+    for i in range(slow_sma + 1, len(ohlcv_all) - 1):
+        # BAR-DELAY LOGIC: Signal is generated on confirmed closes up to bar i-1.
+        # Entry executes at the OPEN of bar i (the next bar after signal fires).
         local_state["cycle"] += 1
-        window = ohlcv_all[: i + 1]
-        current_price = _safe_float(window[-1][4])
+        signal_window = ohlcv_all[:i]
+        entry_candle = ohlcv_all[i]
+        entry_price = _safe_float(entry_candle[1])
+        window = signal_window
+        current_price = _safe_float(signal_window[-1][4])
         ts = datetime.fromtimestamp(window[-1][0] / 1000, tz=timezone.utc).isoformat()
 
         sma_signal, _, _ = sma_crossover_signal(window, fast_sma, slow_sma)
@@ -2687,13 +2837,13 @@ def run_backtest(
             "BUY" if current_price >= _safe_float(window[-1][1]) else "SELL"
         )
         _base_size = max(1.0, candle_vol / max(current_price, 1.0))
-        _rand_jitter = random.uniform(0.80, 1.20)
+        _rand_jitter = rng.uniform(0.80, 1.20)
         if _trade_side_bt == "BUY":
-            _bid_mul = random.uniform(1.5, 3.0) * _rand_jitter
+            _bid_mul = rng.uniform(1.5, 3.0) * _rand_jitter
             _ask_mul = 1.0
         else:
             _bid_mul = 1.0
-            _ask_mul = random.uniform(1.5, 3.0) * _rand_jitter
+            _ask_mul = rng.uniform(1.5, 3.0) * _rand_jitter
         synthetic_orderbook = {
             "bids": [
                 [current_price - 300.0, _base_size * _bid_mul],
@@ -2842,7 +2992,7 @@ def run_backtest(
                 local_state["cycle"] - local_state["last_trade_cycle"]
                 >= local_state["cooldown_candles"]
             ):
-                entry = current_price
+                entry = entry_price
                 if trade_plan:
                     _plan_entry = _safe_float(trade_plan.get("entry", entry))
                     _plan_sl = _safe_float(trade_plan["sl"])
@@ -2888,8 +3038,12 @@ def run_backtest(
                     if side == "LONG"
                     else ((entry - current_price) / entry)
                 )
-                pnl = equity * pnl_pct * 0.5
-                equity += pnl
+                allocation = capital_allocator.allocate(signal_confidence=confidence, regime_context={"regime": "TREND"}, current_equity=equity, max_risk_pct=BACKTEST_RISK_PCT)
+                position_size_usd = allocation["position_size_usd"]
+                gross_pnl = position_size_usd * pnl_pct
+                net_pnl = gross_pnl - position_size_usd * cost_model.round_trip_cost_pct
+                pnl = net_pnl
+                equity += net_pnl
                 returns.append(pnl_pct)
                 peak_equity = max(peak_equity, equity)
                 max_drawdown = max(max_drawdown, (peak_equity - equity) / peak_equity)

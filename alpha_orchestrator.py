@@ -2613,12 +2613,8 @@ class AlphaOrchestrator:
         if stats_block.expected_edge_bps > _EPSILON:
             realized = stats_block.avg_realized_edge_bps
             expected_scale = max(_EPSILON, stats_block.expected_edge_bps)
-            if realized >= 0.0:
-                edge_r = min(
-                    1.0, abs(realized) / expected_scale
-                )
-            else:
-                edge_r = 0.0  # Realized negative: alpha delivered opposite of prediction.
+            # Negative edge_r means realized edge is inverse to expected edge.
+            edge_r = realized / expected_scale
 
         score = (wr * self.config.feedback_win_rate_weight) + (
             edge_r * self.config.feedback_edge_weight
