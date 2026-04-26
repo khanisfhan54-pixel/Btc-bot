@@ -551,7 +551,7 @@ class TestRegimeIntegration:
 
 class TestPerformanceFeedback:
     def _feed(self, orch, source, is_win, n, regime=None):
-        for _ in range(n):
+        for i in range(n):
             orch.update_performance(
                 {
                     "source_id": source,
@@ -559,9 +559,11 @@ class TestPerformanceFeedback:
                     "realized_edge_bps": 20.0 if is_win else -20.0,
                     "expected_edge_bps": 20.0,
                     "expected_win_rate": 0.55,
+                    "timestamp": float(i + 1),
                 },
                 feature_quality=_make_fq(),
                 regime=regime,
+                event_time=float(i + 1),
             )
 
     def test_feedback_cold_start_multiplier_is_one(self):
@@ -614,7 +616,7 @@ class TestPerformanceFeedback:
         ))
         # Manually seed decay high after enough trades.
         self._feed(orch, "alpha_a", is_win=False, n=10)
-        orch.performance_stats["alpha_a"].decay_score = 0.95
+        orch._performance_stats["alpha_a"].decay_score = 0.95
         # Rebuild cached meta with the forced decay_score.
         orch._cached_perf_meta = orch._build_performance_meta()
         now = time.time()

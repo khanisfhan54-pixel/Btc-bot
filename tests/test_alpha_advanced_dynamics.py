@@ -66,24 +66,26 @@ def regime_ctx():
 
 
 def test_alpha_competition(orchestrator):
-    for _ in range(50):
+    for i in range(50):
         orchestrator.update_performance(
             {
                 "source_id": "alpha_good",
                 "realized_pnl": 100,
                 "realized_edge_bps": 50,
                 "expected_edge_bps": 50,
-            }
+            },
+            event_time=float(i + 1),
         )
 
-    for _ in range(50):
+    for i in range(50):
         orchestrator.update_performance(
             {
                 "source_id": "alpha_mid",
                 "realized_pnl": 10,
                 "realized_edge_bps": 5,
                 "expected_edge_bps": 50,
-            }
+            },
+            event_time=float(i + 101),
         )
 
     assert orchestrator.performance_stats["alpha_good"].current_multiplier > orchestrator.performance_stats["alpha_mid"].current_multiplier
@@ -975,24 +977,26 @@ def test_invalid_source_id_safe(orchestrator, regime_ctx, fq, exec_state):
 
 
 def test_delayed_alpha_decay(orchestrator):
-    for _ in range(30):
+    for i in range(30):
         orchestrator.update_performance(
             {
                 "source_id": "alpha1",
                 "realized_pnl": 100,
                 "realized_edge_bps": 50,
                 "expected_edge_bps": 50,
-            }
+            },
+            event_time=float(i + 1),
         )
 
-    for _ in range(30):
+    for i in range(30):
         orchestrator.update_performance(
             {
                 "source_id": "alpha1",
                 "realized_pnl": -100,
                 "realized_edge_bps": -50,
                 "expected_edge_bps": 50,
-            }
+            },
+            event_time=float(i + 101),
         )
 
     stats = orchestrator.performance_stats["alpha1"]
