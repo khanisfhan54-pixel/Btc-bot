@@ -384,39 +384,16 @@ class LiquiditySweepAlpha:
         if not _is_finite(ofi_total):
             return 0.0
 
-        old = self.ofi_history[0] if len(self.ofi_history) == self.history_window else 0.0
         self.ofi_history.append(ofi_total)
         self.short_ofi.append(ofi_total)
 
-        # update rolling sums
-        self.ofi_sum += ofi_total - old
-
-        # protect rolling variance against overflow / inf poisoning
-        if len(self.ofi_history) < self.history_window:
-            ofi2 = ofi_total * ofi_total
-            if not _is_finite(ofi2):
-                # Safeguard: Revert state mutations to prevent desync
-                self.ofi_history.pop()
-                if self.short_ofi:
-                    self.short_ofi.pop()
-                self.ofi_sum -= ofi_total
-                return 0.0
-            self.ofi_sq_sum += ofi2
-        else:
-            # protect rolling variance against overflow / inf poisoning
-            ofi2 = ofi_total * ofi_total
-            old2 = old * old
-            if not _is_finite(ofi2) or not _is_finite(old2):
-                # reset rolling moments safely; keep history deque for continuity
-                finite_hist = [v for v in self.ofi_history if _is_finite(v) and _is_finite(v * v)]
-                if not finite_hist:
-                    self.ofi_sum = 0.0
-                    self.ofi_sq_sum = 0.0
-                    return 0.0
-                self.ofi_sum = sum(finite_hist)
-                self.ofi_sq_sum = sum(v * v for v in finite_hist)
-            else:
-                self.ofi_sq_sum += ofi2 - old2
+        finite_hist = [v for v in self.ofi_history if _is_finite(v)]
+        if not finite_hist:
+            self.ofi_sum = 0.0
+            self.ofi_sq_sum = 0.0
+            return 0.0
+        self.ofi_sum = float(sum(finite_hist))
+        self.ofi_sq_sum = float(sum(v * v for v in finite_hist))
 
         if len(self.ofi_history) < 20:
             return 0.0

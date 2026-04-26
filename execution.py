@@ -959,6 +959,14 @@ class ExecutionEngine:
             logger.error("order_failed_limit cid=%s symbol=%s side=%s amount=%.8f price=%.8f error=%s", cid, symbol, side, amount, price, exc)
             raise
 
+
+    def _send_emergency_alert(self, message: str) -> None:
+        logger.critical("[EXECUTION] %s", message)
+        try:
+            send_telegram_message(message)
+        except Exception:
+            logger.critical("[EXECUTION] emergency alert delivery failed", exc_info=True)
+
     def place_order_with_sl_tp(
         self,
         symbol: str,
@@ -1009,40 +1017,22 @@ class ExecutionEngine:
                         "clientOrderId": f"{cid}_TP",
                     },
                 )
-            except Exception as exc:
-                logger.error("bracket_partial_failure cid=%s error=%s", cid, exc)
-                # FUTURE: compensation hook (disabled for safety)
-                # try:
-                #     entry_id = _get_order_id(entry_order)
-                #     if entry_id and entry_id != "N/A":
-                #         self.exchange.cancel_order(entry_id, symbol=symbol)
-                # except Exception as cancel_exc:
-                #     logger.warning("compensation_cancel_failed cid=%s error=%s", cid, cancel_exc)
-                # TODO (future): centralize all execution feedback in _execute_liquidity_trade()
-                # Current placement is intentional to capture bracket-level failures early.
-                le = getattr(self, "learning_engine", None)
-                if le and hasattr(le, "record_execution_feedback"):
+            except Exception as bracket_exc:
+                logger.critical(f"[EXECUTION] Bracket placement FAILED after entry fill: {bracket_exc}")
+                try:
+                    entry_id = _get_order_id(entry_order)
+                    self.exchange.cancel_order(entry_id, symbol=symbol)
+                    logger.warning("[EXECUTION] Entry order cancelled after bracket failure")
+                except Exception as cancel_exc:
+                    logger.critical(f"[EXECUTION] ENTRY CANCEL FAILED — UNPROTECTED POSITION OPEN: {cancel_exc}")
                     try:
-                        le.record_execution_feedback(
-                            score=0.0,
-                            slippage_bps=0.0,
-                            latency_ms=0.0,
-                            filled_qty=0.0,
-                            requested_qty=amount,
-                            side=side,
-                            reason="bracket_partial_failure",
-                            trade_id=correlation_id or "",
-                        )
-                    except Exception:
-                        pass
-                return {
-                    "entry_order": entry_order,
-                    "sl_order": sl_order,
-                    "tp_order": tp_order,
-                    "partial_failure": True,
-                    "error": str(exc),
-                    "correlation_id": correlation_id or "",
-                }
+                        close_side = "sell" if side.lower() == "buy" else "buy"
+                        self.exchange.create_market_order(symbol, close_side, amount)
+                        logger.warning("[EXECUTION] Emergency market close submitted")
+                    except Exception as close_exc:
+                        logger.critical(f"[EXECUTION] EMERGENCY CLOSE FAILED — MANUAL INTERVENTION REQUIRED: {close_exc}")
+                        self._send_emergency_alert(f"UNPROTECTED POSITION: {symbol} {side} {amount} @ {entry_order.get('price', 'N/A')}")
+                return {"entry_order": entry_order, "sl_order": None, "tp_order": None, "partial_failure": True}
             if isinstance(sl_order, dict):
                 sl_order["correlation_id"] = correlation_id or ""
             if isinstance(tp_order, dict):

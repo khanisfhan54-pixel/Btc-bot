@@ -20,8 +20,10 @@ import traceback
 from scipy.special import logsumexp
 from functools import wraps
 import json
+import os
 import queue
 import threading
+from model_weights import ModelWeightManager
 try:
     from traceback_engine import TracebackEngine
 except Exception:
@@ -45,10 +47,12 @@ _VALID_ENGINE_STATUS = frozenset({
     "NO_FEATURES", "CIRCUIT_BREAKER", "WARMUP", "TOXIC_HALT",
     "OK_WITH_HISTORY", "RNG_RESTORE_FAILED", "UNKNOWN",
 })
-_VALID_EXECUTION_MODE = frozenset({"LIVE", "PAPER", "BACKTEST", "HALTED", "trend_follow", "risk_off_or_short_bias", "flat_or_hedge", "range_mean_revert", "fail_safe", "circuit_breaker"})
+_VALID_OPERATIONAL_MODES = frozenset({"LIVE", "PAPER", "HALTED", "SIMULATION"})
+_VALID_EXECUTION_STRATEGIES = frozenset({"trend_follow", "scalp", "mean_revert", "neutral", "risk_off_or_short_bias", "flat_or_hedge", "range_mean_revert", "fail_safe", "circuit_breaker"})
 _VALID_EXECUTION_SIDE = frozenset({"long", "short", "flat", "range_mean_revert"})
 _PROMETHEUS_ENGINE_ID_LIMIT = 50
 _prometheus_engine_ids: set[str] = set()
+_PROMETHEUS_LOCK = threading.Lock()
 
 # ==========================================
 # Observability (Prometheus Metrics)
@@ -193,7 +197,7 @@ def _validate_output_schema(output: Dict[str, Any]) -> bool:
                 raise ValueError(f"missing required key: {key}")
         if output.get("engine_status", output.get("risk_metrics", {}).get("engine_status")) not in _VALID_ENGINE_STATUS:
             raise ValueError(f"Invalid engine_status: {output.get('engine_status', output.get('risk_metrics', {}).get('engine_status'))}")
-        if output.get("execution_mode") not in _VALID_EXECUTION_MODE:
+        if output.get("execution_mode") not in (_VALID_OPERATIONAL_MODES | _VALID_EXECUTION_STRATEGIES):
             raise ValueError(f"Invalid execution_mode: {output.get('execution_mode')}")
         if output.get("execution_side") not in _VALID_EXECUTION_SIDE:
             raise ValueError(f"Invalid execution_side: {output.get('execution_side')}")
@@ -739,13 +743,20 @@ class NHHMM_Engine:
                 f"NHHMM input validation failed: {e}. "
                 "Upstream feature pipeline produced invalid data."
             ) from e
-        x_t_safe = np.clip(x_t, -10.0, 10.0)
+        x_t_norm = x_t / (np.std(x_t) + 1e-8)
+        x_t_safe = np.clip(x_t_norm, -3.0, 3.0)
         beta_safe = np.clip(self.beta, -5.0, 5.0)
         logits = np.einsum('ijk,k->ij', beta_safe, x_t_safe)
         logits[:, 0] = 0.0  # Identifiability: pin reference category column
         logits = np.clip(logits, -20.0, 20.0)
         p_t = softmax(logits, axis=1)
-        p_t = np.clip(p_t, 1e-6, None)
+        if np.any(p_t > 0.9999):
+            LOGGER.warning(
+                "[NHHMM] Softmax saturation detected — transition matrix degenerate. Check x_t range [%.4f, %.4f]",
+                float(np.min(x_t)),
+                float(np.max(x_t)),
+            )
+        p_t = np.clip(p_t, 1.1e-3, None)
         row_sums = p_t.sum(axis=1, keepdims=True)
         p_t = p_t / np.clip(row_sums, 1e-12, None)
         if not np.all(np.isfinite(p_t)):
@@ -1041,7 +1052,7 @@ class AdvancedRegimeEngine:
     _SHOCK_WARMUP_TICKS: int = 32
     _SHOCK_WARMUP_SECONDS: float = 120.0
     _RETURN_EMA_BASE_DECAY: float = 0.92
-    _MAX_EMA_GAP_DT: float = 10.0
+    _MAX_EMA_GAP_DT: float = 300.0
 
     def _json_default(self, obj: Any):
         """
@@ -1292,6 +1303,8 @@ class AdvancedRegimeEngine:
         self._regime_persistence = 0
         self._REGIME_CONFIRMATION_TICKS = 2
         self._lock = threading.RLock()
+        self._weights_loaded = False
+        self._weight_path = os.environ.get("REGIME_WEIGHT_PATH", "weights/advanced_regime_weights.npz")
         self._regime_smoother = RegimeMarkovSmoother()
         self._regime_state_probs = np.ones(4, dtype=float) / 4.0
         self._last_valid_sjm_probs: np.ndarray | None = None
@@ -1349,16 +1362,17 @@ class AdvancedRegimeEngine:
             stable_hash = hashlib.sha256(stable_source.encode("utf-8")).hexdigest()[:16]
             self.engine_id = f"engine_{stable_hash}"
         effective_engine_id = self.engine_id
-        if self.engine_id not in _prometheus_engine_ids:
-            if len(_prometheus_engine_ids) >= _PROMETHEUS_ENGINE_ID_LIMIT:
-                LOGGER.warning(
-                    "prometheus: engine_id cardinality limit reached (%d). Metrics for engine '%s' will use 'overflow' label.",
-                    _PROMETHEUS_ENGINE_ID_LIMIT,
-                    self.engine_id,
-                )
-                effective_engine_id = "overflow"
-            else:
-                _prometheus_engine_ids.add(self.engine_id)
+        with _PROMETHEUS_LOCK:
+            if self.engine_id not in _prometheus_engine_ids:
+                if len(_prometheus_engine_ids) >= _PROMETHEUS_ENGINE_ID_LIMIT:
+                    LOGGER.warning(
+                        "prometheus: engine_id cardinality limit reached (%d). Metrics for engine '%s' will use 'overflow' label.",
+                        _PROMETHEUS_ENGINE_ID_LIMIT,
+                        self.engine_id,
+                    )
+                    effective_engine_id = "overflow"
+                else:
+                    _prometheus_engine_ids.add(self.engine_id)
         self._metrics_engine_id = effective_engine_id
 
         # ==========================================
@@ -1472,6 +1486,7 @@ class AdvancedRegimeEngine:
         self.garch_var = np.full(2, target_var, dtype=float)
         self.garch_prob = np.ones(2) / 2.0
         self._smoothed_garch_prob = self.garch_prob.copy()
+        self._load_model_weights()
 
     def _stationary_garch_var(self) -> np.ndarray:
         target_var = float(self.garch.target_vol ** 2)
@@ -1801,13 +1816,8 @@ class AdvancedRegimeEngine:
     def _ema_decay(self, dt: float) -> float:
         dt_safe = float(np.clip(dt, 0.0, self._MAX_EMA_GAP_DT))
         decay = float(np.clip(self._return_ema_base_decay ** dt_safe, 1e-9, 1.0))
-        if float(dt) > self._MAX_EMA_GAP_DT:
-            LOGGER.debug(
-                "_ema_decay: dt=%.1fs capped to %.1fs, decay=%.4f",
-                float(dt),
-                self._MAX_EMA_GAP_DT,
-                decay,
-            )
+        if float(dt) > 10.0:
+            LOGGER.warning("[EMA] Gap of %.1fs exceeds max — decay clamped, data may be stale", float(dt))
         return decay
 
     def _resolve_canonical_return(
@@ -1999,6 +2009,24 @@ class AdvancedRegimeEngine:
                 except Exception:
                     pass
 
+    def _load_model_weights(self) -> None:
+        weights = ModelWeightManager.load_weights("advanced_regime", self._weight_path)
+        if not weights:
+            LOGGER.critical("[REGIME] No trained weights found — regime outputs are UNTRUSTED. Run calibration pipeline before live deployment.")
+            self._weights_loaded = False
+            return
+        try:
+            if "nhhmm_beta" in weights and "nhhmm_mu" in weights and "nhhmm_sigma" in weights:
+                self.nhhmm.load_weights(np.asarray(weights["nhhmm_beta"]), np.asarray(weights["nhhmm_mu"]), np.asarray(weights["nhhmm_sigma"]))
+            if "sjm_centroids" in weights:
+                means = np.asarray(weights["sjm_centroids"], dtype=float)
+                w = np.ones(means.shape[0], dtype=float) / means.shape[0]
+                self.sjm.load_weights(means, w)
+            self._weights_loaded = True
+        except Exception:
+            LOGGER.critical("[REGIME] Failed to load trained weights", exc_info=True)
+            self._weights_loaded = False
+
     @staticmethod
     def _snapshot_emitter_loop(
         engine_ref: "weakref.ReferenceType[AdvancedRegimeEngine]",
@@ -2032,7 +2060,8 @@ class AdvancedRegimeEngine:
                 replay_engine = getattr(engine, "_replay_engine", None)
                 if replay_engine is None:
                     continue
-                materialized_payload = engine._materialize_snapshot_payload(snapshot_payload)
+                with engine._lock:
+                    materialized_payload = engine._materialize_snapshot_payload(snapshot_payload)
                 hash_payload = dict(materialized_payload)
                 hash_payload.pop("state_hash", None)
                 hash_payload.pop("_checksum", None)
@@ -3237,6 +3266,9 @@ class AdvancedRegimeEngine:
                 message="update() received non-dict market_data; degraded to fail-safe defaults.",
                 cooldown_s=30.0,
             )
+        if "price" in market_data:
+            assert isinstance(market_data["price"], float) and np.isfinite(market_data["price"]), \
+                f"price must be a finite float, got {market_data.get('price')}"
         # NOTE: enforce globally across codebase:
         # ALL side effects must follow:
         # if not getattr(self, "_is_replay", False): LOGGER / metrics / hooks
@@ -3300,6 +3332,9 @@ class AdvancedRegimeEngine:
                 _observe_latency()
                 if obs_sample and not getattr(self, "_is_replay", False):
                     self._replay_record("update_end", {"regime": "HALTED"})
+                if not self._weights_loaded:
+                    output["signal_valid"] = False
+                    output["regime_label"] = "UNCALIBRATED"
                 return output
             return None
 
@@ -4996,7 +5031,12 @@ class AdvancedRegimeEngine:
     # 🔄 SELF HEALING SYSTEM
     # ==========================================
     @_synchronized
-    def _self_heal(self, error_code: str | None = None, context: Dict[str, Any] | None = None) -> str:
+    def _self_heal(
+        self,
+        error_code: str | None = None,
+        context: Dict[str, Any] | None = None,
+        reset_price_anchor: bool = False,
+    ) -> str:
         """
         Best-effort healing.
 
@@ -5067,10 +5107,16 @@ class AdvancedRegimeEngine:
             self._last_timestamp = None
             self._last_valid_dt = 1.0
             self._last_valid_sjm_probs = np.ones(self.K) / self.K
-            self._last_price = None
-            self._last_price_timestamp = None
-            self._last_price_tick_id = None
-            self._pnl_mode = None
+            if reset_price_anchor:
+                self._last_price = None
+                self._last_price_timestamp = None
+                self._last_price_tick_id = None
+                self._pnl_mode = None
+                LOGGER.warning(
+                    "[REGIME] Price anchor destroyed by self-heal (reset_price_anchor=True) — PnL tracking will reinitialize on next tick"
+                )
+            else:
+                LOGGER.debug("[REGIME] Self-heal complete — price anchor preserved")
             self._valid_return_count = _preserved_valid_return_count
             self._first_valid_return_ts = _preserved_first_valid_return_ts
             self._posterior_update_count = _preserved_posterior_update_count
