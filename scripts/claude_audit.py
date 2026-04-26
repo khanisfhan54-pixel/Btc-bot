@@ -2,6 +2,7 @@ import os
 import requests
 import json
 import sys
+import time
 
 # ==========================================
 # CONFIG
@@ -9,10 +10,13 @@ import sys
 API_KEY = os.getenv("CLAUDE_API_KEY")
 
 TARGET_FILES = [
-    "advanced_regime_engine.py"
+    "alpha_orchestrator.py"
 ]
 
-MAX_INPUT_CHARS = 180000
+MAX_INPUT_CHARS = 120000   # safer for large models
+CHUNK_SIZE = 100000
+MAX_RETRIES = 3
+
 
 # ==========================================
 # READ TARGET FILES
@@ -35,7 +39,17 @@ def read_repo():
                 except Exception as e:
                     print(f"⚠️ Failed reading {path}: {e}")
 
-    return code[:MAX_INPUT_CHARS]
+    return code
+
+
+# ==========================================
+# SPLIT LARGE CODE (prevents timeout)
+# ==========================================
+def split_code(code):
+    chunks = []
+    for i in range(0, len(code), CHUNK_SIZE):
+        chunks.append(code[i:i + CHUNK_SIZE])
+    return chunks
 
 
 # ==========================================
@@ -57,117 +71,86 @@ MANDATORY AUDIT DIMENSIONS
 You MUST audit across ALL of the following:
 
 1. LOGIC CORRECTNESS
-2. STATE MANAGEMENT (mutable state, lifecycle bugs)
-3. NUMERICAL STABILITY (NaN, inf, divide-by-zero, drift)
-4. EDGE CASES (empty input, missing fields, extreme values)
+2. STATE MANAGEMENT
+3. NUMERICAL STABILITY
+4. EDGE CASES
 5. CONCURRENCY / THREAD SAFETY
-6. DATA VALIDATION & SANITIZATION
-7. ERROR HANDLING (silent failures, swallowed exceptions)
+6. DATA VALIDATION
+7. ERROR HANDLING
 8. PERFORMANCE BOTTLENECKS
 9. MEMORY RISKS
-10. DETERMINISM (same input → same output)
+10. DETERMINISM
 11. TIME-DEPENDENCY BUGS
-12. CONFIG / PARAMETER MISUSE
+12. CONFIG MISUSE
 13. ARCHITECTURAL FLAWS
-14. INCOMPLETE / TRUNCATED IMPLEMENTATIONS
-15. DEAD CODE / UNUSED PATHS
-16. INCONSISTENT DATA FLOW
-17. RISK ENGINE FAILURES (if applicable)
+14. INCOMPLETE IMPLEMENTATIONS
+15. DEAD CODE
+16. DATA FLOW ISSUES
+17. RISK ENGINE FAILURES
 
 -------------------------------------
-STRICT OUTPUT FORMAT (NO DEVIATION)
+STRICT OUTPUT FORMAT
 -------------------------------------
 
 ## AUDIT SUMMARY
-
-For EACH issue:
-- Severity: CRITICAL / HIGH / MEDIUM / LOW
-- File:
-- Function:
-- Issue:
-- Impact:
-
--------------------------------------
+(list ALL issues)
 
 ## ROOT CAUSE
-
-For EACH issue:
-- Exact technical cause
-- Why it happens
-- When it triggers
-- Minimal reproducible scenario
-
--------------------------------------
+(full technical explanation)
 
 ## DETAILED FIX PLAN
-
-For EACH issue:
-
-Provide STEP-BY-STEP fix instructions:
-
-- Exact logic correction
-- Required condition checks
-- State handling fixes
-- Data validation additions
-- Numerical safeguards
-- Concurrency protections (if needed)
-- Refactor suggestions (if required)
-
-IMPORTANT:
-- DO NOT output code
-- DO NOT output patch diff
-- DO NOT skip steps
+(step-by-step fixes)
 
 -------------------------------------
 
-STRICT RULES
-
-- NO assumptions without evidence from code
+STRICT RULES:
+- NO assumptions
 - NO generic advice
-- NO summaries
 - MUST be exhaustive
 
 -------------------------------------
 
-CODE TO AUDIT:
-
+CODE:
 {code}
 """
 
 
 # ==========================================
-# CLAUDE CALL
+# CLAUDE CALL (WITH RETRIES)
 # ==========================================
 def call_claude(prompt):
-    try:
-        response = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json"
-            },
-            json={
-                "model": "claude-opus-4-6",
-                "max_tokens": 12000,
-                "messages": [
-                    {"role": "user", "content": prompt}
-                ]
-            },
-            timeout=500
-        )
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json"
+                },
+                json={
+                    "model": "claude-opus-4-6",
+                    "max_tokens": 12000,
+                    "messages": [
+                        {"role": "user", "content": prompt}
+                    ]
+                },
+                timeout=180
+            )
 
-        data = response.json()
+            data = response.json()
 
-        if "error" in data:
-            print("❌ Claude API Error:", data["error"])
-            sys.exit(1)
+            if "error" in data:
+                print("❌ Claude API Error:", data["error"])
+                return None
 
-        return data
+            return data
 
-    except Exception as e:
-        print("❌ Request failed:", str(e))
-        sys.exit(1)
+        except Exception as e:
+            print(f"⚠️ Retry {attempt+1}/{MAX_RETRIES} failed:", e)
+            time.sleep(5)
+
+    return None
 
 
 # ==========================================
@@ -177,7 +160,7 @@ def extract_text(response):
     try:
         return response["content"][0]["text"]
     except Exception:
-        print("❌ Invalid Claude response format")
+        print("❌ Invalid Claude response")
         print(json.dumps(response, indent=2))
         sys.exit(1)
 
@@ -204,7 +187,7 @@ def validate_output(text):
 # MAIN
 # ==========================================
 def main():
-    print("🚀 Running production-grade audit...")
+    print("🚀 Running alpha orchestrator audit...")
 
     if not API_KEY:
         print("❌ Missing CLAUDE_API_KEY")
@@ -216,27 +199,40 @@ def main():
         print("❌ No target files found")
         sys.exit(1)
 
-    print(f"📏 Code length: {len(code)} chars")
+    print(f"📏 Total code length: {len(code)} chars")
 
-    prompt = audit_prompt(code)
+    chunks = split_code(code)
 
-    response = call_claude(prompt)
+    full_report = ""
 
-    text = extract_text(response)
+    for i, chunk in enumerate(chunks):
+        print(f"🔍 Auditing chunk {i+1}/{len(chunks)}")
+
+        prompt = audit_prompt(chunk)
+        response = call_claude(prompt)
+
+        if not response:
+            print("❌ Claude failed on chunk")
+            sys.exit(1)
+
+        text = extract_text(response)
+
+        full_report += f"\n\n# ===== CHUNK {i+1} =====\n\n"
+        full_report += text
 
     # Save report
     with open("CLAUDE_AUDIT_REPORT.md", "w", encoding="utf-8") as f:
-        f.write(text)
+        f.write(full_report)
 
     print("📄 Audit report saved: CLAUDE_AUDIT_REPORT.md")
 
-    # Validate structure
-    errors = validate_output(text)
+    # Validate
+    errors = validate_output(full_report)
 
     if errors:
-        print("⚠️ Output structure issues:")
+        print("⚠️ Output issues:")
         for e in errors:
-            print(f"- {e}")
+            print("-", e)
     else:
         print("✅ Audit completed successfully")
 
