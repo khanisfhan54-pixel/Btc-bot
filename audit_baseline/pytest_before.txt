@@ -1,0 +1,36 @@
+
+==================================== ERRORS ====================================
+____________ ERROR collecting tests/test_advanced_regime_engine.py _____________
+import file mismatch:
+imported module 'test_advanced_regime_engine' has this __file__ attribute:
+  /workspace/Btc-bot/test_advanced_regime_engine.py
+which is not the same as the test file we want to collect:
+  /workspace/Btc-bot/tests/test_advanced_regime_engine.py
+HINT: remove __pycache__ / .pyc files and/or use a unique basename for your test file modules
+____________ ERROR collecting tests/test_alpha_advanced_dynamics.py ____________
+ImportError while importing test module '/workspace/Btc-bot/tests/test_alpha_advanced_dynamics.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/root/.pyenv/versions/3.10.19/lib/python3.10/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+tests/test_alpha_advanced_dynamics.py:10: in <module>
+    from alpha_orchestration import (
+alpha_orchestration.py:3: in <module>
+    from alpha_orchestrator import AlphaOrchestrator, orchestrate_signals
+E   ImportError: cannot import name 'orchestrate_signals' from 'alpha_orchestrator' (/workspace/Btc-bot/alpha_orchestrator.py)
+=============================== warnings summary ===============================
+tests/integration/test_bracket_failure_compensation.py:3
+  /workspace/Btc-bot/tests/integration/test_bracket_failure_compensation.py:3: PytestDeprecationWarning: 
+  Module 'execution' was found, but when imported by pytest it raised:
+      ImportError('ccxt is required for execution.py. Install it with: pip install ccxt')
+  In pytest 9.1 this warning will become an error by default.
+  You can fix the underlying problem, or alternatively overwrite this behavior and silence this warning by passing exc_type=ImportError explicitly.
+  See https://docs.pytest.org/en/stable/deprecations.html#pytest-importorskip-default-behavior-regarding-importerror
+    execution_mod = pytest.importorskip("execution")
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+ERROR tests/test_advanced_regime_engine.py
+ERROR tests/test_alpha_advanced_dynamics.py
+!!!!!!!!!!!!!!!!!!! Interrupted: 2 errors during collection !!!!!!!!!!!!!!!!!!!!
+1 skipped, 1 warning, 2 errors in 3.07s

@@ -1029,7 +1029,7 @@ class AlphaOrchestrator:
 
         if event_time is not None:
             ts = _safe_float(event_time, float("nan"))
-            if math.isfinite(ts) and ts >= 0.0:
+            if math.isfinite(ts) and ts > 0.0:
                 return ts
             self._rejection_telemetry["invalid_timestamp"] = self._rejection_telemetry.get("invalid_timestamp", 0) + 1
             logger.warning(
@@ -3465,3 +3465,24 @@ class AlphaOrchestrator:
 
 # Tests have been moved to test_alpha_orchestrator_embedded.py and
 # test_alpha_orchestrator_hardened.py to avoid polluting the production namespace.
+
+
+def orchestrate_signals(
+    signals: List[Dict[str, Any]],
+    regime_context: RegimeContext,
+    feature_quality: FeatureQuality,
+    execution_state: ExecutionState,
+    *,
+    orchestrator: Optional[AlphaOrchestrator] = None,
+    config: Optional[OrchestratorConfig] = None,
+    current_time: Optional[float] = None,
+) -> OrchestratedAction:
+    """Compatibility wrapper for legacy callers expecting module-level orchestration."""
+    engine = orchestrator or AlphaOrchestrator(config or OrchestratorConfig())
+    return engine.orchestrate(
+        signals=signals,
+        regime_context=regime_context,
+        feature_quality=feature_quality,
+        execution_state=execution_state,
+        current_time=current_time,
+    )
