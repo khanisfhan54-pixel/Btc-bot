@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Any, Deque, Dict, List, Optional, Tuple
 from trading_utils import safe_float, clamp, validate_alpha
+from thread_safe_wrappers import ThreadSafeFeatureEngine, ThreadSafeAlphaPredictor
+from venue_basis import VenueBasisNormalizer
 
 try:
     from dotenv import load_dotenv
@@ -54,6 +56,7 @@ EXCHANGE_MIN_NOTIONAL_USD = float(os.environ.get("EXCHANGE_MIN_NOTIONAL_USD", "1
 EXCHANGE_MAX_NOTIONAL_USD = float(os.environ.get("EXCHANGE_MAX_NOTIONAL_USD", "100000.0"))
 MAX_REGIME_STALENESS_SECONDS = float(os.environ.get("MAX_REGIME_STALENESS_SECONDS", "300"))
 MAX_FEATURE_STALENESS_SECONDS = float(os.environ.get("MAX_FEATURE_STALENESS_SECONDS", "60"))
+BASIS_HALT_THRESHOLD_PCT = float(os.environ.get("BASIS_HALT_THRESHOLD_PCT", "0.5"))
 BACKTEST_RISK_PCT = float(os.environ.get("BACKTEST_RISK_PCT", "0.005"))
 RECONCILIATION_BLOCK_SECONDS = int(os.environ.get("RECONCILIATION_BLOCK_SECONDS", "300"))
 _reconciliation_blocks: Dict[str, float] = {}
@@ -278,7 +281,7 @@ except ImportError as _ca_err:
     raise
 
 engine           = ExecutionEngine()
-feature_engine   = FeatureEngine()
+feature_engine   = ThreadSafeFeatureEngine(FeatureEngine())
 signal_engine    = SignalEngine()
 execution_engine = ExecutionLogic(learning_engine=LEARNING_ENGINE)
 fill_model       = QueueFillModel()
@@ -288,6 +291,7 @@ impact_tracker   = ImpactDecay()
 position_manager = PositionManager()
 trade_lifecycle  = TradeLifecycleManager()
 capital_allocator = CapitalAllocator()
+basis_normalizer = VenueBasisNormalizer(halt_threshold_pct=BASIS_HALT_THRESHOLD_PCT)
 SIGNAL_PIPELINE_CONFIG: Dict[str, Any] = {
     "enable_regime_engine": True,
     "signal_only_mode": SIGNAL_ONLY_MODE,
@@ -299,6 +303,7 @@ _last_regime_context: Dict[str, Any] = {"regime": "UNKNOWN", "confidence": 0.0, 
 _prev_close: Optional[float] = None
 _last_valid_features: Optional[dict] = None
 _last_valid_features_ts: float = 0.0
+_feature_type_error_count: int = 0
 _ANALYSIS_STATE_LOCK = threading.Lock()
 regime_engine = None
 if AdvancedRegimeEngine is not None:
@@ -307,8 +312,10 @@ if AdvancedRegimeEngine is not None:
     except Exception as _regime_init_err:
         logger.warning("AdvancedRegimeEngine init failed; continuing without it: %s", _regime_init_err)
         regime_engine = None
-alpha_predictor = LiquiditySweepAlpha() if LiquiditySweepAlpha is not None else None
+alpha_predictor = ThreadSafeAlphaPredictor(LiquiditySweepAlpha()) if LiquiditySweepAlpha is not None else None
 try:
+    from backtest_engine import BacktestEngine, BacktestConfig
+
     from alpha_orchestrator import (
         AlphaOrchestrator,
         OrchestratorConfig,
@@ -767,12 +774,34 @@ def sma_crossover_signal(ohlcv: list, fast: int = 10, slow: int = 30):
 
 
 def orderbook_imbalance(orderbook: dict) -> float:
+    if not isinstance(orderbook, dict):
+        logger.warning("[ORDERBOOK] invalid orderbook type=%s for imbalance; returning 0.0", type(orderbook).__name__)
+        return 0.0
     bids = orderbook.get("bids", [])
     asks = orderbook.get("asks", [])
-    bid_vol = sum(_safe_float(b[1]) for b in bids)
-    ask_vol = sum(_safe_float(a[1]) for a in asks)
+    if not isinstance(bids, list) or not isinstance(asks, list):
+        logger.warning("[ORDERBOOK] malformed bids/asks structure for imbalance; returning 0.0")
+        return 0.0
+
+    def _sum_side_volume(levels: list) -> float:
+        volume = 0.0
+        for lvl in levels:
+            if not isinstance(lvl, (list, tuple)) or len(lvl) < 2:
+                continue
+            px = _safe_float(lvl[0], float("nan"))
+            sz = _safe_float(lvl[1], float("nan"))
+            if not math.isfinite(px) or not math.isfinite(sz) or px <= 0.0 or sz < 0.0:
+                continue
+            volume += sz
+        return volume
+
+    bid_vol = _sum_side_volume(bids)
+    ask_vol = _sum_side_volume(asks)
     total = bid_vol + ask_vol
-    return 0.0 if total == 0 else (bid_vol - ask_vol) / total
+    if total <= 0.0 or not math.isfinite(total):
+        logger.warning("[ORDERBOOK] non-finite or empty volume in imbalance; returning 0.0")
+        return 0.0
+    return (bid_vol - ask_vol) / total
 
 
 def detect_whale_trades(trades: list, usd_threshold: float = 500_000) -> list:
@@ -1403,8 +1432,11 @@ def _execute_liquidity_trade(
     confidence: float,
     candles_by_tf: Dict[str, Any],
     engines_out: Dict[str, Any],
+    analysis_price: Optional[float] = None,
+    execution_orderbook: Optional[Dict[str, Any]] = None,
     sl_price: Optional[float] = None,
     tp_price: Optional[float] = None,
+    sl_tp_price_space: str = "execution",
     position_size: Optional[float] = None,
     correlation_id: str = "",
 ) -> Dict[str, Any]:
@@ -1436,6 +1468,27 @@ def _execute_liquidity_trade(
     )
     deterministic_trade_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, _trade_seed))
 
+    execution_ref_price = _safe_float(price, float("nan"))
+    analysis_ref_price = _safe_float(analysis_price, execution_ref_price)
+    if execution_ref_price <= 0.0 and isinstance(execution_orderbook, dict):
+        execution_ref_price = _safe_float((execution_orderbook.get("bids") or [[0.0]])[0][0], 0.0)
+    if execution_ref_price <= 0.0 or not math.isfinite(execution_ref_price):
+        return {"executed": False, "reason": "basis_unavailable_execution_price", "trade_id": deterministic_trade_id, "correlation_id": correlation_id or ""}
+    if analysis_ref_price <= 0.0 or not math.isfinite(analysis_ref_price):
+        return {"executed": False, "reason": "basis_unavailable_analysis_price", "trade_id": deterministic_trade_id, "correlation_id": correlation_id or ""}
+
+    basis_delta = execution_ref_price - analysis_ref_price
+    if not math.isfinite(basis_delta):
+        return {"executed": False, "reason": "invalid_basis_delta", "trade_id": deterministic_trade_id, "correlation_id": correlation_id or ""}
+    if abs(basis_delta) > 1e-8:
+        logger.info(
+            "[BASIS] analysis_price=%.6f execution_price=%.6f basis_delta=%.6f cid=%s",
+            analysis_ref_price,
+            execution_ref_price,
+            basis_delta,
+            cid,
+        )
+
     # --- Resolve SL / TP ---
     if sl_price is None or tp_price is None or _safe_float(sl_price) <= 0 or _safe_float(tp_price) <= 0:
         market_data = _build_execution_market_data(candles_by_tf, engines_out)
@@ -1443,25 +1496,37 @@ def _execute_liquidity_trade(
             logger.info("Skipping execution: liquidity market data missing or sweep not confirmed.")
             return {"executed": False, "reason": "missing_liquidity_data", "trade_id": deterministic_trade_id, "correlation_id": correlation_id or ""}
         try:
-            sl_price, tp_price = calculate_liquidity_sl_tp(execution_signal, price, market_data)
+            sl_price, tp_price = calculate_liquidity_sl_tp(execution_signal, analysis_ref_price, market_data)
         except Exception as exc:
             logger.warning("calculate_liquidity_sl_tp failed: %s", exc)
-            atr_sl_tp = _compute_atr_sl_tp(candles_by_tf.get("1h", []), price)
+            atr_sl_tp = _compute_atr_sl_tp(candles_by_tf.get("1h", []), analysis_ref_price)
             if atr_sl_tp[0] is None:
                 return {"executed": False, "reason": "no_sl_tp_available", "trade_id": deterministic_trade_id, "correlation_id": correlation_id or ""}
             sl_pct, tp_pct = atr_sl_tp
             if execution_signal == "LONG":
-                sl_price = price * (1.0 - sl_pct)
-                tp_price = price * (1.0 + tp_pct)
+                sl_price = analysis_ref_price * (1.0 - sl_pct)
+                tp_price = analysis_ref_price * (1.0 + tp_pct)
             else:
-                sl_price = price * (1.0 + sl_pct)
-                tp_price = price * (1.0 - tp_pct)
+                sl_price = analysis_ref_price * (1.0 + sl_pct)
+                tp_price = analysis_ref_price * (1.0 - tp_pct)
 
     try:
         if sl_price is None or tp_price is None:
             return {"executed": False, "reason": "invalid_sl_tp", "trade_id": deterministic_trade_id, "correlation_id": correlation_id or ""}
 
-        stop_loss_distance = abs(price - _safe_float(sl_price))
+        sltp_space = str(sl_tp_price_space or "execution").strip().lower()
+        if sltp_space not in {"analysis", "execution"}:
+            return {"executed": False, "reason": "invalid_sl_tp_price_space", "trade_id": deterministic_trade_id, "correlation_id": correlation_id or ""}
+        if sltp_space == "analysis":
+            logger.info("[BASIS] applying analysis->execution SL/TP conversion once delta=%.6f cid=%s", basis_delta, cid)
+            sl_price = _safe_float(sl_price) + basis_delta
+            tp_price = _safe_float(tp_price) + basis_delta
+        else:
+            sl_price = _safe_float(sl_price)
+            tp_price = _safe_float(tp_price)
+        if not (math.isfinite(sl_price) and math.isfinite(tp_price) and sl_price > 0.0 and tp_price > 0.0):
+            return {"executed": False, "reason": "invalid_sl_tp_non_finite", "trade_id": deterministic_trade_id, "correlation_id": correlation_id or ""}
+        stop_loss_distance = abs(execution_ref_price - _safe_float(sl_price))
         if stop_loss_distance <= 0:
             return {"executed": False, "reason": "invalid_stop_loss_distance", "trade_id": deterministic_trade_id, "correlation_id": correlation_id or ""}
 
@@ -1476,21 +1541,21 @@ def _execute_liquidity_trade(
             title="📊 BTC SIGNAL",
             signal=execution_signal,
             confidence=confidence,
-            price=price,
+            price=execution_ref_price,
             correlation_id=correlation_id,
         )
         send_telegram_message(pre_msg)
 
         if position_size is None or _safe_float(position_size) <= 0:
             return {"executed": False, "reason": "invalid_position_size", "trade_id": deterministic_trade_id, "correlation_id": correlation_id or ""}
-        position_size_usd = _safe_float(position_size) * _safe_float(price)
+        position_size_usd = _safe_float(position_size) * execution_ref_price
         if not (EXCHANGE_MIN_NOTIONAL_USD <= position_size_usd <= EXCHANGE_MAX_NOTIONAL_USD):
             logger.warning("[EXECUTION] Position size %.2f USD out of exchange bounds [%.2f, %.2f] — skipping trade. cid=%s", position_size_usd, EXCHANGE_MIN_NOTIONAL_USD, EXCHANGE_MAX_NOTIONAL_USD, cid)
             return {"executed": False, "reason": "position_size_out_of_bounds", "correlation_id": correlation_id or ""}
 
         if not LIVE_TRADING:
             print(
-                f"🧪 Paper Trade[{cid}]: {execution_signal} @ {price:.2f}"
+                f"🧪 Paper Trade[{cid}]: {execution_signal} @ {execution_ref_price:.2f}"
                 f" | SL={_safe_float(sl_price):.2f} | TP={_safe_float(tp_price):.2f}"
                 f" | Size={_safe_float(position_size):.6f}"
             )
@@ -1498,7 +1563,7 @@ def _execute_liquidity_trade(
                 title="🧪 Paper Trade Executed",
                 signal=execution_signal,
                 confidence=confidence,
-                price=price,
+                price=execution_ref_price,
                 sl_price=_safe_float(sl_price),
                 tp_price=_safe_float(tp_price),
                 order_id="paper",
@@ -1514,6 +1579,9 @@ def _execute_liquidity_trade(
                 "tp": tp_price,
                 "position_size": _safe_float(position_size),
                 "market_data": market_data,
+                "analysis_price": analysis_ref_price,
+                "execution_price": execution_ref_price,
+                "basis_delta": basis_delta,
             }
 
         side = "buy" if execution_signal == "LONG" else "sell"
@@ -1540,7 +1608,7 @@ def _execute_liquidity_trade(
             title="🚀 Trade Executed",
             signal=execution_signal,
             confidence=confidence,
-            price=price,
+            price=execution_ref_price,
             sl_price=_safe_float(sl_price),
             tp_price=_safe_float(tp_price),
             order_id=str(order_id) if order_id is not None else "unknown",
@@ -1559,6 +1627,9 @@ def _execute_liquidity_trade(
             "position_size": position_size,
             "result": execution_result,
             "market_data": market_data,
+                "analysis_price": analysis_ref_price,
+                "execution_price": execution_ref_price,
+                "basis_delta": basis_delta,
         }
     except Exception as exc:
         err_msg = f"❌ Execution Error\nSignal: {execution_signal}\nPrice: {price:,.2f}\nError: {exc}"
@@ -1594,17 +1665,19 @@ def run_analysis_cycle(
     data_exchange: Any = None,
     data_symbol: str = SYMBOL,
 ) -> dict:
-    global _last_regime_update_ts, _last_regime_context, _regime_context_timestamp, _prev_close, _last_valid_features, _last_valid_features_ts
+    global _last_regime_update_ts, _last_regime_context, _regime_context_timestamp, _prev_close, _last_valid_features, _last_valid_features_ts, _feature_type_error_count
     result: Dict[str, Any] = {}
     _dex = data_exchange if data_exchange is not None else exchange
     _dsym = data_symbol
     if hasattr(_dex, "id") and hasattr(exchange, "id") and _dex.id != exchange.id:
         logger.warning("[EXCHANGE] Data exchange (%s) differs from execution exchange (%s). Ensure symbol formats are compatible.", _dex.id, exchange.id)
+    basis_normalizer.set_venues(getattr(_dex, "id", "analysis"), getattr(exchange, "id", "execution"))
     _validate_exchange_symbol_format(_dex, _dsym)
     _validate_exchange_symbol_format(exchange, SYMBOL)
     try:
         candles_by_tf = _fetch_multi_tf(_dex, _dsym)
-        orderbook = fetch_orderbook(_dex, _dsym)
+        analysis_orderbook = fetch_orderbook(_dex, _dsym)
+        execution_orderbook = fetch_orderbook(exchange, SYMBOL)
         trades = fetch_recent_trades(_dex, _dsym)
     except Exception as exc:
         logger.error("Data fetch error: %s", exc)
@@ -1620,7 +1693,7 @@ def run_analysis_cycle(
         current_price = float(primary_1m[-1][4])
     except Exception:
         current_price = _safe_float(
-            orderbook.get("bids", [[0]])[0][0] if orderbook.get("bids") else 0.0
+            analysis_orderbook.get("bids", [[0]])[0][0] if analysis_orderbook.get("bids") else 0.0
         )
 
     log_return: Optional[float] = None
@@ -1633,6 +1706,22 @@ def run_analysis_cycle(
             else:
                 logger.warning("[REGIME] log_return is non-finite (prev=%.4f, curr=%.4f) — skipping regime update this tick", prev_close_local, current_price)
         _prev_close = current_price
+
+    execution_price = _safe_float(
+        (execution_orderbook.get("bids") or [[current_price]])[0][0] if execution_orderbook.get("bids") else current_price,
+        current_price,
+    )
+    analysis_mid = 0.5 * (
+        _safe_float((analysis_orderbook.get("bids") or [[current_price]])[0][0], current_price)
+        + _safe_float((analysis_orderbook.get("asks") or [[current_price]])[0][0], current_price)
+    )
+    execution_mid = 0.5 * (
+        _safe_float((execution_orderbook.get("bids") or [[execution_price]])[0][0], execution_price)
+        + _safe_float((execution_orderbook.get("asks") or [[execution_price]])[0][0], execution_price)
+    )
+    basis_normalizer.seed(analysis_mid=analysis_mid, execution_mid=execution_mid)
+    basis_normalizer.update(analysis_mid=analysis_mid, execution_mid=execution_mid)
+    basis_status = basis_normalizer.validate()
 
     open_interest = _fetch_open_interest(exchange)
     funding_rate = _fetch_funding_rate(exchange)
@@ -1649,7 +1738,7 @@ def run_analysis_cycle(
 
     engines_out = (
         run_all_engines(
-            orderbook=orderbook,
+            orderbook=analysis_orderbook,
             trades=trades,
             price=current_price,
             exchange=exchange,
@@ -1661,7 +1750,7 @@ def run_analysis_cycle(
             liquidation_events=liq_events,
             performance={},
             volume_intelligence=volume_intel,
-            orderbook_snapshots=[orderbook],
+            orderbook_snapshots=[analysis_orderbook],
         )
         or {}
     )
@@ -1688,8 +1777,8 @@ def run_analysis_cycle(
                 logger.info("[REGIME] Skipping regime update on first tick (no prev_close yet)")
                 reg_out = {}
             else:
-                top_bid_depth = sum(_safe_float(b[1]) for b in (orderbook.get("bids") or [])[:10])
-                top_ask_depth = sum(_safe_float(a[1]) for a in (orderbook.get("asks") or [])[:10])
+                top_bid_depth = sum(_safe_float(b[1]) for b in (analysis_orderbook.get("bids") or [])[:10])
+                top_ask_depth = sum(_safe_float(a[1]) for a in (analysis_orderbook.get("asks") or [])[:10])
                 trade_volume = sum(
                     _safe_float(t.get("amount", 0.0)) * _safe_float(t.get("price", current_price))
                     for t in (trades or [])
@@ -1707,7 +1796,7 @@ def run_analysis_cycle(
                     "features": feature_vector,
                     "price": float(current_price),
                     "volume": float(candles_by_tf.get("1m", [[0,0,0,0,0,0]])[-1][5]) if candles_by_tf.get("1m") else 0.0,
-                    "orderbook": orderbook,
+                    "orderbook": analysis_orderbook,
                     "open_interest": float(open_interest) if np.isfinite(float(open_interest)) else 0.0,
                     "funding_rate": float(funding_rate) if np.isfinite(float(funding_rate)) else 0.0,
                 }
@@ -1752,22 +1841,35 @@ def run_analysis_cycle(
 
     try:
         snapshot = {
-            "bids": orderbook.get("bids", []),
-            "asks": orderbook.get("asks", []),
+            "bids": analysis_orderbook.get("bids", []),
+            "asks": analysis_orderbook.get("asks", []),
             "timestamp": time.time(),
         }
         features = feature_engine.update(snapshot, trades, regime_context=regime_context)
         with _ANALYSIS_STATE_LOCK:
             _last_valid_features = dict(features)
             _last_valid_features_ts = time.time()
-    except TypeError:
+    except TypeError as _te_exc:
+        _feature_type_error_count += 1
+        logger.error(
+            "[FEATURE] TypeError in update | exc_type=%s exc=%s args=%s tick_ts=%.6f count=%d",
+            type(_te_exc).__name__,
+            str(_te_exc),
+            json.dumps({"snapshot": snapshot, "trades_count": len(trades or []), "regime_context": regime_context}, default=str)[:2000],
+            time.time(),
+            _feature_type_error_count,
+            exc_info=True,
+        )
+        if _feature_type_error_count > 3:
+            logger.critical("[FEATURE] repeated TypeErrors detected; halting execution mode")
+            regime_context["execution_mode"] = "halt_feature_errors"
         try:
             features = feature_engine.update(snapshot, trades)
             with _ANALYSIS_STATE_LOCK:
                 _last_valid_features = dict(features)
                 _last_valid_features_ts = time.time()
         except Exception as _fe_exc:
-            logger.warning("[FEATURE] Feature engine failed: %s", _fe_exc, exc_info=True)
+            logger.warning("[FEATURE] Feature engine failed after TypeError fallback: %s", _fe_exc, exc_info=True)
             features = None
     except Exception as _fe_exc:
         logger.warning("[FEATURE] Feature engine failed: %s", _fe_exc, exc_info=True)
@@ -1801,8 +1903,8 @@ def run_analysis_cycle(
                 {
                     "price": current_price,
                     "close_price": current_price,
-                    "curr_book": orderbook,
-                    "prev_book": orderbook,
+                    "curr_book": analysis_orderbook,
+                    "prev_book": analysis_orderbook,
                     "timestamp": time.time(),
                     "trades_count": len(trades or []),
                     "atr": max(current_price * 0.001, 1e-8),
@@ -1943,6 +2045,11 @@ def run_analysis_cycle(
 
     # Regime / lifecycle
     lifecycle = trade_lifecycle.update(current_price, feat_dict)
+    if not basis_status.ok:
+        lifecycle["block_new_entries"] = True
+        lifecycle["reason"] = f"{basis_status.reason}:basis={basis_status.basis:.2f},pct={basis_status.basis_pct:.4f}"
+        feat_dict["allow_trade"] = False
+        logger.critical("[BASIS] trading blocked reason=%s basis=%.4f basis_pct=%.4f", basis_status.reason, basis_status.basis, basis_status.basis_pct)
     if regime_fail_closed or str(regime_context.get("regime", "")).upper() in ("HALTED", "STALE_FALLBACK", "UNCALIBRATED"):
         lifecycle["block_new_entries"] = True
         lifecycle["reason"] = f"regime_blocked:{regime_failure_reason or regime_context.get('regime','unknown')}"
@@ -2140,7 +2247,7 @@ def run_analysis_cycle(
 
     if not engines_out.get("liquidity_map"):
         engines_out["liquidity_map"] = _fallback_liquidity_map_from_orderbook(
-            orderbook, current_price
+            analysis_orderbook, current_price
         )
 
     engines_out["volume_intelligence"] = volume_intel
@@ -2153,23 +2260,23 @@ def run_analysis_cycle(
     smc_signal = engines_out.get("smc_signal", {}) or {}
 
     sma_signal, sma_fast, sma_slow = sma_crossover_signal(ohlcv)
-    ob_imb = orderbook_imbalance(orderbook)
+    ob_imb = orderbook_imbalance(analysis_orderbook)
     whales = detect_whale_trades(trades)
     whale_sig, _ = whale_net_signal(whales)
     volatility = _estimate_volatility_from_ohlcv(ohlcv)
 
     best_bid = _safe_float(
-        (orderbook.get("bids") or [[current_price]])[0][0]
-        if orderbook.get("bids")
+        (analysis_orderbook.get("bids") or [[current_price]])[0][0]
+        if analysis_orderbook.get("bids")
         else current_price
     )
     best_ask = _safe_float(
-        (orderbook.get("asks") or [[current_price]])[0][0]
-        if orderbook.get("asks")
+        (analysis_orderbook.get("asks") or [[current_price]])[0][0]
+        if analysis_orderbook.get("asks")
         else current_price
     )
-    bid_vol_top = sum(_safe_float(b[1]) for b in orderbook.get("bids", [])[:10])
-    ask_vol_top = sum(_safe_float(a[1]) for a in orderbook.get("asks", [])[:10])
+    bid_vol_top = sum(_safe_float(b[1]) for b in analysis_orderbook.get("bids", [])[:10])
+    ask_vol_top = sum(_safe_float(a[1]) for a in analysis_orderbook.get("asks", [])[:10])
 
     if open_interest > 0:
         oih = [open_interest * 0.98, open_interest * 0.995, open_interest]
@@ -2336,7 +2443,7 @@ def run_analysis_cycle(
     normalized_signal = _normalize_trade_signal(final_signal)
 
     try:
-        router_decision = order_router.route(normalized_signal, feat_dict, orderbook)
+        router_decision = order_router.route(normalized_signal, feat_dict, execution_orderbook)
     except Exception as _router_exc:
         logger.warning("[ROUTER] route failed, forcing no-exec: %s", _router_exc)
         router_decision = {
@@ -2351,7 +2458,7 @@ def run_analysis_cycle(
             features=feat_dict,
             signal=signal_output,
             router_decision=router_decision,
-            snapshot=orderbook,
+            snapshot=execution_orderbook,
             trades=trades,
         )
     except Exception as _meta_exc:
@@ -2374,7 +2481,7 @@ def run_analysis_cycle(
                 "confidence": float(_safe_float(confidence, 0.0)),
             },
             features_payload=feat_dict,
-            snapshot=orderbook,
+            snapshot=execution_orderbook,
             account_equity=balance,
             meta_result=meta_result,
         )
@@ -2604,12 +2711,15 @@ def run_analysis_cycle(
         try:
             execution_outcome = _execute_liquidity_trade(
                 execution_signal=normalized_signal,
-                price=current_price,
+                price=execution_price,
                 confidence=_safe_float(confidence, 0.0),
                 candles_by_tf=candles_by_tf,
                 engines_out=engines_out,
+                analysis_price=current_price,
+                execution_orderbook=execution_orderbook,
                 sl_price=final_decision.get("sl") or None,
                 tp_price=final_decision.get("tp") or None,
+                sl_tp_price_space="execution",
                 position_size=final_decision.get("position_size") or None,
                 correlation_id=active_correlation_id,
             )
@@ -2709,6 +2819,8 @@ def run_analysis_cycle(
             "ob_imbalance": round(ob_imb, 6),
             "whale_signal": whale_sig,
             "cascade_prob": round(cascade_prob, 6),
+            "basis_okx": round(analysis_mid, 6),
+            "basis_binance": round(execution_mid, 6),
             "heat_score": heatmap.get("heat_score", 0),
             "heat_color": heatmap.get("color", "green"),
             "liq_buy": (liq_monitor.get_stats() if liq_monitor else {"buy_liq": 0})[
@@ -2881,8 +2993,20 @@ def run_backtest(
     capital: float = 10_000.0,
     ohlcv_data: list = None,
 ) -> dict:
-    print("BTCUSDT Institutional Signal Bot Started")
+    """Backtest path uses the shared execution stack via BacktestEngine for live-parity semantics."""
     logger.info("=== BACKTEST START: %s [%s] ===", symbol, timeframe)
+    strict_calibration = os.environ.get("BACKTEST_STRICT_CALIBRATION", "0").strip() == "1"
+    if regime_engine is not None and not bool(getattr(regime_engine, "_weights_loaded", False)):
+        if strict_calibration:
+            logger.critical("[BACKTEST] blocked: regime engine uncalibrated")
+            return {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "error": "uncalibrated_regime_engine",
+                "execution_mode": "halt",
+                "signal_valid": False,
+            }
+        logger.warning("[BACKTEST] proceeding in explicit non-production uncalibrated mode (BACKTEST_STRICT_CALIBRATION=0)")
     if ohlcv_data is not None:
         ohlcv_all = list(ohlcv_data)
     else:
@@ -2893,313 +3017,24 @@ def run_backtest(
             logger.error("Backtest fetch error: %s", exc)
             return {}
 
-    if len(ohlcv_all) < slow_sma + 2:
-        logger.error("Not enough candles (%d) for backtest", len(ohlcv_all))
-        return {}
-
-    trades_log = []
-    position = None
-    equity = capital
-    peak_equity = capital
-    max_drawdown = 0.0
-    returns = []
-    local_state = {
-        "cycle": 0,
-        "last_signal_cycle": -9999,
-        "last_trade_cycle": -9999,
-        "bias_count": 0,
-        "last_direction": None,
-        "cooldown_candles": 3,
-        "min_signal_every": 30,
-    }
-    msd = MarketStateDetector()
-    rng = random.Random(BACKTEST_SEED)
-    cost_model = BacktestCostModel(
-        taker_fee_bps=float(os.environ.get("BACKTEST_FEE_BPS", "5.0")),
-        slippage_bps=float(os.environ.get("BACKTEST_SLIPPAGE_BPS", "5.0")),
-        spread_bps=float(os.environ.get("BACKTEST_SPREAD_BPS", "3.0")),
-    )
-
-    for i in range(slow_sma + 1, len(ohlcv_all) - 1):
-        # BAR-DELAY LOGIC: Signal is generated on confirmed closes up to bar i-1.
-        # Entry executes at the OPEN of bar i (the next bar after signal fires).
-        local_state["cycle"] += 1
-        signal_window = ohlcv_all[:i]
-        entry_candle = ohlcv_all[i]
-        entry_price = _safe_float(entry_candle[1])
-        window = signal_window
-        current_price = _safe_float(signal_window[-1][4])
-        ts = datetime.fromtimestamp(window[-1][0] / 1000, tz=timezone.utc).isoformat()
-
-        sma_signal, _, _ = sma_crossover_signal(window, fast_sma, slow_sma)
-        volatility = _estimate_volatility_from_ohlcv(window)
-
-        candle_vol = _safe_float(window[-1][5])
-        _trade_side_bt = (
-            "BUY" if current_price >= _safe_float(window[-1][1]) else "SELL"
-        )
-        _base_size = max(1.0, candle_vol / max(current_price, 1.0))
-        _rand_jitter = rng.uniform(0.80, 1.20)
-        if _trade_side_bt == "BUY":
-            _bid_mul = rng.uniform(1.5, 3.0) * _rand_jitter
-            _ask_mul = 1.0
-        else:
-            _bid_mul = 1.0
-            _ask_mul = rng.uniform(1.5, 3.0) * _rand_jitter
-        synthetic_orderbook = {
-            "bids": [
-                [current_price - 300.0, _base_size * _bid_mul],
-                [current_price - 500.0, _base_size * _bid_mul * 0.5],
-                [current_price - 750.0, _base_size * _bid_mul * 0.3],
-            ],
-            "asks": [
-                [current_price + 300.0, _base_size * _ask_mul],
-                [current_price + 500.0, _base_size * _ask_mul * 0.5],
-                [current_price + 750.0, _base_size * _ask_mul * 0.3],
-            ],
-        }
-        synthetic_trades = [
-            {
-                "price": current_price,
-                "amount": max(candle_vol / max(current_price, 1.0), 1e-6),
-                "side": _trade_side_bt,
-            }
-        ]
-
-        volume_intel = analyze_volume_intelligence(
-            exchange=None,
-            symbol=symbol,
-            primary_ohlcv=window[-120:],
-            trades=synthetic_trades,
-            use_exchange=False,
-        )
-
-        engines_out = run_all_engines(
-            orderbook=synthetic_orderbook,
-            trades=synthetic_trades,
-            price=current_price,
-            exchange=None,
-            symbol=symbol,
-            cascade_prob=0.0,
-            recent_candles=window,
-            open_interest=1_000_000.0 + _safe_float(window[-1][5]) * 10.0,
-            funding_rate=0.0,
-            liquidation_events=[],
-            performance={},
-            volume_intelligence=volume_intel,
-            orderbook_snapshots=[synthetic_orderbook],
-            market_state_detector=msd,
-        )
-
-        ob_imb = orderbook_imbalance(synthetic_orderbook)
-        cascade_prob = _safe_float(engines_out.get("cascade_probability", 0.0))
-        whales = detect_whale_trades(synthetic_trades)
-        whale_sig, _ = whale_net_signal(whales)
-
-        result = compute_score(
-            sma_signal=sma_signal,
-            ob_imbalance=ob_imb,
-            whale_signal=whale_sig,
-            funding_rate=0.0,
-            cascade_probability=cascade_prob,
-        )
-
-        ai_meta = get_ai_score(
-            ob_imbalance=ob_imb,
-            buy_vol=sum(
-                _safe_float(t["amount"]) * _safe_float(t["price"])
-                for t in synthetic_trades
-                if str(t.get("side", "")).lower() == "buy"
-            ),
-            sell_vol=sum(
-                _safe_float(t["amount"]) * _safe_float(t["price"])
-                for t in synthetic_trades
-                if str(t.get("side", "")).lower() == "sell"
-            ),
-            volatility=volatility,
-            cascade_prob=cascade_prob,
-            sma_signal=sma_signal,
-            engines_out=engines_out,
-            volume_intel=volume_intel,
-        )
-        ai_meta["engines"] = engines_out
-
-        ai_score = ai_meta["ai_score"]
-        confidence = ai_meta["confidence"]
-        sig_decision = determine_signal(
-            ai_score, confidence, volatility, local_state, engines_out=engines_out
-        )
-        final_signal = sig_decision["signal"]
-
-        execution_direction = result["direction"]
-        if final_signal in ("LONG", "STRONG_LONG"):
-            execution_direction = "LONG"
-        elif final_signal in ("SHORT", "STRONG_SHORT"):
-            execution_direction = "SHORT"
-
-        liquidity_map = engines_out.get("liquidity_map", {})
-        sniper = detect_entry_trigger(
-            price=current_price,
-            liquidity_map=liquidity_map,
-            engines=engines_out,
-            ai_score=ai_score,
-            confidence=confidence,
-            volume_intel=volume_intel,
-        )
-
-        trade_plan = None
-        if final_signal != "HOLD":
-            trade_plan = build_trade_plan(
-                price=entry_price,
-                direction=execution_direction,
-                liquidity_map=liquidity_map,
-            )
-
-        _ms = engines_out.get("market_state", {})
-        _lm_zones = (
-            (liquidity_map.get("liquidity_map") or [])
-            if isinstance(liquidity_map, dict)
-            else []
-        )
-        _nearest_dist = (
-            round(
-                abs(
-                    min(
-                        _lm_zones,
-                        key=lambda z: abs(_safe_float(z.get("price")) - current_price),
-                        default={"price": current_price},
-                    ).get("price", current_price)
-                    - current_price
-                ),
-                2,
-            )
-            if _lm_zones
-            else -1
-        )
-        _ob_imb_disp = round(
-            _safe_float(engines_out.get("orderbook_imbalance", 0.0)), 4
-        )
-        _sweep = bool((engines_out.get("liquidity_sweep") or {}).get("sweep"))
-        _trigger = sniper.get("trigger", False)
-        print(
-            f"[C{local_state['cycle']:04d}] {ts[:16]} | {_ms.get('state', '?'):12s} allow={_ms.get('allow_trade', '?')} | "
-            f"ai={ai_score:+.3f} conf={confidence:.2f} | sig={final_signal:13s} | "
-            f"liq_dist={_nearest_dist:6} sweep={_sweep} | imb={_ob_imb_disp:+.4f} | "
-            f"{'>>> PREPARE <<<' if final_signal != 'HOLD' else ''}"
-            f"{'>>> TRIGGERED <<<' if _trigger else ''}"
-        )
-
-        if final_signal != "HOLD" and sniper.get("trigger") and position is None:
-            if (
-                local_state["cycle"] - local_state["last_trade_cycle"]
-                >= local_state["cooldown_candles"]
-            ):
-                entry = entry_price
-                if trade_plan:
-                    _plan_entry = _safe_float(trade_plan.get("entry", entry))
-                    _plan_sl = _safe_float(trade_plan["sl"])
-                    _tp_raw = trade_plan["tp"]
-                    _plan_tp = _safe_float(
-                        _tp_raw[2]
-                        if isinstance(_tp_raw, list) and len(_tp_raw) >= 3
-                        else _tp_raw
-                    )
-                    _risk = max(abs(_plan_entry - _plan_sl), 50.0)
-                    _reward = max(abs(_plan_tp - _plan_entry), _risk * 2.0)
-                    if execution_direction == "LONG":
-                        sl = entry - _risk
-                        tp = entry + _reward
-                    else:
-                        sl = entry + _risk
-                        tp = entry - _reward
-                else:
-                    sl = entry * (0.995 if execution_direction == "LONG" else 1.005)
-                    tp = entry * (1.010 if execution_direction == "LONG" else 0.990)
-                position = {
-                    "side": execution_direction,
-                    "entry": entry,
-                    "sl": sl,
-                    "tp": tp,
-                    "entry_ts": ts,
-                }
-                local_state["last_trade_cycle"] = local_state["cycle"]
-
-        if position is not None:
-            side = position["side"]
-            entry = position["entry"]
-            sl = position["sl"]
-            tp = position["tp"]
-            hit_sl = current_price <= sl if side == "LONG" else current_price >= sl
-            hit_tp = current_price >= tp if side == "LONG" else current_price <= tp
-            exit_on_flip = (side == "LONG" and execution_direction == "SHORT") or (
-                side == "SHORT" and execution_direction == "LONG"
-            )
-            if hit_sl or hit_tp or exit_on_flip:
-                pnl_pct = (
-                    ((current_price - entry) / entry)
-                    if side == "LONG"
-                    else ((entry - current_price) / entry)
-                )
-                allocation = capital_allocator.allocate(signal_confidence=confidence, regime_context={"regime": "TREND"}, current_equity=equity, max_risk_pct=BACKTEST_RISK_PCT)
-                position_size_usd = allocation["position_size_usd"]
-                gross_pnl = position_size_usd * pnl_pct
-                net_pnl = gross_pnl - position_size_usd * cost_model.round_trip_cost_pct
-                pnl = net_pnl
-                equity += net_pnl
-                returns.append(pnl_pct)
-                peak_equity = max(peak_equity, equity)
-                max_drawdown = max(max_drawdown, (peak_equity - equity) / peak_equity)
-                trades_log.append(
-                    {
-                        "entry_ts": position["entry_ts"],
-                        "exit_ts": ts,
-                        "side": side,
-                        "entry_price": round(entry, 2),
-                        "exit_price": round(current_price, 2),
-                        "pnl": round(pnl, 4),
-                        "pnl_pct": round(pnl_pct * 100, 4),
-                        "equity": round(equity, 4),
-                        "ai_score": ai_score,
-                        "confidence": confidence,
-                        "final_signal": final_signal,
-                        "trade_plan": trade_plan,
-                    }
-                )
-                position = None
-
-    total_trades = len(trades_log)
-    wins = sum(1 for t in trades_log if _safe_float(t.get("pnl", 0.0)) > 0)
-    losses = total_trades - wins
-    win_rate = (wins / total_trades * 100.0) if total_trades else 0.0
-    total_return = (equity - capital) / capital * 100.0
-    sharpe = _compute_sharpe(returns)
-
+    bt = BacktestEngine(config=BacktestConfig(initial_balance=capital), learning_engine=LEARNING_ENGINE)
+    result = bt.run_backtest(ohlcv_all, initial_balance=capital)
     summary = {
         "symbol": symbol,
         "timeframe": timeframe,
         "candles_analysed": len(ohlcv_all),
         "initial_capital": capital,
-        "final_equity": round(equity, 2),
-        "total_return_pct": round(total_return, 4),
-        "total_trades": total_trades,
-        "wins": wins,
-        "losses": losses,
-        "win_rate_pct": round(win_rate, 2),
-        "max_drawdown_pct": round(max_drawdown * 100, 4),
-        "sharpe_ratio": round(sharpe, 4),
-        "trades": trades_log,
+        "final_equity": round(capital + _safe_float(result.get("pnl", 0.0)), 2),
+        "total_return_pct": round((_safe_float(result.get("pnl", 0.0)) / max(capital, 1e-9)) * 100.0, 4),
+        "total_trades": int(result.get("total_trades", 0)),
+        "win_rate_pct": round(_safe_float(result.get("win_rate", 0.0)) * 100.0, 2),
+        "max_drawdown_pct": round(_safe_float(result.get("max_drawdown", 0.0)) * 100.0, 4),
+        "sharpe_ratio": round(_safe_float(result.get("sharpe", 0.0)), 4),
+        "trades": result.get("trade_log", []),
     }
     with open(BACKTEST_RESULT_PATH, "w") as f:
         json.dump(summary, f, indent=2)
     logger.info("=== BACKTEST COMPLETE ===")
-    logger.info(
-        "Trades: %d | Win rate: %.2f%% | Return: %.2f%% | Max DD: %.2f%% | Sharpe: %.3f",
-        total_trades,
-        win_rate,
-        total_return,
-        max_drawdown * 100,
-        sharpe,
-    )
     return summary
 
 

@@ -320,6 +320,7 @@ class OrchestratorConfig:
     signal_weights: Dict[str, float]
     regime_alignment: Dict[str, Dict[str, float]] = field(default_factory=dict)
     signal_ttl_seconds: float = 2.0
+    pipeline_latency_buffer_ms: float = 250.0
     action_threshold: float = 0.6
     score_deadband: float = 0.05
     min_liquidity_threshold: float = 0.2
@@ -375,6 +376,7 @@ class OrchestratorConfig:
                 _raw_ttl, _clamped_ttl,
             )
         object.__setattr__(self, "signal_ttl_seconds", _clamped_ttl)
+        object.__setattr__(self, "pipeline_latency_buffer_ms", max(0.0, float(self.pipeline_latency_buffer_ms)))
         object.__setattr__(self, "action_threshold", max(0.0, min(1.0, self.action_threshold)))
         object.__setattr__(self, "score_deadband", max(0.0, min(1.0, self.score_deadband)))
         object.__setattr__(self, "min_liquidity_threshold", max(0.0, min(1.0, self.min_liquidity_threshold)))
@@ -3205,10 +3207,19 @@ class AlphaOrchestrator:
                     )
                     continue
 
-                if age > self.config.signal_ttl_seconds:
+                effective_ttl = self.config.signal_ttl_seconds + (self.config.pipeline_latency_buffer_ms / 1000.0)
+                if age > effective_ttl:
                     metrics["stale"] += 1
-                    rejection_details.append({"source_id": src, "reason": "stale"})
+                    rejection_details.append({"source_id": src, "reason": "stale", "age": age, "ttl": effective_ttl})
                     continue
+                if age > self.config.signal_ttl_seconds:
+                    logger.warning(
+                        "Signal accepted inside latency buffer | source_id=%s age=%.3fs ttl=%.3fs buffer_ms=%.1f",
+                        src,
+                        age,
+                        self.config.signal_ttl_seconds,
+                        self.config.pipeline_latency_buffer_ms,
+                    )
 
                 try:
                     direction = int(direction_raw)

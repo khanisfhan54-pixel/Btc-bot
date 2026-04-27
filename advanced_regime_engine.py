@@ -12,7 +12,7 @@ except Exception:
     ObservabilityController = None
 from dataclasses import dataclass
 from typing import Dict, Any, List
-from collections import Counter, OrderedDict
+from collections import Counter, OrderedDict, deque
 import logging
 import time
 import warnings
@@ -1304,6 +1304,9 @@ class AdvancedRegimeEngine:
         self._REGIME_CONFIRMATION_TICKS = 2
         self._lock = threading.RLock()
         self._weights_loaded = False
+        self._calibration_status = "uncalibrated"
+        self._weights_checksum = ""
+        self._igarch_hard_limit = 1.05
         self._weight_path = os.environ.get("REGIME_WEIGHT_PATH", "weights/advanced_regime_weights.npz")
         self._regime_smoother = RegimeMarkovSmoother()
         self._regime_state_probs = np.ones(4, dtype=float) / 4.0
@@ -1327,6 +1330,7 @@ class AdvancedRegimeEngine:
         self._circuit_breaker_trigger_tick = -1
         self._healing_counter = 0
         self._last_healing_action = "NONE"
+        self._cb_trigger_history: "deque[tuple[float, str, float]]" = deque(maxlen=50)
         self._last_healing_error = None
         self._last_healing_context = {}
         self._healing_count = 0
@@ -1809,7 +1813,7 @@ class AdvancedRegimeEngine:
         if first_ts is not None and current_ts is not None:
             elapsed = max(float(current_ts) - float(first_ts), 0.0)
             time_progress = float(np.clip(elapsed / max(float(self._shock_warmup_seconds), 1.0), 0.0, 1.0))
-        return max(tick_progress, time_progress)
+        return min(tick_progress, time_progress)
 
     def _shock_threshold(self, baseline_vol: float, current_ts: float | None) -> tuple[float, float]:
         warmup = self._warmup_progress(current_ts)
@@ -2030,29 +2034,44 @@ class AdvancedRegimeEngine:
         if not weights:
             LOGGER.critical("[REGIME] No trained weights found — regime outputs are UNTRUSTED. Run calibration pipeline before live deployment.")
             self._weights_loaded = False
+            self._calibration_status = "missing"
             return
         try:
-            if "nhhmm_beta" in weights and "nhhmm_mu" in weights and "nhhmm_sigma" in weights:
-                self.nhhmm.load_weights(np.asarray(weights["nhhmm_beta"]), np.asarray(weights["nhhmm_mu"]), np.asarray(weights["nhhmm_sigma"]))
-            if "sjm_centroids" in weights:
-                means = np.asarray(weights["sjm_centroids"], dtype=float)
-                if means.ndim != 2 or means.shape[1] != self.n_features:
-                    raise ValueError(
-                        f"invalid sjm_centroids shape={means.shape}; expected (*, {self.n_features})"
-                    )
-                raw_w = weights.get("sjm_feature_weights", np.ones(means.shape[1], dtype=float))
-                w = np.asarray(raw_w, dtype=float).reshape(-1)
-                if w.shape[0] != means.shape[1]:
-                    raise ValueError(
-                        f"invalid sjm_feature_weights shape={w.shape}; expected ({means.shape[1]},)"
-                    )
-                if not np.all(np.isfinite(w)) or float(np.sum(np.abs(w))) <= 0.0:
-                    raise ValueError("sjm_feature_weights must be finite and non-zero")
-                self.sjm.load_weights(means, w)
+            canonical_blob = json.dumps({k: np.asarray(v).tolist() for k, v in weights.items()}, sort_keys=True, separators=(",", ":"))
+            self._weights_checksum = hashlib.sha256(canonical_blob.encode("utf-8")).hexdigest()
+
+            required = ("nhhmm_beta", "nhhmm_mu", "nhhmm_sigma", "sjm_centroids")
+            missing = [k for k in required if k not in weights]
+            if missing:
+                raise ValueError(f"missing_weight_keys:{missing}")
+
+            beta = np.asarray(weights["nhhmm_beta"], dtype=float)
+            mu = np.asarray(weights["nhhmm_mu"], dtype=float)
+            sigma = np.asarray(weights["nhhmm_sigma"], dtype=float)
+            if beta.ndim != 2 or mu.ndim != 2 or sigma.ndim != 3:
+                raise ValueError("invalid_nhhmm_weight_shapes")
+            self.nhhmm.load_weights(beta, mu, sigma)
+
+            means = np.asarray(weights["sjm_centroids"], dtype=float)
+            if means.ndim != 2 or means.shape[1] != self.n_features:
+                raise ValueError(
+                    f"invalid sjm_centroids shape={means.shape}; expected (*, {self.n_features})"
+                )
+            raw_w = weights.get("sjm_feature_weights", np.ones(means.shape[1], dtype=float))
+            w = np.asarray(raw_w, dtype=float).reshape(-1)
+            if w.shape[0] != means.shape[1]:
+                raise ValueError(
+                    f"invalid sjm_feature_weights shape={w.shape}; expected ({means.shape[1]},)"
+                )
+            if not np.all(np.isfinite(w)) or float(np.sum(np.abs(w))) <= 0.0:
+                raise ValueError("sjm_feature_weights must be finite and non-zero")
+            self.sjm.load_weights(means, w)
             self._weights_loaded = True
+            self._calibration_status = "calibrated"
         except Exception:
             LOGGER.critical("[REGIME] Failed to load trained weights", exc_info=True)
             self._weights_loaded = False
+            self._calibration_status = "invalid"
 
     @staticmethod
     def _snapshot_emitter_loop(
@@ -2089,10 +2108,10 @@ class AdvancedRegimeEngine:
                     continue
                 with engine._lock:
                     materialized_payload = engine._materialize_snapshot_payload(snapshot_payload)
-                hash_payload = dict(materialized_payload)
-                hash_payload.pop("state_hash", None)
-                hash_payload.pop("_checksum", None)
-                materialized_payload["state_hash"] = engine._state_hash(hash_payload)
+                    hash_payload = dict(materialized_payload)
+                    hash_payload.pop("state_hash", None)
+                    hash_payload.pop("_checksum", None)
+                    materialized_payload["state_hash"] = engine._state_hash(hash_payload)
                 replay_engine.snapshot(materialized_payload)
             except Exception as exc:
                 engine._snapshot_backend_failure_count = int(
@@ -2602,6 +2621,7 @@ class AdvancedRegimeEngine:
             "circuit_breaker_active": bool(self._circuit_breaker_active),
             "circuit_breaker_reason": self._circuit_breaker_reason,
             "circuit_breaker_trigger_tick": int(getattr(self, "_circuit_breaker_trigger_tick", -1)),
+            "cb_trigger_history": list(getattr(self, "_cb_trigger_history", [])),
             "equity": float(self._equity),
             "equity_peak": float(self._equity_peak),
             "drawdown": float(self._drawdown),
@@ -2760,6 +2780,7 @@ class AdvancedRegimeEngine:
         self._circuit_breaker_trigger_tick = -1
         self._healing_counter = 0
         self._last_healing_action = "NONE"
+        self._cb_trigger_history: "deque[tuple[float, str, float]]" = deque(maxlen=50)
         self._last_healing_error = None
         self._last_healing_context = {}
         self._healing_count = 0
@@ -3404,6 +3425,16 @@ class AdvancedRegimeEngine:
                     self._replay_record("update_end", {"regime": "HALTED"})
                 return output
 
+        max_persistence = float(np.max(np.asarray(self.garch.alpha) + np.asarray(self.garch.beta_garch)))
+        if bool(self._allow_igarch) and max_persistence >= 1.0:
+            LOGGER.critical("[IGARCH] Non-stationary persistence detected alpha+beta=%.4f; blocking trading", max_persistence)
+            out = _build_halted_output()
+            out["execution_mode"] = "halt_igarch"
+            out["signal_valid"] = False
+            out["feed_status"] = "HALT_IGARCH_NON_STATIONARY"
+            _observe_latency()
+            return out
+
         mtf_data = market_data.get("mtf", None)
         canonical_ok, canonical_return, canonical_source = self._resolve_canonical_return(market_data, mtf_data)
         if not canonical_ok:
@@ -3755,6 +3786,7 @@ class AdvancedRegimeEngine:
                     continue
                 candidate_tfs.append((tf, tf_data, weight))
 
+            rolling_prior = np.asarray(self.nhhmm_prior, dtype=float).copy()
             for tf, tf_data, weight in candidate_tfs:
                 y_raw = tf_data.get("return", 0.0)
                 try:
@@ -3780,8 +3812,9 @@ class AdvancedRegimeEngine:
                 # Expected data/math failures are isolated per timeframe.
                 try:
                     nhhmm_post_tf, _ = self.nhhmm.forward_pass_step(
-                        y_t_tf, x_t_tf, self.nhhmm_prior
+                        y_t_tf, x_t_tf, rolling_prior
                     )
+                    rolling_prior = _normalize_prob_vector(nhhmm_post_tf)
                 except Exception as e:
                     self._warn_tf_failure(tf, e)
                     mtf_degradation_reasons["forward_pass_failure"] += 1
@@ -3792,6 +3825,8 @@ class AdvancedRegimeEngine:
                 valid_tf_count += 1
 
             total_candidate_tfs = len(candidate_tfs)
+            if candidate_tfs:
+                self.nhhmm_prior = np.asarray(rolling_prior, dtype=float).copy()
 
             if total_candidate_tfs > 0 and valid_tf_count < total_candidate_tfs:
                 mtf_partial_survival = True
@@ -4298,11 +4333,6 @@ class AdvancedRegimeEngine:
             "prev_directional_label_runtime",
         )
         regime = regime_scores["regime"]
-        if getattr(self, "_regime_smoother", None) is not None:
-            regime, self._regime_state_probs = self._regime_smoother.update(
-                regime_scores,
-                self._confirmed_regime,
-            )
         directional_recovery_label = None
         if regime == "RANGE":
             directional_recovery = (
@@ -4468,6 +4498,13 @@ class AdvancedRegimeEngine:
                     confirmed_regime = prev_regime_snapshot
                     confirmed_regime_idx = self._confirmed_regime_idx
                     regime_changed = False
+
+        if getattr(self, "_regime_smoother", None) is not None:
+            regime, self._regime_state_probs = self._regime_smoother.update(
+                regime_scores,
+                confirmed_regime,
+            )
+            assert confirmed_regime == self._validate_regime_label(confirmed_regime, "confirmed_regime_for_smoother")
 
         self._prev_raw_regime = regime
         self._confirmed_regime = confirmed_regime
@@ -5069,29 +5106,29 @@ class AdvancedRegimeEngine:
     # ==========================================
     def _trigger_circuit_breaker(self, reason: str):
         current_tick = int(getattr(self, "_tick_id", -1))
+        reason_text = str(reason)
+        trigger_value = float(getattr(self, "_drawdown", 0.0))
+        self._cb_trigger_history.append((time.time(), reason_text, trigger_value))
+        self._circuit_breaker_reason = reason_text
         if self._circuit_breaker_active:
-            if self._circuit_breaker_reason is None:
-                self._circuit_breaker_reason = str(reason)
             return
         if int(getattr(self, "_circuit_breaker_trigger_tick", -1)) == current_tick:
             return
         self._circuit_breaker_active = True
-        self._circuit_breaker_reason = str(reason)
         self._circuit_breaker_trigger_tick = current_tick
         self._healing_counter = 0
         if not getattr(self, "_is_replay", False):
-            self._replay_record("circuit_breaker", {"reason": reason})
+            self._replay_record("circuit_breaker", {"reason": reason_text})
 
         try:
             if not getattr(self, "_is_replay", False):
-                LOGGER.critical(f"[CIRCUIT BREAKER TRIGGERED] Reason={reason}")
+                LOGGER.critical(f"[CIRCUIT BREAKER TRIGGERED] Reason={reason_text}")
         except Exception:
             self._warn_rate_limited("circuit_breaker_log_failure", "Circuit breaker logging failed", cooldown_s=30.0)
 
     # ==========================================
     # 🔄 SELF HEALING SYSTEM
     # ==========================================
-    @_synchronized
     def _self_heal(
         self,
         error_code: str | None = None,
@@ -5101,9 +5138,11 @@ class AdvancedRegimeEngine:
         """
         Best-effort healing.
 
+        Internal-only helper: must be called while holding self._lock (typically from update()).
         - Called without an error_code: preserves existing circuit-breaker recovery behavior.
         - Called with an error_code: applies category-aware recovery action.
         """
+        assert self._lock._is_owned(), "_self_heal must be invoked while holding self._lock"
         self._healing_count = int(getattr(self, "_healing_count", 0)) + 1
         self._last_healing_error = error_code
         self._last_healing_context = dict(context or {})
