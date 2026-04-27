@@ -295,6 +295,17 @@ class LiquiditySweepAlpha:
         self.hawkes_alpha = 0.1 
         self._lock = threading.RLock()
 
+    @staticmethod
+    def _normalize_timestamp(ts: float, fallback: float = 0.0) -> float:
+        value = _safe_float(ts, fallback)
+        if value > 1e15:
+            value *= 1e-9
+        elif value > 1e12:
+            value *= 1e-3
+        if not math.isfinite(value):
+            return _safe_float(fallback, 0.0)
+        return max(0.0, value)
+
     def _normalize_thresholds(self, atr: float, price: float) -> Dict[str, float]:
         """
         Dynamic threshold scaling based on volatility regime.
@@ -324,13 +335,7 @@ class LiquiditySweepAlpha:
                     self.liquidity_pools['low'] = min(valid_lows)
 
     def _update_hawkes(self, timestamp: float, trade_count: int) -> float:
-        # sanitize inputs + protect against timestamp unit mismatches (s vs ms/ns)
-        ts = _safe_float(timestamp, self.last_trade_time)
-        # order matters: ns (~1e18) must be handled before ms (~1e12-1e13)
-        if ts > 1e15:      # likely ns
-            ts *= 1e-9
-        elif ts > 1e12:    # likely ms
-            ts *= 1e-3
+        ts = self._normalize_timestamp(timestamp, self.last_trade_time)
         # if initialization wall-clock is far from feed epoch, realign baseline once
         if abs(ts - self.last_trade_time) > 3600.0 and not self.hawkes_history:
             self.last_trade_time = ts
@@ -384,16 +389,11 @@ class LiquiditySweepAlpha:
         if not _is_finite(ofi_total):
             return 0.0
 
+        old_ofi = self.ofi_history[0] if len(self.ofi_history) == self.history_window else 0.0
         self.ofi_history.append(ofi_total)
         self.short_ofi.append(ofi_total)
-
-        finite_hist = [v for v in self.ofi_history if _is_finite(v)]
-        if not finite_hist:
-            self.ofi_sum = 0.0
-            self.ofi_sq_sum = 0.0
-            return 0.0
-        self.ofi_sum = float(sum(finite_hist))
-        self.ofi_sq_sum = float(sum(v * v for v in finite_hist))
+        self.ofi_sum += float(ofi_total - old_ofi)
+        self.ofi_sq_sum += float((ofi_total * ofi_total) - (old_ofi * old_ofi))
 
         if len(self.ofi_history) < 20:
             return 0.0
@@ -740,13 +740,9 @@ class LiquiditySweepAlpha:
             # Use data-timestamp inter-tick gap (not wall clock) for backtest fidelity
             # ATOMIC TIME READ + UPDATE (fix race condition)
             with self._time_lock:
-                current_time = _safe_float(md.get("timestamp", self.last_trade_time))
-                if not math.isfinite(current_time):
-                    current_time = self.last_trade_time
-
+                current_time = self._normalize_timestamp(md.get("timestamp", self.last_trade_time), self.last_trade_time)
                 if current_time <= self.last_trade_time:
                     current_time = self.last_trade_time
-
                 raw_gap = current_time - self.last_trade_time
                 if not math.isfinite(raw_gap):
                     raw_gap = 0.0

@@ -299,6 +299,7 @@ _last_regime_context: Dict[str, Any] = {"regime": "UNKNOWN", "confidence": 0.0, 
 _prev_close: Optional[float] = None
 _last_valid_features: Optional[dict] = None
 _last_valid_features_ts: float = 0.0
+_ANALYSIS_STATE_LOCK = threading.Lock()
 regime_engine = None
 if AdvancedRegimeEngine is not None:
     try:
@@ -308,7 +309,14 @@ if AdvancedRegimeEngine is not None:
         regime_engine = None
 alpha_predictor = LiquiditySweepAlpha() if LiquiditySweepAlpha is not None else None
 try:
-    from alpha_orchestrator import AlphaOrchestrator, OrchestratorConfig
+    from alpha_orchestrator import (
+        AlphaOrchestrator,
+        OrchestratorConfig,
+        AlphaSignal,
+        RegimeContext,
+        FeatureQuality,
+        ExecutionState,
+    )
 except Exception as _ao_exc:
     logger.critical("alpha_orchestrator import failed: %s", _ao_exc)
     raise
@@ -1361,7 +1369,7 @@ def _format_execution_message(
 ) -> str:
     cid = (correlation_id or "")[:12]
     if _reconciliation_blocks.get(SYMBOL, 0.0) > time.time():
-        return {"executed": False, "reason": "reconciliation_block_active", "correlation_id": correlation_id or ""}
+        return f"{title}\nCID: {cid or 'n/a'}\nStatus: reconciliation_block_active"
     lines = [title]
     lines.append(f"CID: {cid or 'n/a'}")
     lines.append(f"Side: {signal}")
@@ -1616,13 +1624,15 @@ def run_analysis_cycle(
         )
 
     log_return: Optional[float] = None
-    if _prev_close is not None and _prev_close > 0.0 and current_price > 0.0:
-        raw_lr = float(np.log(current_price / _prev_close))
-        if np.isfinite(raw_lr):
-            log_return = raw_lr
-        else:
-            logger.warning("[REGIME] log_return is non-finite (prev=%.4f, curr=%.4f) — skipping regime update this tick", _prev_close, current_price)
-    _prev_close = current_price
+    with _ANALYSIS_STATE_LOCK:
+        prev_close_local = _prev_close
+        if prev_close_local is not None and prev_close_local > 0.0 and current_price > 0.0:
+            raw_lr = float(np.log(current_price / prev_close_local))
+            if np.isfinite(raw_lr):
+                log_return = raw_lr
+            else:
+                logger.warning("[REGIME] log_return is non-finite (prev=%.4f, curr=%.4f) — skipping regime update this tick", prev_close_local, current_price)
+        _prev_close = current_price
 
     open_interest = _fetch_open_interest(exchange)
     funding_rate = _fetch_funding_rate(exchange)
@@ -1657,29 +1667,41 @@ def run_analysis_cycle(
     )
 
     # Base features + advanced regime context (signal-only safe path)
-    regime_context: Dict[str, Any] = dict(_last_regime_context)
+    with _ANALYSIS_STATE_LOCK:
+        regime_context: Dict[str, Any] = dict(_last_regime_context)
     update_freq = _safe_float(SIGNAL_PIPELINE_CONFIG.get("regime_update_frequency_sec", 1.0), 1.0)
     if update_freq <= 0:
         update_freq = 1.0
     now_ts = time.time()
+    with _ANALYSIS_STATE_LOCK:
+        last_regime_update_ts = float(_last_regime_update_ts)
     should_update_regime = (
         bool(SIGNAL_PIPELINE_CONFIG.get("enable_regime_engine", True))
         and regime_engine is not None
-        and (now_ts - _last_regime_update_ts >= update_freq)
+        and (now_ts - last_regime_update_ts >= update_freq)
     )
+    regime_fail_closed = False
+    regime_failure_reason = ""
     if should_update_regime:
         try:
             if log_return is None:
                 logger.info("[REGIME] Skipping regime update on first tick (no prev_close yet)")
                 reg_out = {}
             else:
-                feature_vector = np.array([
-                    float(feat_dict.get("imbalance", 0.0)) if "feat_dict" in locals() else 0.0,
-                    float(feat_dict.get("bid_vol", 0.0)) if "feat_dict" in locals() else 0.0,
-                    float(feat_dict.get("ask_vol", 0.0)) if "feat_dict" in locals() else 0.0,
-                    float(feat_dict.get("trade_count", 0.0)) if "feat_dict" in locals() else 0.0,
-                ], dtype=float)
-                feature_vector = np.where(np.isfinite(feature_vector), feature_vector, 0.0)
+                top_bid_depth = sum(_safe_float(b[1]) for b in (orderbook.get("bids") or [])[:10])
+                top_ask_depth = sum(_safe_float(a[1]) for a in (orderbook.get("asks") or [])[:10])
+                trade_volume = sum(
+                    _safe_float(t.get("amount", 0.0)) * _safe_float(t.get("price", current_price))
+                    for t in (trades or [])
+                )
+                total_depth = top_bid_depth + top_ask_depth
+                imbalance = 0.0 if total_depth <= 0.0 else (top_bid_depth - top_ask_depth) / total_depth
+                feature_vector = np.asarray([imbalance, top_bid_depth, trade_volume], dtype=float)
+                expected_n = int(getattr(regime_engine, "n_features", feature_vector.shape[0]))
+                if feature_vector.shape != (expected_n,):
+                    raise ValueError(f"regime_feature_dim_mismatch:{feature_vector.shape} expected ({expected_n},)")
+                if not np.all(np.isfinite(feature_vector)):
+                    raise ValueError(f"regime_feature_non_finite:{feature_vector}")
                 regime_input = {
                     "return": log_return,
                     "features": feature_vector,
@@ -1690,6 +1712,9 @@ def run_analysis_cycle(
                     "funding_rate": float(funding_rate) if np.isfinite(float(funding_rate)) else 0.0,
                 }
                 reg_out = regime_engine.update(regime_input) or {}
+                if not bool(reg_out.get("signal_valid", True)):
+                    regime_fail_closed = True
+                    regime_failure_reason = str(reg_out.get("feed_status", "regime_invalid"))
             r_metrics = reg_out.get("risk_metrics", {}) if isinstance(reg_out, dict) else {}
             if not isinstance(r_metrics, dict):
                 r_metrics = {}
@@ -1709,13 +1734,18 @@ def run_analysis_cycle(
                     "feed_status": str(r_metrics.get("feed_status", "unknown")),
                 },
             }
-            _last_regime_context = dict(regime_context)
-            _last_regime_update_ts = now_ts
-            _regime_context_timestamp = time.time()
+            with _ANALYSIS_STATE_LOCK:
+                _last_regime_context = dict(regime_context)
+                _last_regime_update_ts = now_ts
+                _regime_context_timestamp = time.time()
         except Exception as _re_exc:
-            logger.warning("[REGIME] update failed, keeping prior context: %s", _re_exc)
-            regime_context = dict(_last_regime_context)
-            staleness = time.time() - _regime_context_timestamp
+            regime_fail_closed = True
+            regime_failure_reason = str(_re_exc)
+            logger.error("[REGIME] update failed, entering fail-closed mode: %s", _re_exc, exc_info=True)
+            with _ANALYSIS_STATE_LOCK:
+                regime_context = dict(_last_regime_context)
+                regime_ts = _regime_context_timestamp
+            staleness = time.time() - regime_ts
             if staleness > MAX_REGIME_STALENESS_SECONDS:
                 logger.critical("[REGIME] Context is %.0fs stale (limit %.0fs) — forcing STALE_FALLBACK HALT. No new trades will be opened.", staleness, MAX_REGIME_STALENESS_SECONDS)
                 regime_context = {"regime": "STALE_FALLBACK", "confidence": 0.0, "position_size": 0.0, "signal_valid": False, "execution_mode": "halt", "features": {}}
@@ -1727,13 +1757,15 @@ def run_analysis_cycle(
             "timestamp": time.time(),
         }
         features = feature_engine.update(snapshot, trades, regime_context=regime_context)
-        _last_valid_features = dict(features)
-        _last_valid_features_ts = time.time()
+        with _ANALYSIS_STATE_LOCK:
+            _last_valid_features = dict(features)
+            _last_valid_features_ts = time.time()
     except TypeError:
         try:
             features = feature_engine.update(snapshot, trades)
-            _last_valid_features = dict(features)
-            _last_valid_features_ts = time.time()
+            with _ANALYSIS_STATE_LOCK:
+                _last_valid_features = dict(features)
+                _last_valid_features_ts = time.time()
         except Exception as _fe_exc:
             logger.warning("[FEATURE] Feature engine failed: %s", _fe_exc, exc_info=True)
             features = None
@@ -1742,12 +1774,15 @@ def run_analysis_cycle(
         features = None
 
     if features is None:
-        feature_staleness = time.time() - _last_valid_features_ts
-        if _last_valid_features is None or feature_staleness > MAX_FEATURE_STALENESS_SECONDS:
+        with _ANALYSIS_STATE_LOCK:
+            last_valid_features = dict(_last_valid_features) if isinstance(_last_valid_features, dict) else None
+            last_valid_features_ts = _last_valid_features_ts
+        feature_staleness = time.time() - last_valid_features_ts
+        if last_valid_features is None or feature_staleness > MAX_FEATURE_STALENESS_SECONDS:
             logger.warning("[FEATURE] No valid features available (staleness=%.1fs, limit=%.1fs) — skipping signal generation", feature_staleness, MAX_FEATURE_STALENESS_SECONDS)
             return {"signal_output": {"signal": "HOLD", "confidence": 0.0, "reason": "no_features"}}
         logger.warning("[FEATURE] Using stale features (%.1fs old) after engine failure", feature_staleness)
-        features = dict(_last_valid_features)
+        features = dict(last_valid_features)
     features = fill_model.enrich(features)
     features = tox_filter.enrich(features)
 
@@ -1878,6 +1913,15 @@ def run_analysis_cycle(
             ),
         }
         logger.info("[SIGNAL_ONLY] %s", signal_payload)
+        log_trade({
+            "timestamp": signal_payload["timestamp"],
+            "symbol": SYMBOL,
+            "signal": signal_value,
+            "confidence": signal_payload["confidence"],
+            "execution_skipped": True,
+            "reason": "signal_only_mode",
+            "regime": signal_payload["regime"],
+        })
         return {
             "signal_output": signal_payload,
             "predictor_output": _sanitize_dict({
@@ -1899,6 +1943,10 @@ def run_analysis_cycle(
 
     # Regime / lifecycle
     lifecycle = trade_lifecycle.update(current_price, feat_dict)
+    if regime_fail_closed or str(regime_context.get("regime", "")).upper() in ("HALTED", "STALE_FALLBACK", "UNCALIBRATED"):
+        lifecycle["block_new_entries"] = True
+        lifecycle["reason"] = f"regime_blocked:{regime_failure_reason or regime_context.get('regime','unknown')}"
+        feat_dict["allow_trade"] = False
     session_guard = trade_lifecycle.session_guard() or {}
     if session_guard.get("block_new_entries"):
         lifecycle["block_new_entries"] = True
@@ -2188,19 +2236,72 @@ def run_analysis_cycle(
 
     institutional = engines_out.get("composite", {}) or {}
 
-    assert len(feat_dict.get("candles", [])) > 0, "Candles must be non-empty before calling signal_engine"
+    if len(feat_dict.get("candles", [])) == 0:
+        logger.error("[SIGNAL_ENGINE] missing candles in features payload; forcing HOLD")
+        feat_dict["candles"] = candles_by_tf.get("1m", [])[-60:]
     try:
         signal_output = signal_engine.generate(feat_dict)
     except Exception as _signal_exc:
         logger.warning("[SIGNAL_ENGINE] generate failed, forcing HOLD: %s", _signal_exc)
         signal_output = {"signal": "HOLD", "confidence": 0.0, "reason": f"signal_error:{_signal_exc}"}
     result["signal_engine_output"] = signal_output
+    direction_map = {"LONG": 1, "BUY": 1, "SHORT": -1, "SELL": -1, "HOLD": 0, "NEUTRAL": 0}
+    sig_dir = direction_map.get(str(signal_output.get("signal", "HOLD")).upper(), 0)
+    alpha_signals = [
+        AlphaSignal(
+            source_id="signal_engine",
+            direction=sig_dir,
+            conviction=_clamp(_safe_float(signal_output.get("confidence", 0.0), 0.0), 0.0, 1.0),
+            expected_edge_bps=abs(10.0 * sig_dir),
+            timestamp=now_ts if now_ts > 0 else time.time(),
+            timeframe="1m",
+            correlation_group_id="directional",
+        )
+    ]
+    feature_quality = FeatureQuality(
+        staleness_ratio=_clamp(_safe_float(feat_dict.get("staleness_ratio", 0.0), 0.0), 0.0, 1.0),
+        missing_data_ratio=_clamp(_safe_float(feat_dict.get("missing_data_ratio", 0.0), 0.0), 0.0, 1.0),
+    )
+    regime_for_orch = RegimeContext(
+        regime_name=str(regime_context.get("regime", "unknown")).lower(),
+        volatility_score=_clamp(_safe_float(feat_dict.get("volatility_score", 0.2), 0.2), 0.0, 1.0),
+        liquidity_score=_clamp(_safe_float(feat_dict.get("liquidity_score", 0.8), 0.8), 0.0, 1.0),
+    )
+    exec_state = ExecutionState(
+        current_exposure_usd=0.0,
+        max_exposure_usd=max(_safe_float(engine.get_balance(), 0.0), 1.0),
+        current_drawdown_pct=_clamp(_safe_float(lifecycle.get("drawdown", 0.0), 0.0), 0.0, 1.0),
+    )
     try:
-        fused_signal = alpha_orchestrator.orchestrate(signal_output, regime_context, engines_out.get("alpha", {}))
+        fused_signal = alpha_orchestrator.orchestrate(
+            alpha_signals,
+            regime_for_orch,
+            feature_quality,
+            exec_state,
+            current_time=now_ts,
+        )
     except Exception as _orch_exc:
-        logger.warning("[ORCHESTRATOR] orchestrate failed, using raw signal: %s", _orch_exc, exc_info=True)
-        fused_signal = signal_output
-    signal_output = fused_signal if isinstance(fused_signal, dict) else signal_output
+        logger.error("[ORCHESTRATOR] orchestrate failed; fail-closed HOLD: %s", _orch_exc, exc_info=True)
+        lifecycle["block_new_entries"] = True
+        lifecycle["reason"] = f"orchestrator_failure:{_orch_exc}"
+        feat_dict["allow_trade"] = False
+        signal_output = {
+            "signal": "HOLD",
+            "confidence": 0.0,
+            "reason": "orchestrator_failure",
+            "meta": {
+                "failure_mode": "orchestrator_exception",
+                "failure_detail": str(_orch_exc),
+                "execution_blocked": True,
+            },
+        }
+    else:
+        signal_output = {
+            "signal": {1: "LONG", -1: "SHORT", 0: "HOLD"}.get(int(fused_signal.action.value), "HOLD"),
+            "confidence": _clamp(_safe_float(getattr(fused_signal, "net_conviction", 0.0), 0.0), 0.0, 1.0),
+            "reason": str((fused_signal.meta_info or {}).get("rationale", "orchestrated")),
+            "meta": fused_signal.meta_info or {},
+        }
     logger.info("[SIGNAL] %s", signal_output)
 
     learning_params: Dict[str, Any] = {}
@@ -2292,10 +2393,9 @@ def run_analysis_cycle(
 
     risk_scale = _safe_float(lifecycle.get("risk_scale", 1.0))
     regime_scale = _safe_float(feat_dict.get("position_scale", 1.0))
-    meta_scale = _safe_float(meta_result.get("risk_scale", 1.0))
     if decision.get("position_size", 0.0):
         decision["position_size"] = (
-            _safe_float(decision["position_size"]) * risk_scale * regime_scale * meta_scale
+            _safe_float(decision["position_size"]) * risk_scale * regime_scale
         )
 
     # ── Execution-quality position sizing and trade blocking ──────────
@@ -2418,12 +2518,13 @@ def run_analysis_cycle(
         "reason": "not_applied",
     }
     if decision.get("execute", False) and normalized_signal in ("LONG", "SHORT"):
+        signal_conf_for_alloc = _clamp(_safe_float(signal_output.get("confidence", confidence), 0.0), 0.0, 1.0)
+        alloc_regime = {"regime": str(regime_context.get("regime", "UNKNOWN")).upper()}
         capital_decision = capital_allocator.allocate(
-            learning_params=learning_params,
-            meta_result=meta_result,
-            features=feat_dict,
-            current_drawdown=_safe_float(lifecycle.get("drawdown", 0.0)),
-            account_equity=balance,
+            signal_confidence=signal_conf_for_alloc,
+            regime_context=alloc_regime,
+            current_equity=balance,
+            max_risk_pct=BACKTEST_RISK_PCT,
         )
 
         if not capital_decision.get("allow_trading", True):
@@ -2458,12 +2559,13 @@ def run_analysis_cycle(
         logger.warning("[SAFETY] forcing HOLD because execute=False after finalization")
         normalized_signal = "HOLD"
 
-    try:
-        assert final_position_size >= 0
-        if decision.get("execute") is False:
-            assert normalized_signal == "HOLD"
-    except AssertionError as _assert_err:
-        logger.warning("[SAFETY] finalization assertion failed: %s", _assert_err)
+    if final_position_size < 0:
+        logger.error("[SAFETY] invalid negative final_position_size %.6f; forcing to zero", final_position_size)
+        final_position_size = 0.0
+        decision["position_size"] = 0.0
+    if decision.get("execute") is False and normalized_signal != "HOLD":
+        logger.warning("[SAFETY] forcing HOLD to keep execute=False contract")
+        normalized_signal = "HOLD"
 
     final_decision = decision.copy()
     final_decision["position_size"] = final_position_size
@@ -2948,7 +3050,7 @@ def run_backtest(
         trade_plan = None
         if final_signal != "HOLD":
             trade_plan = build_trade_plan(
-                price=current_price,
+                price=entry_price,
                 direction=execution_direction,
                 liquidity_map=liquidity_map,
             )

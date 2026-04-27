@@ -4,6 +4,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 from typing import Dict
 
 LOGGER = logging.getLogger(__name__)
@@ -15,6 +16,7 @@ class TradeLifecycleManager:
         self.cooldown_seconds = float(os.environ.get("TRADE_COOLDOWN_SECONDS", "300"))
         self._lock = threading.Lock()
         self._last_trade_time: Dict[str, float] = {}
+        self._active_correlation_id: Dict[str, str] = {}
         self._open_trade_count = 0
 
     def can_open_new_trade(self, symbol: str | dict, regime_context: dict | None = None) -> bool:
@@ -38,11 +40,13 @@ class TradeLifecycleManager:
     def on_trade_opened(self, symbol: str) -> None:
         with self._lock:
             self._open_trade_count += 1
+            self._active_correlation_id[symbol] = uuid.uuid4().hex
 
     def on_trade_closed(self, symbol: str) -> None:
         with self._lock:
             self._open_trade_count = max(0, self._open_trade_count - 1)
             self._last_trade_time[symbol] = time.time()
+            self._active_correlation_id.pop(symbol, None)
 
     # compatibility hooks
     def update(self, price: float, features: dict) -> dict:
@@ -53,7 +57,8 @@ class TradeLifecycleManager:
         return {"action": "ALLOW", "block_new_entries": False}
 
     def get_correlation_id(self) -> str:
-        return ""
+        with self._lock:
+            return self._active_correlation_id.get("BTC/USDT", "")
 
     def on_entry(self, **kwargs) -> None:
         self.on_trade_opened(str(kwargs.get("symbol", "BTC/USDT")))
