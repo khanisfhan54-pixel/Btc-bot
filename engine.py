@@ -22,6 +22,8 @@ import logging
 import math
 import numbers
 import os
+import copy
+import hashlib
 import statistics
 import sys
 import threading
@@ -39,6 +41,7 @@ _LIQUIDITY_SWEEP_ALPHA = LiquiditySweepAlpha()
 _ALPHA_STATE: Dict[str, Dict[str, Any]] = {}
 _ALPHA_STATE_LOCK = threading.Lock()
 _LIQUIDITY_UPDATE_LOCK = threading.RLock()
+_BACKTEST_CACHE_LOCK = threading.RLock()
 
 
 def _debug_import_integrity() -> None:
@@ -3376,26 +3379,46 @@ def run_all_engines(
     trades = trades or []
     price = _safe_float(price, 0.0)
     ohlcv_data = ohlcv if ohlcv is not None else recent_candles
-    _cache_key = None
-    if isinstance(recent_candles, (list, tuple)) and recent_candles:
-        last = recent_candles[-1]
-        if isinstance(last, (list, tuple)) and len(last) >= 5:
-            best_bid = _safe_float((orderbook.get("bids") or [[price]])[0][0], price)
-            best_ask = _safe_float((orderbook.get("asks") or [[price]])[0][0], price)
-            _cache_key = (
-                _safe_float(last[0], 0.0),
-                _safe_float(last[4], 0.0),
-                _safe_float(price, 0.0),
-                best_bid,
-                best_ask,
-                len(trades),
-            )
-            _cache = getattr(run_all_engines, "_backtest_cache", {})
-            cached = _cache.get(_cache_key)
-            if cached is not None:
-                run_all_engines._cache_hits = int(getattr(run_all_engines, "_cache_hits", 0)) + 1
-                return dict(cached)
-            run_all_engines._cache_misses = int(getattr(run_all_engines, "_cache_misses", 0)) + 1
+    _cache_key = _build_run_all_engines_cache_key(
+        orderbook=orderbook,
+        trades=trades,
+        price=price,
+        symbol=symbol,
+        recent_candles=recent_candles,
+        open_interest=open_interest,
+        funding_rate=funding_rate,
+        orderbook_snapshots=orderbook_snapshots,
+        liquidation_events=liquidation_events,
+        performance=performance,
+        volume_intelligence=volume_intelligence,
+        ohlcv=ohlcv,
+        oi_history=oi_history,
+        current_oi=current_oi,
+        market_state_detector=market_state_detector,
+    )
+    with _BACKTEST_CACHE_LOCK:
+        _cache = getattr(run_all_engines, "_backtest_cache", {})
+        if not isinstance(_cache, dict):
+            logger.warning("run_all_engines cache malformed (%s); resetting cache", type(_cache).__name__)
+            _cache = {}
+            run_all_engines._backtest_cache = _cache
+        cached = _cache.get(_cache_key)
+        if cached is not None:
+            if not isinstance(cached, dict):
+                logger.warning("run_all_engines cache entry malformed for key=%s; evicting", _cache_key)
+                _cache.pop(_cache_key, None)
+                cached = None
+            else:
+                try:
+                    cached = copy.deepcopy(cached)
+                except Exception as cache_exc:
+                    logger.warning("run_all_engines cache deepcopy failed for key=%s: %s; evicting", _cache_key, cache_exc)
+                    _cache.pop(_cache_key, None)
+                    cached = None
+        if cached is not None:
+            run_all_engines._cache_hits = int(getattr(run_all_engines, "_cache_hits", 0)) + 1
+            return cached
+        run_all_engines._cache_misses = int(getattr(run_all_engines, "_cache_misses", 0)) + 1
     try:
         fr = _safe_float(funding_rate, 0.0)
         if exchange is not None and symbol:
@@ -3948,13 +3971,19 @@ def run_all_engines(
             "composite": institutional,
         }
         if _cache_key is not None:
-            _cache = getattr(run_all_engines, "_backtest_cache", {})
-            if not isinstance(_cache, dict):
-                _cache = {}
-            _cache[_cache_key] = dict(_out)
-            if len(_cache) > 2048:
-                _cache.pop(next(iter(_cache)), None)
-            run_all_engines._backtest_cache = _cache
+            with _BACKTEST_CACHE_LOCK:
+                _cache = getattr(run_all_engines, "_backtest_cache", {})
+                if not isinstance(_cache, dict):
+                    logger.warning("run_all_engines cache malformed on write (%s); resetting cache", type(_cache).__name__)
+                    _cache = {}
+                try:
+                    _cache[_cache_key] = copy.deepcopy(_out)
+                except Exception as cache_exc:
+                    logger.warning("run_all_engines cache write deepcopy failed for key=%s: %s", _cache_key, cache_exc)
+                if len(_cache) > 2048:
+                    oldest_key = next(iter(_cache))
+                    _cache.pop(oldest_key, None)
+                run_all_engines._backtest_cache = _cache
         return _out
     except Exception as exc:
         logger.error("run_all_engines error: %s", exc)
@@ -5468,6 +5497,89 @@ def update_weights_from_outcome(trade_outcome: dict):
     return update_model_weights(trade_outcome)
 
 
+def _freeze_for_cache(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    if isinstance(value, float):
+        return round(value, 12) if math.isfinite(value) else str(value)
+    if isinstance(value, dict):
+        return {str(k): _freeze_for_cache(v) for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))}
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_for_cache(v) for v in value)
+    if isinstance(value, set):
+        normalized = [_freeze_for_cache(v) for v in value]
+        return tuple(sorted(normalized, key=lambda x: json.dumps(x, sort_keys=True, separators=(",", ":"), default=str)))
+    if hasattr(value, "__dict__"):
+        try:
+            return {
+                "__class__": value.__class__.__name__,
+                "__dict__": _freeze_for_cache(vars(value)),
+            }
+        except Exception:
+            pass
+    return {"__class__": value.__class__.__name__, "__repr__": repr(value), "__id__": id(value)}
+
+
+def _fingerprint_for_cache(value: Any) -> str:
+    frozen = _freeze_for_cache(value)
+    payload = json.dumps(frozen, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _market_state_detector_signature(detector: Any) -> str:
+    if detector is None:
+        return "none"
+    class_name = detector.__class__.__name__
+    try:
+        frozen_state = _freeze_for_cache(vars(detector))
+        payload = json.dumps(frozen_state, sort_keys=True, separators=(",", ":"), default=str)
+    except Exception:
+        return f"{class_name}:{repr(detector)}:{id(detector)}"
+    return f"{class_name}:{hashlib.sha256(payload.encode('utf-8')).hexdigest()}"
+
+
+def _build_run_all_engines_cache_key(
+    *,
+    orderbook: Optional[dict] = None,
+    trades: Optional[List[dict]] = None,
+    price: Optional[float] = None,
+    symbol: Optional[str] = None,
+    recent_candles: Any = None,
+    open_interest: float = 0.0,
+    funding_rate: Optional[float] = None,
+    orderbook_snapshots: Optional[List[dict]] = None,
+    liquidation_events: Optional[List[dict]] = None,
+    performance: Optional[dict] = None,
+    volume_intelligence: Optional[dict] = None,
+    ohlcv: Any = None,
+    oi_history: Optional[List[float]] = None,
+    current_oi: Optional[float] = None,
+    market_state_detector: Optional[Any] = None,
+) -> tuple:
+    local_orderbook = orderbook or {}
+    norm_price = _safe_float(price, 0.0)
+    best_bid = _safe_float((local_orderbook.get("bids") or [[norm_price]])[0][0], norm_price)
+    best_ask = _safe_float((local_orderbook.get("asks") or [[norm_price]])[0][0], norm_price)
+    return (
+        str(symbol or ""),
+        round(norm_price, 8),
+        round(best_bid, 8),
+        round(best_ask, 8),
+        _fingerprint_for_cache(recent_candles),
+        _fingerprint_for_cache(trades or []),
+        round(_safe_float(open_interest, 0.0), 8),
+        round(_safe_float(funding_rate, 0.0), 12),
+        _fingerprint_for_cache(orderbook_snapshots or []),
+        _fingerprint_for_cache(liquidation_events or []),
+        _fingerprint_for_cache(performance or {}),
+        _fingerprint_for_cache(volume_intelligence or {}),
+        _fingerprint_for_cache(ohlcv if ohlcv is not None else recent_candles),
+        _fingerprint_for_cache(oi_history or []),
+        round(_safe_float(current_oi, 0.0), 8),
+        _market_state_detector_signature(market_state_detector),
+    )
+
+
 __all__ = [
     "predict_liquidity_map",
     "liquidity_gravity_engine",
@@ -5519,6 +5631,8 @@ __all__ = [
     "BinanceRestData",
     "TelegramAlertSystem",
     "run_all_engines",
+    "_freeze_for_cache",
+    "_build_run_all_engines_cache_key",
     "analyze_liquidity_intent",
     "detect_traps",
     "compute_mtf_bias",

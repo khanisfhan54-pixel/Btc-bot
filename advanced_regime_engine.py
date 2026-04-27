@@ -5143,17 +5143,14 @@ class AdvancedRegimeEngine:
         - Called with an error_code: applies category-aware recovery action.
         """
         assert self._lock._is_owned(), "_self_heal must be invoked while holding self._lock"
+        side_effects: List[tuple[str, Any]] = []
         self._healing_count = int(getattr(self, "_healing_count", 0)) + 1
         self._last_healing_error = error_code
         self._last_healing_context = dict(context or {})
         if getattr(self, "_is_replay", False):
             context = dict(context or {})
 
-        try:
-            if not getattr(self, "_is_replay", False):
-                LOGGER.warning("[SELF HEALING INITIATED]")
-        except Exception:
-            self._warn_rate_limited("self_heal_log_failure", "Self-healing logging failed", cooldown_s=30.0)
+        side_effects.append(("log_warning", "[SELF HEALING INITIATED]"))
         _preserved_valid_return_count = int(getattr(self, "_valid_return_count", 0))
         _preserved_first_valid_return_ts = getattr(self, "_first_valid_return_ts", None)
         _preserved_posterior_update_count = int(getattr(self, "_posterior_update_count", 0))
@@ -5212,11 +5209,12 @@ class AdvancedRegimeEngine:
                 self._last_price_timestamp = None
                 self._last_price_tick_id = None
                 self._pnl_mode = None
-                LOGGER.warning(
-                    "[REGIME] Price anchor destroyed by self-heal (reset_price_anchor=True) — PnL tracking will reinitialize on next tick"
-                )
+                side_effects.append((
+                    "log_warning",
+                    "[REGIME] Price anchor destroyed by self-heal (reset_price_anchor=True) — PnL tracking will reinitialize on next tick",
+                ))
             else:
-                LOGGER.debug("[REGIME] Self-heal complete — price anchor preserved")
+                side_effects.append(("log_debug", "[REGIME] Self-heal complete — price anchor preserved"))
             self._valid_return_count = _preserved_valid_return_count
             self._first_valid_return_ts = _preserved_first_valid_return_ts
             self._posterior_update_count = _preserved_posterior_update_count
@@ -5231,14 +5229,22 @@ class AdvancedRegimeEngine:
             self._last_healing_action = "RESET_FULL"
             self._health_status = "HEALING_COMPLETE"
             self._last_heal_ts = time.time()
-            LOGGER.info(
-                "_self_heal: warmup state preserved (valid_returns=%d, posteriors=%d) after recovery.",
-                _preserved_valid_return_count,
-                _preserved_posterior_update_count,
-            )
+            side_effects.append((
+                "log_info",
+                ("_self_heal: warmup state preserved (valid_returns=%d, posteriors=%d) after recovery.",
+                 _preserved_valid_return_count, _preserved_posterior_update_count),
+            ))
             if not getattr(self, "_is_replay", False):
-                self._replay_record("self_heal", {"error": error_code, "action": "RESET_FULL"})
-            return self._last_healing_action
+                replay_payload = self._build_self_heal_replay_payload(error=error_code, action="RESET_FULL")
+                side_effects.append(("replay", ("self_heal", replay_payload)))
+            action = self._last_healing_action
+            _lock = self._lock
+            _lock.release()
+            try:
+                self._run_self_heal_side_effects(side_effects)
+            finally:
+                _lock.acquire()
+            return action
 
         action = "NO_ACTION"
         category = ""
@@ -5328,15 +5334,50 @@ class AdvancedRegimeEngine:
             action = "SKIP_AND_DEGRADE"
 
         if not getattr(self, "_is_replay", False):
-            self._replay_record(
-                "self_heal",
-                {
-                    "error": error_code,
-                    "action": action,
-                },
-            )
+            replay_payload = self._build_self_heal_replay_payload(error=error_code, action=action)
+            side_effects.append(("replay", ("self_heal", replay_payload)))
 
         self._last_healing_action = action
+        _lock = self._lock
+        _lock.release()
+        try:
+            self._run_self_heal_side_effects(side_effects)
+        finally:
+            _lock.acquire()
         return action
+
+    def _build_self_heal_replay_payload(self, error: Any, action: str) -> Dict[str, Any]:
+        frozen_payload = {
+            "error": error,
+            "action": action,
+            "state": {
+                "last_healing_error": getattr(self, "_last_healing_error", None),
+                "last_healing_context": copy.deepcopy(getattr(self, "_last_healing_context", {})),
+                "healing_count": int(getattr(self, "_healing_count", 0)),
+                "circuit_breaker_active": bool(getattr(self, "_circuit_breaker_active", False)),
+                "circuit_breaker_reason": getattr(self, "_circuit_breaker_reason", None),
+                "circuit_breaker_trigger_tick": int(getattr(self, "_circuit_breaker_trigger_tick", -1)),
+            },
+        }
+        return copy.deepcopy(frozen_payload)
+
+    def _run_self_heal_side_effects(self, side_effects: List[tuple[str, Any]]) -> None:
+        for effect_type, payload in side_effects:
+            try:
+                if effect_type == "log_warning":
+                    if not getattr(self, "_is_replay", False):
+                        LOGGER.warning(payload)
+                elif effect_type == "log_debug":
+                    LOGGER.debug(payload)
+                elif effect_type == "log_info":
+                    if isinstance(payload, tuple):
+                        LOGGER.info(*payload)
+                    else:
+                        LOGGER.info(payload)
+                elif effect_type == "replay":
+                    event_type, event_payload = payload
+                    self._replay_record(event_type, event_payload)
+            except Exception:
+                self._warn_rate_limited("self_heal_log_failure", "Self-healing logging failed", cooldown_s=30.0)
 
 #### END OF MODULE: RECOVERY COMPLETE ####
