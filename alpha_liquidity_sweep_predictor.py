@@ -283,9 +283,10 @@ class LiquiditySweepAlpha:
         self.hawkes_history = deque(maxlen=history_window)
         self.short_ofi = deque(maxlen=5)
 
-        # rolling stats (O(1))
-        self.ofi_sum = 0.0
-        self.ofi_sq_sum = 0.0
+        # rolling stats (stable sliding-window Welford)
+        self._ofi_count = 0
+        self._ofi_mean = 0.0
+        self._ofi_M2 = 0.0
         self.hawkes_sum = 0.0
 
         # Hawkes Process State
@@ -389,27 +390,40 @@ class LiquiditySweepAlpha:
         if not _is_finite(ofi_total):
             return 0.0
 
-        old_ofi = self.ofi_history[0] if len(self.ofi_history) == self.history_window else 0.0
+        outgoing = self.ofi_history[0] if len(self.ofi_history) == self.history_window else None
+        if outgoing is not None and self._ofi_count > 0:
+            old_n = self._ofi_count
+            if old_n <= 1:
+                self._ofi_count = 0
+                self._ofi_mean = 0.0
+                self._ofi_M2 = 0.0
+            else:
+                new_n = old_n - 1
+                delta = float(outgoing) - self._ofi_mean
+                self._ofi_mean -= delta / float(new_n)
+                self._ofi_M2 -= delta * (float(outgoing) - self._ofi_mean)
+                self._ofi_M2 = max(0.0, self._ofi_M2)
+                self._ofi_count = new_n
+
         self.ofi_history.append(ofi_total)
         self.short_ofi.append(ofi_total)
-        self.ofi_sum += float(ofi_total - old_ofi)
-        self.ofi_sq_sum += float((ofi_total * ofi_total) - (old_ofi * old_ofi))
 
-        if len(self.ofi_history) < 20:
+        self._ofi_count += 1
+        delta_add = ofi_total - self._ofi_mean
+        self._ofi_mean += delta_add / float(self._ofi_count)
+        self._ofi_M2 += delta_add * (ofi_total - self._ofi_mean)
+        self._ofi_M2 = max(0.0, self._ofi_M2)
+
+        if self._ofi_count < 20:
             return 0.0
 
-        n = len(self.ofi_history)
-        ofi_mean = self.ofi_sum / n
-        if not _is_finite(ofi_mean):
-            return 0.0
-        var = (self.ofi_sq_sum / n) - (ofi_mean * ofi_mean)
-        if not _is_finite(var) or var <= 0.0:
-            var = 1e-12
+        n = self._ofi_count
+        var = max(self._ofi_M2 / max(float(n - 1), 1.0), 1e-8)
         ofi_std = math.sqrt(var)
-        if not _is_finite(ofi_std) or ofi_std <= 1e-12:
+        if not _is_finite(ofi_std) or ofi_std <= 0.0:
             return 0.0
 
-        z = (ofi_total - ofi_mean) / ofi_std
+        z = (ofi_total - self._ofi_mean) / ofi_std
         return 4.0 * math.tanh(z / 3.0)
 
     def _detect_regime(self, ema_fast: float, ema_slow: float, buffer: float = 0.001) -> str:

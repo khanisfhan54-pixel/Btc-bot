@@ -32,6 +32,7 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 from alpha_liquidity_sweep_predictor import LiquiditySweepAlpha, predict_sweep
 from trading_utils import safe_float, clamp, validate_alpha
+from thread_safe_wrappers import ordered_lock
 
 logger = logging.getLogger(__name__)
 _LIQUIDITY_SWEEP_ALPHA = LiquiditySweepAlpha()
@@ -3375,6 +3376,26 @@ def run_all_engines(
     trades = trades or []
     price = _safe_float(price, 0.0)
     ohlcv_data = ohlcv if ohlcv is not None else recent_candles
+    _cache_key = None
+    if isinstance(recent_candles, (list, tuple)) and recent_candles:
+        last = recent_candles[-1]
+        if isinstance(last, (list, tuple)) and len(last) >= 5:
+            best_bid = _safe_float((orderbook.get("bids") or [[price]])[0][0], price)
+            best_ask = _safe_float((orderbook.get("asks") or [[price]])[0][0], price)
+            _cache_key = (
+                _safe_float(last[0], 0.0),
+                _safe_float(last[4], 0.0),
+                _safe_float(price, 0.0),
+                best_bid,
+                best_ask,
+                len(trades),
+            )
+            _cache = getattr(run_all_engines, "_backtest_cache", {})
+            cached = _cache.get(_cache_key)
+            if cached is not None:
+                run_all_engines._cache_hits = int(getattr(run_all_engines, "_cache_hits", 0)) + 1
+                return dict(cached)
+            run_all_engines._cache_misses = int(getattr(run_all_engines, "_cache_misses", 0)) + 1
     try:
         fr = _safe_float(funding_rate, 0.0)
         if exchange is not None and symbol:
@@ -3638,33 +3659,32 @@ def run_all_engines(
             alpha_direction = "NEUTRAL"
             alpha_confidence = 0.5
         _alpha_symbol = (symbol or "BTC/USDT").replace("/", "").upper()
-        with _ALPHA_STATE_LOCK:
-            _alpha_st = _ALPHA_STATE.setdefault(_alpha_symbol, {})
-            prev_alpha_direction = _alpha_st.get("direction", "NEUTRAL")
-            prev_alpha_conf = _clamp(_safe_float(_alpha_st.get("confidence", 0.5), 0.5), 0.0, 1.0)
-        flip_threshold = 0.55 if prev_alpha_direction == "NEUTRAL" else 0.65
         now_ts = time.time()
-        with _ALPHA_STATE_LOCK:
-            prev_flip_ts = _safe_float(_alpha_st.get("flip_ts", 0.0), 0.0)
-        if alpha_direction != prev_alpha_direction:
-            if abs(alpha_prob_above - alpha_prob_below) < 0.2:
-                alpha_direction = prev_alpha_direction
-        if (
-            alpha_direction != prev_alpha_direction
-            and alpha_confidence < flip_threshold
-            and alpha_confidence < prev_alpha_conf
-            and abs(alpha_prob_above - alpha_prob_below) < 0.15
-        ):
-            alpha_direction = prev_alpha_direction
-        if alpha_direction != prev_alpha_direction and (now_ts - prev_flip_ts) < 1.0 and alpha_confidence < 0.7:
-            alpha_direction = prev_alpha_direction
         liq_bias = str((liquidity_intent or {}).get("direction", "")).upper()
-        if liq_bias in ("LONG", "SHORT") and alpha_direction in ("LONG", "SHORT"):
-            if liq_bias == alpha_direction:
-                alpha_confidence = _clamp(alpha_confidence + 0.02, 0.0, 1.0)
-            else:
-                alpha_confidence = _clamp(alpha_confidence - 0.02, 0.0, 1.0)
-        with _ALPHA_STATE_LOCK:
+        with ordered_lock(_ALPHA_STATE_LOCK, "_ALPHA_STATE_LOCK"):
+            _alpha_st = _ALPHA_STATE.setdefault(_alpha_symbol, {})
+            prev_alpha_direction = str(_alpha_st.get("direction", "NEUTRAL"))
+            prev_alpha_conf = _clamp(_safe_float(_alpha_st.get("confidence", 0.5), 0.5), 0.0, 1.0)
+            prev_flip_ts = _safe_float(_alpha_st.get("flip_ts", 0.0), 0.0)
+            flip_threshold = 0.55 if prev_alpha_direction == "NEUTRAL" else 0.65
+
+            if alpha_direction != prev_alpha_direction and abs(alpha_prob_above - alpha_prob_below) < 0.2:
+                alpha_direction = prev_alpha_direction
+            if (
+                alpha_direction != prev_alpha_direction
+                and alpha_confidence < flip_threshold
+                and alpha_confidence < prev_alpha_conf
+                and abs(alpha_prob_above - alpha_prob_below) < 0.15
+            ):
+                alpha_direction = prev_alpha_direction
+            if alpha_direction != prev_alpha_direction and (now_ts - prev_flip_ts) < 1.0 and alpha_confidence < 0.7:
+                alpha_direction = prev_alpha_direction
+            if liq_bias in ("LONG", "SHORT") and alpha_direction in ("LONG", "SHORT"):
+                if liq_bias == alpha_direction:
+                    alpha_confidence = _clamp(alpha_confidence + 0.02, 0.0, 1.0)
+                else:
+                    alpha_confidence = _clamp(alpha_confidence - 0.02, 0.0, 1.0)
+
             _alpha_st["direction"] = alpha_direction
             if alpha_direction == "NEUTRAL":
                 _alpha_st["flip_ts"] = 0.0
@@ -3868,7 +3888,7 @@ def run_all_engines(
             "liquidity_zones": liquidity_intent.get("liquidity_zones", []),
         }
 
-        return {
+        _out = {
             "order_flow_pressure": round(_safe_float(ofp.get("pressure_score", 0.0)), 6),
             "order_imbalance": round(_safe_float(imb.get("imbalance", 0.0)), 6),
             "smart_money_detected": bool(smart.get("smart_money_detected", False) or smart_abs.get("absorption", False)),
@@ -3927,9 +3947,18 @@ def run_all_engines(
             "smc_signal": smc_signal,
             "composite": institutional,
         }
+        if _cache_key is not None:
+            _cache = getattr(run_all_engines, "_backtest_cache", {})
+            if not isinstance(_cache, dict):
+                _cache = {}
+            _cache[_cache_key] = dict(_out)
+            if len(_cache) > 2048:
+                _cache.pop(next(iter(_cache)), None)
+            run_all_engines._backtest_cache = _cache
+        return _out
     except Exception as exc:
         logger.error("run_all_engines error: %s", exc)
-        return {
+        _fallback = {
             "order_flow_pressure": 0.0,
             "order_imbalance": 0.0,
             "smart_money_detected": False,
