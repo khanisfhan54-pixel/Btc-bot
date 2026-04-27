@@ -18,13 +18,17 @@ import os
 import threading
 import time
 
+import numpy as np
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import pytest
 
 import alpha_liquidity_sweep_predictor as alpha
+import calibrate_regime
+from advanced_regime_engine import AdvancedRegimeEngine
 from alpha_liquidity_sweep_predictor import LiquiditySweepAlpha, predict_sweep
 from feature_engine import FeatureEngine
+from model_weights import ModelWeightManager
 
 
 REQUIRED_PREDICTOR_KEYS = {
@@ -333,6 +337,11 @@ def test_run_analysis_cycle_signal_only_schema():
     import main as main_mod
 
     class _StubExchange:
+        id = "stub"
+
+        def load_markets(self):
+            return {"BTC/USDT": {}}
+
         def fetch_ohlcv(self, symbol, timeframe="1m", limit=50):
             now_ms = int(time.time() * 1000)
             return [
@@ -473,3 +482,46 @@ def test_e2e_feature_engine_to_predictor():
             regime_context=regime_context,
         )
     _assert_predictor_schema(out)
+
+
+def test_calibrate_regime_output_is_compatible_with_advanced_regime_engine(tmp_path):
+    csv_path = tmp_path / "ohlcv.csv"
+    weights_path = tmp_path / "advanced_regime_weights.npz"
+    rows = []
+    for i in range(30):
+        ts = 1_700_000_000 + (i * 60)
+        close = 100.0 + (0.2 * i)
+        rows.append([ts, close - 1.0, close + 1.0, close - 2.0, close, 10.0 + i])
+    np.savetxt(csv_path, np.asarray(rows, dtype=float), delimiter=",")
+
+    calibrate_regime.calibrate(str(csv_path), str(weights_path))
+    weights = ModelWeightManager.load_weights("advanced_regime", str(weights_path))
+    assert weights is not None
+
+    required = {"nhhmm_beta", "nhhmm_mu", "nhhmm_sigma", "sjm_centroids"}
+    missing = required - set(weights.keys())
+    assert not missing, f"missing keys: {sorted(missing)}"
+
+    beta = np.asarray(weights["nhhmm_beta"], dtype=float)
+    mu = np.asarray(weights["nhhmm_mu"], dtype=float)
+    sigma = np.asarray(weights["nhhmm_sigma"], dtype=float)
+    centroids = np.asarray(weights["sjm_centroids"], dtype=float)
+
+    assert beta.ndim == 3
+    assert beta.shape[:2] == (3, 3)
+    assert mu.shape == (3,)
+    assert sigma.shape == (3,)
+    assert centroids.ndim == 2
+    assert centroids.shape[0] == 3
+    assert beta.shape[2] == centroids.shape[1]
+
+    for arr in (beta, mu, sigma, centroids):
+        assert np.isfinite(arr).all()
+
+    engine = AdvancedRegimeEngine(
+        n_states=3,
+        n_features=centroids.shape[1],
+        enable_background_workers=False,
+        seed=42,
+    )
+    engine.nhhmm.load_weights(beta, mu, sigma)

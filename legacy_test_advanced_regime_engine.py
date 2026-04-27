@@ -18,6 +18,17 @@ def nhhmm() -> NHHMM_Engine:
     return NHHMM_Engine(n_states=3, n_features=5)
 
 
+def test_nhhmm_load_weights_requires_3d_beta_and_preserves_shape():
+    engine = NHHMM_Engine(n_states=3, n_features=4)
+    beta = np.arange(3 * 3 * 4, dtype=float).reshape(3, 3, 4) * 1e-4
+    mu = np.array([0.001, -0.001, 0.0], dtype=float)
+    sigma = np.array([0.004, 0.004, 0.010], dtype=float)
+
+    engine.load_weights(beta, mu, sigma)
+    np.testing.assert_array_equal(engine.beta, beta)
+    assert engine.beta.shape == (3, 3, 4)
+
+
 class TestCritical1ScoreSplitting:
     def test_directional_wins_over_range_when_trend_score_dominant(self):
         result = compute_hmm_regime(np.array([0.9, 0.1, 0.0]))
