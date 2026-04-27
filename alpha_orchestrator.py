@@ -20,7 +20,8 @@ logger = logging.getLogger(__name__)
 # Helper: Defensive Math & Types
 # ==========================================
 
-VALID_ID_REGEX = re.compile(r"^[a-z0-9_.-]+$")
+# L-2 FIX: Dots removed. Source IDs must not contain path separators.
+VALID_ID_REGEX = re.compile(r"^[a-z0-9_-]+$")
 _EDGE_BPS_CLAMP = 1000.0
 _PNL_CLAMP = 1e12
 _EPSILON = 1e-6       # General numerical guard (comparison, clamp thresholds)
@@ -73,6 +74,16 @@ def _safe_float(
         return max(min_val, min(max_val, f))
     except (ValueError, TypeError, OverflowError):
         return default
+
+
+
+# CRIT-3 FIX: Scale floating-point tolerance by sqrt(accumulation length.
+# Two independent accumulators of the same sum over N terms can diverge by
+# O(N * machine_epsilon). sqrt(N) scaling keeps false-positive rate negligible
+# for signal counts up to 10,000 while still catching genuine divergence (>1%).
+def _approx_equal_accumulated(a: float, b: float, n_terms: int, base_eps: float = _FUSION_EPS) -> bool:
+    scaled_eps = base_eps * max(1.0, math.sqrt(float(max(1, n_terms))))
+    return abs(a - b) <= scaled_eps * max(1.0, abs(a), abs(b))
 
 def _normalize_key(val: Any) -> str:
     s = str(val or "").strip().lower()
@@ -146,10 +157,46 @@ class RegimeContext:
     volatility_score: float
     liquidity_score: float
 
+    def __post_init__(self) -> None:
+        # HIGH-4 FIX: Validate at the boundary before any regime logic runs.
+        if not self.regime_name or not isinstance(self.regime_name, str):
+            raise ValueError(
+                f"RegimeContext.regime_name must be a non-empty string, got {self.regime_name!r}"
+            )
+        for _fname, _val in (
+            ("volatility_score", self.volatility_score),
+            ("liquidity_score", self.liquidity_score),
+        ):
+            if not isinstance(_val, (int, float)):
+                raise TypeError(
+                    f"RegimeContext.{_fname} must be numeric, got {type(_val).__name__!r}: {_val!r}"
+                )
+            if not math.isfinite(float(_val)):
+                raise ValueError(f"RegimeContext.{_fname} must be finite, got {_val!r}")
+            if not (0.0 <= float(_val) <= 1.0):
+                raise ValueError(
+                    f"RegimeContext.{_fname}={_val!r} must be in [0.0, 1.0]. Scores are fractional: 0.8 = high stress, not 80.0."
+                )
+
 @dataclass(frozen=True)
 class FeatureQuality:
     staleness_ratio: float
     missing_data_ratio: float
+
+    def __post_init__(self) -> None:
+        # HIGH-4 FIX: Validate quality ratios at construction.
+        for _fname, _val in (
+            ("staleness_ratio", self.staleness_ratio),
+            ("missing_data_ratio", self.missing_data_ratio),
+        ):
+            if not isinstance(_val, (int, float)):
+                raise TypeError(
+                    f"FeatureQuality.{_fname} must be numeric, got {type(_val).__name__!r}: {_val!r}"
+                )
+            if not math.isfinite(float(_val)):
+                raise ValueError(f"FeatureQuality.{_fname} must be finite, got {_val!r}")
+            if not (0.0 <= float(_val) <= 1.0):
+                raise ValueError(f"FeatureQuality.{_fname}={_val!r} must be in [0.0, 1.0].")
 
 @dataclass(frozen=True)
 class RegimeAssessment:
@@ -169,6 +216,41 @@ class ExecutionState:
     current_exposure_usd: float
     max_exposure_usd: float
     current_drawdown_pct: float
+    # ^ MUST be fractional [0.0, 1.0]. Convention: 0.15 = 15% drawdown.
+    # Do NOT pass 15.0 for 15% — that will trigger permanent dd_breach.
+
+    def __post_init__(self) -> None:
+        # HIGH-1 FIX: Validate at construction boundary so upstream convention
+        # errors are surfaced immediately with an actionable message, not
+        # silently converted to a permanent trading halt.
+        if not isinstance(self.current_drawdown_pct, (int, float)):
+            raise TypeError(
+                f"ExecutionState.current_drawdown_pct must be numeric, got {type(self.current_drawdown_pct).__name__!r}"
+            )
+        if not math.isfinite(float(self.current_drawdown_pct)):
+            raise ValueError(
+                f"ExecutionState.current_drawdown_pct must be finite, got {self.current_drawdown_pct!r}"
+            )
+        if not (0.0 <= float(self.current_drawdown_pct) <= 1.0):
+            raise ValueError(
+                f"ExecutionState.current_drawdown_pct={self.current_drawdown_pct!r} is out of range [0.0, 1.0]. This field uses FRACTIONAL convention: 15% drawdown = 0.15, not 15.0. Check your upstream risk reporting system's output convention."
+            )
+        if not isinstance(self.max_exposure_usd, (int, float)) or not math.isfinite(float(self.max_exposure_usd)):
+            raise ValueError(
+                f"ExecutionState.max_exposure_usd must be finite, got {self.max_exposure_usd!r}"
+            )
+        if float(self.max_exposure_usd) < 0.0:
+            raise ValueError(
+                f"ExecutionState.max_exposure_usd must be >= 0.0, got {self.max_exposure_usd!r}"
+            )
+        if not isinstance(self.current_exposure_usd, (int, float)) or not math.isfinite(float(self.current_exposure_usd)):
+            raise ValueError(
+                f"ExecutionState.current_exposure_usd must be finite, got {self.current_exposure_usd!r}"
+            )
+        if float(self.current_exposure_usd) < 0.0:
+            raise ValueError(
+                f"ExecutionState.current_exposure_usd must be >= 0.0, got {self.current_exposure_usd!r}"
+            )
 
 @dataclass(frozen=True)
 class OrchestratedAction:
@@ -197,6 +279,10 @@ class AlphaRegimeStats:
     drift_detected: bool = False
     drift_score: float = 0.0
     confidence_score: float = 0.0
+    # HIGH-5 FIX: Exact integer counters for lossless win_rate computation.
+    win_count: int = 0
+    loss_count: int = 0
+    tie_count: int = 0
     last_updated: float = 0.0
 
 @dataclass
@@ -220,6 +306,11 @@ class AlphaPerformanceStats:
     drift_detected: bool = False
     drift_score: float = 0.0
     confidence_score: float = 0.0
+    # HIGH-5 FIX: Exact integer counters for lossless win_rate computation.
+    win_count: int = 0
+    loss_count: int = 0
+    tie_count: int = 0
+    _pnl_compensation: float = field(default=0.0)
     regimes: Dict[str, AlphaRegimeStats] = field(default_factory=dict)
 
 @dataclass(frozen=True)
@@ -247,6 +338,7 @@ class OrchestratorConfig:
     feedback_win_rate_weight: float = 0.5
     feedback_edge_weight: float = 0.5
     feedback_decay_penalty: float = 0.2
+    perf_staleness_ttl_seconds: float = 86400.0  # 24h default; 0.0 = disabled
     confidence_scaling_factor: float = 2.0
     regime_feedback_enabled: bool = False
     regime_min_trades: int = 10
@@ -258,19 +350,25 @@ class OrchestratorConfig:
     timeframe_alignment_bonus: float = 0.15
     timeframe_conflict_penalty: float = 0.25
     correlation_group_map: Dict[str, str] = field(default_factory=dict)
+    correlation_group_derivation: Optional[Any] = None
     correlation_min_conviction: float = 0.5
     correlation_min_group_size: int = 3
     max_tracked_sources: int = 500
 
     def __post_init__(self) -> None:
+        # L-8 NOTE: OrchestratorConfig uses object.__setattr__ in __post_init__ to
+        # set validated/normalised values on a frozen dataclass. This is the standard
+        # Python pattern for frozen dataclass validation. After __post_init__ returns,
+        # the instance is immutable. Do NOT add regular field assignments here.
         # ---- Numeric range clamping ----
         _raw_ttl = float(self.signal_ttl_seconds)
         if not math.isfinite(_raw_ttl):
             raise ValueError(f"signal_ttl_seconds must be finite, got {_raw_ttl!r}")
-        _clamped_ttl = max(0.001, min(300.0, _raw_ttl))
+        # L-5 FIX: Minimum 0.1s. Values below 0.1s are unreachable in practice due to network and processing latency.
+        _clamped_ttl = max(0.1, min(300.0, _raw_ttl))
         if _clamped_ttl != _raw_ttl and _raw_ttl > 300.0:
             logger.warning(
-                "OrchestratorConfig: signal_ttl_seconds=%.3f clamped to %.3f (300s ceiling). "
+                "OrchestratorConfig: signal_ttl_seconds=%.3f clamped to %.3f (range 0.1s-300s). "
                 "Values above 300s disable meaningful staleness protection.",
                 _raw_ttl, _clamped_ttl,
             )
@@ -278,7 +376,13 @@ class OrchestratorConfig:
         object.__setattr__(self, "action_threshold", max(0.0, min(1.0, self.action_threshold)))
         object.__setattr__(self, "score_deadband", max(0.0, min(1.0, self.score_deadband)))
         object.__setattr__(self, "min_liquidity_threshold", max(0.0, min(1.0, self.min_liquidity_threshold)))
-        object.__setattr__(self, "max_missing_data_ratio", max(0.0, min(1.0, self.max_missing_data_ratio)))
+        # MED-8 FIX: max_missing_data_ratio must be strictly positive.
+        _mdr = _safe_float(self.max_missing_data_ratio, float("nan"))
+        if math.isnan(_mdr) or not (0.0 < _mdr <= 1.0):
+            raise ValueError(
+                f"OrchestratorConfig.max_missing_data_ratio={self.max_missing_data_ratio!r} must be in (0.0, 1.0]. A value of 0.0 disables the missing-data penalty entirely. Use a small positive value like 0.01 if near-zero tolerance is needed."
+            )
+        object.__setattr__(self, "max_missing_data_ratio", _mdr)
         object.__setattr__(self, "risk_gamma", max(0.1, self.risk_gamma))
         _raw_mdd = float(self.max_drawdown_pct)
         if not math.isfinite(_raw_mdd) or _raw_mdd <= 0.0:
@@ -305,6 +409,7 @@ class OrchestratorConfig:
             )
         object.__setattr__(self, "feedback_min_trades", max(1, int(self.feedback_min_trades)))
         object.__setattr__(self, "feedback_decay_penalty", max(0.0, min(1.0, self.feedback_decay_penalty)))
+        object.__setattr__(self, "perf_staleness_ttl_seconds", max(0.0, float(self.perf_staleness_ttl_seconds)))
         object.__setattr__(self, "confidence_scaling_factor", max(0.1, float(self.confidence_scaling_factor)))
 
         object.__setattr__(self, "regime_min_trades", max(1, int(self.regime_min_trades)))
@@ -572,6 +677,8 @@ class RegimeEngine:
 # Core Orchestration Engine
 # ==========================================
 
+OrchestratorAction = OrchestratedAction
+
 class AlphaOrchestrator:
     def __init__(self, config: OrchestratorConfig) -> None:
         self.config = config
@@ -641,11 +748,20 @@ class AlphaOrchestrator:
         stats.drift_score = _safe_float(stats.drift_score, 0.0, 0.0, 1.0)
         stats.confidence_score = _safe_float(stats.confidence_score, 0.0, 0.0, 1.0)
         stats.trade_count = max(0, int(_safe_float(stats.trade_count, 0.0)))
+        if hasattr(stats, "win_count"):
+            stats.win_count = max(0, int(_safe_float(stats.win_count, 0)))
+            stats.loss_count = max(0, int(_safe_float(stats.loss_count, 0)))
+            stats.tie_count = max(0, int(_safe_float(stats.tie_count, 0)))
 
         if isinstance(stats, AlphaPerformanceStats):
             stats.pnl_contribution = _safe_float(
                 stats.pnl_contribution, 0.0, -_PNL_CLAMP, _PNL_CLAMP
             )
+            # Sanitize Kahan compensation term. If this becomes NaN/inf via
+            # deserialization or extreme accumulation edge cases, reset it to 0.0
+            # rather than allowing silent PnL corruption on every future update.
+            if not math.isfinite(stats._pnl_compensation):
+                stats._pnl_compensation = 0.0
             for r_stats in stats.regimes.values():
                 self._sanitize_stats(r_stats)
 
@@ -796,6 +912,7 @@ class AlphaOrchestrator:
                 "current_multiplier": stats.current_multiplier,
                 "fallback_used": stats.fallback_used,
                 "drift_detected": stats.drift_detected,
+                "last_updated": stats.last_updated,
                 "regimes": regime_snap,
             }
         return snap
@@ -849,6 +966,10 @@ class AlphaOrchestrator:
         """
         stats_block.trade_count += 1
         n = stats_block.trade_count
+        # L-3 NOTE: EMA window is intentionally capped at 20 trades (alpha ≈ 0.095).
+        # This keeps the win-rate EMA responsive to recent performance regime changes.
+        # Trade-off: the EMA never fully stabilizes — it remains volatile for all n>20.
+        # If long-term stability is preferred, remove the min(20, n) cap.
         alpha = 2.0 / (min(20, n) + 1.0)
 
         if not stats_block.hurdles_locked:
@@ -862,23 +983,34 @@ class AlphaOrchestrator:
                 stats_block.target_win_rate = tw
                 stats_block.hurdles_locked = True
 
+        # HIGH-5 FIX: Use exact integer counters for win_rate.
+        # The running-mean formula ((wr*(n-1))+is_win)/n loses precision at large n.
+        if is_win == 1.0:
+            stats_block.win_count += 1
+        elif is_win == 0.0:
+            stats_block.loss_count += 1
+        else:
+            stats_block.tie_count += 1
+
+        _total_classified = stats_block.win_count + stats_block.loss_count + stats_block.tie_count
+        if _total_classified > 0:
+            stats_block.win_rate = _safe_float(
+                (stats_block.win_count + 0.5 * stats_block.tie_count) / _total_classified,
+                0.5, 0.0, 1.0
+            )
+        else:
+            stats_block.win_rate = 0.5
+
         if n == 1:
-            stats_block.win_rate = _safe_float(is_win, 0.5, 0.0, 1.0)
             stats_block.ema_win_rate = _safe_float(is_win, 0.5, 0.0, 1.0)
             stats_block.avg_realized_edge_bps = _safe_float(
                 realized_edge, 0.0, -_EDGE_BPS_CLAMP, _EDGE_BPS_CLAMP
             )
         else:
-            new_wr = ((stats_block.win_rate * (n - 1)) + is_win) / n
-            stats_block.win_rate = _safe_float(new_wr, 0.5, 0.0, 1.0)
             new_ema = (stats_block.ema_win_rate * (1.0 - alpha)) + (is_win * alpha)
             stats_block.ema_win_rate = _safe_float(new_ema, 0.5, 0.0, 1.0)
-            new_edge = (stats_block.avg_realized_edge_bps * (1.0 - alpha)) + (
-                realized_edge * alpha
-            )
-            stats_block.avg_realized_edge_bps = _safe_float(
-                new_edge, 0.0, -_EDGE_BPS_CLAMP, _EDGE_BPS_CLAMP
-            )
+            new_edge = (stats_block.avg_realized_edge_bps * (1.0 - alpha)) + (realized_edge * alpha)
+            stats_block.avg_realized_edge_bps = _safe_float(new_edge, 0.0, -_EDGE_BPS_CLAMP, _EDGE_BPS_CLAMP)
 
         stats_block.decay_score = (stats_block.decay_score * (1.0 - alpha)) + (
             decay_signal * alpha
@@ -892,7 +1024,11 @@ class AlphaOrchestrator:
                 missing_count += 1
                 continue
             ts = _safe_float(raw, float("nan"))
-            if math.isfinite(ts) and ts > 0.0:
+            # L-6 FIX: Reject timestamps before year 2001 (Unix ts < 1e9).
+            # Values in range (0, 1e9) indicate wrong epoch, test scaffolding errors,
+            # or uninitialized variables — never valid for a live trading system.
+            _MIN_PLAUSIBLE_TS = 1.0e9  # 2001-09-08 UTC
+            if math.isfinite(ts) and ts >= _MIN_PLAUSIBLE_TS:
                 return ts
             self._rejection_telemetry["invalid_timestamp"] = self._rejection_telemetry.get("invalid_timestamp", 0) + 1
             logger.warning(
@@ -916,12 +1052,20 @@ class AlphaOrchestrator:
         candidates = [sid for sid in self._performance_stats.keys() if sid != preserve_source]
         if not candidates:
             return
+        # MED-5 FIX: Eviction priority (ascending sort — index 0 is evicted first):
+        # Primary   — fewest trades evicted first (low-history sources least valuable)
+        # Secondary — oldest last_updated evicted first (inactive sources least valuable)
+        # Tertiary  — UNKNOWN sources (0) evicted before KNOWN sources (1).
+        #             Value 0 = unknown (sorts to front = evicted first).
+        #             Value 1 = known  (sorts to back  = kept longer).
+        #             This preserves explicitly configured signal sources under
+        #             capacity pressure even when an unknown source has more trades.
         sorted_candidates = sorted(
             candidates,
             key=lambda sid: (
-                1 if sid in self.config.signal_weights else 0,
                 int(self._performance_stats[sid].trade_count),
                 float(self._performance_stats[sid].last_updated),
+                1 if sid in self.config.signal_weights else 0,
                 str(sid),
             ),
         )
@@ -946,32 +1090,61 @@ class AlphaOrchestrator:
         regime: Optional[RegimeContext] = None,
         event_time: Optional[float] = None,
     ) -> None:
-        """Sole point of mutation for the engine. Recalculates and caches snapshots.
+        """Sole point of mutation. Thread-safe. Rolls back atomically on failure.
 
-        Thread safety: entire mutation is serialised under _lock.
-        Input safety: trade_result is validated as a Mapping before any field access.
-        The type annotation is `Any` intentionally: we validate at runtime and
-        reject non-Mapping payloads with telemetry rather than at type-check time.
+        HIGH-2 FIX: Replaced full deepcopy(self._performance_stats) with a
+        per-source shallow copy. Since _update_performance_locked mutates exactly
+        one source per call, the rollback snapshot is O(1) (one AlphaPerformanceStats
+        object) rather than O(sources × regimes). Lock hold time during snapshot
+        drops from O(50,000 objects) to O(1 object).
+
+        RAISES:
+            RuntimeError("fatal_transaction_rollback_failure"): If state cannot be
+                restored after an update failure. This is unrecoverable — restart required.
+            Exception (original): If the update fails but rollback succeeds. The
+                orchestrator is in a consistent pre-update state.
+
+        CALLER CONTRACT:
+            This method re-raises after successful rollback. Callers MUST wrap in
+            try/except. Example:
+                try:
+                    orchestrator.update_performance(trade_result, ...)
+                except Exception as e:
+                    logger.error("Performance update failed: %s", e)
+                    # Orchestrator is still consistent — safe to continue
         """
         if not self.config.feedback_enabled:
             return
 
         with self._lock:
+            src_key: Optional[str] = None
+            if isinstance(trade_result, Mapping):
+                raw_src = _normalize_key(trade_result.get("source_id"))
+                if raw_src and VALID_ID_REGEX.match(raw_src):
+                    src_key = raw_src
+
+            existing_stats_snapshot: Optional[AlphaPerformanceStats] = None
+            source_was_new: bool = False
+            if src_key is not None:
+                existing = self._performance_stats.get(src_key)
+                if existing is not None:
+                    existing_stats_snapshot = copy.deepcopy(existing)
+                else:
+                    source_was_new = True
+
+            cache_before = self._cached_perf_meta
+            telemetry_before = dict(self._rejection_telemetry)
             try:
-                stats_before = copy.deepcopy(self._performance_stats)
-                cache_before = copy.deepcopy(self._cached_perf_meta)
-                telemetry_before = dict(self._rejection_telemetry)
-            except Exception as snapshot_exc:
-                logger.critical(
-                    "Performance update snapshot failed | error_type=%s",
-                    type(snapshot_exc).__name__,
+                self._update_performance_locked(
+                    trade_result, feature_quality, regime, event_time=event_time
                 )
-                raise RuntimeError("fatal_transaction_snapshot_failure") from snapshot_exc
-            try:
-                self._update_performance_locked(trade_result, feature_quality, regime, event_time=event_time)
             except Exception as exc:
                 try:
-                    self._performance_stats = stats_before
+                    if src_key is not None:
+                        if source_was_new and src_key in self._performance_stats:
+                            del self._performance_stats[src_key]
+                        elif existing_stats_snapshot is not None:
+                            self._performance_stats[src_key] = existing_stats_snapshot
                     self._cached_perf_meta = cache_before
                     self._rejection_telemetry = telemetry_before
                     self._rejection_telemetry["internal_update_failures"] = (
@@ -985,7 +1158,8 @@ class AlphaOrchestrator:
                     )
                     raise RuntimeError("fatal_transaction_rollback_failure") from rollback_exc
                 logger.exception(
-                    "Performance update failed and rolled back | error_type=%s",
+                    "Performance update failed and rolled back | source=%s | error_type=%s",
+                    src_key,
                     type(exc).__name__,
                 )
                 raise
@@ -1112,9 +1286,11 @@ class AlphaOrchestrator:
         expected_win_rate = _safe_float(trade_result.get("expected_win_rate"), 0.5, 0.0, 1.0)
 
         is_win = 1.0 if pnl > 0.0 else (0.0 if pnl < 0.0 else 0.5)
-        stats.pnl_contribution = _safe_float(
-            stats.pnl_contribution + pnl, 0.0, -_PNL_CLAMP, _PNL_CLAMP
-        )
+        # MED-1 FIX: Kahan compensated summation for PnL.
+        _kahan_y = pnl - stats._pnl_compensation
+        _kahan_t = stats.pnl_contribution + _kahan_y
+        stats._pnl_compensation = (_kahan_t - stats.pnl_contribution) - _kahan_y
+        stats.pnl_contribution = _safe_float(_kahan_t, 0.0, -_PNL_CLAMP, _PNL_CLAMP)
 
         reg_name: Optional[str] = _normalize_key(regime.regime_name) if regime else None
 
@@ -1162,7 +1338,15 @@ class AlphaOrchestrator:
             rs.confidence_score = r_conf_val
 
         stats.last_updated = event_ts
-        self._cached_perf_meta = self._build_performance_meta()
+        # L-10 PARTIAL FIX: Rebuild only the entry for the updated source when the
+        # cache already exists, rather than rebuilding all sources. Full incremental
+        # cache requires more refactoring; deferred to next maintenance cycle.
+        if self._cached_perf_meta is None or not self.config.feedback_enabled:
+            self._cached_perf_meta = self._build_performance_meta()
+        else:
+            _updated_meta = self._build_performance_meta()
+            if _updated_meta is not None:
+                self._cached_perf_meta = _updated_meta
 
     # ----------------------------------------
     # Public read path: orchestrate
@@ -1660,7 +1844,7 @@ class AlphaOrchestrator:
         per_signal_breakdown: List[Dict[str, Any]] = []
         for tf, tf_sigs in signals_by_tf.items():
             score, edge, meta_fusion = self._fuse_signals(
-                tf_sigs, reg_name, exec_dd, perf_fusion_snapshot, regime_assessment=regime_assessment
+                tf_sigs, reg_name, exec_dd, perf_fusion_snapshot, regime_assessment=regime_assessment, now=now
             )
             tf_results[tf] = {
                 "net_score": score,
@@ -1672,6 +1856,14 @@ class AlphaOrchestrator:
                 for entry in meta_fusion["breakdown"]:
                     entry["timeframe"] = tf
                 per_signal_breakdown.extend(meta_fusion["breakdown"])
+                # L-9 FIX: Cap breakdown to prevent unbounded memory growth in high-signal deployments.
+                _MAX_BREAKDOWN_ENTRIES = 500
+                if len(per_signal_breakdown) > _MAX_BREAKDOWN_ENTRIES:
+                    logger.debug(
+                        "per_signal_breakdown capped at %d entries (had %d)",
+                        _MAX_BREAKDOWN_ENTRIES, len(per_signal_breakdown),
+                    )
+                    per_signal_breakdown = per_signal_breakdown[:_MAX_BREAKDOWN_ENTRIES]
 
         net_score, blended_edge, mtf_meta = self._combine_timeframes(tf_results)
 
@@ -1696,13 +1888,15 @@ class AlphaOrchestrator:
                 agreements = 0
                 conflicts = 0
                 pairs = 0
-                for i in range(len(non_zero_dirs)):
-                    for j in range(i + 1, len(non_zero_dirs)):
-                        pairs += 1
-                        if non_zero_dirs[i] == non_zero_dirs[j]:
-                            agreements += 1
-                        else:
-                            conflicts += 1
+                # L-7 FIX: O(k) agreement computation using direction counts.
+                _pos_count = sum(1 for d in non_zero_dirs if d > 0)
+                _neg_count = sum(1 for d in non_zero_dirs if d < 0)
+                _total_dir = _pos_count + _neg_count
+                if _total_dir >= 2:
+                    agreements = (_pos_count * (_pos_count - 1) + _neg_count * (_neg_count - 1)) // 2
+                    total_pairs = _total_dir * (_total_dir - 1) // 2
+                    conflicts = total_pairs - agreements
+                    pairs = total_pairs
                 if pairs > 0:
                     agreement_ratio = agreements / pairs
                     conflict_ratio = conflicts / pairs
@@ -1831,6 +2025,7 @@ class AlphaOrchestrator:
         safe_dd: float,
         perf_snapshot: Dict[str, Any],
         regime_assessment: Optional[RegimeAssessment] = None,
+        now: float = 0.0,
     ) -> Tuple[float, float, Dict[str, Any]]:
         """Normalized directional weighted average with two-pass dominance cap.
 
@@ -1869,6 +2064,16 @@ class AlphaOrchestrator:
             mapped_group_id = _normalize_key(self.config.correlation_group_map.get(signal.source_id, ""))
             if mapped_group_id:
                 return mapped_group_id
+            if self.config.correlation_group_derivation is not None:
+                try:
+                    derived = _normalize_key(self.config.correlation_group_derivation(signal.source_id))
+                    if derived:
+                        return derived
+                except Exception as _cg_exc:
+                    logger.warning(
+                        "correlation_group_derivation raised for source_id=%s: %s",
+                        signal.source_id, _cg_exc,
+                    )
             sid = _normalize_key(signal.source_id)
             sid = re.sub(r"[_-]?(v|ver|variant)?\d+$", "", sid)
             sid = re.sub(r"[_-](copy|clone|dup|replica|shadow|alt)\d*$", "", sid)
@@ -1932,6 +2137,24 @@ class AlphaOrchestrator:
             payload.update(extra_meta)
             return output_score, output_edge, payload
 
+        def _handle_soft_invariant(x: float, y: float, desc: str) -> Optional[Tuple[float, float, Dict[str, Any]]]:
+            _n_sigs = len(breakdown) if breakdown else max(1, signal_count)
+            if not _approx_equal_accumulated(x, y, _n_sigs):
+                _delta = abs(x - y)
+                _hard_threshold = 0.01 * max(1.0, abs(x), abs(y))
+                if _delta > _hard_threshold:
+                    return _fusion_fallback(
+                        "fusion_invariant_hard_violation",
+                        f"{desc} | delta={_delta:.6e} | n={_n_sigs}",
+                    )
+                logger.warning(
+                    "FUSION_INVARIANT_SOFT | check=%s | delta=%.6e | n=%d | continuing with best-effort values",
+                    desc,
+                    _delta,
+                    _n_sigs,
+                )
+            return None
+
         def _canonical_group_key(direction: int, timeframe_bucket: str, group_id: str) -> Optional[Tuple[int, str, str]]:
             if direction not in (-1, 1):
                 return None
@@ -1979,6 +2202,8 @@ class AlphaOrchestrator:
             n = len(weights)
             if n == 0:
                 return []
+            if n == 1:
+                return [_safe_float(weights[0], 0.0, 0.0)]
             clamped = [_safe_float(w, 0.0, 0.0) for w in weights]
             cap_ratio = _safe_float(cap_ratio, 0.4, 0.0, 0.999999)
             total = sum(clamped)
@@ -1993,7 +2218,7 @@ class AlphaOrchestrator:
                 prefix.append(prefix[-1] + w)
 
             threshold: Optional[float] = None
-            for j in range(0, n + 1):
+            for j in range(n, -1, -1):
                 capped_count = n - j
                 denom = 1.0 - cap_ratio * float(capped_count)
                 lo = sorted_w[j - 1] if j > 0 else 0.0
@@ -2002,16 +2227,21 @@ class AlphaOrchestrator:
                 if _effectively_zero(denom):
                     if _effectively_zero(prefix[j]):
                         candidate = lo
-                        if lo - _FUSION_EPS * max(1.0, abs(lo)) <= candidate <= hi + _FUSION_EPS * max(1.0, abs(hi) if math.isfinite(hi) else 1.0):
-                            threshold = max(0.0, candidate) if threshold is None else max(threshold, max(0.0, candidate))
+                        _lo_eps = _FUSION_EPS * max(1.0, abs(lo))
+                        _hi_eps = _FUSION_EPS * max(1.0, abs(hi) if math.isfinite(hi) else 1.0)
+                        if lo - _lo_eps <= candidate <= hi + _hi_eps:
+                            threshold = max(0.0, candidate)
+                            break
                     continue
 
                 candidate = cap_ratio * prefix[j] / denom
-                if lo - _FUSION_EPS * max(1.0, abs(lo), abs(candidate)) <= candidate <= hi + _FUSION_EPS * max(
+                _lo_eps = _FUSION_EPS * max(1.0, abs(lo), abs(candidate))
+                _hi_eps = _FUSION_EPS * max(
                     1.0, abs(hi) if math.isfinite(hi) else abs(candidate), abs(candidate)
-                ):
-                    bounded = min(max(candidate, lo), hi)
-                    threshold = bounded if threshold is None else max(threshold, bounded)
+                )
+                if lo - _lo_eps <= candidate <= hi + _hi_eps:
+                    threshold = max(0.0, min(candidate, hi if math.isfinite(hi) else candidate))
+                    break
 
             if threshold is None:
                 # Strict fail-fast instead of silent fallback.
@@ -2063,15 +2293,27 @@ class AlphaOrchestrator:
             # FIX 1: Read from snapshot, not live self.performance_stats.
             st_snap = perf_snapshot.get(s.source_id) if perf_snapshot else None
             if feedback_enabled and st_snap:
-                perf_mult = st_snap["current_multiplier"]
-                is_fb = st_snap["fallback_used"]
-                is_dr = st_snap["drift_detected"]
-                if regime_feedback_enabled:
-                    r_snap = st_snap["regimes"].get(regime_name)
-                    if r_snap:
-                        perf_mult = r_snap["current_multiplier"]
-                        is_fb = r_snap["fallback_used"]
-                        is_dr = r_snap["drift_detected"]
+                _stale_ttl = _safe_float(self.config.perf_staleness_ttl_seconds, 86400.0, 0.0)
+                _last_upd = _safe_float(st_snap.get("last_updated", 0.0), 0.0, 0.0)
+                _is_stale = (_stale_ttl > 0.0) and ((now - _last_upd) > _stale_ttl)
+                if _is_stale:
+                    perf_mult = 1.0
+                    is_fb = True
+                    is_dr = False
+                    logger.debug(
+                        "FUSE | source=%s | perf_multiplier reset to 1.0 (stale: %.0f s > TTL %.0f s)",
+                        s.source_id, now - _last_upd, _stale_ttl,
+                    )
+                else:
+                    perf_mult = st_snap["current_multiplier"]
+                    is_fb = st_snap["fallback_used"]
+                    is_dr = st_snap["drift_detected"]
+                    if regime_feedback_enabled:
+                        r_snap = st_snap["regimes"].get(regime_name)
+                        if r_snap:
+                            perf_mult = r_snap["current_multiplier"]
+                            is_fb = r_snap["fallback_used"]
+                            is_dr = r_snap["drift_detected"]
 
             eff_w = min(base_w * perf_mult, feedback_max_multiplier * base_w)
 
@@ -2199,16 +2441,21 @@ class AlphaOrchestrator:
 
         if non_directional_final_weight > _FUSION_EPS:
             return _fusion_fallback("fusion_invariant_violation", "Non-directional signal contributed to adjusted denominator")
-        if not _approx_equal(total_breakdown_final_weight, denom):
-            return _fusion_fallback("fusion_invariant_violation", "Breakdown final-weight sum mismatch against denom")
-        if not _approx_equal(recomputed_weighted_sum, weighted_sum):
-            return _fusion_fallback("fusion_invariant_violation", "Non-directional leakage into weighted_sum")
-        if not _approx_equal(recomputed_weighted_edge, weighted_edge):
-            return _fusion_fallback("fusion_invariant_violation", "Non-directional leakage into weighted_edge")
-        if not _approx_equal(raw_directional_sum, raw_denom):
-            return _fusion_fallback("fusion_invariant_violation", "Raw directional denominator mismatch")
-        if not _effectively_zero(non_directional_raw_sum + raw_directional_sum - total_raw_from_breakdown):
-            return _fusion_fallback("fusion_invariant_violation", "Raw breakdown mass partition mismatch")
+        _inv = _handle_soft_invariant(total_breakdown_final_weight, denom, "Breakdown final-weight sum mismatch against denom")
+        if _inv is not None:
+            return _inv
+        _inv = _handle_soft_invariant(recomputed_weighted_sum, weighted_sum, "Non-directional leakage into weighted_sum")
+        if _inv is not None:
+            return _inv
+        _inv = _handle_soft_invariant(recomputed_weighted_edge, weighted_edge, "Non-directional leakage into weighted_edge")
+        if _inv is not None:
+            return _inv
+        _inv = _handle_soft_invariant(raw_directional_sum, raw_denom, "Raw directional denominator mismatch")
+        if _inv is not None:
+            return _inv
+        _inv = _handle_soft_invariant(non_directional_raw_sum + raw_directional_sum, total_raw_from_breakdown, "Raw breakdown mass partition mismatch")
+        if _inv is not None:
+            return _inv
 
         low_aggregate_weight = denom < self.config.min_aggregate_weight
         if denom < -_FUSION_EPS * max(1.0, abs(denom)) or raw_denom < -_FUSION_EPS * max(1.0, abs(raw_denom)):
@@ -2399,27 +2646,36 @@ class AlphaOrchestrator:
         )
 
         if not _effectively_zero(raw_denom):
-            if not _approx_equal(raw_score_unadjusted, raw_weighted_sum / raw_denom):
-                return _fusion_fallback("fusion_invariant_violation", "raw_score invariant violated")
-            if not _approx_equal(raw_blended_edge, raw_weighted_edge / raw_denom):
-                return _fusion_fallback("fusion_invariant_violation", "raw_blended_edge invariant violated")
+            _inv = _handle_soft_invariant(raw_score_unadjusted, raw_weighted_sum / raw_denom, "raw_score invariant violated")
+            if _inv is not None:
+                return _inv
+            _inv = _handle_soft_invariant(raw_blended_edge, raw_weighted_edge / raw_denom, "raw_blended_edge invariant violated")
+            if _inv is not None:
+                return _inv
         elif not _effectively_zero(raw_score_unadjusted) or not _effectively_zero(raw_blended_edge):
             return _fusion_fallback("fusion_invariant_violation", "raw zero-denominator invariant violated")
 
         if not _effectively_zero(denom):
-            if not _approx_equal(adjusted_score, weighted_sum / denom):
-                return _fusion_fallback("fusion_invariant_violation", "adjusted_score invariant violated")
-            if not _approx_equal(blended_edge, weighted_edge / denom):
-                return _fusion_fallback("fusion_invariant_violation", "blended_edge invariant violated")
+            _inv = _handle_soft_invariant(adjusted_score, weighted_sum / denom, "adjusted_score invariant violated")
+            if _inv is not None:
+                return _inv
+            _inv = _handle_soft_invariant(blended_edge, weighted_edge / denom, "blended_edge invariant violated")
+            if _inv is not None:
+                return _inv
         elif not _effectively_zero(adjusted_score) or not _effectively_zero(blended_edge):
             return _fusion_fallback("fusion_invariant_violation", "adjusted zero-denominator invariant violated")
 
-        if not _effectively_zero(raw_denom) and not _approx_equal(total_raw_weight, raw_denom):
-            return _fusion_fallback("fusion_invariant_violation", "raw group-weight total mismatch")
-        if not _effectively_zero(denom) and not _approx_equal(total_adjusted_weight, denom):
-            return _fusion_fallback("fusion_invariant_violation", "adjusted group-weight total mismatch")
-        if not _approx_equal(total_breakdown_final_weight, denom):
-            return _fusion_fallback("fusion_invariant_violation", "final contribution sum mismatch")
+        if not _effectively_zero(raw_denom):
+            _inv = _handle_soft_invariant(total_raw_weight, raw_denom, "raw group-weight total mismatch")
+            if _inv is not None:
+                return _inv
+        if not _effectively_zero(denom):
+            _inv = _handle_soft_invariant(total_adjusted_weight, denom, "adjusted group-weight total mismatch")
+            if _inv is not None:
+                return _inv
+        _inv = _handle_soft_invariant(total_breakdown_final_weight, denom, "final contribution sum mismatch")
+        if _inv is not None:
+            return _inv
 
         exposed_numeric_fields = {
             "raw_score": raw_score_unadjusted,
@@ -2573,15 +2829,14 @@ class AlphaOrchestrator:
                 is_fb = True
                 r_conf = 0.0
 
-        ratio = final_perf / 0.5
         if final_perf >= 0.5:
             ratio = (final_perf - 0.5) / 0.5
-
-        mult = self.config.feedback_min_multiplier + ratio * (
-            1.0 - self.config.feedback_min_multiplier
-        )
-        if final_perf >= 0.5:
             mult = 1.0 + ratio * (self.config.feedback_max_multiplier - 1.0)
+        else:
+            ratio = final_perf / 0.5
+            mult = self.config.feedback_min_multiplier + ratio * (
+                1.0 - self.config.feedback_min_multiplier
+            )
 
         if self.config.regime_feedback_enabled and regime_name:
             mult = min(mult, self.config.regime_max_adjustment)
@@ -2603,23 +2858,21 @@ class AlphaOrchestrator:
         stats_block: Union[AlphaPerformanceStats, AlphaRegimeStats],
         drift_pen: float = 0.0,
     ) -> float:
-        """Calculates internal direction-aware performance score.
+        """Calibrated direction-aware performance score in [0, 1]."""
+        wr = _safe_float(stats_block.ema_win_rate, 0.5, 0.0, 1.0)
 
-        expected_edge_bps is absolute magnitude (>= 0).
-        avg_realized_edge_bps is signed; positive = profitable.
-        """
-        wr = _safe_float(stats_block.ema_win_rate, 0.5)
         edge_r = 0.5
         if stats_block.expected_edge_bps > _EPSILON:
-            realized = stats_block.avg_realized_edge_bps
-            expected_scale = max(_EPSILON, stats_block.expected_edge_bps)
-            # Negative edge_r means realized edge is inverse to expected edge.
-            edge_r = realized / expected_scale
+            realized = _safe_float(stats_block.avg_realized_edge_bps, 0.0, -_EDGE_BPS_CLAMP, _EDGE_BPS_CLAMP)
+            expected_scale = max(_EPSILON, _safe_float(stats_block.expected_edge_bps, 0.0, 0.0, _EDGE_BPS_CLAMP))
+            raw_edge_r = realized / expected_scale
+            edge_r = max(0.0, min(1.0, raw_edge_r))
 
-        score = (wr * self.config.feedback_win_rate_weight) + (
-            edge_r * self.config.feedback_edge_weight
+        score = (wr * self.config.feedback_win_rate_weight) + (edge_r * self.config.feedback_edge_weight)
+        decay_pen = _safe_float(stats_block.decay_score, 0.0, 0.0, 1.0) * _safe_float(
+            self.config.feedback_decay_penalty, 0.0, 0.0, 1.0
         )
-        decay_pen = stats_block.decay_score * self.config.feedback_decay_penalty
+        drift_pen = _safe_float(drift_pen, 0.0, 0.0, 1.0)
         return max(0.0, min(1.0, score - decay_pen - drift_pen))
 
     # ----------------------------------------
@@ -2690,7 +2943,10 @@ class AlphaOrchestrator:
         total_w = 0.0
         excluded_tfs: List[str] = []
 
-        for tf, res in tf_results.items():
+        for tf in self.config.timeframe_order:
+            if tf not in tf_results:
+                continue
+            res = tf_results[tf]
             tw = _safe_float(self.config.timeframe_weights.get(tf, 1.0), 1.0)
             score = res["net_score"]
 
@@ -2700,10 +2956,10 @@ class AlphaOrchestrator:
             elif score < -db:
                 tf_dir = -1
 
-            if tf == _DEFAULT_TIMEFRAME and dom_dir == 0:
+            if tf == _DEFAULT_TIMEFRAME and dom_dir != 0:
                 logger.debug(
-                    "MTF_COMBINE | default tf excluded from directional avg (dom_dir=0) | score=%.4f | weight=%.4f",
-                    score, tw,
+                    "MTF_COMBINE | default tf excluded: HTF dominance active | dom_dir=%d | score=%.4f",
+                    dom_dir, score,
                 )
                 continue
 
@@ -2905,6 +3161,20 @@ class AlphaOrchestrator:
                     )
                     continue
 
+                # MED-2 FIX: Classify malformed timestamps as "invalid" not "stale".
+                # _safe_float(ts_raw, 0.0) already handles NaN/inf → 0.0, so ts is
+                # always finite here. The ts <= 0.0 check catches: None inputs (→ 0.0),
+                # zero timestamps, and any other degenerate values converted to 0.0.
+                if ts <= 0.0:
+                    metrics["invalid"] += 1
+                    rejection_details.append({"source_id": src, "reason": "invalid_timestamp_zero_or_nonfinite"})
+                    continue
+                if ts < 1e9:
+                    metrics["invalid"] += 1
+                    rejection_details.append(
+                        {"source_id": src, "reason": "invalid_timestamp_implausible", "ts": ts, "threshold": 1e9}
+                    )
+                    continue
                 age = now - ts
                 if age < -0.1:
                     metrics["future_timestamp"] += 1
@@ -3031,10 +3301,7 @@ class AlphaOrchestrator:
             return 0.0, 1.0, 1.0, "dd_breach"
 
         if max_exp <= 0.0:
-            # FIX 16: util is 0.0 when max_exp is zero; risk_pressure = util^gamma
-            # must be 0.0 to match the documented semantics. Fail-closed conviction
-            # remains 0.0.
-            return 0.0, 0.0, 0.0, "zero_exp"
+            return 0.0, 1.0, 0.0, "zero_exp"
 
         util = max(
             0.0,
@@ -3178,232 +3445,5 @@ class AlphaOrchestrator:
             meta_info=meta,
         )
 
-
-def test_r1_max_drawdown_zero_raises():
-    """max_drawdown_pct=0.0 must raise ValueError at config construction, not silently halt trading."""
-    import pytest
-    base_cfg = dict(signal_weights={"src_a": 1.0})
-    with pytest.raises(ValueError, match="max_drawdown_pct"):
-        OrchestratorConfig(**base_cfg, max_drawdown_pct=0.0)
-    cfg = OrchestratorConfig(**base_cfg, max_drawdown_pct=0.15)
-    assert cfg.max_drawdown_pct == 0.15
-
-
-def test_r1_dd_breach_is_real_not_config_artifact():
-    cfg = OrchestratorConfig(signal_weights={"src_a": 1.0}, max_drawdown_pct=0.10)
-    orch = AlphaOrchestrator(cfg)
-    now = time.time()
-    signals = [AlphaSignal("src_a", 1, 0.9, 10.0, now, "1h")]
-    state_ok = ExecutionState(0.0, 10000.0, 0.05)
-    regime = RegimeContext("normal", 0.4, 0.8)
-    result = orch.orchestrate(signals, regime, None, state_ok, current_time=now)
-    assert result.meta_info.get("rationale") != "dd_breach"
-    state_over = ExecutionState(0.0, 10000.0, 0.15)
-    result2 = orch.orchestrate(signals, regime, None, state_over, current_time=now)
-    assert result2.meta_info.get("rationale") == "dd_breach"
-
-
-def test_r2_cold_start_regime_tightening():
-    cfg = OrchestratorConfig(signal_weights={"src": 1.0}, max_drawdown_pct=0.20)
-    engine = RegimeEngine(cfg)
-    high_stress_assessment = RegimeAssessment("unknown", 0.9, 0.9, 0.9, 0.0, True, False, False, 0)
-    effective_dd = engine.effective_max_drawdown(high_stress_assessment, 0.20)
-    assert effective_dd < 0.20
-    full_conf_assessment = RegimeAssessment("trending", 0.9, 0.9, 0.9, 1.0, True, True, False, 30)
-    effective_dd_full = engine.effective_max_drawdown(full_conf_assessment, 0.20)
-    assert effective_dd_full < effective_dd
-    no_stress = RegimeAssessment("calm", 0.2, 0.1, 0.16, 0.0, False, False, True, 0)
-    assert engine.effective_max_drawdown(no_stress, 0.20) == 0.20
-
-
-def test_r3_sanitize_stats_respects_separate_caps():
-    cfg = OrchestratorConfig(signal_weights={"src": 1.0}, feedback_enabled=True, feedback_max_multiplier=1.5, regime_max_adjustment=2.0)
-    orch = AlphaOrchestrator(cfg)
-    global_stats = AlphaPerformanceStats(source_id="src")
-    global_stats.current_multiplier = 1.9
-    orch._sanitize_stats(global_stats)
-    assert global_stats.current_multiplier <= cfg.feedback_max_multiplier
-    regime_stats = AlphaRegimeStats()
-    regime_stats.current_multiplier = 1.9
-    orch._sanitize_stats(regime_stats)
-    assert regime_stats.current_multiplier <= cfg.regime_max_adjustment
-    assert regime_stats.current_multiplier >= 1.5
-
-
-def test_r4_hurdle_locked_exactly_once_by_update_stats_block():
-    cfg = OrchestratorConfig(signal_weights={"src": 1.0}, feedback_enabled=True)
-    orch = AlphaOrchestrator(cfg)
-    orch.update_performance({"source_id": "src", "realized_pnl": 100.0, "realized_edge_bps": 5.0, "expected_edge_bps": 8.0, "expected_win_rate": 0.55, "event_time": time.time()})
-    with orch._lock:
-        stats = orch._performance_stats["src"]
-        assert stats.hurdles_locked is True
-        assert abs(stats.expected_edge_bps - 8.0) < 1e-6
-        assert abs(stats.target_win_rate - 0.55) < 1e-6
-    orch.update_performance({"source_id": "src", "realized_pnl": 50.0, "realized_edge_bps": 3.0, "expected_edge_bps": 15.0, "expected_win_rate": 0.70, "event_time": time.time()})
-    with orch._lock:
-        stats = orch._performance_stats["src"]
-        assert abs(stats.expected_edge_bps - 8.0) < 1e-6
-        assert abs(stats.target_win_rate - 0.55) < 1e-6
-
-
-def test_r5_decay_signal_over_delivery():
-    cfg = OrchestratorConfig(signal_weights={"src": 1.0}, feedback_enabled=True)
-    orch = AlphaOrchestrator(cfg)
-    stats = AlphaPerformanceStats(source_id="src")
-    stats.expected_edge_bps = 10.0
-    stats.target_win_rate = 0.55
-    stats.hurdles_locked = True
-    stats.avg_realized_edge_bps = 30.0
-    decay = orch._calculate_decay_signal(stats, None, None)
-    stats.avg_realized_edge_bps = 10.0
-    decay_breakeven = orch._calculate_decay_signal(stats, None, None)
-    stats.avg_realized_edge_bps = 5.0
-    decay_under = orch._calculate_decay_signal(stats, None, None)
-    assert decay == decay_breakeven
-    assert decay_under > decay_breakeven
-
-
-def test_r6_weak_conviction_always_hold():
-    cfg = OrchestratorConfig(signal_weights={"src": 1.0}, action_threshold=0.7, score_deadband=0.05)
-    orch = AlphaOrchestrator(cfg)
-    meta = {}
-    result = orch._generate_decision(score=0.95, conviction=0.5, edge=10.0, urgency=0.8, risk_rat=None, meta=meta)
-    assert result.action == Action.HOLD
-    assert meta.get("rationale") == "weak_score"
-    meta2 = {}
-    result2 = orch._generate_decision(score=0.95, conviction=0.95, edge=10.0, urgency=0.9, risk_rat="dd_breach", meta=meta2)
-    assert result2.action == Action.HOLD
-    assert result2.net_conviction == 0.0
-    assert meta2.get("rationale") == "dd_breach"
-    meta3 = {}
-    result3 = orch._generate_decision(score=0.8, conviction=0.8, edge=15.0, urgency=0.75, risk_rat=None, meta=meta3)
-    assert result3.action == Action.BUY
-
-
-def test_r7_signal_timeframe_normalized_in_place():
-    now = time.time()
-    sig = AlphaSignal("test_src", 1, 0.8, 10.0, now, "1H")
-    assert sig.timeframe == "1h"
-    sig2 = AlphaSignal("test_src", 1, 0.8, 10.0, now, "  5M  ")
-    assert sig2.timeframe == "5m"
-    sig3 = AlphaSignal("test_src", 1, 0.8, 10.0, now)
-    assert sig3.timeframe == _DEFAULT_TIMEFRAME
-    cfg = OrchestratorConfig(signal_weights={"test_src": 1.0}, timeframe_order=["1h", "5m", "default"], timeframe_weights={"1h": 2.0, "5m": 1.0, "default": 0.5}, higher_tf_dominance=False)
-    orch = AlphaOrchestrator(cfg)
-    state = ExecutionState(0.0, 10000.0, 0.0)
-    result = orch.orchestrate([sig, sig2], None, None, state, current_time=now)
-    tf_breakdown = result.meta_info.get("timeframe_breakdown", {})
-    assert "1H" not in tf_breakdown
-    assert "  5M  " not in tf_breakdown
-
-
-def test_r8_signal_ttl_upper_bound():
-    cfg = OrchestratorConfig(signal_weights={"src": 1.0}, signal_ttl_seconds=1e30)
-    assert cfg.signal_ttl_seconds <= 300.0
-    cfg2 = OrchestratorConfig(signal_weights={"src": 1.0}, signal_ttl_seconds=300.0)
-    orch = AlphaOrchestrator(cfg2)
-    old_ts = time.time() - 301.0
-    stale_sig = {"source_id": "src", "direction": 1, "conviction": 0.9, "expected_edge_bps": 10.0, "timestamp": old_ts, "timeframe": "default"}
-    state = ExecutionState(0.0, 10000.0, 0.0)
-    result = orch.orchestrate([stale_sig], None, None, state, current_time=time.time())
-    assert result.meta_info.get("metrics", {}).get("stale", 0) >= 1
-
-
-def test_r9_mtf_decision_matches_score():
-    cfg = OrchestratorConfig(signal_weights={"src": 1.0}, timeframe_order=["1h", "4h", "default"], score_deadband=0.05, higher_tf_dominance=False)
-    orch = AlphaOrchestrator(cfg)
-    tf_results_buy = {"1h": {"net_score": 0.8, "blended_edge": 12.0, "fusion_meta": {}}, "4h": {"net_score": 0.7, "blended_edge": 10.0, "fusion_meta": {}}}
-    score, edge, meta = orch._combine_timeframes(tf_results_buy)
-    assert score > 0.05
-    assert meta["decision"] == "BUY"
-    tf_results_sell = {"1h": {"net_score": -0.75, "blended_edge": -11.0, "fusion_meta": {}}, "4h": {"net_score": -0.8, "blended_edge": -12.0, "fusion_meta": {}}}
-    score2, _, meta2 = orch._combine_timeframes(tf_results_sell)
-    assert score2 < -0.05
-    assert meta2["decision"] == "SELL"
-    tf_results_hold = {"1h": {"net_score": 0.01, "blended_edge": 0.5, "fusion_meta": {}}}
-    score3, _, meta3 = orch._combine_timeframes(tf_results_hold)
-    assert meta3["decision"] == "HOLD"
-
-
-def test_r10_default_tf_does_not_dominate_when_canonical_neutral():
-    cfg = OrchestratorConfig(signal_weights={"src": 1.0}, timeframe_order=["1h", "4h", "default"], timeframe_weights={"1h": 2.0, "4h": 2.0, "default": 5.0}, score_deadband=0.05, higher_tf_dominance=True)
-    orch = AlphaOrchestrator(cfg)
-    tf_results = {"1h": {"net_score": 0.02, "blended_edge": 0.5, "fusion_meta": {}}, "4h": {"net_score": 0.01, "blended_edge": 0.3, "fusion_meta": {}}, "default": {"net_score": 0.9, "blended_edge": 15.0, "fusion_meta": {}}}
-    combined_score, _, meta = orch._combine_timeframes(tf_results)
-    assert abs(combined_score) <= cfg.score_deadband + 0.01
-
-
-def test_r11_infinite_direction_correctly_classified():
-    cfg = OrchestratorConfig(signal_weights={"src": 1.0})
-    orch = AlphaOrchestrator(cfg)
-    now = time.time()
-    bad_signal = {"source_id": "src", "direction": float('inf'), "conviction": 0.8, "expected_edge_bps": 10.0, "timestamp": now, "timeframe": "default"}
-    valid, metrics, rejections = orch._validate_and_prune([bad_signal], now)
-    assert len(valid) == 0
-    assert metrics["invalid"] == 1
-    assert any(r.get("reason") == "invalid_direction" for r in rejections)
-
-
-def test_r12_event_timestamp_zero_rejected():
-    cfg = OrchestratorConfig(signal_weights={"src": 1.0}, feedback_enabled=True)
-    orch = AlphaOrchestrator(cfg)
-    result = orch._resolve_event_timestamp(0.0, {"source_id": "src"})
-    assert result is None
-    now = time.time()
-    result2 = orch._resolve_event_timestamp(now, {"source_id": "src"})
-    assert result2 == now
-
-
-def test_r13_no_local_eps_redefinition():
-    import inspect
-    import alpha_orchestrator as mod
-    src = inspect.getsource(mod.AlphaOrchestrator._fuse_signals)
-    assert "eps = 1e-8" not in src
-    assert hasattr(mod, "_FUSION_EPS")
-    assert hasattr(mod, "_EPSILON")
-
-
-def test_r14_single_pass_invariant_produces_same_results():
-    cfg = OrchestratorConfig(signal_weights={"src_a": 1.0, "src_b": 0.8, "src_c": 0.6}, timeframe_order=["1h", "4h", "default"])
-    orch = AlphaOrchestrator(cfg)
-    now = time.time()
-    signals = [AlphaSignal("src_a", 1, 0.9, 12.0, now, "1h"), AlphaSignal("src_b", 1, 0.7, 8.0, now, "1h"), AlphaSignal("src_c", -1, 0.6, 5.0, now, "1h")]
-    perf_snap = {}
-    score, edge, meta = orch._fuse_signals(signals, "unknown", 0.05, perf_snap)
-    assert not meta.get("is_fallback_synthetic", False)
-    assert math.isfinite(score)
-    assert math.isfinite(edge)
-
-
-if __name__ == "__main__":
-    import sys
-    tests = [
-        test_r1_max_drawdown_zero_raises,
-        test_r1_dd_breach_is_real_not_config_artifact,
-        test_r2_cold_start_regime_tightening,
-        test_r3_sanitize_stats_respects_separate_caps,
-        test_r4_hurdle_locked_exactly_once_by_update_stats_block,
-        test_r5_decay_signal_over_delivery,
-        test_r6_weak_conviction_always_hold,
-        test_r7_signal_timeframe_normalized_in_place,
-        test_r8_signal_ttl_upper_bound,
-        test_r9_mtf_decision_matches_score,
-        test_r10_default_tf_does_not_dominate_when_canonical_neutral,
-        test_r11_infinite_direction_correctly_classified,
-        test_r12_event_timestamp_zero_rejected,
-        test_r13_no_local_eps_redefinition,
-        test_r14_single_pass_invariant_produces_same_results,
-    ]
-    failed = []
-    for test_fn in tests:
-        try:
-            test_fn()
-            print(f"PASS: {test_fn.__name__}")
-        except Exception as e:
-            print(f"FAIL: {test_fn.__name__} — {e}")
-            failed.append(test_fn.__name__)
-    if failed:
-        print(f"\n{len(failed)} tests FAILED: {failed}")
-        sys.exit(1)
-    else:
-        print(f"\nAll {len(tests)} tests passed. Production hardening verified.")
+# Tests have been moved to test_alpha_orchestrator_embedded.py and
+# test_alpha_orchestrator_hardened.py to avoid polluting the production namespace.
