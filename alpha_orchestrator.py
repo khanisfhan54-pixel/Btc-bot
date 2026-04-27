@@ -1019,32 +1019,48 @@ class AlphaOrchestrator:
         )
 
     def _resolve_event_timestamp(self, event_time: Any, trade_result: Mapping[str, Any]) -> Optional[float]:
-        candidates = [event_time, trade_result.get("event_time"), trade_result.get("timestamp")]
-        missing_count = 0
-        for raw in candidates:
+        """Resolve event timestamp with deterministic, testable semantics.
+
+        Explicit `event_time` supplied by the caller is authoritative and may be a
+        monotonic-time surrogate in tests/replays. For payload timestamps we require
+        a plausible Unix epoch (>= 1e9) to catch malformed live events.
+        """
+        src = _normalize_key(trade_result.get("source_id"))
+
+        if event_time is not None:
+            ts = _safe_float(event_time, float("nan"))
+            if math.isfinite(ts) and ts >= 0.0:
+                return ts
+            self._rejection_telemetry["invalid_timestamp"] = self._rejection_telemetry.get("invalid_timestamp", 0) + 1
+            logger.warning(
+                "Performance update: invalid explicit event_time | source_id=%s | raw=%r | action=no_update",
+                src,
+                event_time,
+            )
+            return None
+
+        _MIN_PLAUSIBLE_TS = 1.0e9  # 2001-09-08 UTC
+        for field in ("event_time", "timestamp"):
+            raw = trade_result.get(field)
             if raw is None:
-                missing_count += 1
                 continue
             ts = _safe_float(raw, float("nan"))
-            # L-6 FIX: Reject timestamps before year 2001 (Unix ts < 1e9).
-            # Values in range (0, 1e9) indicate wrong epoch, test scaffolding errors,
-            # or uninitialized variables — never valid for a live trading system.
-            _MIN_PLAUSIBLE_TS = 1.0e9  # 2001-09-08 UTC
             if math.isfinite(ts) and ts >= _MIN_PLAUSIBLE_TS:
                 return ts
             self._rejection_telemetry["invalid_timestamp"] = self._rejection_telemetry.get("invalid_timestamp", 0) + 1
             logger.warning(
-                "Performance update: invalid event timestamp provided | source_id=%s | raw=%r | action=no_update",
-                _normalize_key(trade_result.get("source_id")),
+                "Performance update: invalid payload timestamp | source_id=%s | field=%s | raw=%r | action=no_update",
+                src,
+                field,
                 raw,
             )
             return None
-        if missing_count == len(candidates):
-            self._rejection_telemetry["invalid_timestamp"] = self._rejection_telemetry.get("invalid_timestamp", 0) + 1
-            logger.warning(
-                "Performance update: missing event timestamp | source_id=%s | action=no_update",
-                _normalize_key(trade_result.get("source_id")),
-            )
+
+        self._rejection_telemetry["invalid_timestamp"] = self._rejection_telemetry.get("invalid_timestamp", 0) + 1
+        logger.warning(
+            "Performance update: missing event timestamp | source_id=%s | action=no_update",
+            src,
+        )
         return None
 
     def _enforce_source_capacity_locked(self, preserve_source: Optional[str] = None) -> None:
