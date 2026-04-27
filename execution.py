@@ -1314,12 +1314,14 @@ class ExecutionEngine:
         )
         final_decision = dict(decision)
         final_decision["position_size"] = _safe_float(final_decision.get("position_size", 0.0), 0.0)
-        try:
-            assert final_decision["position_size"] >= 0.0, "position_size must be >= 0"
-            if not bool(final_decision.get("execute")):
-                assert final_decision["position_size"] == 0.0, "execute=False requires position_size=0"
-        except AssertionError as assert_exc:
-            logger.warning("[EXECUTION VALIDATION] %s", assert_exc)
+        if final_decision["position_size"] < 0.0:
+            logger.warning("[EXECUTION VALIDATION] position_size must be >= 0")
+            final_decision["position_size"] = 0.0
+            final_decision["execute"] = False
+            final_decision["reason"] = "invalid_negative_position_size"
+        if not bool(final_decision.get("execute")) and final_decision["position_size"] != 0.0:
+            logger.warning("[EXECUTION VALIDATION] execute=False requires position_size=0")
+            final_decision["position_size"] = 0.0
 
         if not bool(final_decision.get("execute")):
             final_decision["position_size"] = 0.0

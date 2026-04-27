@@ -1034,7 +1034,7 @@ class AdvancedRegimeEngine:
     _MAX_PRICE_STALENESS_SEC: float = 300.0
     _MAX_PRICE_STALENESS_TICKS: int = 5
     _PRICE_RETURN_MISMATCH_TOLERANCE: float = 1e-3
-    _CANONICAL_RETURN_MISMATCH_TOLERANCE: float = 1e-12
+    _CANONICAL_RETURN_MISMATCH_TOLERANCE: float = 1e-8
     _DIRECTION_SWITCH_GAP: float = 0.02
     _SJM_RESERVED_RETURN_IDX: int = 0
     _SJM_RESERVED_ABS_RETURN_IDX: int = 2
@@ -1704,7 +1704,23 @@ class AdvancedRegimeEngine:
         if current_mode is None:
             self._pnl_mode = inferred_mode
         elif current_mode != inferred_mode:
-            return False, f"PNL_MODE_SWITCH:{current_mode}->{inferred_mode}"
+            stale_switch = (
+                (current_mode == "TICK" and inferred_mode == "TIMESTAMP")
+                or (
+                    current_mode == "TIMESTAMP"
+                    and inferred_mode == "TICK"
+                    and bool(self._allow_timestamp_free_pnl)
+                )
+            )
+            if stale_switch:
+                self._warn_rate_limited(
+                    key="pnl_mode_recovered",
+                    message=f"Recovering pnl mode from {current_mode} to {inferred_mode}",
+                    cooldown_s=30.0,
+                )
+                self._pnl_mode = inferred_mode
+            else:
+                return False, f"PNL_MODE_SWITCH:{current_mode}->{inferred_mode}"
         self._last_price = float(price)
         self._last_price_timestamp = None if timestamp is None else float(timestamp)
         self._last_price_tick_id = int(tick_id)
@@ -2020,7 +2036,18 @@ class AdvancedRegimeEngine:
                 self.nhhmm.load_weights(np.asarray(weights["nhhmm_beta"]), np.asarray(weights["nhhmm_mu"]), np.asarray(weights["nhhmm_sigma"]))
             if "sjm_centroids" in weights:
                 means = np.asarray(weights["sjm_centroids"], dtype=float)
-                w = np.ones(means.shape[0], dtype=float) / means.shape[0]
+                if means.ndim != 2 or means.shape[1] != self.n_features:
+                    raise ValueError(
+                        f"invalid sjm_centroids shape={means.shape}; expected (*, {self.n_features})"
+                    )
+                raw_w = weights.get("sjm_feature_weights", np.ones(means.shape[1], dtype=float))
+                w = np.asarray(raw_w, dtype=float).reshape(-1)
+                if w.shape[0] != means.shape[1]:
+                    raise ValueError(
+                        f"invalid sjm_feature_weights shape={w.shape}; expected ({means.shape[1]},)"
+                    )
+                if not np.all(np.isfinite(w)) or float(np.sum(np.abs(w))) <= 0.0:
+                    raise ValueError("sjm_feature_weights must be finite and non-zero")
                 self.sjm.load_weights(means, w)
             self._weights_loaded = True
         except Exception:
@@ -3172,7 +3199,6 @@ class AdvancedRegimeEngine:
             self._determinism_had_failure = True
             self._determinism_status = "OK_WITH_HISTORY"
 
-    @_synchronized
     def load_state(self, state: Dict[str, Any]) -> None:
         """
         Atomic state load:
@@ -3199,24 +3225,41 @@ class AdvancedRegimeEngine:
                 self._mark_determinism_failure()
                 self._log_state_load_issue("engine_rng_state", exc, "invalid_rng_state")
                 return
+        with self._lock:
+            init_params = dict(self._init_params)
+            allow_igarch = bool(self._allow_igarch)
+            emit_extended_schema = bool(self._emit_extended_schema)
+            strict_mtf_keys = bool(self._strict_mtf_keys)
+            mtf_weights = copy.deepcopy(self.mtf_weights)
+            sjm_reserved = self._sjm_reserved_feature_indices
+            allow_timestamp_free_pnl = bool(self._allow_timestamp_free_pnl)
+            max_price_staleness_ticks = int(self._max_price_staleness_ticks)
+            shock_warmup_ticks = int(self._shock_warmup_ticks)
+            shock_warmup_seconds = float(self._shock_warmup_seconds)
+            shock_startup_multiplier = float(self._shock_startup_multiplier)
+            shock_startup_vol_floor_mult = float(self._shock_startup_vol_floor_mult)
+            rng_seed = self._rng_seed
+            engine_id = self.engine_id
+            determinism_status = str(getattr(self, "_determinism_status", "OK"))
+            determinism_had_failure = bool(getattr(self, "_determinism_had_failure", False))
         staging = AdvancedRegimeEngine(
-            n_states=int(self._init_params.get("n_states", self.K)),
-            n_features=int(self._init_params.get("n_features", self.n_features)),
-            target_vol=float(self._init_params.get("target_vol", self.garch.target_vol)),
-            allow_igarch=bool(self._allow_igarch),
+            n_states=int(init_params.get("n_states", self.K)),
+            n_features=int(init_params.get("n_features", self.n_features)),
+            target_vol=float(init_params.get("target_vol", self.garch.target_vol)),
+            allow_igarch=allow_igarch,
             regime_prob_floor=float(self.garch._REGIME_PROB_FLOOR),
-            emit_extended_schema=bool(self._emit_extended_schema),
-            strict_mtf_keys=bool(self._strict_mtf_keys),
-            mtf_weights=copy.deepcopy(self.mtf_weights),
-            sjm_reserved_feature_indices=self._sjm_reserved_feature_indices,
-            allow_timestamp_free_pnl=bool(self._allow_timestamp_free_pnl),
-            max_price_staleness_ticks=int(self._max_price_staleness_ticks),
-            shock_warmup_ticks=int(self._shock_warmup_ticks),
-            shock_warmup_seconds=float(self._shock_warmup_seconds),
-            shock_startup_multiplier=float(self._shock_startup_multiplier),
-            shock_startup_vol_floor_mult=float(self._shock_startup_vol_floor_mult),
-            seed=self._rng_seed,
-            engine_id=self.engine_id,
+            emit_extended_schema=emit_extended_schema,
+            strict_mtf_keys=strict_mtf_keys,
+            mtf_weights=mtf_weights,
+            sjm_reserved_feature_indices=sjm_reserved,
+            allow_timestamp_free_pnl=allow_timestamp_free_pnl,
+            max_price_staleness_ticks=max_price_staleness_ticks,
+            shock_warmup_ticks=shock_warmup_ticks,
+            shock_warmup_seconds=shock_warmup_seconds,
+            shock_startup_multiplier=shock_startup_multiplier,
+            shock_startup_vol_floor_mult=shock_startup_vol_floor_mult,
+            seed=rng_seed,
+            engine_id=engine_id,
             enable_background_workers=False,
         )
         _staging_warnings: List[tuple[str, str]] = []
@@ -3228,8 +3271,8 @@ class AdvancedRegimeEngine:
         staging._warn_rate_limited = _accumulating_warn
         try:
             staging._is_replay = True
-            staging._determinism_status = str(getattr(self, "_determinism_status", "OK"))
-            staging._determinism_had_failure = bool(getattr(self, "_determinism_had_failure", False))
+            staging._determinism_status = determinism_status
+            staging._determinism_had_failure = determinism_had_failure
             staging._load_state_inplace(copy.deepcopy(state))
             if str(getattr(staging, "_determinism_status", "OK")) == "RNG_RESTORE_FAILED":
                 self._mark_determinism_failure()
@@ -3248,9 +3291,10 @@ class AdvancedRegimeEngine:
             staging._shutdown_snapshot_worker()
 
         # Commit in one shot (no validation failures expected after staging).
-        self._load_state_inplace(committed_state)
-        if committed_rng_state is not None and getattr(self, "_rng", None) is not None:
-            self._rng.bit_generator.state = committed_rng_state
+        with self._lock:
+            self._load_state_inplace(committed_state)
+            if committed_rng_state is not None and getattr(self, "_rng", None) is not None:
+                self._rng.bit_generator.state = committed_rng_state
         for level, message in _staging_warnings:
             LOGGER.log(getattr(logging, level, logging.WARNING), "[state_load] %s", message)
         if _staging_warnings:
@@ -3267,8 +3311,12 @@ class AdvancedRegimeEngine:
                 cooldown_s=30.0,
             )
         if "price" in market_data:
-            assert isinstance(market_data["price"], float) and np.isfinite(market_data["price"]), \
-                f"price must be a finite float, got {market_data.get('price')}"
+            try:
+                market_data["price"] = float(market_data["price"])
+            except Exception as exc:
+                raise ValueError(f"price must be numeric, got {market_data.get('price')!r}") from exc
+            if not np.isfinite(market_data["price"]):
+                raise ValueError(f"price must be finite, got {market_data.get('price')}")
         # NOTE: enforce globally across codebase:
         # ALL side effects must follow:
         # if not getattr(self, "_is_replay", False): LOGGER / metrics / hooks
@@ -4216,7 +4264,14 @@ class AdvancedRegimeEngine:
         if (not use_fused_macro_only) and np.isfinite(y_t):
             shock_decay = float(np.clip(self._SHOCK_MEMORY_DECAY, 0.0, 0.999))
             prev_shock_memory = float(getattr(self, "_shock_memory", 0.0))
-            self._shock_memory = max(abs(float(y_t)), shock_decay * prev_shock_memory)
+            abs_ret = abs(float(y_t))
+            baseline_vol = max(float(self._last_valid_vol), float(self.garch.target_vol), 1e-8)
+            shock_threshold = 2.0 * baseline_vol
+            if abs_ret >= shock_threshold:
+                self._shock_memory = max(abs_ret, shock_decay * prev_shock_memory)
+            else:
+                evidence_decay = np.clip(0.75 + (abs_ret / max(shock_threshold, 1e-8)) * 0.2, 0.70, 0.95)
+                self._shock_memory = max(abs_ret, float(prev_shock_memory * evidence_decay))
             shock_scale = max(
                 float(self.garch.target_vol) * float(self._SHOCK_INTENSITY_VOL_MULT),
                 0.01,
@@ -4814,8 +4869,14 @@ class AdvancedRegimeEngine:
             extended_schema=self._emit_extended_schema,
             range_ticks=rticks,
             include_signal_valid=True,
-            signal_valid=True,
+            signal_valid=bool(self._weights_loaded),
         )
+        if not self._weights_loaded:
+            output["regime_label"] = "UNCALIBRATED"
+            output["execution_mode"] = "halt"
+            output["position_size"] = 0.0
+            output["signed_position_size"] = 0.0
+            output["feed_status"] = "UNCALIBRATED_WEIGHTS"
         if obs_sample and not getattr(self, "_is_replay", False):
             self._replay_record("update_end", {"regime": confirmed_regime})
         if _PROM_AVAILABLE and not getattr(self, "_is_replay", False):

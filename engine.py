@@ -3640,11 +3640,12 @@ def run_all_engines(
         _alpha_symbol = (symbol or "BTC/USDT").replace("/", "").upper()
         with _ALPHA_STATE_LOCK:
             _alpha_st = _ALPHA_STATE.setdefault(_alpha_symbol, {})
-        prev_alpha_direction = _alpha_st.get("direction", "NEUTRAL")
-        prev_alpha_conf = _clamp(_safe_float(_alpha_st.get("confidence", 0.5), 0.5), 0.0, 1.0)
+            prev_alpha_direction = _alpha_st.get("direction", "NEUTRAL")
+            prev_alpha_conf = _clamp(_safe_float(_alpha_st.get("confidence", 0.5), 0.5), 0.0, 1.0)
         flip_threshold = 0.55 if prev_alpha_direction == "NEUTRAL" else 0.65
         now_ts = time.time()
-        prev_flip_ts = _safe_float(_alpha_st.get("flip_ts", 0.0), 0.0)
+        with _ALPHA_STATE_LOCK:
+            prev_flip_ts = _safe_float(_alpha_st.get("flip_ts", 0.0), 0.0)
         if alpha_direction != prev_alpha_direction:
             if abs(alpha_prob_above - alpha_prob_below) < 0.2:
                 alpha_direction = prev_alpha_direction
@@ -3663,13 +3664,14 @@ def run_all_engines(
                 alpha_confidence = _clamp(alpha_confidence + 0.02, 0.0, 1.0)
             else:
                 alpha_confidence = _clamp(alpha_confidence - 0.02, 0.0, 1.0)
-        _alpha_st["direction"] = alpha_direction
-        if alpha_direction == "NEUTRAL":
-            _alpha_st["flip_ts"] = 0.0
-            _alpha_st["confidence"] = 0.5
-        elif alpha_direction != prev_alpha_direction:
-            _alpha_st["flip_ts"] = now_ts
-        _alpha_st["confidence"] = alpha_confidence
+        with _ALPHA_STATE_LOCK:
+            _alpha_st["direction"] = alpha_direction
+            if alpha_direction == "NEUTRAL":
+                _alpha_st["flip_ts"] = 0.0
+                _alpha_st["confidence"] = 0.5
+            elif alpha_direction != prev_alpha_direction:
+                _alpha_st["flip_ts"] = now_ts
+            _alpha_st["confidence"] = alpha_confidence
         alpha_confidence = _clamp(_safe_float(alpha_confidence, 0.5), 0.01, 0.99)
         alpha_payload = {
             "direction": alpha_direction,
@@ -3746,10 +3748,20 @@ def run_all_engines(
 
         debug = bool(getattr(run_all_engines, "_debug_alpha", False))
         if debug:
-            assert 0.0 <= alpha_payload["confidence"] <= 1.0
-            assert abs(alpha_payload["prob_above"] + alpha_payload["prob_below"] - 1.0) < 1e-6
-            assert alpha_payload["direction"] in ("LONG", "SHORT", "NEUTRAL")
-            assert 0.0 <= alpha_payload["confidence"] <= 1.0
+            invalid_alpha_payload = False
+            if not (0.0 <= alpha_payload["confidence"] <= 1.0):
+                invalid_alpha_payload = True
+            if abs(alpha_payload["prob_above"] + alpha_payload["prob_below"] - 1.0) >= 1e-6:
+                invalid_alpha_payload = True
+            if alpha_payload["direction"] not in ("LONG", "SHORT", "NEUTRAL"):
+                invalid_alpha_payload = True
+            if invalid_alpha_payload:
+                logger.error("[ALPHA_DEBUG] invalid alpha payload detected; forcing fail-closed neutral alpha")
+                alpha_payload["direction"] = "NEUTRAL"
+                alpha_payload["confidence"] = 0.0
+                alpha_payload["prob_above"] = 0.5
+                alpha_payload["prob_below"] = 0.5
+                market_data["allow_trade"] = False
 
         if not math.isfinite(alpha_payload["confidence"]):
             alpha_payload["confidence"] = 0.5
@@ -3791,16 +3803,37 @@ def run_all_engines(
 
         institutional = institutional or {}
 
-        smc_signal = evaluate_smc_sniper(
-            candles_by_tf=candles_by_tf,
-            orderbook=orderbook,
-            trades=trades,
-            price=price,
-            volume_intel=vol_intel,
-            market_state=market_state,
-            engines_out={},
-            use_learning=True,
+        _last_candle = primary_1m[-1] if primary_1m else []
+        _last_candle_ts = _safe_float(_last_candle[0], 0.0) if len(_last_candle) >= 1 else 0.0
+        _book_sig = (
+            round(_safe_float((orderbook.get("bids") or [[0.0, 0.0]])[0][0]), 2),
+            round(_safe_float((orderbook.get("bids") or [[0.0, 0.0]])[0][1]), 6),
+            round(_safe_float((orderbook.get("asks") or [[0.0, 0.0]])[0][0]), 2),
+            round(_safe_float((orderbook.get("asks") or [[0.0, 0.0]])[0][1]), 6),
         )
+        _smc_cache_key = (
+            str(symbol),
+            round(_safe_float(price, 0.0), 4),
+            int(len(primary_1m)),
+            _last_candle_ts,
+            _book_sig,
+            int(len(trades or [])),
+        )
+        _smc_cache = getattr(run_all_engines, "_smc_cache", {})
+        if _smc_cache.get("key") == _smc_cache_key:
+            smc_signal = dict(_smc_cache.get("value", {}))
+        else:
+            smc_signal = evaluate_smc_sniper(
+                candles_by_tf=candles_by_tf,
+                orderbook=orderbook,
+                trades=trades,
+                price=price,
+                volume_intel=vol_intel,
+                market_state=market_state,
+                engines_out={},
+                use_learning=True,
+            )
+            run_all_engines._smc_cache = {"key": _smc_cache_key, "value": dict(smc_signal or {})}
 
         smc_signal = smc_signal or {}
 

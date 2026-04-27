@@ -136,6 +136,8 @@ class AlphaSignal:
             raise ValueError("AlphaSignal.conviction must be in [0, 1]")
         if self.expected_edge_bps is None or not math.isfinite(float(self.expected_edge_bps)):
             raise ValueError("AlphaSignal.expected_edge_bps must be finite")
+        if float(self.expected_edge_bps) < 0.0:
+            raise ValueError("AlphaSignal.expected_edge_bps must be >= 0 and direction-agnostic")
         if self.timestamp is None or not math.isfinite(float(self.timestamp)):
             raise ValueError("AlphaSignal.timestamp must be a finite unix timestamp")
         if float(self.timestamp) <= 0.0:
