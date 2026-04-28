@@ -50,3 +50,12 @@ def test_invalid_inputs_raise_or_safe_fallback():
         assert np.isfinite(output_arr).all(), "invalid inputs should return safe finite fallback"
     except ValueError:
         assert True, "raising controlled ValueError is acceptable behavior"
+
+
+def test_detect_liquidity_sweep_invalid_price_fail_closed():
+    out = engine.detect_liquidity_sweep(trades=[], price=float("nan"))
+    values = np.array([float(out.get("size_usd", 0.0))])
+    assert out["sweep"] is False
+    assert out["reason"] == "invalid_price"
+    assert not np.isnan(values).any()
+    assert not np.isinf(values).any()

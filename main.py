@@ -61,6 +61,7 @@ BACKTEST_RISK_PCT = float(os.environ.get("BACKTEST_RISK_PCT", "0.005"))
 RECONCILIATION_BLOCK_SECONDS = int(os.environ.get("RECONCILIATION_BLOCK_SECONDS", "300"))
 _reconciliation_blocks: Dict[str, float] = {}
 _ORDERBOOK_SNAPSHOTS: Deque[Dict[str, Any]] = deque(maxlen=8)
+_ORDERBOOK_SNAPSHOTS_LOCK = threading.RLock()
 
 try:
     from feature_engine import FeatureEngine
@@ -543,8 +544,7 @@ except Exception as _e:
     def evaluate_meta_filter(*args, **kwargs):
         return {"allow_trade": False, "risk_scale": 0.0, "reason": "engine_unavailable", "meta_state": {"fail_closed": True}}
 
-    def get_shared_alpha_predictor():
-        return LiquiditySweepAlpha() if LiquiditySweepAlpha is not None else None
+    from engine import get_shared_alpha_predictor
 
     def apply_meta_to_decision(decision, meta_result):
         return decision if isinstance(decision, dict) else {}
@@ -579,6 +579,36 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return default
+
+
+def _append_orderbook_snapshot(orderbook: Dict[str, Any], timestamp: Optional[float] = None) -> None:
+    if not isinstance(orderbook, dict):
+        return
+
+    def _normalize_levels(levels: Any) -> List[List[float]]:
+        normalized: List[List[float]] = []
+        for lvl in (levels or [])[:20]:
+            try:
+                p = _safe_float(lvl[0], 0.0)
+                q = _safe_float(lvl[1], 0.0)
+                if p > 0.0 and q >= 0.0 and np.isfinite(p) and np.isfinite(q):
+                    normalized.append([float(p), float(q)])
+            except Exception:
+                continue
+        return normalized
+
+    snapshot = {
+        "bids": _normalize_levels(orderbook.get("bids")),
+        "asks": _normalize_levels(orderbook.get("asks")),
+        "timestamp": float(_safe_float(timestamp, time.time())),
+    }
+    with _ORDERBOOK_SNAPSHOTS_LOCK:
+        _ORDERBOOK_SNAPSHOTS.append(snapshot)
+
+
+def _get_orderbook_snapshot_history() -> List[Dict[str, Any]]:
+    with _ORDERBOOK_SNAPSHOTS_LOCK:
+        return list(_ORDERBOOK_SNAPSHOTS)
 
 
 def _enforce_entry_fee_metadata(fees, fee_type, trade_id=None):
@@ -1745,6 +1775,8 @@ def run_analysis_cycle(
     )
 
     liq_events = liq_monitor.get_events() if liq_monitor else []
+    _append_orderbook_snapshot(analysis_orderbook, timestamp=time.time())
+    snapshot_history = _get_orderbook_snapshot_history()
 
     engines_out = (
         run_all_engines(
@@ -1760,7 +1792,7 @@ def run_analysis_cycle(
             liquidation_events=liq_events,
             performance={},
             volume_intelligence=volume_intel,
-            orderbook_snapshots=list(_ORDERBOOK_SNAPSHOTS),
+            orderbook_snapshots=snapshot_history,
         )
         or {}
     )
@@ -2456,6 +2488,9 @@ def run_analysis_cycle(
             "order_type": "market",
         }
     result["router_decision"] = router_decision
+    critical_input_missing = bool(engines_out.get("open_interest_missing", False))
+    if critical_input_missing:
+        logger.error("[RISK] Critical input missing (open_interest). Forcing fail-closed execution block.")
 
     try:
         meta_result = evaluate_meta_filter(
@@ -2468,6 +2503,16 @@ def run_analysis_cycle(
     except Exception as _meta_exc:
         logger.warning("[META_FILTER] evaluation error (fail-closed): %s", _meta_exc)
         meta_result = {"allow_trade": False, "risk_scale": 0.0, "reason": "eval_error", "meta_state": {"fail_closed": True}}
+    if critical_input_missing:
+        meta_state = dict(meta_result.get("meta_state", {})) if isinstance(meta_result, dict) else {}
+        meta_state["fail_closed"] = True
+        meta_state["open_interest_missing"] = True
+        meta_result = {
+            "allow_trade": False,
+            "risk_scale": 0.0,
+            "reason": "open_interest_missing",
+            "meta_state": meta_state,
+        }
 
     if not meta_result.get("allow_trade", True):
         logger.info(
@@ -3047,10 +3092,3 @@ if __name__ == "__main__":
         run_backtest()
     else:
         run_live()
-    if isinstance(analysis_orderbook, dict):
-        _ORDERBOOK_SNAPSHOTS.append(
-            {
-                "bids": list((analysis_orderbook.get("bids") or [])[:20]),
-                "asks": list((analysis_orderbook.get("asks") or [])[:20]),
-            }
-        )

@@ -58,3 +58,12 @@ def test_pipeline_deterministic_and_fail_closed_on_missing_critical_inputs():
     assert result1["used_capital"] <= result1["total_capital"], "used capital must not exceed total capital"
     assert result1["deprecated_authoritative"] is False, "deprecated helper must not be authoritative"
     assert result1["fail_closed"] is True, "pipeline must fail closed when critical OI input is missing"
+
+
+def test_orderbook_snapshot_pipeline_rolls_before_engine_execution():
+    main._ORDERBOOK_SNAPSHOTS.clear()
+    ob = {"bids": [[99990.0, 1.0]], "asks": [[100010.0, 1.0]]}
+    main._append_orderbook_snapshot(ob, timestamp=1.0)
+    history = main._get_orderbook_snapshot_history()
+    assert len(history) == 1
+    assert history[0]["bids"][0][0] == 99990.0

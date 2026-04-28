@@ -37,7 +37,8 @@ from trading_utils import safe_float, clamp, validate_alpha
 from thread_safe_wrappers import ordered_lock
 
 logger = logging.getLogger(__name__)
-_LIQUIDITY_SWEEP_ALPHA = LiquiditySweepAlpha()
+_LIQUIDITY_SWEEP_ALPHA: Optional[LiquiditySweepAlpha] = None
+_LIQUIDITY_SWEEP_ALPHA_INIT_LOCK = threading.Lock()
 _ALPHA_STATE: Dict[str, Dict[str, Any]] = {}
 _ALPHA_STATE_LOCK = threading.Lock()
 _LIQUIDITY_UPDATE_LOCK = threading.RLock()
@@ -124,6 +125,13 @@ def evaluate_meta_filter(
 
 
 def get_shared_alpha_predictor() -> LiquiditySweepAlpha:
+    global _LIQUIDITY_SWEEP_ALPHA
+    if _LIQUIDITY_SWEEP_ALPHA is not None:
+        return _LIQUIDITY_SWEEP_ALPHA
+    with _LIQUIDITY_SWEEP_ALPHA_INIT_LOCK:
+        if _LIQUIDITY_SWEEP_ALPHA is None:
+            _LIQUIDITY_SWEEP_ALPHA = LiquiditySweepAlpha()
+            logger.info("[ALPHA] Initialized shared LiquiditySweepAlpha singleton")
     return _LIQUIDITY_SWEEP_ALPHA
 
 
@@ -778,10 +786,30 @@ def order_imbalance_engine(orderbook: dict) -> Dict[str, Any]:
 def detect_liquidity_sweep(
     trades: List[dict],
     price: float,
-    threshold_usd: float = 50_000,
+    threshold_usd: float = 0.0,
+    atr_value: Optional[float] = None,
     lookback: int = 40,
 ) -> Dict[str, Any]:
     try:
+        px = _safe_float(price, 0.0)
+        if px <= 0.0 or not math.isfinite(px):
+            return {
+                "sweep": False,
+                "side": "unknown",
+                "size_usd": 0.0,
+                "trade": None,
+                "reason": "invalid_price",
+                "buy_usd": 0.0,
+                "sell_usd": 0.0,
+            }
+        atr_val = _safe_float(atr_value, 0.0)
+        if atr_val <= 0.0 or not math.isfinite(atr_val):
+            atr_val = max(px * 0.001, 1e-8)
+        dynamic_threshold_usd = max(
+            _safe_float(threshold_usd, 0.0),
+            px * 0.25,
+            atr_val * 400.0,
+        )
         recent = (trades or [])[-lookback:]
         if not recent:
             return {
@@ -797,24 +825,28 @@ def detect_liquidity_sweep(
         same_side = {"BUY": 0.0, "SELL": 0.0}
         for t in recent:
             side = _trade_side(t)
-            usd = _trade_usd(t, price)
+            usd = _trade_usd(t, px)
             if side in same_side:
                 same_side[side] += usd
-            if usd >= threshold_usd * 0.5:
+            if usd >= dynamic_threshold_usd * 0.5:
                 large.append((usd, side, t))
         if large:
             usd, side, trade = max(large, key=lambda x: x[0])
             return {
-                "sweep": bool(usd >= threshold_usd),
+                "sweep": bool(usd >= dynamic_threshold_usd),
                 "side": side or "unknown",
                 "size_usd": round(float(usd), 6),
                 "trade": trade,
-                "reason": "single_large_taker" if usd >= threshold_usd else "clustered_large_takers",
+                "reason": "single_large_taker" if usd >= dynamic_threshold_usd else "clustered_large_takers",
                 "buy_usd": round(float(same_side["BUY"]), 6),
                 "sell_usd": round(float(same_side["SELL"]), 6),
             }
-        total_large = sum(_trade_usd(t, price) for t in recent if _trade_usd(t, price) >= threshold_usd * 0.2)
-        if total_large >= threshold_usd:
+        total_large = sum(
+            _trade_usd(t, px)
+            for t in recent
+            if _trade_usd(t, px) >= dynamic_threshold_usd * 0.2
+        )
+        if total_large >= dynamic_threshold_usd:
             dominant = "BUY" if same_side["BUY"] > same_side["SELL"] else "SELL"
             return {
                 "sweep": True,
@@ -3295,8 +3327,14 @@ def detect_entry_trigger(price, liquidity_map, engines, ai_score, confidence, vo
         if not nearest:
             return {"trigger": False, "reason": "no_nearest_zone", "confidence": 0.0}
 
-        dist = abs(_safe_float(price) - _safe_float(nearest.get("price")))
-        window_ok = 150.0 <= dist <= 450.0
+        px = _safe_float(price, 0.0)
+        if px <= 0.0 or not math.isfinite(px):
+            return {"trigger": False, "reason": "invalid_price", "confidence": 0.0}
+        dist = abs(px - _safe_float(nearest.get("price")))
+        volatility = _safe_float((engines or {}).get("market_state", {}).get("volatility", 0.0), 0.0)
+        dyn_window_min = max(px * 0.0008, px * max(volatility, 0.0005) * 0.60)
+        dyn_window_max = max(px * 0.0045, dyn_window_min * 2.0)
+        window_ok = dyn_window_min <= dist <= dyn_window_max
         strong_signal = abs(_safe_float(ai_score)) >= 0.25 and _safe_float(confidence) >= 0.55
         trigger = bool(window_ok and strong_signal)
 
@@ -3311,7 +3349,7 @@ def detect_entry_trigger(price, liquidity_map, engines, ai_score, confidence, vo
 
 
 # DEPRECATED (moved to signal_engine) — EXECUTION MOVED TO execution_logic.py
-def build_trade_plan(price, direction, liquidity_map):
+def build_trade_plan(price, direction, liquidity_map, recent_candles: Optional[List[list]] = None):
     try:
         price = _safe_float(price, 0.0)
         zones = (liquidity_map or {}).get("liquidity_map") if isinstance(liquidity_map, dict) else liquidity_map
@@ -3334,20 +3372,28 @@ def build_trade_plan(price, direction, liquidity_map):
         below = sorted([v for v in values if v < price])
         above = sorted([v for v in values if v > price])
 
+        atr_value = _atr(_to_rows(recent_candles or [])[-30:], 14)
+        atr_base = max(_safe_float(atr_value, 0.0), price * 0.0006)
+        sl_buffer = max(atr_base * 0.35, price * 0.0004)
+        min_risk = max(atr_base * 0.90, price * 0.0010)
+        tp_step_1 = max(atr_base * 1.50, price * 0.0012)
+        tp_step_2 = max(atr_base * 2.20, price * 0.0018)
+        tp_step_3 = max(atr_base * 3.00, price * 0.0024)
+
         if direction == "LONG":
             entry = price
-            sl = (below[-1] - 20.0) if below else entry - 90.0
-            sl = min(sl, entry - 50.0)
-            tp1 = entry + 150.0
-            tp2 = entry + 220.0
-            tp3 = entry + 300.0
+            sl = (below[-1] - sl_buffer) if below else entry - min_risk
+            sl = min(sl, entry - min_risk)
+            tp1 = entry + tp_step_1
+            tp2 = entry + tp_step_2
+            tp3 = entry + tp_step_3
         elif direction == "SHORT":
             entry = price
-            sl = (above[0] + 20.0) if above else entry + 90.0
-            sl = max(sl, entry + 50.0)
-            tp1 = entry - 150.0
-            tp2 = entry - 220.0
-            tp3 = entry - 300.0
+            sl = (above[0] + sl_buffer) if above else entry + min_risk
+            sl = max(sl, entry + min_risk)
+            tp1 = entry - tp_step_1
+            tp2 = entry - tp_step_2
+            tp3 = entry - tp_step_3
         else:
             return None
 
@@ -3497,7 +3543,11 @@ def run_all_engines(
 
         liquidity_map = predict_liquidity_map(orderbook, price, depth=10) or {}
         gravity = liquidity_gravity_engine(orderbook, price, depth=10) or {}
-        sweep = detect_liquidity_sweep(trades, price, threshold_usd=50_000) or {}
+        sweep = detect_liquidity_sweep(
+            trades,
+            price,
+            atr_value=max(_atr(_to_rows(primary_1m)[-30:], 14), price * 0.0006),
+        ) or {}
         liq_track = track_liquidations(trades, price, lookback=100) or {}
         liq_events = liquidation_stream_processor(liquidation_events or []) or {}
         liquid_cluster_usd = _safe_float(liq_track.get("total_liq", 0.0)) + _safe_float(liq_events.get("total_liquidations", 0.0))
@@ -3643,8 +3693,9 @@ def run_all_engines(
                 if math.isfinite(v)
             ]
             with _LIQUIDITY_UPDATE_LOCK:
-                _LIQUIDITY_SWEEP_ALPHA.update_liquidity_pools(recent_highs, recent_lows)
-                alpha_raw = _LIQUIDITY_SWEEP_ALPHA.get_signal(
+                alpha_predictor = get_shared_alpha_predictor()
+                alpha_predictor.update_liquidity_pools(recent_highs, recent_lows)
+                alpha_raw = alpha_predictor.get_signal(
                     {
                     "price": price,
                     "close_price": _safe_float(primary_1m[-1][4], price) if primary_1m else price,
@@ -3944,6 +3995,11 @@ def run_all_engines(
             "liquidity_zones": liquidity_intent.get("liquidity_zones", []),
         }
 
+        allow_trade_out = bool(market_state.get("allow_trade", True)) and not oi_missing
+        if oi_missing:
+            logger.error("[RISK] Missing open interest, forcing fail-closed trade block")
+            market_data["allow_trade"] = False
+            market_data["reason"] = "open_interest_missing"
         _out = {
             "order_flow_pressure": round(_safe_float(ofp.get("pressure_score", 0.0)), 6),
             "order_imbalance": round(_safe_float(imb.get("imbalance", 0.0)), 6),
@@ -3983,7 +4039,7 @@ def run_all_engines(
             "mtf_bias": mtf_bias,
             "funding_rate": round(float(fr), 8),
             "price": round(float(price), 8),
-            "allow_trade": bool(market_state.get("allow_trade", True)),
+            "allow_trade": allow_trade_out,
             "orderbook_imbalance": round(float(ob_imbalance), 6),
             "order_flow_details": ofp,
             "orderflow": orderflow,
@@ -3993,6 +4049,7 @@ def run_all_engines(
             "market_maker_details": mm,
             "oi_details": oi,
             "open_interest_missing": bool(oi_missing),
+            "reason": "open_interest_missing" if oi_missing else str(market_data.get("reason", "ok")),
             "fvg": fvg,
             "liquidity_magnet": liquidity_magnet,
             "regime": regime,

@@ -17,6 +17,8 @@ def test_open_interest_missing_does_not_use_phantom_values():
     )
     assert result.get("open_interest_missing") is True, "missing OI must be flagged explicitly"
     assert float(result.get("cascade_probability", 0.0)) == 0.0, "cascade probability must not be fabricated without OI"
+    assert result.get("allow_trade") is False
+    assert result.get("reason") == "open_interest_missing"
 
 
 def test_risk_outputs_are_finite_and_position_bounds_safe():
