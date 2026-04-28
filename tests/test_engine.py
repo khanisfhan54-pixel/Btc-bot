@@ -61,3 +61,33 @@ def test_run_all_engines_deterministic_and_thread_safe_cache_reads():
 
     assert len(outputs) == 8, "all concurrent run_all_engines calls should complete"
     assert all(o == result1 for o in outputs), "concurrent identical requests should remain deterministic"
+
+
+def test_shared_alpha_predictor_is_singleton_thread_safe():
+    instances = []
+    lock = threading.Lock()
+
+    def _worker():
+        inst = engine.get_shared_alpha_predictor()
+        with lock:
+            instances.append(inst)
+
+    threads = [threading.Thread(target=_worker) for _ in range(16)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(instances) == 16
+    assert len({id(i) for i in instances}) == 1
+
+
+def test_build_trade_plan_uses_scaled_thresholds():
+    price = 100000.0
+    candles = [[i, price, price + 150.0, price - 120.0, price + 20.0, 10.0] for i in range(1, 50)]
+    liquidity_map = {"liquidity_map": [{"price": 99850.0}, {"price": 100150.0}]}
+    plan = engine.build_trade_plan(price, "LONG", liquidity_map, recent_candles=candles)
+    assert isinstance(plan, dict)
+    assert plan["entry"] > 0
+    assert plan["sl"] < plan["entry"]
+    assert len(plan["tp"]) == 3

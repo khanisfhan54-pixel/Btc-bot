@@ -71,6 +71,18 @@ def _default_alpha():
     }
 
 
+def _critical_input_blocked(meta_result: Optional[Dict[str, Any]], features: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
+    meta = meta_result if isinstance(meta_result, dict) else {}
+    meta_state = meta.get("meta_state", {})
+    if isinstance(meta_state, dict) and bool(meta_state.get("open_interest_missing", False)):
+        return True, "open_interest_missing"
+    raw_features = features if isinstance(features, dict) else {}
+    feature_state = raw_features.get("features", raw_features)
+    if isinstance(feature_state, dict) and bool(feature_state.get("open_interest_missing", False)):
+        return True, "open_interest_missing"
+    return False, ""
+
+
 def _validate_alpha(alpha: Dict[str, Any]) -> Dict[str, Any]:
     try:
         if not isinstance(alpha, dict):
@@ -274,6 +286,16 @@ class ExecutionLogic:
 
         raw_features = features_payload.get("features", features_payload)
         features = raw_features if isinstance(raw_features, dict) else {}
+        blocked_by_critical, critical_reason = _critical_input_blocked(meta_result, features)
+        if blocked_by_critical:
+            return {
+                "execute": False,
+                "side": "buy" if signal == "LONG" else "sell",
+                "sl": 0.0, "tp": 0.0, "position_size": 0.0,
+                "reason": critical_reason,
+                "meta_result": meta_result,
+                "learning_params": learning_params,
+            }
         if meta_result and not meta_result.get("allow_trade", True):
             return {
                 "execute": False,
@@ -1118,6 +1140,15 @@ class ExecutionEngine:
                 if conf_thr > 0 and confidence < conf_thr:
                     return {"status": "filtered", "executed": False, "reason": "low_confidence", "fees": fees, "fee_type": fee_type}
 
+            blocked_by_critical, critical_reason = _critical_input_blocked(meta_result, features)
+            if blocked_by_critical:
+                return {
+                    "executed": False,
+                    "reason": critical_reason,
+                    "meta_result": meta_result,
+                    "fees": fees,
+                    "fee_type": fee_type,
+                }
             if meta_result and not meta_result.get("allow_trade", True):
                 return {
                     "executed": False,
@@ -1707,7 +1738,10 @@ def build_execution_decision(
     quality_result: Dict[str, Any],
     liq_plan: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
+    blocked_by_critical, _ = _critical_input_blocked(meta_result, {})
     allow = (
+        not blocked_by_critical
+        and
         meta_result.get("allow_trade", True)
         and quality_result.get("execute", True)
         and signal in ("LONG", "SHORT")

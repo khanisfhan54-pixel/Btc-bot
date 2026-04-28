@@ -26,3 +26,15 @@ def test_deprecated_helpers_are_not_authoritative_live_source():
     source = inspect.getsource(main.run_analysis_cycle)
     assert "compute_score(" not in source, "deprecated compute_score helper must not be in active pipeline"
     assert "signal_engine.generate(" in source, "production signal path must use active signal_engine"
+
+
+def test_execution_layer_blocks_when_oi_missing():
+    decision = main.execution_engine.decide(
+        signal_payload={"signal": "LONG", "confidence": 0.8},
+        features_payload={"features": {"open_interest_missing": True}},
+        snapshot={"bids": [[100000.0, 1.0]], "asks": [[100010.0, 1.0]], "timestamp": time.time()},
+        account_equity=1000.0,
+        meta_result={"allow_trade": True, "risk_scale": 1.0, "meta_state": {"open_interest_missing": True}},
+    )
+    assert decision["execute"] is False
+    assert decision["reason"] in {"open_interest_missing", "fallback"}
