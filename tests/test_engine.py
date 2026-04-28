@@ -1,7 +1,10 @@
 import threading
+import warnings
 import numpy as np
 
 import engine
+import main
+from trading_utils import safe_float
 
 
 def _base_inputs(price=100000.0):
@@ -86,8 +89,88 @@ def test_build_trade_plan_uses_scaled_thresholds():
     price = 100000.0
     candles = [[i, price, price + 150.0, price - 120.0, price + 20.0, 10.0] for i in range(1, 50)]
     liquidity_map = {"liquidity_map": [{"price": 99850.0}, {"price": 100150.0}]}
-    plan = engine.build_trade_plan(price, "LONG", liquidity_map, recent_candles=candles)
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        plan = engine.build_trade_plan(price, "LONG", liquidity_map, recent_candles=candles)
+    assert any(isinstance(w.message, DeprecationWarning) for w in rec)
     assert isinstance(plan, dict)
     assert plan["entry"] > 0
     assert plan["sl"] < plan["entry"]
     assert len(plan["tp"]) == 3
+
+
+def test_deprecated_helpers_not_in_public_exports():
+    assert "compute_score" not in engine.__all__
+    assert "evaluate_smc_sniper" not in engine.__all__
+    assert "detect_entry_trigger" not in engine.__all__
+    assert "build_trade_plan" not in engine.__all__
+    assert "build_trade_plan_for_signal" not in engine.__all__
+
+
+def test_get_market_data_spread_gate_reachable_and_excessive_blocked():
+    price = 100000.0
+    realistic = {
+        "bids": [[99999.5, 12.0], [99999.0, 10.0]],
+        "asks": [[100000.5, 1.0], [100001.0, 1.0]],
+    }
+    wide = {
+        "bids": [[99900.0, 10.0], [99890.0, 9.0]],
+        "asks": [[100200.0, 1.0], [100220.0, 1.0]],
+    }
+    snaps = [realistic, realistic, realistic]
+    trades = [{"price": 100000.0, "amount": 2.0, "side": "BUY"} for _ in range(120)]
+    out_reachable = engine.get_market_data(realistic, trades=trades, recent_candles=[], price=price, orderbook_snapshots=snaps)
+    out_blocked = engine.get_market_data(wide, trades=[], recent_candles=[], price=price, orderbook_snapshots=snaps)
+    assert out_reachable["signal"] in {"LONG", "SHORT"}
+    assert out_blocked["signal"] == "NONE"
+
+
+def test_spoof_reliability_requires_minimum_snapshots():
+    one_snap = [{"bids": [[100000.0, 5000.0]], "asks": [[100010.0, 5000.0]]}]
+    details_unreliable = engine._detect_spoofing_details(one_snap)
+    assert details_unreliable["reliable"] is False
+    assert details_unreliable["spoof"] is False
+    assert details_unreliable["reason"] == "insufficient_snapshots"
+
+    full_history = [
+        {"bids": [[100000.0, 5000.0], [99999.0, 100.0], [99998.0, 100.0]], "asks": [[100010.0, 10.0], [100011.0, 10.0], [100012.0, 10.0]]},
+        {"bids": [[100000.0, 100.0], [99999.0, 100.0], [99998.0, 100.0]], "asks": [[100010.0, 10.0], [100011.0, 10.0], [100012.0, 10.0]]},
+        {"bids": [[100000.0, 50.0], [99999.0, 100.0], [99998.0, 100.0]], "asks": [[100010.0, 10.0], [100011.0, 10.0], [100012.0, 10.0]]},
+    ]
+    details_reliable = engine._detect_spoofing_details(full_history)
+    assert details_reliable["reliable"] is True
+
+
+def test_market_state_detector_failure_is_fail_closed_with_stable_reason():
+    class BadDetector:
+        def detect(self, *_args, **_kwargs):
+            raise RuntimeError("boom")
+
+    orderbook, trades, candles = _base_inputs()
+    out = engine.run_all_engines(
+        orderbook=orderbook,
+        trades=trades,
+        price=100000.0,
+        recent_candles=candles,
+        current_oi=100.0,
+        open_interest=100.0,
+        market_state_detector=BadDetector(),
+    )
+    assert out["allow_trade"] is False
+    assert out["market_state"]["reason"] == "market_state_detector_error"
+    assert out["reason"] == "market_state_detector_error"
+
+
+def test_safe_float_consistent_across_modules_and_deterministic():
+    bad_obj = object()
+    cases = [None, float("nan"), float("inf"), "123.45", "bad", bad_obj]
+    for value in cases:
+        r1 = engine._safe_float(value, 7.0)
+        r2 = main._safe_float(value, 7.0)
+        r3 = safe_float(value, 7.0)
+        assert r1 == r2 == r3
+        assert engine._safe_float(value, 7.0) == r1
+
+
+def test_main_and_engine_share_alpha_getter_contract():
+    assert main.get_shared_alpha_predictor() is engine.get_shared_alpha_predictor()

@@ -28,6 +28,7 @@ import statistics
 import sys
 import threading
 import time
+import warnings
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
@@ -164,15 +165,7 @@ def apply_meta_to_decision(
 
 
 def _safe_float(x: Any, default: float = 0.0) -> float:
-    try:
-        if x is None:
-            return default
-        v = float(x)
-        if not math.isfinite(v):
-            return default
-        return v
-    except Exception:
-        return default
+    return safe_float(x, default=default)
 
 
 def _enforce_entry_fee_metadata(fees, fee_type, trade_id=None):
@@ -1261,7 +1254,8 @@ def get_market_data(
         recent_high = max(_safe_float(r[2]) for r in recent_rows) if recent_rows else price
         recent_low = min(_safe_float(r[3]) for r in recent_rows) if recent_rows else price
         signal = "NONE"
-        if not spoof_detected and liquidity_score >= 0.50 and spread <= 0.001:
+        spread_gate_pct = 0.0015  # 15 bps max spread for BTC/USDT signal gating
+        if not spoof_detected and liquidity_score >= 0.50 and spread <= spread_gate_pct:
             if imbalance >= 0.12:
                 signal = "LONG"
             elif imbalance <= -0.12:
@@ -3030,8 +3024,7 @@ def score_setup(
     }
 
 
-# DEPRECATED (moved to signal_engine) — kept for backward compatibility
-def evaluate_smc_sniper(
+def _evaluate_smc_sniper_internal(
     candles_by_tf: Any,
     orderbook: dict,
     trades: List[dict],
@@ -3292,7 +3285,40 @@ def evaluate_smc_sniper(
 
 
 # DEPRECATED (moved to signal_engine) — kept for backward compatibility
+def evaluate_smc_sniper(
+    candles_by_tf: Any,
+    orderbook: dict,
+    trades: List[dict],
+    price: float,
+    volume_intel: Optional[Dict[str, Any]] = None,
+    market_state: Optional[Dict[str, Any]] = None,
+    engines_out: Optional[Dict[str, Any]] = None,
+    use_learning: bool = True,
+) -> Dict[str, Any]:
+    warnings.warn(
+        "engine.evaluate_smc_sniper is deprecated and is not part of the live production API.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return _evaluate_smc_sniper_internal(
+        candles_by_tf=candles_by_tf,
+        orderbook=orderbook,
+        trades=trades,
+        price=price,
+        volume_intel=volume_intel,
+        market_state=market_state,
+        engines_out=engines_out,
+        use_learning=use_learning,
+    )
+
+
+# DEPRECATED (moved to signal_engine) — kept for backward compatibility
 def detect_entry_trigger(price, liquidity_map, engines, ai_score, confidence, volume_intel=None):
+    warnings.warn(
+        "engine.detect_entry_trigger is deprecated and is not part of the live production API.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     try:
         engines = engines or {}
         smc = engines.get("smc_signal") or {}
@@ -3350,6 +3376,11 @@ def detect_entry_trigger(price, liquidity_map, engines, ai_score, confidence, vo
 
 # DEPRECATED (moved to signal_engine) — EXECUTION MOVED TO execution_logic.py
 def build_trade_plan(price, direction, liquidity_map, recent_candles: Optional[List[list]] = None):
+    warnings.warn(
+        "engine.build_trade_plan is deprecated and is not part of the live production API.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     try:
         price = _safe_float(price, 0.0)
         zones = (liquidity_map or {}).get("liquidity_map") if isinstance(liquidity_map, dict) else liquidity_map
@@ -3601,23 +3632,48 @@ def run_all_engines(
             spread_pct=spread_pct,
         ) or {}
         _msd = market_state_detector if market_state_detector is not None else MarketStateDetector()
-        market_state = _msd.detect(
-            MarketSnapshot(
-                symbol=(symbol or "BTC/USDT").replace("/", "").upper(),
-                price=price,
-                orderbook=orderbook,
-                trades=trades,
-                candles={
-                    "1m": primary_1m,
-                    "3m": _aggregate_rows(primary_1m, 3),
-                    "5m": candles_by_tf.get("5m") or _aggregate_rows(primary_1m, 5),
-                    "15m": primary_15m,
-                },
-                open_interest=_safe_float(current_oi if current_oi is not None else open_interest, 0.0),
-                funding_rate=fr,
+        market_state_reason = "ok"
+        try:
+            market_state = _msd.detect(
+                MarketSnapshot(
+                    symbol=(symbol or "BTC/USDT").replace("/", "").upper(),
+                    price=price,
+                    orderbook=orderbook,
+                    trades=trades,
+                    candles={
+                        "1m": primary_1m,
+                        "3m": _aggregate_rows(primary_1m, 3),
+                        "5m": candles_by_tf.get("5m") or _aggregate_rows(primary_1m, 5),
+                        "15m": primary_15m,
+                    },
+                    open_interest=_safe_float(current_oi if current_oi is not None else open_interest, 0.0),
+                    funding_rate=fr,
+                )
             )
-        )
-        market_state = market_state or {}
+        except Exception as market_state_exc:
+            logger.error("[MARKET_STATE] detect failed; fail-closed: %s", market_state_exc, exc_info=True)
+            market_state = {}
+            market_state_reason = "market_state_detector_error"
+
+        if not isinstance(market_state, dict):
+            market_state = {}
+            market_state_reason = "market_state_invalid_type"
+
+        market_state_state = str(market_state.get("state", "UNKNOWN")).upper()
+        market_state_allow_raw = market_state.get("allow_trade", None)
+        market_state_allow_valid = isinstance(market_state_allow_raw, bool)
+        market_state_allow = bool(market_state_allow_raw) if market_state_allow_valid else False
+        if not market_state_allow_valid and market_state_reason == "ok":
+            market_state_reason = "market_state_allow_trade_invalid"
+            logger.warning("[MARKET_STATE] invalid allow_trade=%r; forcing fail-closed", market_state_allow_raw)
+
+        market_state = {
+            **market_state,
+            "state": market_state_state,
+            "allow_trade": market_state_allow,
+            "fail_closed": not market_state_allow or market_state_reason != "ok",
+            "reason": market_state_reason,
+        }
 
         strategy = strategy_optimization_engine(
             volatility=_estimate_volatility_from_ohlcv(ohlcv_data),
@@ -3790,14 +3846,6 @@ def run_all_engines(
                     alpha_confidence = _clamp(alpha_confidence + 0.02, 0.0, 1.0)
                 else:
                     alpha_confidence = _clamp(alpha_confidence - 0.02, 0.0, 1.0)
-
-            _alpha_st["direction"] = alpha_direction
-            if alpha_direction == "NEUTRAL":
-                _alpha_st["flip_ts"] = 0.0
-                _alpha_st["confidence"] = 0.5
-            elif alpha_direction != prev_alpha_direction:
-                _alpha_st["flip_ts"] = now_ts
-            _alpha_st["confidence"] = alpha_confidence
         alpha_confidence = _clamp(_safe_float(alpha_confidence, 0.5), 0.01, 0.99)
         alpha_payload = {
             "direction": alpha_direction,
@@ -3813,52 +3861,30 @@ def run_all_engines(
         alpha_payload = _validate_alpha(alpha_payload)
         _raw_signal_ts = _safe_float(alpha_raw.get("timestamp", now_ts), now_ts)
         age = max(0.0, now_ts - _raw_signal_ts)
-        decay = math.exp(-age / 3.0)
-        pre_attenuation_conf = alpha_payload["confidence"]
-        alpha_payload["confidence"] *= decay
-        logger.debug("[ALPHA] post_decay_confidence=%.4f", alpha_payload["confidence"])
-
-        p_up = alpha_payload.get("prob_above", 0.5)
-        p_dn = alpha_payload.get("prob_below", 0.5)
-        entropy_raw = -(
-            p_up * math.log(p_up + 1e-8) +
-            p_dn * math.log(p_dn + 1e-8)
-        )
-        entropy_norm = entropy_raw / math.log(2.0)
-        alpha_payload["confidence"] *= (1.0 - 0.4 * entropy_norm)
-        logger.debug("[ALPHA] post_entropy_confidence=%.4f", alpha_payload["confidence"])
-        alpha_payload["confidence"] = _clamp(alpha_payload["confidence"], 0.0, 1.0)
-
-        micro = alpha_payload.get("micro_prob", 0.5)
-        macro = alpha_payload.get("macro_prob", 0.5)
-        if abs(micro - macro) > 0.4:
-            alpha_payload["confidence"] *= 0.7
-        logger.debug("[ALPHA] post_micro_macro_confidence=%.4f", alpha_payload["confidence"])
-        alpha_payload["confidence"] = _clamp(alpha_payload["confidence"], 0.0, 1.0)
-
-        prev_conf = prev_alpha_conf
-        prev_conf = _clamp(prev_conf, 0.0, 1.0)
-        delta = alpha_payload["confidence"] - prev_conf
-        if delta > 0:
-            alpha_payload["confidence"] *= 1.05
-        else:
-            alpha_payload["confidence"] *= 0.95
-        logger.debug("[ALPHA] post_temporal_delta_confidence=%.4f", alpha_payload["confidence"])
-
-        vol_factor = _clamp(atr_for_alpha / max(price, 1e-8), 0.5, 2.0)
-        alpha_payload["confidence"] *= (0.75 + 0.25 * vol_factor)
-        logger.debug("[ALPHA] post_vol_factor_confidence=%.4f", alpha_payload["confidence"])
-        alpha_payload["confidence"] = _clamp(alpha_payload["confidence"], 0.0, 1.0)
-
-        # Keep weak-but-valid signals alive after stacked penalties.
-        alpha_payload["confidence"] = max(alpha_payload["confidence"], pre_attenuation_conf * 0.5)
-
-        # Final temporal smoothing for stable downstream consumption.
-        alpha_payload["confidence"] = 0.7 * prev_conf + 0.3 * alpha_payload["confidence"]
-        logger.debug("[ALPHA] post_smoothing_confidence=%.4f", alpha_payload["confidence"])
-        alpha_payload["confidence"] = _clamp(alpha_payload["confidence"], 0.0, 1.0)
-        if pre_attenuation_conf > 0.6 and alpha_payload["confidence"] < 0.6:
-            logger.warning("[ALPHA] Signal attenuated below threshold by compound factors — check individual factor magnitudes")
+        pre_attenuation_conf = _clamp(_safe_float(alpha_payload["confidence"], 0.5), 0.0, 1.0)
+        p_up = _clamp(_safe_float(alpha_payload.get("prob_above", 0.5), 0.5), 0.0, 1.0)
+        p_dn = _clamp(_safe_float(alpha_payload.get("prob_below", 0.5), 0.5), 0.0, 1.0)
+        entropy_raw = -((p_up * math.log(p_up + 1e-8)) + (p_dn * math.log(p_dn + 1e-8)))
+        entropy_norm = _clamp(entropy_raw / math.log(2.0), 0.0, 1.0)
+        micro = _clamp(_safe_float(alpha_payload.get("micro_prob", 0.5), 0.5), 0.0, 1.0)
+        macro = _clamp(_safe_float(alpha_payload.get("macro_prob", 0.5), 0.5), 0.0, 1.0)
+        divergence = abs(micro - macro)
+        decay_factor = _clamp(math.exp(-age / 3.0), 0.65, 1.0)
+        entropy_factor = _clamp(1.0 - (0.25 * entropy_norm), 0.75, 1.0)
+        divergence_factor = _clamp(1.0 - (0.3 * divergence), 0.75, 1.0)
+        vol_factor = _clamp(0.85 + (0.15 * _clamp(atr_for_alpha / max(price, 1e-8), 0.0, 1.0)), 0.85, 1.0)
+        attenuated_conf = pre_attenuation_conf * decay_factor * entropy_factor * divergence_factor * vol_factor
+        confidence_floor = 0.55 if pre_attenuation_conf >= 0.7 else pre_attenuation_conf * 0.65
+        attenuated_conf = max(attenuated_conf, confidence_floor)
+        alpha_payload["confidence"] = _clamp((0.7 * prev_alpha_conf) + (0.3 * attenuated_conf), 0.0, 1.0)
+        with ordered_lock(_ALPHA_STATE_LOCK, "_ALPHA_STATE_LOCK"):
+            _alpha_st = _ALPHA_STATE.setdefault(_alpha_symbol, {})
+            _alpha_st["direction"] = alpha_direction
+            if alpha_direction == "NEUTRAL":
+                _alpha_st["flip_ts"] = 0.0
+            elif alpha_direction != prev_alpha_direction:
+                _alpha_st["flip_ts"] = now_ts
+            _alpha_st["confidence"] = alpha_payload["confidence"]
 
         alpha_prob_above = _clamp(_safe_float(alpha_payload.get("prob_above", 0.5), 0.5), 0.0, 1.0)
         alpha_prob_below = _clamp(_safe_float(alpha_payload.get("prob_below", 0.5), 0.5), 0.0, 1.0)
@@ -3950,7 +3976,7 @@ def run_all_engines(
             if _smc_cache.get("key") == _smc_cache_key:
                 smc_signal = dict(_smc_cache.get("value", {}))
             else:
-                smc_signal = evaluate_smc_sniper(
+                smc_signal = _evaluate_smc_sniper_internal(
                     candles_by_tf=candles_by_tf,
                     orderbook=orderbook,
                     trades=trades,
@@ -3995,7 +4021,10 @@ def run_all_engines(
             "liquidity_zones": liquidity_intent.get("liquidity_zones", []),
         }
 
-        allow_trade_out = bool(market_state.get("allow_trade", True)) and not oi_missing
+        allow_trade_out = bool(market_state.get("allow_trade", False)) and not oi_missing
+        if not bool(market_state.get("allow_trade", False)):
+            market_data["allow_trade"] = False
+            market_data["reason"] = str(market_state.get("reason", "market_state_untrusted"))
         if oi_missing:
             logger.error("[RISK] Missing open interest, forcing fail-closed trade block")
             market_data["allow_trade"] = False
@@ -4049,7 +4078,7 @@ def run_all_engines(
             "market_maker_details": mm,
             "oi_details": oi,
             "open_interest_missing": bool(oi_missing),
-            "reason": "open_interest_missing" if oi_missing else str(market_data.get("reason", "ok")),
+            "reason": "open_interest_missing" if oi_missing else str(market_data.get("reason", market_state.get("reason", "ok"))),
             "fvg": fvg,
             "liquidity_magnet": liquidity_magnet,
             "regime": regime,
@@ -4178,11 +4207,12 @@ def run_all_engines(
             "market_state": {
                 "state": "CHOPPY",
                 "substate": "CHOPPY",
-                "allow_trade": True,
+                "allow_trade": False,
                 "bias": 0.0,
                 "volatility": 0.0,
                 "compression": 1.0,
                 "timeframe_breakdown": {},
+                "reason": "engine_error_fail_closed",
             },
             "mtf_bias": {
                 "htf_trend": "neutral",
@@ -4203,6 +4233,8 @@ def run_all_engines(
             "ai_score": 0.0,
             "confidence": 0.0,
             "direction": "HOLD",
+            "allow_trade": False,
+            "reason": "run_all_engines_error",
             "smc_signal": {
                 "signal": "NONE",
                 "entry": None,
@@ -5720,15 +5752,11 @@ __all__ = [
     "compute_sma_signal",
     "_sigmoid",
     "heatmap_value_from_cluster",
-    "compute_score",
     "institutional_score_engine",
-    "detect_entry_trigger",
-    "build_trade_plan",
     "detect_liquidity_map",
     "detect_liquidity_gravity",
     "get_liquidation_heatmap",
     "detect_entry_condition",
-    "build_trade_plan_for_signal",
     "MarketStateDetector",
     "LiquidityMapper",
     "BreakoutValidator",
@@ -5754,7 +5782,6 @@ __all__ = [
     "compute_confluence_score",
     "update_model_weights",
     "update_learning_memory",
-    "evaluate_smc_sniper",
     "detect_structure",
     "detect_liquidity",
     "detect_fibonacci_zone",

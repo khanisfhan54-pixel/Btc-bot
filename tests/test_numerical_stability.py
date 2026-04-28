@@ -1,6 +1,8 @@
 import numpy as np
+import threading
 
 import engine
+import main
 from alpha_liquidity_sweep_predictor import predict_sweep
 
 
@@ -59,3 +61,66 @@ def test_detect_liquidity_sweep_invalid_price_fail_closed():
     assert out["reason"] == "invalid_price"
     assert not np.isnan(values).any()
     assert not np.isinf(values).any()
+
+
+def test_alpha_output_bounded_finite_and_deterministic():
+    price = 100000.0
+    orderbook = {"bids": [[price - 5.0, 2.0]], "asks": [[price + 5.0, 1.0]]}
+    candles = {"1m": [[1, price, price + 20.0, price - 20.0, price, 10.0] for _ in range(60)]}
+    kwargs = dict(
+        orderbook=orderbook,
+        trades=[{"price": price, "amount": 0.2, "side": "BUY"}],
+        price=price,
+        recent_candles=candles,
+        symbol="BTC/USDT",
+        open_interest=100.0,
+        current_oi=100.0,
+        orderbook_snapshots=[orderbook, orderbook, orderbook],
+    )
+    out1 = engine.run_all_engines(**kwargs)
+    out2 = engine.run_all_engines(**kwargs)
+    alpha = out1.get("alpha", {})
+    arr = np.array([alpha.get("confidence", 0.0), alpha.get("prob_above", 0.0), alpha.get("prob_below", 0.0)], dtype=float)
+    assert np.isfinite(arr).all()
+    assert not np.isnan(arr).any()
+    assert (arr >= 0.0).all() and (arr <= 1.0).all()
+    assert out1 == out2
+
+
+def test_alpha_output_deterministic_under_concurrency_and_shared_getter():
+    price = 100000.0
+    orderbook = {"bids": [[price - 5.0, 2.0]], "asks": [[price + 5.0, 1.0]]}
+    candles = {"1m": [[1, price, price + 20.0, price - 20.0, price, 10.0] for _ in range(60)]}
+    kwargs = dict(
+        orderbook=orderbook,
+        trades=[{"price": price, "amount": 0.2, "side": "BUY"}],
+        price=price,
+        recent_candles=candles,
+        symbol="BTC/USDT",
+        open_interest=100.0,
+        current_oi=100.0,
+        orderbook_snapshots=[orderbook, orderbook, orderbook],
+    )
+    baseline = engine.run_all_engines(**kwargs)
+    outputs = []
+    lock = threading.Lock()
+
+    def _worker():
+        out = engine.run_all_engines(**kwargs)
+        arr = np.array([
+            float(out.get("alpha", {}).get("confidence", 0.0)),
+            float(out.get("alpha", {}).get("prob_above", 0.0)),
+            float(out.get("alpha", {}).get("prob_below", 0.0)),
+        ])
+        assert not np.isnan(arr).any()
+        with lock:
+            outputs.append(out)
+
+    threads = [threading.Thread(target=_worker) for _ in range(12)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert all(o == baseline for o in outputs)
+    assert main.get_shared_alpha_predictor() is engine.get_shared_alpha_predictor()

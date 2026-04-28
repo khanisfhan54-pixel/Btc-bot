@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass
 from statistics import median
 from typing import Any, Dict, List, Optional, Tuple
+from trading_utils import safe_float
 
 try:
     from dotenv import load_dotenv
@@ -52,12 +53,7 @@ def _safe_div(a: float, b: float, default: float = 0.0) -> float:
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
-    try:
-        if value is None:
-            return default
-        return float(value)
-    except Exception:
-        return default
+    return safe_float(value, default=default)
 
 
 def _default_alpha():
@@ -250,7 +246,24 @@ class ExecutionLogic:
         account_equity: float,
         meta_result: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        meta_result = meta_result or {}
+        if not isinstance(meta_result, dict):
+            meta_result = {
+                "allow_trade": False,
+                "risk_scale": 0.0,
+                "reason": "invalid_meta_result",
+                "meta_state": {"fail_closed": True},
+            }
+        elif not isinstance(meta_result.get("allow_trade"), bool):
+            meta_result = {
+                **meta_result,
+                "allow_trade": False,
+                "risk_scale": _safe_float(meta_result.get("risk_scale", 0.0), 0.0),
+                "reason": str(meta_result.get("reason", "invalid_meta_result")),
+                "meta_state": {
+                    **(meta_result.get("meta_state", {}) if isinstance(meta_result.get("meta_state"), dict) else {}),
+                    "fail_closed": True,
+                },
+            }
         learning_params: Dict[str, Any] = {}
         if self.learning_engine is not None:
             try:

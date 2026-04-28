@@ -38,3 +38,24 @@ def test_risk_outputs_are_finite_and_position_bounds_safe():
     assert position_size <= max_position_size, "position size must be bounded by max position size"
     assert not np.isnan(risk_value), "risk value must not be NaN"
     assert not np.isinf(risk_value), "risk value must not be infinite"
+
+
+def test_market_state_invalid_payload_fails_closed():
+    class InvalidDetector:
+        def detect(self, *_args, **_kwargs):
+            return {"state": "TRENDING", "allow_trade": "yes"}
+
+    price = 100000.0
+    orderbook = {"bids": [[price - 5.0, 1.0]], "asks": [[price + 5.0, 1.0]]}
+    candles = {"1m": [[1, price, price + 10.0, price - 10.0, price, 10.0] for _ in range(40)]}
+    result = engine.run_all_engines(
+        orderbook=orderbook,
+        trades=[],
+        price=price,
+        recent_candles=candles,
+        open_interest=100.0,
+        current_oi=100.0,
+        market_state_detector=InvalidDetector(),
+    )
+    assert result["allow_trade"] is False
+    assert result["market_state"]["reason"] == "market_state_allow_trade_invalid"
