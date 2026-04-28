@@ -63,3 +63,39 @@ def test_calibrate_rejects_insufficient_ohlcv_rows(tmp_path):
 
     with pytest.raises(ValueError, match="at least"):
         calibrate_regime.calibrate(str(csv_path), str(weights_path))
+
+
+def test_calibrate_rejects_non_finite_close_prices(tmp_path):
+    csv_path = tmp_path / "non_finite_close.csv"
+    weights_path = tmp_path / "unused.npz"
+    _write_valid_ohlcv(csv_path, rows=8)
+    data = np.loadtxt(csv_path, delimiter=",", ndmin=2)
+    data[3, 4] = np.nan
+    np.savetxt(csv_path, data, delimiter=",")
+
+    with pytest.raises(ValueError, match="non-finite close prices"):
+        calibrate_regime.calibrate(str(csv_path), str(weights_path))
+
+
+def test_calibrate_rejects_non_finite_volumes(tmp_path):
+    csv_path = tmp_path / "non_finite_volume.csv"
+    weights_path = tmp_path / "unused.npz"
+    _write_valid_ohlcv(csv_path, rows=8)
+    data = np.loadtxt(csv_path, delimiter=",", ndmin=2)
+    data[3, 5] = np.inf
+    np.savetxt(csv_path, data, delimiter=",")
+
+    with pytest.raises(ValueError, match="non-finite volumes"):
+        calibrate_regime.calibrate(str(csv_path), str(weights_path))
+
+
+def test_calibrate_rejects_non_positive_close_prices(tmp_path):
+    csv_path = tmp_path / "non_positive_close.csv"
+    weights_path = tmp_path / "unused.npz"
+    _write_valid_ohlcv(csv_path, rows=8)
+    data = np.loadtxt(csv_path, delimiter=",", ndmin=2)
+    data[2, 4] = 0.0
+    np.savetxt(csv_path, data, delimiter=",")
+
+    with pytest.raises(ValueError, match="strictly positive close prices"):
+        calibrate_regime.calibrate(str(csv_path), str(weights_path))

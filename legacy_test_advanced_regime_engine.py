@@ -29,6 +29,16 @@ def test_nhhmm_load_weights_requires_3d_beta_and_preserves_shape():
     assert engine.beta.shape == (3, 3, 4)
 
 
+def test_nhhmm_load_weights_rejects_malformed_beta_shape():
+    engine = NHHMM_Engine(n_states=3, n_features=4)
+    bad_beta = np.array([1.0, 2.0, 3.0], dtype=float)
+    mu = np.array([0.001, -0.001, 0.0], dtype=float)
+    sigma = np.array([0.004, 0.004, 0.010], dtype=float)
+
+    with pytest.raises(ValueError):
+        engine.load_weights(bad_beta, mu, sigma)
+
+
 class TestCritical1ScoreSplitting:
     def test_directional_wins_over_range_when_trend_score_dominant(self):
         result = compute_hmm_regime(np.array([0.9, 0.1, 0.0]))

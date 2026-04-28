@@ -1052,7 +1052,7 @@ class AdvancedRegimeEngine:
     _SHOCK_WARMUP_TICKS: int = 32
     _SHOCK_WARMUP_SECONDS: float = 120.0
     _RETURN_EMA_BASE_DECAY: float = 0.92
-    _MAX_EMA_GAP_DT: float = 300.0
+    _MAX_EMA_GAP_DT: float = 10.0
 
     def _json_default(self, obj: Any):
         """
@@ -1195,6 +1195,7 @@ class AdvancedRegimeEngine:
         seed: int | None = 7,
         engine_id: str | None = None,
         enable_background_workers: bool = True,
+        load_model_weights_on_init: bool = True,
     ):
         if n_states != 3:
             raise ValueError(
@@ -1490,7 +1491,8 @@ class AdvancedRegimeEngine:
         self.garch_var = np.full(2, target_var, dtype=float)
         self.garch_prob = np.ones(2) / 2.0
         self._smoothed_garch_prob = self.garch_prob.copy()
-        self._load_model_weights()
+        if bool(load_model_weights_on_init):
+            self._load_model_weights()
 
     def _stationary_garch_var(self) -> np.ndarray:
         target_var = float(self.garch.target_vol ** 2)
@@ -1836,7 +1838,7 @@ class AdvancedRegimeEngine:
     def _ema_decay(self, dt: float) -> float:
         dt_safe = float(np.clip(dt, 0.0, self._MAX_EMA_GAP_DT))
         decay = float(np.clip(self._return_ema_base_decay ** dt_safe, 1e-9, 1.0))
-        if float(dt) > 10.0:
+        if float(dt) > float(self._MAX_EMA_GAP_DT):
             LOGGER.warning("[EMA] Gap of %.1fs exceeds max — decay clamped, data may be stale", float(dt))
         return decay
 
@@ -2032,7 +2034,7 @@ class AdvancedRegimeEngine:
     def _load_model_weights(self) -> None:
         weights = ModelWeightManager.load_weights("advanced_regime", self._weight_path)
         if not weights:
-            LOGGER.critical("[REGIME] No trained weights found — regime outputs are UNTRUSTED. Run calibration pipeline before live deployment.")
+            LOGGER.warning("[REGIME] No trained weights found — regime outputs are UNTRUSTED. Run calibration pipeline before live deployment.")
             self._weights_loaded = False
             self._calibration_status = "missing"
             return
@@ -2048,8 +2050,16 @@ class AdvancedRegimeEngine:
             beta = np.asarray(weights["nhhmm_beta"], dtype=float)
             mu = np.asarray(weights["nhhmm_mu"], dtype=float)
             sigma = np.asarray(weights["nhhmm_sigma"], dtype=float)
-            if beta.ndim != 2 or mu.ndim != 2 or sigma.ndim != 3:
+            if beta.ndim != 3 or mu.ndim != 1 or sigma.ndim != 1:
                 raise ValueError("invalid_nhhmm_weight_shapes")
+            if beta.shape != (self.K, self.K, self.n_features):
+                raise ValueError(
+                    f"invalid nhhmm_beta shape={beta.shape}; expected ({self.K}, {self.K}, {self.n_features})"
+                )
+            if mu.shape != (self.K,) or sigma.shape != (self.K,):
+                raise ValueError(
+                    f"invalid nhhmm_mu/sigma shapes: mu={mu.shape}, sigma={sigma.shape}; expected ({self.K},)"
+                )
             self.nhhmm.load_weights(beta, mu, sigma)
 
             means = np.asarray(weights["sjm_centroids"], dtype=float)
@@ -3282,6 +3292,7 @@ class AdvancedRegimeEngine:
             seed=rng_seed,
             engine_id=engine_id,
             enable_background_workers=False,
+            load_model_weights_on_init=False,
         )
         _staging_warnings: List[tuple[str, str]] = []
         original_warn = staging._warn_rate_limited
