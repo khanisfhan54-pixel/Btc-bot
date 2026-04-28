@@ -42,6 +42,7 @@ _ALPHA_STATE: Dict[str, Dict[str, Any]] = {}
 _ALPHA_STATE_LOCK = threading.Lock()
 _LIQUIDITY_UPDATE_LOCK = threading.RLock()
 _BACKTEST_CACHE_LOCK = threading.RLock()
+_SMC_CACHE_LOCK = threading.RLock()
 
 
 def _debug_import_integrity() -> None:
@@ -95,10 +96,10 @@ def evaluate_meta_filter(
     trades: Optional[list] = None,
 ) -> Dict[str, Any]:
     _fallback: Dict[str, Any] = {
-        "allow_trade": True,
-        "risk_scale": 1.0,
+        "allow_trade": False,
+        "risk_scale": 0.0,
         "reason": "meta_filter_unavailable",
-        "meta_state": {},
+        "meta_state": {"fail_closed": True},
     }
     _meta_filter = _get_meta_filter()
     if _meta_filter is None:
@@ -113,8 +114,17 @@ def evaluate_meta_filter(
             trades=trades,
         )
     except Exception as exc:
-        logger.warning("[META_FILTER] evaluate failed (fallback allow): %s", exc)
-        return _fallback
+        logger.warning("[META_FILTER] evaluate failed (fail-closed): %s", exc)
+        return {
+            "allow_trade": False,
+            "risk_scale": 0.0,
+            "reason": "meta_filter_error",
+            "meta_state": {"fail_closed": True, "error": str(exc)},
+        }
+
+
+def get_shared_alpha_predictor() -> LiquiditySweepAlpha:
+    return _LIQUIDITY_SWEEP_ALPHA
 
 
 def apply_meta_to_decision(
@@ -1105,7 +1115,7 @@ def _detect_spoofing_details(
     try:
         snaps = orderbook_snapshots or []
         if len(snaps) < 3:
-            return {"spoof": False, "evidence": []}
+            return {"spoof": False, "evidence": [], "reliable": False, "reason": "insufficient_snapshots"}
         evidence = []
         for side in ("bids", "asks"):
             for level in range(top_n):
@@ -1131,10 +1141,10 @@ def _detect_spoofing_details(
                             "prices": prices,
                         }
                     )
-        return {"spoof": bool(evidence), "evidence": evidence}
+        return {"spoof": bool(evidence), "evidence": evidence, "reliable": True}
     except Exception as exc:
         logger.error("_detect_spoofing_details error: %s", exc)
-        return {"spoof": False, "evidence": []}
+        return {"spoof": False, "evidence": [], "reliable": False, "reason": "spoof_detection_error"}
 
 
 def detect_spoofing(order_book: Any) -> bool:
@@ -1200,7 +1210,9 @@ def get_market_data(
         imbalance = 0.0 if total_vol == 0 else (bid_vol - ask_vol) / total_vol
         spread = _spread_pct(orderbook, price)
         liquidity_score = calculate_liquidity_score(orderbook, trades, recent_candles)
-        spoof_details = _detect_spoofing_details(orderbook_snapshots or [orderbook])
+        spoof_details = _detect_spoofing_details(orderbook_snapshots or [])
+        spoof_reliable = bool(spoof_details.get("reliable", False))
+        spoof_detected = bool(spoof_reliable and spoof_details.get("spoof", False))
         liq_sweep = detect_liquidity_sweep(trades or [], price)
         rows: list = []
         if isinstance(recent_candles, dict):
@@ -1217,7 +1229,7 @@ def get_market_data(
         recent_high = max(_safe_float(r[2]) for r in recent_rows) if recent_rows else price
         recent_low = min(_safe_float(r[3]) for r in recent_rows) if recent_rows else price
         signal = "NONE"
-        if not spoof_details.get("spoof", False) and liquidity_score >= 0.50 and spread <= 0.001:
+        if not spoof_detected and liquidity_score >= 0.50 and spread <= 0.001:
             if imbalance >= 0.12:
                 signal = "LONG"
             elif imbalance <= -0.12:
@@ -1236,7 +1248,7 @@ def get_market_data(
                 "sweep": bool((liq_sweep or {}).get("sweep", False)),
                 "size_usd": _safe_float((liq_sweep or {}).get("size_usd", 0.0)),
             },
-            "spoof_detected": bool(spoof_details.get("spoof", False)),
+            "spoof_detected": spoof_detected,
             "spoof_details": spoof_details,
         }
     except Exception:
@@ -3378,6 +3390,24 @@ def run_all_engines(
     orderbook = orderbook or {}
     trades = trades or []
     price = _safe_float(price, 0.0)
+    if price <= 0.0 or not math.isfinite(price):
+        logger.warning("[ENGINE] run_all_engines rejected invalid price=%s", price)
+        return {
+            "price": 0.0,
+            "allow_trade": False,
+            "reason": "invalid_price",
+            "market_data": {
+                "price": 0.0,
+                "allow_trade": False,
+                "reason": "invalid_price",
+                "spoof_detected": False,
+                "spoof_details": {"spoof": False, "evidence": [], "reliable": False, "reason": "invalid_price"},
+            },
+            "alpha": _default_alpha(),
+            "direction": "HOLD",
+            "confidence": 0.0,
+            "composite": {"direction": "HOLD", "confidence": 0.0},
+        }
     ohlcv_data = ohlcv if ohlcv is not None else recent_candles
     _cache_key = _build_run_all_engines_cache_key(
         orderbook=orderbook,
@@ -3471,7 +3501,9 @@ def run_all_engines(
         liq_track = track_liquidations(trades, price, lookback=100) or {}
         liq_events = liquidation_stream_processor(liquidation_events or []) or {}
         liquid_cluster_usd = _safe_float(liq_track.get("total_liq", 0.0)) + _safe_float(liq_events.get("total_liquidations", 0.0))
-        oi_value = _safe_float(current_oi if current_oi is not None else open_interest, 1_000_000.0) if (current_oi if current_oi is not None else open_interest) else 1_000_000.0
+        oi_raw = current_oi if current_oi is not None else open_interest
+        oi_value = _safe_float(oi_raw, 0.0)
+        oi_missing = oi_value <= 0.0
         liq_clusters = detect_liquidation_clusters(
             liquidation_cluster_usd=liquid_cluster_usd,
             open_interest=oi_value,
@@ -3499,7 +3531,7 @@ def run_all_engines(
             price=price,
         ) or {}
         cprob = _safe_float(cascade_prob, 0.0)
-        if cprob <= 0.0:
+        if cprob <= 0.0 and not oi_missing:
             cprob = get_cascade_probability(
                 open_interest=oi_value,
                 oi_history=oi_hist or [oi_value * 0.95, oi_value],
@@ -3862,21 +3894,22 @@ def run_all_engines(
             _book_sig,
             int(len(trades or [])),
         )
-        _smc_cache = getattr(run_all_engines, "_smc_cache", {})
-        if _smc_cache.get("key") == _smc_cache_key:
-            smc_signal = dict(_smc_cache.get("value", {}))
-        else:
-            smc_signal = evaluate_smc_sniper(
-                candles_by_tf=candles_by_tf,
-                orderbook=orderbook,
-                trades=trades,
-                price=price,
-                volume_intel=vol_intel,
-                market_state=market_state,
-                engines_out={},
-                use_learning=True,
-            )
-            run_all_engines._smc_cache = {"key": _smc_cache_key, "value": dict(smc_signal or {})}
+        with _SMC_CACHE_LOCK:
+            _smc_cache = getattr(run_all_engines, "_smc_cache", {})
+            if _smc_cache.get("key") == _smc_cache_key:
+                smc_signal = dict(_smc_cache.get("value", {}))
+            else:
+                smc_signal = evaluate_smc_sniper(
+                    candles_by_tf=candles_by_tf,
+                    orderbook=orderbook,
+                    trades=trades,
+                    price=price,
+                    volume_intel=vol_intel,
+                    market_state=market_state,
+                    engines_out={},
+                    use_learning=True,
+                )
+                run_all_engines._smc_cache = {"key": _smc_cache_key, "value": dict(smc_signal or {})}
 
         smc_signal = smc_signal or {}
 
@@ -3920,7 +3953,7 @@ def run_all_engines(
             "market_maker_bias": str(mm.get("market_maker_bias", "neutral")),
             "oi_spike": bool(oi.get("oi_spike", False)),
             "liquidation_data": liq_data,
-            "cascade_probability": round(_safe_float(cprob, 0.0), 6),
+            "cascade_probability": round(0.0 if oi_missing else _safe_float(cprob, 0.0), 6),
             "strategy_adjustment": strategy,
             "liquidity_map": liquidity_bundle,
             "liquidity": liquidity_intent,
@@ -3949,6 +3982,8 @@ def run_all_engines(
             "market_state": market_state,
             "mtf_bias": mtf_bias,
             "funding_rate": round(float(fr), 8),
+            "price": round(float(price), 8),
+            "allow_trade": bool(market_state.get("allow_trade", True)),
             "orderbook_imbalance": round(float(ob_imbalance), 6),
             "order_flow_details": ofp,
             "orderflow": orderflow,
@@ -3957,6 +3992,7 @@ def run_all_engines(
             "smart_money_absorption_details": smart_abs,
             "market_maker_details": mm,
             "oi_details": oi,
+            "open_interest_missing": bool(oi_missing),
             "fvg": fvg,
             "liquidity_magnet": liquidity_magnet,
             "regime": regime,
@@ -4482,10 +4518,18 @@ class TrapFilter:
 class EntryTriggerEngine:
     def __init__(self) -> None:
         self.max_trades_per_session = 3
-        self.trades_taken = 0
+        self.session_window_sec = 3600.0
+        self.trade_timestamps: Deque[float] = deque(maxlen=256)
         self.last_loss_ts = 0.0
         self.loss_cooldown_sec = 600.0
         self.session_start = time.time()
+
+    def _active_trade_count(self) -> int:
+        now = time.time()
+        cutoff = now - self.session_window_sec
+        while self.trade_timestamps and self.trade_timestamps[0] < cutoff:
+            self.trade_timestamps.popleft()
+        return len(self.trade_timestamps)
 
     def _cooldown_active(self) -> bool:
         return (time.time() - self.last_loss_ts) < self.loss_cooldown_sec
@@ -4526,10 +4570,13 @@ class EntryTriggerEngine:
         risk = abs(entry - sl)
         if risk <= 0:
             return [], 0.0
+        base_tp = max(risk * 1.8, entry * 0.0012)
+        tp2_mult = 1.5
+        tp3_mult = 2.2
         if direction == "LONG":
-            tps = [entry + 150.0, entry + 220.0, entry + 300.0]
+            tps = [entry + base_tp, entry + (base_tp * tp2_mult), entry + (base_tp * tp3_mult)]
         else:
-            tps = [entry - 150.0, entry - 220.0, entry - 300.0]
+            tps = [entry - base_tp, entry - (base_tp * tp2_mult), entry - (base_tp * tp3_mult)]
         rr = abs(tps[-1] - entry) / risk
         return tps, rr
 
@@ -4544,7 +4591,7 @@ class EntryTriggerEngine:
         volume_intel: Optional[Dict[str, Any]] = None,
         regime_context: Optional[Dict[str, Any]] = None,
     ) -> SniperSignal:
-        if self.trades_taken >= self.max_trades_per_session:
+        if self._active_trade_count() >= self.max_trades_per_session:
             return SniperSignal(
                 bias="WAIT",
                 entry_price=None,
@@ -4680,24 +4727,29 @@ class EntryTriggerEngine:
         if bias == "LONG":
             level = above_lvl if above_lvl > 0 else price
             entry_price = level
-            zone_low = level - 10.0
-            zone_high = level + 10.0
-            sl = max(below_lvl - 20.0, entry_price - _clamp(_atr(snapshot.candles.get("1m", [])[-30:], 14), 50.0, 120.0))
-            sl = min(sl, entry_price - 50.0)
+            atr_1m = _clamp(_atr(snapshot.candles.get("1m", [])[-30:], 14), entry_price * 0.0004, entry_price * 0.004)
+            zone_pad = max(entry_price * 0.00012, atr_1m * 0.2)
+            zone_low = level - zone_pad
+            zone_high = level + zone_pad
+            sl = max(below_lvl - zone_pad, entry_price - atr_1m)
+            sl = min(sl, entry_price - max(entry_price * 0.0006, atr_1m * 0.5))
         else:
             level = below_lvl if below_lvl > 0 else price
             entry_price = level
-            zone_low = level - 10.0
-            zone_high = level + 10.0
-            sl = min(above_lvl + 20.0, entry_price + _clamp(_atr(snapshot.candles.get("1m", [])[-30:], 14), 50.0, 120.0))
-            sl = max(sl, entry_price + 50.0)
+            atr_1m = _clamp(_atr(snapshot.candles.get("1m", [])[-30:], 14), entry_price * 0.0004, entry_price * 0.004)
+            zone_pad = max(entry_price * 0.00012, atr_1m * 0.2)
+            zone_low = level - zone_pad
+            zone_high = level + zone_pad
+            sl = min(above_lvl + zone_pad, entry_price + atr_1m)
+            sl = max(sl, entry_price + max(entry_price * 0.0006, atr_1m * 0.5))
 
         tps, rr = self._build_rr(entry_price, sl, bias)
         if rr < 2.0:
+            tp_base = max(abs(entry_price - sl) * 1.8, entry_price * 0.0012)
             if bias == "LONG":
-                tps = [entry_price + 150.0, entry_price + 220.0, entry_price + 300.0]
+                tps = [entry_price + tp_base, entry_price + (tp_base * 1.5), entry_price + (tp_base * 2.2)]
             else:
-                tps = [entry_price - 150.0, entry_price - 220.0, entry_price - 300.0]
+                tps = [entry_price - tp_base, entry_price - (tp_base * 1.5), entry_price - (tp_base * 2.2)]
             rr = abs(tps[-1] - entry_price) / abs(entry_price - sl)
 
         confidence = self._estimate_confidence(
@@ -4744,7 +4796,7 @@ class EntryTriggerEngine:
         )
 
     def register_trade_result(self, pnl: float) -> None:
-        self.trades_taken += 1
+        self.trade_timestamps.append(time.time())
         if pnl < 0:
             self.last_loss_ts = time.time()
 
@@ -5631,6 +5683,7 @@ __all__ = [
     "BinanceRestData",
     "TelegramAlertSystem",
     "run_all_engines",
+    "get_shared_alpha_predictor",
     "_freeze_for_cache",
     "_build_run_all_engines_cache_key",
     "analyze_liquidity_intent",
