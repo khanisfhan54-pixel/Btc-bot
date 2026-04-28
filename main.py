@@ -335,11 +335,8 @@ try:
     from engine import (
         run_all_engines,
         analyze_volume_intelligence,
-        detect_entry_trigger,
-        build_trade_plan,
         get_cascade_probability,
         MarketStateDetector,
-        evaluate_smc_sniper,
         evaluate_meta_filter,
         apply_meta_to_decision,
         get_shared_alpha_predictor,
@@ -446,11 +443,12 @@ except Exception as _e:
             "market_state": {
                 "state": "CHOPPY",
                 "substate": "CHOPPY",
-                "allow_trade": True,
+                "allow_trade": False,
                 "bias": 0.0,
                 "volatility": 0.0,
                 "compression": 1.0,
                 "timeframe_breakdown": {},
+                "reason": "engine_import_fallback_fail_closed",
             },
             "funding_rate": 0.0,
             "orderbook_imbalance": 0.0,
@@ -487,12 +485,6 @@ except Exception as _e:
             "sell_notional": 0.0,
         }
 
-    def detect_entry_trigger(*args, **kwargs):
-        return {"trigger": False, "reason": "fallback", "confidence": 0.0}
-
-    def build_trade_plan(*args, **kwargs):
-        return None
-
     def compute_score(
         sma_signal, ob_imbalance, whale_signal, funding_rate, cascade_probability
     ):
@@ -514,37 +506,32 @@ except Exception as _e:
     def get_cascade_probability(*args, **kwargs):
         return 0.0
 
-    def evaluate_smc_sniper(*args, **kwargs):
-        return {
-            "signal": "NONE",
-            "entry": None,
-            "sl": None,
-            "tp": [],
-            "reason": "fallback",
-            "confidence": 0,
-            "market_state": "unknown",
-            "trap_type": None,
-            "fib_zone": {"low": None, "high": None, "timeframe": "15m"},
-            "invalidations": [],
-            "features": {},
-        }
-
     class MarketStateDetector:
         def detect(self, *args, **kwargs):
             return {
                 "state": "CHOPPY",
                 "substate": "CHOPPY",
-                "allow_trade": True,
+                "allow_trade": False,
                 "bias": 0.0,
                 "volatility": 0.0,
                 "compression": 1.0,
                 "timeframe_breakdown": {},
+                "reason": "market_state_fallback_fail_closed",
             }
 
     def evaluate_meta_filter(*args, **kwargs):
         return {"allow_trade": False, "risk_scale": 0.0, "reason": "engine_unavailable", "meta_state": {"fail_closed": True}}
 
-    from engine import get_shared_alpha_predictor
+    def get_shared_alpha_predictor():
+        try:
+            import engine as _engine_mod
+            getter = getattr(_engine_mod, "get_shared_alpha_predictor", None)
+            if callable(getter):
+                return getter()
+            logger.warning("[ALPHA] engine.get_shared_alpha_predictor unavailable in fallback path")
+        except Exception as _alpha_getter_exc:
+            logger.warning("[ALPHA] failed to resolve shared alpha getter in fallback path: %s", _alpha_getter_exc)
+        return None
 
     def apply_meta_to_decision(decision, meta_result):
         return decision if isinstance(decision, dict) else {}
@@ -554,7 +541,12 @@ except Exception as _e:
 _signal_pipeline_engine = None
 if LiquiditySweepAlpha is not None:
     try:
-        alpha_predictor = ThreadSafeAlphaPredictor(get_shared_alpha_predictor())
+        shared_alpha = get_shared_alpha_predictor()
+        if shared_alpha is None:
+            logger.warning("Shared alpha predictor getter returned None; disabling alpha predictor.")
+            alpha_predictor = None
+        else:
+            alpha_predictor = ThreadSafeAlphaPredictor(shared_alpha)
     except Exception as _alpha_shared_err:
         logger.warning("Shared alpha predictor init failed; disabling alpha predictor: %s", _alpha_shared_err)
         alpha_predictor = None
@@ -573,12 +565,7 @@ if globals().get("SniperExecutionEngine") is not None:
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
-    try:
-        if value is None:
-            return default
-        return float(value)
-    except Exception:
-        return default
+    return safe_float(value, default=default)
 
 
 def _append_orderbook_snapshot(orderbook: Dict[str, Any], timestamp: Optional[float] = None) -> None:
@@ -1777,6 +1764,11 @@ def run_analysis_cycle(
     liq_events = liq_monitor.get_events() if liq_monitor else []
     _append_orderbook_snapshot(analysis_orderbook, timestamp=time.time())
     snapshot_history = _get_orderbook_snapshot_history()
+    if len(snapshot_history) < 3:
+        logger.info(
+            "[SPOOF] insufficient orderbook snapshots (%d/3); spoof detection is unreliable this cycle",
+            len(snapshot_history),
+        )
 
     engines_out = (
         run_all_engines(
@@ -2105,7 +2097,7 @@ def run_analysis_cycle(
         "[REGIME] regime=%s conf=%.3f allow_trade=%s mode=%s scale=%.2f reason=%s",
         feat_dict.get("regime", "unknown"),
         _safe_float(feat_dict.get("regime_confidence", 0.0)),
-        feat_dict.get("allow_trade", True),
+        feat_dict.get("allow_trade", False),
         feat_dict.get("trade_mode", "balanced"),
         _safe_float(feat_dict.get("position_scale", 1.0)),
         feat_dict.get("regime_reasons", []),
@@ -2514,7 +2506,7 @@ def run_analysis_cycle(
             "meta_state": meta_state,
         }
 
-    if not meta_result.get("allow_trade", True):
+    if not meta_result.get("allow_trade", False):
         logger.info(
             "[META_FILTER] BLOCKED reason=%s score=%.3f",
             meta_result.get("reason", "unknown"),
@@ -2736,7 +2728,7 @@ def run_analysis_cycle(
 
     logger.info(
         "[META_FILTER] allow=%s scale=%.2f reason=%s",
-        meta_result.get("allow_trade", True),
+        meta_result.get("allow_trade", False),
         _safe_float(meta_result.get("risk_scale", 1.0)),
         meta_result.get("reason", ""),
     )

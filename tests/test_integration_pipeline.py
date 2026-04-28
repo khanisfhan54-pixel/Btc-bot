@@ -1,5 +1,6 @@
 import main
 import engine
+import inspect
 
 
 def _pipeline_once(price: float = 100000.0):
@@ -67,3 +68,13 @@ def test_orderbook_snapshot_pipeline_rolls_before_engine_execution():
     history = main._get_orderbook_snapshot_history()
     assert len(history) == 1
     assert history[0]["bids"][0][0] == 99990.0
+
+
+def test_deprecated_helper_not_exported_and_live_path_uses_signal_engine():
+    assert "compute_score" not in engine.__all__
+    assert "evaluate_smc_sniper" not in engine.__all__
+    assert "detect_entry_trigger" not in engine.__all__
+    assert "build_trade_plan" not in engine.__all__
+    source = inspect.getsource(main.run_analysis_cycle)
+    assert "signal_engine.generate(" in source
+    assert "compute_score(" not in source

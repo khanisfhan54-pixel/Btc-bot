@@ -38,3 +38,18 @@ def test_execution_layer_blocks_when_oi_missing():
     )
     assert decision["execute"] is False
     assert decision["reason"] in {"open_interest_missing", "fallback"}
+
+
+def test_execution_decide_fail_closed_on_invalid_meta_and_capital_safe():
+    equity = 5000.0
+    decision = main.execution_engine.decide(
+        signal_payload={"signal": "LONG", "confidence": 0.85},
+        features_payload={"features": {"liquidity_score": 0.9, "spread_bps": 2.0}},
+        snapshot={"bids": [[100000.0, 2.0]], "asks": [[100010.0, 2.0]], "timestamp": time.time()},
+        account_equity=equity,
+        meta_result=None,
+    )
+    used_capital = float(decision.get("position_size", 0.0)) * 100000.0 if decision.get("execute") else 0.0
+    assert decision["execute"] is False
+    assert decision["reason"] in {"invalid_meta_result", "fallback"}
+    assert used_capital <= equity
