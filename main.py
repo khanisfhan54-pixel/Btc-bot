@@ -60,6 +60,7 @@ BASIS_HALT_THRESHOLD_PCT = float(os.environ.get("BASIS_HALT_THRESHOLD_PCT", "0.5
 BACKTEST_RISK_PCT = float(os.environ.get("BACKTEST_RISK_PCT", "0.005"))
 RECONCILIATION_BLOCK_SECONDS = int(os.environ.get("RECONCILIATION_BLOCK_SECONDS", "300"))
 _reconciliation_blocks: Dict[str, float] = {}
+_ORDERBOOK_SNAPSHOTS: Deque[Dict[str, Any]] = deque(maxlen=8)
 
 try:
     from feature_engine import FeatureEngine
@@ -312,7 +313,7 @@ if AdvancedRegimeEngine is not None:
     except Exception as _regime_init_err:
         logger.warning("AdvancedRegimeEngine init failed; continuing without it: %s", _regime_init_err)
         regime_engine = None
-alpha_predictor = ThreadSafeAlphaPredictor(LiquiditySweepAlpha()) if LiquiditySweepAlpha is not None else None
+alpha_predictor = None
 try:
     from backtest_engine import BacktestEngine, BacktestConfig
 
@@ -335,12 +336,12 @@ try:
         analyze_volume_intelligence,
         detect_entry_trigger,
         build_trade_plan,
-        compute_score,
         get_cascade_probability,
         MarketStateDetector,
         evaluate_smc_sniper,
         evaluate_meta_filter,
         apply_meta_to_decision,
+        get_shared_alpha_predictor,
         _default_alpha,
         SniperExecutionEngine,
     )
@@ -540,7 +541,10 @@ except Exception as _e:
             }
 
     def evaluate_meta_filter(*args, **kwargs):
-        return {"allow_trade": True, "risk_scale": 1.0, "reason": "engine_unavailable", "meta_state": {}}
+        return {"allow_trade": False, "risk_scale": 0.0, "reason": "engine_unavailable", "meta_state": {"fail_closed": True}}
+
+    def get_shared_alpha_predictor():
+        return LiquiditySweepAlpha() if LiquiditySweepAlpha is not None else None
 
     def apply_meta_to_decision(decision, meta_result):
         return decision if isinstance(decision, dict) else {}
@@ -548,6 +552,12 @@ except Exception as _e:
     SniperExecutionEngine = None  # type: ignore
 
 _signal_pipeline_engine = None
+if LiquiditySweepAlpha is not None:
+    try:
+        alpha_predictor = ThreadSafeAlphaPredictor(get_shared_alpha_predictor())
+    except Exception as _alpha_shared_err:
+        logger.warning("Shared alpha predictor init failed; disabling alpha predictor: %s", _alpha_shared_err)
+        alpha_predictor = None
 if globals().get("SniperExecutionEngine") is not None:
     try:
         _signal_pipeline_engine = SniperExecutionEngine(
@@ -1750,7 +1760,7 @@ def run_analysis_cycle(
             liquidation_events=liq_events,
             performance={},
             volume_intelligence=volume_intel,
-            orderbook_snapshots=[analysis_orderbook],
+            orderbook_snapshots=list(_ORDERBOOK_SNAPSHOTS),
         )
         or {}
     )
@@ -2281,12 +2291,12 @@ def run_analysis_cycle(
     if open_interest > 0:
         oih = [open_interest * 0.98, open_interest * 0.995, open_interest]
     else:
-        oih = [900_000.0, 1_000_000.0]
+        oih = []
 
     cascade_prob = _safe_float(engines_out.get("cascade_probability", 0.0))
-    if cascade_prob <= 0.0:
+    if cascade_prob <= 0.0 and open_interest > 0:
         cascade_prob = get_cascade_probability(
-            open_interest=max(open_interest, 1_000_000.0),
+            open_interest=open_interest,
             oi_history=oih,
             liquidation_cluster=_safe_float(
                 (liq_monitor.get_stats()["total_liq"] if liq_monitor else 0.0)
@@ -2304,13 +2314,7 @@ def run_analysis_cycle(
         "heat_score": 0,
         "color": "green",
     }
-    result = compute_score(
-        sma_signal=sma_signal,
-        ob_imbalance=ob_imb,
-        whale_signal=whale_sig,
-        funding_rate=funding_rate,
-        cascade_probability=cascade_prob,
-    )
+    result = {}
 
     ai_meta = get_ai_score(
         ob_imbalance=ob_imb,
@@ -2462,8 +2466,8 @@ def run_analysis_cycle(
             trades=trades,
         )
     except Exception as _meta_exc:
-        logger.warning("[META_FILTER] evaluation error (fallback allow): %s", _meta_exc)
-        meta_result = {"allow_trade": True, "risk_scale": 1.0, "reason": "eval_error", "meta_state": {}}
+        logger.warning("[META_FILTER] evaluation error (fail-closed): %s", _meta_exc)
+        meta_result = {"allow_trade": False, "risk_scale": 0.0, "reason": "eval_error", "meta_state": {"fail_closed": True}}
 
     if not meta_result.get("allow_trade", True):
         logger.info(
@@ -3043,3 +3047,10 @@ if __name__ == "__main__":
         run_backtest()
     else:
         run_live()
+    if isinstance(analysis_orderbook, dict):
+        _ORDERBOOK_SNAPSHOTS.append(
+            {
+                "bids": list((analysis_orderbook.get("bids") or [])[:20]),
+                "asks": list((analysis_orderbook.get("asks") or [])[:20]),
+            }
+        )
