@@ -2,34 +2,47 @@ name: React Doctor Full Scan
 
 on:
   push:
-    branches: ["**"]   # runs on all branches
+    branches: ["**"]   # run on all branches
   pull_request:
-    branches: ["**"]   # runs on all PRs
+    branches: ["**"]   # run on all PRs
 
 jobs:
   react-doctor:
     runs-on: ubuntu-latest
 
     steps:
-      - name: 📥 Checkout repository
+      # 📥 Step 1: Checkout your repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: 🟢 Setup Node.js
+      # 🟢 Step 2: Setup Node (recommended for stability)
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 18
 
-      - name: 📦 Install dependencies
-        run: npm install
-
-      - name: 🩺 Run full React Doctor scan
+      # 🩺 Step 3: Run React Doctor (full repo scan)
+      - name: Run React Doctor scan
         run: npx -y react-doctor@latest . --verbose --json > report.json
 
-      - name: 📊 Show report
+      # 📊 Step 4: Show results in logs
+      - name: Show report
         run: cat report.json
 
-      - name: 📤 Upload report artifact
+      # 📤 Step 5: Upload report (so you can download it)
+      - name: Upload report artifact
         uses: actions/upload-artifact@v4
         with:
           name: react-doctor-report
           path: report.json
+
+      # 🚨 Step 6 (Optional): Fail if score is too low
+      - name: Enforce quality threshold
+        run: |
+          score=$(cat report.json | jq '.score')
+          echo "React Doctor Score: $score"
+
+          if [ "$score" -lt 70 ]; then
+            echo "❌ Code quality below threshold (70)"
+            exit 1
+          fi
