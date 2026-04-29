@@ -89,6 +89,7 @@ class ReplayEngine:
         self._normalize_floats_strict_only = True
         self._HASH_NAMESPACE = "ADV_REGIME_REPLAY"
         self._replay_timeout_seconds = 5.0
+        self._copy_fidelity_failures = 0
 
     # ==========================================
     # INTERNAL SAFE COPY (UNSAFE MODE PROTECTION)
@@ -104,7 +105,11 @@ class ReplayEngine:
                 flat = value.ravel()
                 out = np.empty(flat.shape, dtype=object)
                 for i in range(len(flat)):
-                    out[i] = self._freeze(flat[i], depth, seen)
+                    try:
+                        out[i] = copy.deepcopy(flat[i])
+                    except Exception:
+                        LOGGER.debug("_copy_ndarray: element %d deepcopy failed, using structural freeze. type=%s", i, type(flat[i]).__qualname__)
+                        out[i] = self._freeze(flat[i], depth, seen)
                 return out.reshape(value.shape)
             return np.array(value, copy=True)
         except Exception:
@@ -120,8 +125,11 @@ class ReplayEngine:
     def _copy_any(self, value: Any):
         try:
             return copy.deepcopy(value)
-        except Exception:
-            return self._safe_payload(value, depth=8)
+        except Exception as exc:
+            LOGGER.error("ReplayEngine._copy_any: deepcopy failed for type %s; falling back to structural copy. Data fidelity NOT guaranteed. error_type=%s error=%s", type(value).__qualname__, type(exc).__name__, str(exc)[:200], exc_info=True)
+            with self._lock:
+                self._copy_fidelity_failures += 1
+            return self._safe_payload(value, depth=self._MAX_SAFE_PAYLOAD_DEPTH)
 
     def _canonical_key_string(self, value: Any) -> str:
         """
@@ -227,10 +235,19 @@ class ReplayEngine:
             finally:
                 seen.discard(obj_id)
 
-        return {
-            "__type__": f"{type(value).__module__}.{type(value).__qualname__}",
-            "__repr__": repr(value),
-        }
+        if hasattr(value, "__reduce_ex__"):
+            try:
+                import pickle
+                return pickle.loads(pickle.dumps(value))
+            except Exception:
+                pass
+        if hasattr(value, "__slots__"):
+            slots = {}
+            for slot in getattr(value, "__slots__", []):
+                slots[slot] = freeze_fn(getattr(value, slot, "__UNAVAILABLE__"), max(0, cur_depth - 1), seen)
+            return {"__slots_object__": f"{type(value).__module__}.{type(value).__qualname__}", "slots": slots}
+        LOGGER.debug("_freeze_unknown_object: using repr fallback for type=%s", type(value).__qualname__)
+        return {"__type__": f"{type(value).__module__}.{type(value).__qualname__}", "__repr__": repr(value)}
 
     def _freeze(self, value, depth: int, seen: set[int]):
         container_types = (dict, list, tuple, set, frozenset, np.ndarray)
@@ -298,7 +315,7 @@ class ReplayEngine:
         if isinstance(obj, dict):
             seen.add(obj_id)
             return {
-                str(k): self._canonicalize(obj[k], seen)
+                f"{type(k).__qualname__}:{str(k)}": self._canonicalize(obj[k], seen)
                 for k in sorted(obj, key=lambda x: f"{type(x).__name__}:{str(x)}")
             }
         if isinstance(obj, (list, tuple)):
@@ -387,7 +404,7 @@ class ReplayEngine:
             canonical = self._deep_sort(self._canonicalize(state))
             wrapped_payload = {
                 "namespace": self._HASH_NAMESPACE,
-                "schema_version": str(state.get("schema_version", "1.0")),
+                "schema_version": str(state.get("schema_version", "2.4")),
                 "payload": canonical,
             }
             s = json.dumps(
@@ -400,14 +417,14 @@ class ReplayEngine:
             return hashlib.sha256(f"{self._HASH_NAMESPACE}|{s}".encode()).hexdigest()
         except Exception:
             try:
-                LOGGER.error("State hash canonicalization failed", exc_info=True)
+                LOGGER.error("_state_hash fallback activated for state type=%s. Hash fidelity may be reduced.", type(state).__qualname__, exc_info=True)
             except Exception:
                 pass
             fallback = {
                 "namespace": self._HASH_NAMESPACE,
                 "error": "STATE_HASH_ERROR",
                 "payload_type": f"{type(state).__module__}.{type(state).__qualname__}",
-                "payload": self._safe_payload(state, depth=6),
+                "payload": self._safe_payload(state, depth=self._MAX_SAFE_PAYLOAD_DEPTH),
             }
             s = json.dumps(
                 fallback,
@@ -421,7 +438,7 @@ class ReplayEngine:
     # ==========================================
     # RECORDING
     # ==========================================
-    def record_event(self, event_type: str, payload: Dict[str, Any]) -> None:
+    def record_event(self, event_type: str, payload: Dict[str, Any], source: str = "advanced_regime_engine") -> None:
         if not self._recording:
             return
 
@@ -440,7 +457,8 @@ class ReplayEngine:
                 "id": self._event_id,
                 "type": event_type,
                 "ts_ns": int(time.time_ns()),
-                "source": "advanced_regime_engine",
+                "ts_monotonic_ns": int(time.monotonic_ns()),
+                "source": str(source or "advanced_regime_engine").strip(),
                 "dropped_events_before": int(self._dropped_events),
                 # Defensive isolation prevents post-record mutation from corrupting replay history.
                 "payload": self._copy_any(payload),
@@ -456,10 +474,10 @@ class ReplayEngine:
         tmp.pop("_checksum", None)
         snapshot_state["_checksum"] = self._state_hash(tmp)
         with self._lock:
-            self._snapshots.append({
-                "id": self._event_id,
-                "state": snapshot_state
-            })
+            out={"id": self._event_id,"ts_ns": int(time.time_ns()),"ts_monotonic_ns": int(time.monotonic_ns()),"state": snapshot_state,"event_boundary": int(self._event_id),"dropped_events_before": int(self._dropped_events)}
+            if isinstance(state, dict):
+                out["regime_marker"] = state.get("_confirmed_regime", state.get("regime"))
+            self._snapshots.append(out)
             if len(self._snapshots) > self._max_snapshots:
                 over_by = len(self._snapshots) - self._max_snapshots
                 del self._snapshots[:over_by]
@@ -485,6 +503,9 @@ class ReplayEngine:
                 events.append(event_copy)
         else:
             events = self._copy_any(source_events)
+        if self._dropped_events > 0:
+            LOGGER.warning("ReplayEngine.replay: %d events were dropped before this replay. Replay state may be incorrect.", self._dropped_events)
+            yield {"id": None, "type": "__REPLAY_GAP__", "ts_ns": int(time.time_ns()), "source": "replay_engine", "dropped_events_before": self._dropped_events, "payload": {"reason": "EVENTS_DROPPED_BEFORE_REPLAY", "dropped_count": self._dropped_events, "first_surviving_id": events[0].get("id") if events else None}}
         for e in events:
             yield e
 
@@ -502,6 +523,9 @@ class ReplayEngine:
                 events.append(event_copy)
         else:
             events = self._copy_any(source_events)
+        if events and int(event_id) > 0 and events[0].get("id") != int(event_id):
+            LOGGER.warning("ReplayEngine.replay_from: replay gap detected requested_start_id=%s first_surviving_id=%s", event_id, events[0].get("id"))
+            yield {"id": None, "type": "__REPLAY_GAP__", "ts_ns": int(time.time_ns()), "source": "replay_engine", "dropped_events_before": self._dropped_events, "payload": {"reason": "REPLAY_GAP_DETECTED", "requested_start_id": int(event_id), "first_surviving_id": events[0].get("id")}}
         for e in events:
             if e.get("id", 0) >= int(event_id):
                 yield e
@@ -524,18 +548,26 @@ class ReplayEngine:
             events_slice = list(self._events)[-n:]
         return self._copy_any(events_slice)
 
+    def copy_fidelity_failures(self) -> int:
+        with self._lock:
+            return int(self._copy_fidelity_failures)
+
     def dropped_snapshots(self) -> int:
         with self._lock:
             return int(self._dropped_snapshot_count)
 
-    def clear(self):
+    def clear(self, reset_counters: bool = False):
         with self._lock:
             self._events.clear()
             self._snapshots.clear()
             self._fsm_error = None
+            if reset_counters:
+                self._event_id = 0
+                self._dropped_events = 0
+                self._dropped_snapshot_count = 0
 
-    def _set_replay_timeout_error(self, engine, prev_event, etype):
-        err = {"last_event": prev_event, "event": etype, "reason": "REPLAY_TIMEOUT"}
+    def _set_replay_timeout_error(self, engine, prev_event, etype, phase="UNKNOWN"):
+        err = {"last_event": prev_event, "event": etype, "reason": "REPLAY_TIMEOUT", "phase": phase}
         self._fsm_error = err
         setattr(engine, "_fsm_error", err)
 
@@ -548,19 +580,28 @@ class ReplayEngine:
             getattr(engine, callback_name)(callback_arg)
             return
 
+        warned_non_serializable = getattr(self, "_warned_non_serializable_state_this_apply", False)
+        try:
+            engine_for_child = copy.deepcopy(engine)
+        except Exception as exc:
+            LOGGER.error("ReplayEngine: engine is not safely deepcopy-able for subprocess isolation. callback=%s engine_type=%s error=%s", callback_name, type(engine).__qualname__, str(exc), exc_info=True)
+            raise RuntimeError("ENGINE_NOT_COPYABLE_FOR_SUBPROCESS") from exc
         try:
             # Use fork on POSIX to avoid spawn-time re-import deadlocks in tight test loops.
             ctx = mp.get_context("fork")
             parent_conn, child_conn = ctx.Pipe(duplex=False)
             process = ctx.Process(
                 target=_replay_callback_worker,
-                args=(child_conn, self._copy_any(engine), callback_name, self._copy_any(callback_arg)),
+                args=(child_conn, engine_for_child, callback_name, self._copy_any(callback_arg)),
                 daemon=True,
             )
             process.start()
-        except Exception:
-            getattr(engine, callback_name)(callback_arg)
-            return
+        except Exception as exc:
+            LOGGER.error("ReplayEngine callback watchdog init failed", exc_info=True)
+            fault = {"reason": "CALLBACK_WATCHDOG_INIT_FAILED", "callback": callback_name, "error_type": type(exc).__name__, "error": str(exc)}
+            self._fsm_error = fault
+            setattr(engine, "_fsm_error", fault)
+            raise RuntimeError("CALLBACK_WATCHDOG_INIT_FAILED") from exc
         child_conn.close()
         try:
             if not parent_conn.poll(timeout_seconds):
@@ -576,8 +617,15 @@ class ReplayEngine:
 
         if not isinstance(msg, dict) or not msg.get("ok"):
             err_type = msg.get("error_type") if isinstance(msg, dict) else "RuntimeError"
-            raise RuntimeError(msg.get("error", "Replay callback failed"))
+            LOGGER.error("Replay callback error: callback=%s error_type=%s error=%s", callback_name, err_type, msg.get("error") if isinstance(msg, dict) else "invalid response", exc_info=False)
+            raise RuntimeError(f"[{err_type or 'UnknownError'}] Replay callback failed: {msg.get('error', '')}")
         engine.load_state(msg["state"])
+        if not warned_non_serializable:
+            LOGGER.warning("ReplayEngine: engine state restored via serialize/load cycle. Non-serializable state (RNG, caches, C extensions) may not be fully restored. Engine type=%s", type(engine).__qualname__)
+            self._warned_non_serializable_state_this_apply = True
+        if hasattr(engine, "post_replay_restore"):
+            LOGGER.debug("ReplayEngine: calling post_replay_restore hook")
+            engine.post_replay_restore()
 
     def _run_snapshot_restore_with_timeout(self, engine, snapshot: Dict[str, Any], timeout_seconds: float):
         if timeout_seconds <= 0:
@@ -623,7 +671,8 @@ class ReplayEngine:
             "self_heal": {"update_start"},
             "error": {"error", "update_end", "circuit_breaker", "self_heal", "update_start"},
         }
-        supported_event_types = {"update_start", "update_end", "circuit_breaker", "self_heal", "error"}
+        supported_event_types = {"update_start", "update_end", "circuit_breaker", "self_heal", "error", "__REPLAY_GAP__"}
+        self._warned_non_serializable_state_this_apply = False
         replay_timeout_s = float(getattr(self, "_replay_timeout_seconds", 5.0))
         replay_deadline = time.perf_counter() + replay_timeout_s if replay_timeout_s > 0 else None
         try:
@@ -631,16 +680,26 @@ class ReplayEngine:
             setattr(engine, "_fsm_error", None)
             self._fsm_error = None
             prev_event = None
+            in_update_cycle = False
             for e in self.replay_from(start_id):
                 etype = e.get("type")
                 payload = e.get("payload", {})
                 prev_event = last_event
+                if etype == "__REPLAY_GAP__":
+                    LOGGER.warning("ReplayEngine.apply_events: replay gap marker observed payload=%s", payload)
+                    err = {"reason": "REPLAY_GAP", "dropped_count": payload.get("dropped_count", 0)}
+                    self._fsm_error = err
+                    setattr(engine, "_fsm_error", err)
+                    if getattr(engine, "_strict_replay", True):
+                        raise RuntimeError("REPLAY_GAP_DETECTED")
+                    continue
                 if etype not in supported_event_types:
                     err = {"last_event": prev_event, "event": etype, "reason": "EVENT_TYPE_UNSUPPORTED"}
                     self._fsm_error = err
                     setattr(engine, "_fsm_error", err)
                     if getattr(engine, "_strict_replay", True):
                         raise RuntimeError(f"Unsupported replay event type: {etype}")
+                    LOGGER.warning("ReplayEngine.apply_events [non-strict]: suppressing error and returning. reason=%s last_event=%s current_event=%s error_type=%s", err["reason"], prev_event, etype, None)
                     return
 
                 # STRICT FSM VALIDATION
@@ -651,11 +710,12 @@ class ReplayEngine:
                     if getattr(engine, "_strict_replay", True):
                         raise RuntimeError(f"Replay corruption: {prev_event} -> {etype}")
                     else:
+                        LOGGER.warning("ReplayEngine.apply_events [non-strict]: suppressing error and returning. reason=%s last_event=%s current_event=%s error_type=%s", err["reason"], prev_event, etype, None)
                         return
 
                 last_event = etype
                 if replay_deadline is not None and time.perf_counter() > replay_deadline:
-                    err = {"last_event": prev_event, "event": etype, "reason": "REPLAY_TIMEOUT"}
+                    err = {"last_event": prev_event, "event": etype, "reason": "REPLAY_TIMEOUT", "phase": "DEADLINE"}
                     self._fsm_error = err
                     setattr(engine, "_fsm_error", err)
                     raise RuntimeError("Replay timeout exceeded")
@@ -663,6 +723,7 @@ class ReplayEngine:
                 try:
                     engine_lock = getattr(engine, "_lock", None)
                     if etype == "update_start":
+                        in_update_cycle = True
                         if not isinstance(payload, dict):
                             raise RuntimeError("update_start payload must be dict")
                         if engine_lock is not None:
@@ -672,27 +733,21 @@ class ReplayEngine:
                             self._run_replay_callback_with_timeout(engine, "update", self._copy_any(payload), replay_timeout_s)
 
                     elif etype == "circuit_breaker":
-                        reason = "replay"
-                        if isinstance(payload, dict):
-                            reason = payload.get("reason", "replay")
                         if engine_lock is not None:
                             with engine_lock:
-                                self._run_replay_callback_with_timeout(engine, "_trigger_circuit_breaker", reason, replay_timeout_s)
+                                self._run_replay_callback_with_timeout(engine, "_trigger_circuit_breaker", self._copy_any(payload), replay_timeout_s)
                         else:
-                            self._run_replay_callback_with_timeout(engine, "_trigger_circuit_breaker", reason, replay_timeout_s)
+                            self._run_replay_callback_with_timeout(engine, "_trigger_circuit_breaker", self._copy_any(payload), replay_timeout_s)
 
                     elif etype == "self_heal":
-                        error = None
-                        if isinstance(payload, dict):
-                            error = payload.get("error")
                         if engine_lock is not None:
                             with engine_lock:
-                                self._run_replay_callback_with_timeout(engine, "_self_heal", error, replay_timeout_s)
+                                self._run_replay_callback_with_timeout(engine, "_self_heal", self._copy_any(payload), replay_timeout_s)
                         else:
-                            self._run_replay_callback_with_timeout(engine, "_self_heal", error, replay_timeout_s)
+                            self._run_replay_callback_with_timeout(engine, "_self_heal", self._copy_any(payload), replay_timeout_s)
                     elif etype == "update_end":
                         # Replay marker event; no action required.
-                        pass
+                        in_update_cycle = False
                     elif etype == "error":
                         # Observability-only event in live mode; deterministic no-op in replay.
                         pass
@@ -702,7 +757,7 @@ class ReplayEngine:
                         setattr(engine, "_fsm_error", err)
                         raise RuntimeError(f"Unsupported replay event type: {etype}")
                     if replay_deadline is not None and time.perf_counter() > replay_deadline:
-                        err = {"last_event": prev_event, "event": etype, "reason": "REPLAY_TIMEOUT"}
+                        err = {"last_event": prev_event, "event": etype, "reason": "REPLAY_TIMEOUT", "phase": "DEADLINE"}
                         self._fsm_error = err
                         setattr(engine, "_fsm_error", err)
                         raise RuntimeError("Replay timeout exceeded")
@@ -715,9 +770,10 @@ class ReplayEngine:
                     if isinstance(existing_err, dict) and existing_err.get("reason") in {"REPLAY_TIMEOUT", "EVENT_TYPE_UNSUPPORTED"}:
                         if getattr(engine, "_strict_replay", True):
                             raise
+                        LOGGER.warning("ReplayEngine.apply_events [non-strict]: suppressing error and returning. reason=%s last_event=%s current_event=%s error_type=%s", existing_err.get("reason"), prev_event, etype, type(exc).__name__)
                         return
                     if isinstance(exc, TimeoutError):
-                        self._set_replay_timeout_error(engine, prev_event, etype)
+                        self._set_replay_timeout_error(engine, prev_event, etype, phase="CALLBACK")
                         raise RuntimeError("Replay timeout exceeded")
                     err = {
                         "last_event": prev_event,
@@ -729,6 +785,7 @@ class ReplayEngine:
                     setattr(engine, "_fsm_error", err)
                     if getattr(engine, "_strict_replay", True):
                         raise RuntimeError(f"Replay handler error: {etype}") from exc
+                    LOGGER.warning("ReplayEngine.apply_events [non-strict]: suppressing error and returning. reason=%s last_event=%s current_event=%s error_type=%s", err["reason"], prev_event, etype, type(exc).__name__)
                     return
         finally:
             try:
@@ -739,7 +796,7 @@ class ReplayEngine:
         # ==========================================
         # 🚨 FSM COMPLETENESS CHECK
         # ==========================================
-        if last_event == "update_start":
+        if in_update_cycle:
             err = {"reason": "INCOMPLETE_EVENT_CYCLE"}
             self._fsm_error = err
             setattr(engine, "_fsm_error", err)
@@ -814,16 +871,27 @@ class ReplayEngine:
                 snapshot,
                 float(getattr(self, "_replay_timeout_seconds", 5.0)),
             )
+            if hasattr(engine, "post_snapshot_restore"):
+                LOGGER.debug("ReplayEngine: calling post_snapshot_restore hook")
+                engine.post_snapshot_restore()
             # RNG restore handled ONLY in engine.load_snapshot()
             start_id = int(snapshot.get("id", 0))
             self.apply_events(engine, start_id=start_id)
         except Exception as exc:
             # rollback engine to pre-replay state
-            if backup:
+            if backup is not None:
                 rollback_error = None
                 try:
                     if hasattr(engine, "load_state") and backup_mode == "state":
                         engine.load_state(backup)
+                        if hasattr(engine, "post_rollback_restore"):
+                            LOGGER.debug("ReplayEngine: calling post_rollback_restore hook")
+                            engine.post_rollback_restore()
+                        LOGGER.warning("ReplayEngine: rollback completed via load_state. Transient and RNG state may not be fully restored. Verify engine integrity after rollback. engine_type=%s", type(engine).__qualname__)
+                        try:
+                            setattr(engine, "_replay_rollback_occurred", True)
+                        except Exception:
+                            pass
                     elif hasattr(engine, "load_snapshot"):
                         engine.load_snapshot({"state": backup})
                 except Exception as rollback_exc:
@@ -923,12 +991,12 @@ class ReplayEngine:
             baseline_hash_payload = {
                 "engine": baseline_state,
                 "rng": self._normalize_rng_state(baseline_engine),
-                "schema_version": str(baseline_state.get("schema_version", "2.3")) if isinstance(baseline_state, dict) else "2.3",
+                "schema_version": str(baseline_state.get("schema_version", "2.4")) if isinstance(baseline_state, dict) else "2.4",
             }
             replay_hash_payload = {
                 "engine": replay_state,
                 "rng": self._normalize_rng_state(replay_engine),
-                "schema_version": str(replay_state.get("schema_version", "2.3")) if isinstance(replay_state, dict) else "2.3",
+                "schema_version": str(replay_state.get("schema_version", "2.4")) if isinstance(replay_state, dict) else "2.4",
             }
 
             baseline_hash = self._state_hash(baseline_hash_payload)
