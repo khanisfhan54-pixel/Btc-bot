@@ -1,0 +1,35 @@
+name: React Doctor Full Scan
+
+on:
+  push:
+    branches: ["**"]   # runs on all branches
+  pull_request:
+    branches: ["**"]   # runs on all PRs
+
+jobs:
+  react-doctor:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🟢 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: 📦 Install dependencies
+        run: npm install
+
+      - name: 🩺 Run full React Doctor scan
+        run: npx -y react-doctor@latest . --verbose --json > report.json
+
+      - name: 📊 Show report
+        run: cat report.json
+
+      - name: 📤 Upload report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: react-doctor-report
+          path: report.json
