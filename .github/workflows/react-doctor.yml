@@ -2,41 +2,41 @@ name: React Doctor Full Scan
 
 on:
   push:
-    branches: ["**"]   # run on all branches
+    branches: ["**"]
   pull_request:
-    branches: ["**"]   # run on all PRs
+    branches: ["**"]
 
 jobs:
   react-doctor:
     runs-on: ubuntu-latest
 
     steps:
-      # 📥 Step 1: Checkout your repository
+      # 📥 Checkout repo
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 🟢 Step 2: Setup Node (recommended for stability)
+      # 🟢 FIX: Use Node 20 (not 18)
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 18
+          node-version: 20
 
-      # 🩺 Step 3: Run React Doctor (full repo scan)
+      # 🩺 Run scan and save report
       - name: Run React Doctor scan
         run: npx -y react-doctor@latest . --verbose --json > report.json
 
-      # 📊 Step 4: Show results in logs
+      # 📊 Show results in logs
       - name: Show report
         run: cat report.json
 
-      # 📤 Step 5: Upload report (so you can download it)
+      # 📤 Upload report
       - name: Upload report artifact
         uses: actions/upload-artifact@v4
         with:
           name: react-doctor-report
           path: report.json
 
-      # 🚨 Step 6 (Optional): Fail if score is too low
+      # 🚨 Enforce quality (optional)
       - name: Enforce quality threshold
         run: |
           score=$(cat report.json | jq '.score')
