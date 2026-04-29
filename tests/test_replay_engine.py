@@ -87,6 +87,16 @@ class SlowUpdateTarget(StubReplayTarget):
         super().update(payload)
 
 
+
+
+class HangingUpdateTarget(StubReplayTarget):
+    def update(self, payload):
+        while True:
+            time.sleep(0.01)
+
+
+class SnapshotLoadStateOnlyTarget(StubReplayTarget):
+    load_snapshot = None
 class BadRngTarget(StubReplayTarget):
     class _BadBitGen:
         @property
@@ -725,6 +735,85 @@ def test_apply_events_timeout_fails_closed_with_reason():
     assert target._fsm_error["reason"] == "REPLAY_TIMEOUT"
 
 
+
+
+def test_apply_events_hanging_callback_times_out_without_stalling():
+    replay = ReplayEngine()
+    replay._replay_timeout_seconds = 0.05
+    replay.record_event("update_start", {"price": 1.0, "regime": "A"})
+    replay.record_event("update_end", {"regime": "A"})
+
+    target = HangingUpdateTarget(strict=True)
+    start = time.perf_counter()
+    with pytest.raises(RuntimeError, match="Replay timeout exceeded"):
+        replay.apply_events(target)
+    elapsed = time.perf_counter() - start
+
+    assert elapsed < 1.5
+    assert target._fsm_error["reason"] == "REPLAY_TIMEOUT"
+    assert target._is_replay is False
+
+
+def test_validate_replay_snapshot_path_fails_closed_on_timeout():
+    replay = _build_engine_with_snapshot()
+    replay._replay_timeout_seconds = 0.05
+    original = ReplayEngine._run_snapshot_restore_with_timeout
+    def _forced_timeout(self, engine, snapshot, timeout_seconds):
+        raise TimeoutError("forced timeout")
+    ReplayEngine._run_snapshot_restore_with_timeout = _forced_timeout
+    try:
+        result = replay.validate_replay(StubReplayTarget, snapshot_index=-1)
+    finally:
+        ReplayEngine._run_snapshot_restore_with_timeout = original
+
+    assert result["diverged"] is True
+    assert result["reason"] in {"REPLAY_TIMEOUT", "Replay timeout exceeded", "FSM_CORRUPTION"}
+
+
+def test_snapshot_restore_load_snapshot_timeout_fails_closed():
+    replay = _build_engine_with_snapshot()
+    replay._replay_timeout_seconds = 0.05
+    target = StubReplayTarget(strict=False)
+    original = replay._run_snapshot_restore_with_timeout
+    replay._run_snapshot_restore_with_timeout = lambda *_args, **_kwargs: (_ for _ in ()).throw(TimeoutError("forced"))
+    replay.replay_from_snapshot(target, snapshot_index=-1)
+    replay._run_snapshot_restore_with_timeout = original
+    assert target._fsm_error["reason"] == "REPLAY_TIMEOUT"
+    assert target._is_replay is False
+
+
+def test_snapshot_restore_load_state_timeout_fails_closed():
+    replay = _build_engine_with_snapshot()
+    replay._replay_timeout_seconds = 0.05
+    target = SnapshotLoadStateOnlyTarget(strict=False)
+    original = replay._run_snapshot_restore_with_timeout
+    replay._run_snapshot_restore_with_timeout = lambda *_args, **_kwargs: (_ for _ in ()).throw(TimeoutError("forced"))
+    replay.replay_from_snapshot(target, snapshot_index=-1)
+    replay._run_snapshot_restore_with_timeout = original
+    assert target._fsm_error["reason"] == "REPLAY_TIMEOUT"
+    assert target._is_replay is False
+
+
+def test_snapshot_restore_fast_path_not_timeout():
+    replay = _build_engine_with_snapshot()
+    replay._replay_timeout_seconds = 0.5
+    target = StubReplayTarget(strict=True)
+    replay.replay_from_snapshot(target, snapshot_index=-1)
+    assert target._fsm_error is None
+
+
+def test_snapshot_restore_watchdog_init_failure_fails_closed(monkeypatch):
+    replay = _build_engine_with_snapshot()
+    replay._replay_timeout_seconds = 0.05
+    target = StubReplayTarget(strict=False)
+    monkeypatch.setattr(
+        replay,
+        "_run_snapshot_restore_with_timeout",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("SNAPSHOT_WATCHDOG_INIT_FAILED")),
+    )
+    replay.replay_from_snapshot(target, snapshot_index=-1)
+    assert target._fsm_error["reason"] == "WATCHDOG_INIT_FAILED"
+    assert target._is_replay is False
 def test_fsm_error_resets_between_snapshot_replays():
     replay = _build_engine_with_snapshot()
     replay._snapshots[-1]["state"]["_checksum"] = "tampered"

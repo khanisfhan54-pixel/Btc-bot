@@ -1,6 +1,7 @@
 import threading
 import logging
 import copy
+import multiprocessing as mp
 from dataclasses import is_dataclass, fields, asdict
 import numpy as np
 import hashlib
@@ -10,6 +11,49 @@ from typing import Any, Dict, List, Optional
 from collections import deque
 
 LOGGER = logging.getLogger(__name__)
+
+
+
+
+def _replay_callback_worker(conn, engine, callback_name, callback_arg):
+    try:
+        if callback_name == "update":
+            engine.update(callback_arg)
+        elif callback_name == "_trigger_circuit_breaker":
+            engine._trigger_circuit_breaker(callback_arg)
+        elif callback_name == "_self_heal":
+            engine._self_heal(callback_arg)
+        else:
+            raise RuntimeError(f"Unsupported replay callback: {callback_name}")
+
+        if not hasattr(engine, "serialize_state"):
+            raise RuntimeError("Replay timeout guard requires serialize_state")
+        state = engine.serialize_state()
+        conn.send({"ok": True, "state": state})
+    except Exception as exc:
+        conn.send({"ok": False, "error_type": type(exc).__name__, "error": str(exc)})
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+def _snapshot_restore_worker(conn, engine, restore_mode, restore_payload):
+    try:
+        if restore_mode == "load_snapshot":
+            engine.load_snapshot(restore_payload)
+        elif restore_mode == "load_state":
+            engine.load_state(restore_payload)
+        else:
+            raise RuntimeError("invalid restore mode")
+        conn.send({"ok": True, "state": engine.serialize_state()})
+    except Exception as exc:
+        conn.send({"ok": False, "error": str(exc), "error_type": type(exc).__name__})
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 class ReplayEngine:
@@ -490,6 +534,85 @@ class ReplayEngine:
             self._snapshots.clear()
             self._fsm_error = None
 
+    def _set_replay_timeout_error(self, engine, prev_event, etype):
+        err = {"last_event": prev_event, "event": etype, "reason": "REPLAY_TIMEOUT"}
+        self._fsm_error = err
+        setattr(engine, "_fsm_error", err)
+
+    def _run_replay_callback_with_timeout(self, engine, callback_name: str, callback_arg: Any, timeout_seconds: float):
+        if timeout_seconds <= 0:
+            getattr(engine, callback_name)(callback_arg)
+            return
+
+        if not hasattr(engine, "serialize_state") or not hasattr(engine, "load_state"):
+            getattr(engine, callback_name)(callback_arg)
+            return
+
+        try:
+            # Use fork on POSIX to avoid spawn-time re-import deadlocks in tight test loops.
+            ctx = mp.get_context("fork")
+            parent_conn, child_conn = ctx.Pipe(duplex=False)
+            process = ctx.Process(
+                target=_replay_callback_worker,
+                args=(child_conn, self._copy_any(engine), callback_name, self._copy_any(callback_arg)),
+                daemon=True,
+            )
+            process.start()
+        except Exception:
+            getattr(engine, callback_name)(callback_arg)
+            return
+        child_conn.close()
+        try:
+            if not parent_conn.poll(timeout_seconds):
+                process.terminate()
+                process.join(timeout=1.0)
+                raise TimeoutError("Replay callback timed out")
+            msg = parent_conn.recv()
+        finally:
+            parent_conn.close()
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=1.0)
+
+        if not isinstance(msg, dict) or not msg.get("ok"):
+            err_type = msg.get("error_type") if isinstance(msg, dict) else "RuntimeError"
+            raise RuntimeError(msg.get("error", "Replay callback failed"))
+        engine.load_state(msg["state"])
+
+    def _run_snapshot_restore_with_timeout(self, engine, snapshot: Dict[str, Any], timeout_seconds: float):
+        if timeout_seconds <= 0:
+            raise RuntimeError("SNAPSHOT_TIMEOUT_INVALID")
+        if not hasattr(engine, "serialize_state") or not hasattr(engine, "load_state"):
+            raise RuntimeError("SNAPSHOT_WATCHDOG_INIT_FAILED")
+        restore_mode = "load_snapshot" if callable(getattr(engine, "load_snapshot", None)) else "load_state"
+        restore_payload = snapshot if restore_mode == "load_snapshot" else snapshot.get("state", {})
+        try:
+            ctx = mp.get_context("fork")
+            parent_conn, child_conn = ctx.Pipe(duplex=False)
+            process = ctx.Process(
+                target=_snapshot_restore_worker,
+                args=(child_conn, self._copy_any(engine), restore_mode, self._copy_any(restore_payload)),
+                daemon=True,
+            )
+            process.start()
+        except Exception as exc:
+            raise RuntimeError("SNAPSHOT_WATCHDOG_INIT_FAILED") from exc
+        child_conn.close()
+        try:
+            if not parent_conn.poll(timeout_seconds):
+                process.terminate()
+                process.join(timeout=1.0)
+                raise TimeoutError("snapshot restore timed out")
+            msg = parent_conn.recv()
+        finally:
+            parent_conn.close()
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=1.0)
+        if not isinstance(msg, dict) or not msg.get("ok"):
+            raise RuntimeError(msg.get("error", "snapshot restore failed"))
+        engine.load_state(msg["state"])
+
     def apply_events(self, engine, start_id: int = 0):
         last_event = None
         valid_transitions = {
@@ -544,9 +667,9 @@ class ReplayEngine:
                             raise RuntimeError("update_start payload must be dict")
                         if engine_lock is not None:
                             with engine_lock:
-                                engine.update(self._copy_any(payload))
+                                self._run_replay_callback_with_timeout(engine, "update", self._copy_any(payload), replay_timeout_s)
                         else:
-                            engine.update(self._copy_any(payload))
+                            self._run_replay_callback_with_timeout(engine, "update", self._copy_any(payload), replay_timeout_s)
 
                     elif etype == "circuit_breaker":
                         reason = "replay"
@@ -554,9 +677,9 @@ class ReplayEngine:
                             reason = payload.get("reason", "replay")
                         if engine_lock is not None:
                             with engine_lock:
-                                engine._trigger_circuit_breaker(reason)
+                                self._run_replay_callback_with_timeout(engine, "_trigger_circuit_breaker", reason, replay_timeout_s)
                         else:
-                            engine._trigger_circuit_breaker(reason)
+                            self._run_replay_callback_with_timeout(engine, "_trigger_circuit_breaker", reason, replay_timeout_s)
 
                     elif etype == "self_heal":
                         error = None
@@ -564,9 +687,9 @@ class ReplayEngine:
                             error = payload.get("error")
                         if engine_lock is not None:
                             with engine_lock:
-                                engine._self_heal(error)
+                                self._run_replay_callback_with_timeout(engine, "_self_heal", error, replay_timeout_s)
                         else:
-                            engine._self_heal(error)
+                            self._run_replay_callback_with_timeout(engine, "_self_heal", error, replay_timeout_s)
                     elif etype == "update_end":
                         # Replay marker event; no action required.
                         pass
@@ -593,6 +716,9 @@ class ReplayEngine:
                         if getattr(engine, "_strict_replay", True):
                             raise
                         return
+                    if isinstance(exc, TimeoutError):
+                        self._set_replay_timeout_error(engine, prev_event, etype)
+                        raise RuntimeError("Replay timeout exceeded")
                     err = {
                         "last_event": prev_event,
                         "event": etype,
@@ -683,11 +809,11 @@ class ReplayEngine:
                         if getattr(engine, "_strict_replay", True):
                             raise RuntimeError("Replay corruption: snapshot checksum mismatch")
                         return
-            if hasattr(engine, "load_snapshot"):
-                engine.load_snapshot(snapshot)
-            elif hasattr(engine, "load_state"):
-                if isinstance(state, dict):
-                    engine.load_state(state)
+            self._run_snapshot_restore_with_timeout(
+                engine,
+                snapshot,
+                float(getattr(self, "_replay_timeout_seconds", 5.0)),
+            )
             # RNG restore handled ONLY in engine.load_snapshot()
             start_id = int(snapshot.get("id", 0))
             self.apply_events(engine, start_id=start_id)
@@ -704,6 +830,22 @@ class ReplayEngine:
                     rollback_error = rollback_exc
                 if rollback_error is not None:
                     raise RuntimeError("SNAPSHOT_ROLLBACK_FAILED") from rollback_error
+
+
+            if isinstance(exc, TimeoutError):
+                err = {"snapshot_index": snapshot_index, "reason": "REPLAY_TIMEOUT"}
+                self._fsm_error = err
+                setattr(engine, "_fsm_error", err)
+                if getattr(engine, "_strict_replay", True):
+                    raise RuntimeError("Replay timeout exceeded") from exc
+                return
+            if isinstance(exc, RuntimeError) and str(exc) == "SNAPSHOT_WATCHDOG_INIT_FAILED":
+                err = {"snapshot_index": snapshot_index, "reason": "WATCHDOG_INIT_FAILED"}
+                self._fsm_error = err
+                setattr(engine, "_fsm_error", err)
+                if getattr(engine, "_strict_replay", True):
+                    raise RuntimeError("Snapshot watchdog init failed") from exc
+                return
 
             if getattr(engine, "_strict_replay", True):
                 raise
