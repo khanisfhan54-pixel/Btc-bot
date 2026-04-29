@@ -892,14 +892,15 @@ class ReplayEngine:
         # ==========================================
         # 🚨 SNAPSHOT ROLLBACK SAFETY
         # ==========================================
-        backup = None
+        _no_backup = object()
+        backup = _no_backup
         backup_mode = None
         if hasattr(engine, "serialize_state"):
             try:
                 backup = copy.deepcopy(engine.serialize_state())
                 backup_mode = "state"
             except Exception:
-                backup = None
+                backup = _no_backup
 
         try:
             state = snapshot.get("state", {}) if isinstance(snapshot, dict) else {}
@@ -929,7 +930,7 @@ class ReplayEngine:
             self.apply_events(engine, start_id=start_id)
         except Exception as exc:
             # rollback engine to pre-replay state
-            if backup is not None:
+            if backup is not _no_backup:
                 rollback_error = None
                 try:
                     if hasattr(engine, "load_state") and backup_mode == "state":

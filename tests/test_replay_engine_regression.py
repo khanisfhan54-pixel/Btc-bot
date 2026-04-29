@@ -104,3 +104,36 @@ def test_snapshot_replay_failure_sets_fsm_error_non_strict_and_rolls_back():
     assert eng._fsm_error is not None and eng._fsm_error.get("reason") == "SNAPSHOT_RESTORE_FAILED"
     assert eng.state == {}
     assert getattr(eng, "_is_replay", False) is False
+
+
+@pytest.mark.parametrize("backup_payload", [{}, [], 0, False])
+def test_snapshot_replay_rolls_back_when_backup_is_falsy_but_valid(backup_payload):
+    r = ReplayEngine()
+
+    class FalsyPayloadBackupEngine(E):
+        def __init__(self):
+            super().__init__(strict=True)
+            self.rollback_states = []
+            self.live_state = backup_payload
+
+        def serialize_state(self):
+            return backup_payload
+
+        def load_state(self, s):
+            self.rollback_states.append(s)
+            self.live_state = s
+
+        def update(self, p):
+            self.live_state = "mutated"
+            raise RuntimeError("forced failure")
+
+    eng = FalsyPayloadBackupEngine()
+    r._snapshots.append({"id": 0, "state": {"_checksum": r._state_hash({})}})
+    r.record_event("update_start", {"price": 1.0})
+
+    with pytest.raises(RuntimeError):
+        r.replay_from_snapshot(eng)
+
+    assert eng.rollback_states == [backup_payload]
+    assert eng.live_state == backup_payload
+    assert getattr(eng, "_is_replay", False) is False
