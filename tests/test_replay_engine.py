@@ -1,6 +1,7 @@
 import copy
 import statistics
 import time
+import threading
 import warnings
 
 import numpy as np
@@ -78,6 +79,23 @@ class FailingSnapshotTarget(StubReplayTarget):
 class FailingUpdateTarget(StubReplayTarget):
     def update(self, payload):
         raise ValueError("update failed")
+
+
+class SlowUpdateTarget(StubReplayTarget):
+    def update(self, payload):
+        time.sleep(0.05)
+        super().update(payload)
+
+
+class BadRngTarget(StubReplayTarget):
+    class _BadBitGen:
+        @property
+        def state(self):
+            raise RuntimeError("rng-state-failure")
+
+    def __init__(self):
+        super().__init__()
+        self._rng = type("BadRng", (), {"bit_generator": BadRngTarget._BadBitGen()})()
 
 
 class SnapshotOnlyRollbackTarget:
@@ -259,9 +277,9 @@ def test_safe_payload_depth_boundary_correctness():
     replayed = replay._safe_payload(payload, depth=2)
 
     replayed["outer"]["inner"]["leaf"]["k"] = 999
-    assert payload["outer"]["inner"]["leaf"]["k"] == 999
+    assert payload["outer"]["inner"]["leaf"]["k"] == 1
     replayed["outer"]["inner"]["shared"]["z"]["w"] = 777
-    assert payload["outer"]["inner"]["shared"]["z"]["w"] == 777
+    assert payload["outer"]["inner"]["shared"]["z"]["w"] == 1
 
 
 def test_safe_payload_supports_tuple_set_and_frozenset():
@@ -617,6 +635,28 @@ def test_unsafe_replay_object_dtype_ndarray_no_nested_mutation_leak():
     assert replayed[0]["payload"]["arr"][0]["x"] == [1, 2]
 
 
+def test_numeric_ndarray_payload_preserves_dtype_and_values():
+    replay = ReplayEngine()
+    arr = np.array([1.25, np.nan, np.inf, -np.inf], dtype=np.float64)
+    replay.record_event("update_start", {"arr": arr})
+    out = list(replay.replay())[0]["payload"]["arr"]
+    assert isinstance(out, np.ndarray)
+    assert out.dtype == np.float64
+    assert np.isnan(out[1])
+    assert np.isposinf(out[2])
+    assert np.isneginf(out[3])
+
+
+def test_unsafe_replay_deep_nested_payload_no_alias_leak():
+    replay = ReplayEngine()
+    replay._unsafe_no_copy = True
+    payload = {"a": {"b": {"c": {"d": {"e": {"f": {"g": {"h": {"i": {"j": [1, 2, 3]}}}}}}}}}}
+    replay.record_event("update_start", payload)
+    payload["a"]["b"]["c"]["d"]["e"]["f"]["g"]["h"]["i"]["j"][0] = 999
+    out = list(replay.replay())[0]["payload"]
+    assert out["a"]["b"]["c"]["d"]["e"]["f"]["g"]["h"]["i"]["j"][0] == 1
+
+
 def test_unsafe_mode_logs_critical_warning_once(caplog):
     replay = ReplayEngine()
     replay._unsafe_no_copy = True
@@ -637,6 +677,15 @@ def test_validate_replay_rejects_unsafe_mode():
 
     with pytest.raises(RuntimeError, match="_unsafe_no_copy=True"):
         replay.validate_replay(StubReplayTarget)
+
+
+def test_validate_replay_fails_closed_on_rng_state_error():
+    replay = ReplayEngine()
+    replay.record_event("update_start", {"price": 1.0, "regime": "A"})
+    replay.record_event("update_end", {"regime": "A"})
+    result = replay.validate_replay(BadRngTarget)
+    assert result["diverged"] is True
+    assert result["reason"] == "RNG_STATE_UNAVAILABLE"
 
 
 def test_handler_error_reports_correct_previous_event():
@@ -665,6 +714,17 @@ def test_snapshot_replay_isolation_replay_twice_same_result():
     assert replay._state_hash(left.serialize_state()) == replay._state_hash(right.serialize_state())
 
 
+def test_apply_events_timeout_fails_closed_with_reason():
+    replay = ReplayEngine()
+    replay._replay_timeout_seconds = 0.01
+    replay.record_event("update_start", {"price": 1.0, "regime": "A"})
+    replay.record_event("update_end", {"regime": "A"})
+    target = SlowUpdateTarget(strict=True)
+    with pytest.raises(RuntimeError, match="Replay timeout exceeded"):
+        replay.apply_events(target)
+    assert target._fsm_error["reason"] == "REPLAY_TIMEOUT"
+
+
 def test_fsm_error_resets_between_snapshot_replays():
     replay = _build_engine_with_snapshot()
     replay._snapshots[-1]["state"]["_checksum"] = "tampered"
@@ -689,3 +749,53 @@ def test_snapshot_rollback_uses_schema_safe_snapshot_fallback():
         replay.replay_from_snapshot(target, snapshot_index=-1)
 
     assert target.serialize_state() == initial
+
+
+def test_replay_rejects_unsupported_event_type_explicitly():
+    replay = ReplayEngine()
+    replay.record_event("update_start", {"price": 1.0})
+    replay.record_event("update_end", {})
+    replay.record_event("unknown_type", {})
+
+    target = StubReplayTarget(strict=False)
+    replay.apply_events(target)
+    assert target._fsm_error["reason"] in {"EVENT_SEQUENCE_CORRUPTION", "EVENT_TYPE_UNSUPPORTED"}
+
+
+def test_snapshot_ring_buffer_limits_growth():
+    replay = ReplayEngine(max_snapshots=2)
+    replay.snapshot({"schema_version": "2.3", "equity": 1.0})
+    replay.snapshot({"schema_version": "2.3", "equity": 2.0})
+    replay.snapshot({"schema_version": "2.3", "equity": 3.0})
+    assert len(replay._snapshots) == 2
+    assert replay.dropped_snapshots() == 1
+
+
+def test_record_event_accepts_non_dict_payload_and_isolates():
+    replay = ReplayEngine()
+    payload = [{"x": 1}]
+    replay.record_event("update_start", payload)
+    payload[0]["x"] = 99
+    replayed = list(replay.replay())
+    assert replayed[0]["payload"][0]["x"] == 1
+
+
+def test_self_heal_event_replay_runs_under_engine_lock():
+    class LockedTarget(StubReplayTarget):
+        def __init__(self):
+            super().__init__(strict=True)
+            self._lock = threading.RLock()
+            self.healed = False
+
+        def _self_heal(self, error=None):
+            assert self._lock._is_owned()
+            self.healed = True
+
+    replay = ReplayEngine()
+    replay.record_event("update_start", {"price": 1.0})
+    replay.record_event("self_heal", {"error": "E"})
+    replay.record_event("update_start", {"price": 0.0})
+    replay.record_event("update_end", {})
+    target = LockedTarget()
+    replay.apply_events(target)
+    assert target.healed is True

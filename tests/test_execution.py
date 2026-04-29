@@ -1,7 +1,9 @@
 import inspect
 import time
+import pytest
 
 import main
+from replay_engine import ReplayEngine
 
 
 def test_signal_execution_time_alignment_and_safe_decision_set():
@@ -53,3 +55,32 @@ def test_execution_decide_fail_closed_on_invalid_meta_and_capital_safe():
     assert decision["execute"] is False
     assert decision["reason"] in {"invalid_meta_result", "fallback"}
     assert used_capital <= equity
+
+
+def test_replay_event_has_traceability_timestamps():
+    replay = ReplayEngine()
+    replay.record_event("update_start", {"price": 1.0})
+    event = replay.last_events(1)[0]
+    assert event["ts_ns"] > 0
+    assert event["source"] == "advanced_regime_engine"
+
+
+def test_replay_timeout_reports_clear_failure_reason():
+    class SlowTarget:
+        def __init__(self):
+            self._strict_replay = True
+            self._fsm_error = None
+            self._is_replay = False
+        def update(self, payload):
+            time.sleep(0.05)
+        def _trigger_circuit_breaker(self, reason): return reason
+        def _self_heal(self, error=None): return error
+
+    replay = ReplayEngine()
+    replay._replay_timeout_seconds = 0.01
+    replay.record_event("update_start", {"price": 1.0})
+    replay.record_event("update_end", {})
+    target = SlowTarget()
+    with pytest.raises(RuntimeError, match="Replay timeout exceeded"):
+        replay.apply_events(target)
+    assert target._fsm_error["reason"] == "REPLAY_TIMEOUT"

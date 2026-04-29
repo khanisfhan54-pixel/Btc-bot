@@ -4,6 +4,7 @@ import threading
 import engine
 import main
 from alpha_liquidity_sweep_predictor import predict_sweep
+from replay_engine import ReplayEngine
 
 
 def test_run_all_engines_nan_inf_and_empty_inputs_safe():
@@ -124,3 +125,24 @@ def test_alpha_output_deterministic_under_concurrency_and_shared_getter():
 
     assert all(o == baseline for o in outputs)
     assert main.get_shared_alpha_predictor() is engine.get_shared_alpha_predictor()
+
+
+def test_replay_state_hash_fallback_not_constant_for_distinct_bad_payloads():
+    replay = ReplayEngine()
+    a = []
+    a.append(a)
+    b = []
+    b.append({"x": b})
+    h1 = replay._state_hash({"payload": a, "schema_version": "2.3"})
+    h2 = replay._state_hash({"payload": b, "schema_version": "2.3"})
+    assert isinstance(h1, str) and isinstance(h2, str)
+    assert h1 != h2
+
+
+def test_replay_float_vector_is_numeric_and_finite_when_finite_input():
+    replay = ReplayEngine()
+    replay.record_event("update_start", {"vec": np.array([0.01, 0.02, 0.03], dtype=np.float64)})
+    out = list(replay.replay())[0]["payload"]["vec"]
+    assert out.dtype == np.float64
+    assert np.isfinite(out).all()
+    assert not np.isnan(out).any()
