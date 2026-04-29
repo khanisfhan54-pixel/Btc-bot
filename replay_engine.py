@@ -11,12 +11,17 @@ from typing import Any, Dict, List, Optional
 from collections import deque
 
 LOGGER = logging.getLogger(__name__)
+_IN_REPLAY_SUBPROCESS = False
 
 
 
 
 def _replay_callback_worker(conn, engine, callback_name, callback_arg):
+    global _IN_REPLAY_SUBPROCESS
     try:
+        _IN_REPLAY_SUBPROCESS = True
+        setattr(engine, "_is_replay", True)
+        logging.disable(logging.CRITICAL)
         if callback_name == "update":
             engine.update(callback_arg)
         elif callback_name == "_trigger_circuit_breaker":
@@ -38,8 +43,18 @@ def _replay_callback_worker(conn, engine, callback_name, callback_arg):
         except Exception:
             pass
 
-def _snapshot_restore_worker(conn, engine, restore_mode, restore_payload):
+def _snapshot_restore_worker(conn, engine_class, engine_init_params, engine_state_dict, restore_mode, restore_payload):
+    global _IN_REPLAY_SUBPROCESS
     try:
+        _IN_REPLAY_SUBPROCESS = True
+        logging.disable(logging.CRITICAL)
+        init_params = dict(engine_init_params or {})
+        init_params["enable_background_workers"] = False
+        init_params["load_model_weights_on_init"] = False
+        engine = engine_class(**init_params)
+        setattr(engine, "_is_replay", True)
+        if isinstance(engine_state_dict, dict):
+            engine.load_state(engine_state_dict)
         if restore_mode == "load_snapshot":
             engine.load_snapshot(restore_payload)
         elif restore_mode == "load_state":
@@ -90,6 +105,8 @@ class ReplayEngine:
         self._HASH_NAMESPACE = "ADV_REGIME_REPLAY"
         self._replay_timeout_seconds = 5.0
         self._copy_fidelity_failures = 0
+        self._is_replaying = False
+        self._decision_traces: deque = deque(maxlen=max_events)
 
     # ==========================================
     # INTERNAL SAFE COPY (UNSAFE MODE PROTECTION)
@@ -235,19 +252,13 @@ class ReplayEngine:
             finally:
                 seen.discard(obj_id)
 
-        if hasattr(value, "__reduce_ex__"):
-            try:
-                import pickle
-                return pickle.loads(pickle.dumps(value))
-            except Exception:
-                pass
         if hasattr(value, "__slots__"):
             slots = {}
             for slot in getattr(value, "__slots__", []):
                 slots[slot] = freeze_fn(getattr(value, slot, "__UNAVAILABLE__"), max(0, cur_depth - 1), seen)
             return {"__slots_object__": f"{type(value).__module__}.{type(value).__qualname__}", "slots": slots}
         LOGGER.debug("_freeze_unknown_object: using repr fallback for type=%s", type(value).__qualname__)
-        return {"__type__": f"{type(value).__module__}.{type(value).__qualname__}", "__repr__": repr(value)}
+        return {"__type__": f"{type(value).__module__}.{type(value).__qualname__}", "__repr__": repr(value)[:512]}
 
     def _freeze(self, value, depth: int, seen: set[int]):
         container_types = (dict, list, tuple, set, frozenset, np.ndarray)
@@ -443,6 +454,8 @@ class ReplayEngine:
             return
 
         with self._lock:
+            if self._is_replaying:
+                return
             event_type = str(event_type or "").strip()
             if not event_type:
                 raise ValueError("event_type must be a non-empty string")
@@ -465,6 +478,15 @@ class ReplayEngine:
             }
             self._event_id += 1
             self._events.append(event)
+            if event_type == "update_end" and isinstance(payload, dict):
+                tick_id = payload.get("tick_id")
+                for idx in range(len(self._decision_traces) - 1, -1, -1):
+                    trace = self._decision_traces[idx]
+                    if trace.get("outcome_event_id") is None and trace.get("tick_id") == tick_id:
+                        updated = dict(trace)
+                        updated["outcome_event_id"] = event["id"]
+                        self._decision_traces[idx] = updated
+                        break
 
     def snapshot(self, state: Dict[str, Any]) -> None:
         # Snapshot correctness must never depend on unsafe replay mode.
@@ -474,6 +496,8 @@ class ReplayEngine:
         tmp.pop("_checksum", None)
         snapshot_state["_checksum"] = self._state_hash(tmp)
         with self._lock:
+            if self._is_replaying:
+                return
             out={"id": self._event_id,"ts_ns": int(time.time_ns()),"ts_monotonic_ns": int(time.monotonic_ns()),"state": snapshot_state,"event_boundary": int(self._event_id),"dropped_events_before": int(self._dropped_events)}
             if isinstance(state, dict):
                 out["regime_marker"] = state.get("_confirmed_regime", state.get("regime"))
@@ -539,6 +563,25 @@ class ReplayEngine:
             idx = max(len(self._events) - steps, 0)
             events_slice = list(self._events)[idx:]
         return self._copy_any(events_slice)
+
+    def record_decision_trace(self, trace: Dict[str, Any]) -> None:
+        with self._lock:
+            if self._is_replaying:
+                return
+            entry = dict(trace or {})
+            entry["event_id"] = int(self._event_id)
+            self._decision_traces.append(entry)
+
+    def get_decision_traces(self, n: int = 100) -> List[dict]:
+        with self._lock:
+            return self._copy_any(list(self._decision_traces)[-max(0, int(n)):])
+
+    def get_outcome_trace(self, event_id: int) -> Optional[dict]:
+        with self._lock:
+            for trace in reversed(self._decision_traces):
+                if trace.get("outcome_event_id") == int(event_id):
+                    return self._copy_any(trace)
+        return None
 
     # ==========================================
     # DEBUG UTILITIES
@@ -635,11 +678,14 @@ class ReplayEngine:
         restore_mode = "load_snapshot" if callable(getattr(engine, "load_snapshot", None)) else "load_state"
         restore_payload = snapshot if restore_mode == "load_snapshot" else snapshot.get("state", {})
         try:
+            engine_state_dict = copy.deepcopy(engine.serialize_state())
+            engine_class = engine.__class__
+            engine_init_params = dict(getattr(engine, "_init_params", {}) or {})
             ctx = mp.get_context("fork")
             parent_conn, child_conn = ctx.Pipe(duplex=False)
             process = ctx.Process(
                 target=_snapshot_restore_worker,
-                args=(child_conn, self._copy_any(engine), restore_mode, self._copy_any(restore_payload)),
+                args=(child_conn, engine_class, engine_init_params, engine_state_dict, restore_mode, self._copy_any(restore_payload)),
                 daemon=True,
             )
             process.start()
@@ -677,6 +723,8 @@ class ReplayEngine:
         replay_deadline = time.perf_counter() + replay_timeout_s if replay_timeout_s > 0 else None
         try:
             setattr(engine, "_is_replay", True)
+            with self._lock:
+                self._is_replaying = True
             setattr(engine, "_fsm_error", None)
             self._fsm_error = None
             prev_event = None
@@ -792,6 +840,8 @@ class ReplayEngine:
                 setattr(engine, "_is_replay", False)
             except Exception:
                 pass
+            with self._lock:
+                self._is_replaying = False
 
         # ==========================================
         # 🚨 FSM COMPLETENESS CHECK
