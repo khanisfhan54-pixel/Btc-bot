@@ -4931,6 +4931,33 @@ class AdvancedRegimeEngine:
             output["feed_status"] = "UNCALIBRATED_WEIGHTS"
         if obs_sample and not getattr(self, "_is_replay", False):
             self._replay_record("update_end", {"regime": confirmed_regime})
+            if self._replay_engine is not None:
+                self._replay_engine.record_decision_trace({
+                    "event_id": None,
+                    "tick_id": int(self._tick_id),
+                    "engine_id": str(self.engine_id),
+                    "signal_type": "update_end",
+                    "regime_label": str(confirmed_regime),
+                    "regime_confidence": float(regime_scores.get("conviction", 0.0)),
+                    "position_size": float(position_size),
+                    "signed_position_size": float(signed_position_size),
+                    "execution_mode": str(execution_mode),
+                    "execution_side": str(final_execution_side),
+                    "edge_score": float(edge_score),
+                    "conviction": float(regime_scores.get("conviction", 0.0)),
+                    "risk_level": float(regime_scores.get("risk_level", 0.0)),
+                    "feed_status": str(feed_status),
+                    "engine_status": str(getattr(self, "_determinism_status", "OK")),
+                    "timestamp_ns": int(time.time_ns()),
+                    "outcome_event_id": None,
+                    "return_ema": float(self._return_ema),
+                    "abs_return_ema": float(self._abs_return_ema),
+                    "shock_memory": float(self._shock_memory),
+                    "switch_stability_ema": float(self._switch_stability_ema),
+                    "loss_streak": int(self._loss_streak),
+                    "equity": float(self._equity),
+                    "drawdown": float(self._drawdown),
+                })
         if _PROM_AVAILABLE and not getattr(self, "_is_replay", False):
             REGIME_COUNTER.labels(self._metrics_engine_id, confirmed_regime).inc()
         if self._replay_engine is not None and (self._tick_id % 100 == 0) and not getattr(self, "_is_replay", False):

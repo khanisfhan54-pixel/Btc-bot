@@ -63,3 +63,44 @@ def test_issue_15_clear_reset_counters_true():
 def test_issue_12_snapshot_contains_timestamp_and_regime():
     r=ReplayEngine(); r.snapshot({"_confirmed_regime":"bear","equity":1})
     s=r._snapshots[-1]; assert 'ts_ns' in s and 'ts_monotonic_ns' in s and s['regime_marker']=='bear'
+
+def test_snapshot_replay_rolls_back_with_falsy_backup_state():
+    r = ReplayEngine()
+    class FalsyBackupEngine(E):
+        def __init__(self):
+            super().__init__(strict=False)
+            self.loaded_states = []
+            self._strict_replay = True
+        def serialize_state(self):
+            return {}
+        def load_state(self, s):
+            self.loaded_states.append(s)
+        def update(self, p):
+            raise RuntimeError("boom")
+    eng = FalsyBackupEngine()
+    r._snapshots.append({"id": 0, "state": {"_checksum": r._state_hash({})}})
+    r.record_event("update_start", {"price": 1.0})
+    with pytest.raises(RuntimeError):
+        r.replay_from_snapshot(eng)
+    assert {} in eng.loaded_states
+    assert getattr(eng, "_is_replay", False) is False
+
+def test_snapshot_replay_failure_sets_fsm_error_non_strict_and_rolls_back():
+    r = ReplayEngine()
+    class NonStrictFailEngine(E):
+        def __init__(self):
+            super().__init__(strict=False)
+            self.state = {"eq": 123.0}
+        def serialize_state(self):
+            return {}
+        def load_state(self, s):
+            self.state = dict(s)
+        def update(self, p):
+            raise RuntimeError("handler fail")
+    eng = NonStrictFailEngine()
+    r._snapshots.append({"id": 0, "state": {"_checksum": r._state_hash({})}})
+    r.record_event("update_start", {"price": 1.0})
+    r.replay_from_snapshot(eng)
+    assert eng._fsm_error is not None and eng._fsm_error.get("reason") == "SNAPSHOT_RESTORE_FAILED"
+    assert eng.state == {}
+    assert getattr(eng, "_is_replay", False) is False
