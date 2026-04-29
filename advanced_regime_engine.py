@@ -1552,16 +1552,20 @@ class AdvancedRegimeEngine:
         replay_engine = getattr(self, "_replay_engine", None)
         if replay_engine is None:
             return
-        safe_payload = {}
+        safe_payload = {
+            "source_engine_id": str(getattr(self, "engine_id", "UNKNOWN")),
+            "source_tick_id": int(getattr(self, "_tick_id", -1)),
+            "source_time_s": float(getattr(self, "_last_update_ts", 0.0)),
+        }
         if isinstance(payload, dict):
             for k, v in payload.items():
                 try:
                     if isinstance(v, (int, float, str, bool, type(None))):
                         safe_payload[k] = v
                     else:
-                        safe_payload[k] = str(v)[:200]
+                        safe_payload[k] = copy.deepcopy(v)
                 except Exception:
-                    safe_payload[k] = "UNSERIALIZABLE"
+                    safe_payload[k] = {"__unserializable__": type(v).__name__}
         try:
             replay_engine.record_event(event_type, safe_payload)
         except Exception as exc:

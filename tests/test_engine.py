@@ -5,6 +5,7 @@ import numpy as np
 import engine
 import main
 from trading_utils import safe_float
+from replay_engine import ReplayEngine
 
 
 def _base_inputs(price=100000.0):
@@ -174,3 +175,48 @@ def test_safe_float_consistent_across_modules_and_deterministic():
 
 def test_main_and_engine_share_alpha_getter_contract():
     assert main.get_shared_alpha_predictor() is engine.get_shared_alpha_predictor()
+
+
+def test_replay_validation_detects_divergence_for_mutated_history():
+    replay = ReplayEngine()
+    replay.record_event("update_start", {"price": 1.0, "regime": "A"})
+    replay.record_event("update_end", {"regime": "A"})
+    replay.record_event("update_start", {"price": 2.0, "regime": "B"})
+    replay.record_event("update_end", {"regime": "B"})
+    replay.snapshot({"schema_version": "2.3", "equity": 2.0, "confirmed_regime": "A"})
+    replay._events[-2]["payload"]["price"] = 200.0
+
+    class E:
+        def __init__(self):
+            self._strict_replay = True
+            self._fsm_error = None
+            self._is_replay = False
+            self._equity = 0.0
+            self._confirmed_regime = "INIT"
+            self._rng = np.random.default_rng(7)
+        def update(self, payload):
+            self._equity += float(payload.get("price", 0.0))
+            self._confirmed_regime = payload.get("regime", self._confirmed_regime)
+        def _trigger_circuit_breaker(self, _reason): return None
+        def _self_heal(self, _error=None): return None
+        def serialize_state(self):
+            return {"schema_version": "2.3", "equity": self._equity, "confirmed_regime": self._confirmed_regime}
+        def load_snapshot(self, snapshot):
+            self.load_state(snapshot.get("state", {}))
+        def load_state(self, state):
+            self._equity = float(state.get("equity", 0.0))
+            self._confirmed_regime = str(state.get("confirmed_regime", "INIT"))
+
+    result = replay.validate_replay(E, snapshot_index=-1)
+    assert result["diverged"] is True
+
+
+def test_replay_numeric_arrays_remain_numeric_usable():
+    replay = ReplayEngine()
+    vec = np.array([1.0, 2.0, np.nan], dtype=np.float64)
+    replay.record_event("update_start", {"vec": vec})
+    replay.record_event("update_end", {})
+    out = list(replay.replay())[0]["payload"]["vec"]
+    assert isinstance(out, np.ndarray)
+    assert out.dtype == np.float64
+    assert not np.isnan(out[:2]).any()

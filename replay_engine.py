@@ -5,6 +5,7 @@ from dataclasses import is_dataclass, fields, asdict
 import numpy as np
 import hashlib
 import json
+import time
 from typing import Any, Dict, List, Optional
 from collections import deque
 
@@ -24,16 +25,18 @@ class ReplayEngine:
 
     # Keep these helpers local to the replay engine so payload copying stays
     # deterministic and compatible with existing callers.
-    _MAX_SAFE_PAYLOAD_DEPTH = 50
+    _MAX_SAFE_PAYLOAD_DEPTH = 512
 
-    def __init__(self, max_events: int = 100000):
+    def __init__(self, max_events: int = 100000, max_snapshots: int = 1024):
         self._lock = threading.RLock()
         self._events = deque(maxlen=max_events)
         self._snapshots: List[Dict[str, Any]] = []
+        self._max_snapshots = max(1, int(max_snapshots))
         self._max_events = max_events
         self._recording = True
         self._event_id = 0
         self._dropped_events = 0
+        self._dropped_snapshot_count = 0
         self._fsm_error = None
         self._strict_replay = True
         self._unsafe_no_copy = False
@@ -41,6 +44,7 @@ class ReplayEngine:
         self._normalize_floats = True
         self._normalize_floats_strict_only = True
         self._HASH_NAMESPACE = "ADV_REGIME_REPLAY"
+        self._replay_timeout_seconds = 5.0
 
     # ==========================================
     # INTERNAL SAFE COPY (UNSAFE MODE PROTECTION)
@@ -58,30 +62,22 @@ class ReplayEngine:
                 for i in range(len(flat)):
                     out[i] = self._freeze(flat[i], depth, seen)
                 return out.reshape(value.shape)
-            if (
-                self._normalize_floats
-                and np.issubdtype(value.dtype, np.floating)
-                and (not self._normalize_floats_strict_only or self._strict_replay)
-            ):
-                flat = value.ravel()
-                out = np.empty(flat.shape, dtype=object)
-                for i in range(len(flat)):
-                    v = flat[i]
-                    if not np.isfinite(v):
-                        if np.isnan(v):
-                            out[i] = {"__float__": "NaN"}
-                        else:
-                            out[i] = {"__float__": "Infinity" if v > 0 else "-Infinity"}
-                    else:
-                        out[i] = format(v, ".17g")
-                return out.reshape(value.shape)
             return np.array(value, copy=True)
         except Exception:
             # Fallback should never mutate caller state.
             try:
                 return np.array(value, copy=True)
             except Exception:
-                return value
+                try:
+                    return np.asarray(copy.deepcopy(value), dtype=object)
+                except Exception:
+                    return np.asarray([repr(value)], dtype=object)
+
+    def _copy_any(self, value: Any):
+        try:
+            return copy.deepcopy(value)
+        except Exception:
+            return self._safe_payload(value, depth=8)
 
     def _canonical_key_string(self, value: Any) -> str:
         """
@@ -206,17 +202,6 @@ class ReplayEngine:
             if isinstance(value, np.ndarray):
                 return self._copy_ndarray(value, depth, seen)
 
-            if depth <= 0:
-                if isinstance(value, dict):
-                    return {self._freeze_key(k, 0, seen): v for k, v in value.items()}
-                if isinstance(value, list):
-                    return list(value)
-                if isinstance(value, tuple):
-                    return tuple(value)
-                if isinstance(value, (set, frozenset)):
-                    return self._freeze_set_like(value, 0, seen)
-                return self._freeze_unknown_object(value, 0, seen, self._freeze)
-
             next_depth = max(0, depth - 1)
             if isinstance(value, dict):
                 return {
@@ -260,21 +245,30 @@ class ReplayEngine:
             pass
         self._unsafe_warning_emitted = True
 
-    def _canonicalize(self, obj: Any):
+    def _canonicalize(self, obj: Any, seen: Optional[set[int]] = None):
+        if seen is None:
+            seen = set()
+        obj_id = id(obj)
+        if isinstance(obj, (dict, list, tuple, set, frozenset, np.ndarray)) and obj_id in seen:
+            return {"__cycle__": type(obj).__name__}
         if isinstance(obj, dict):
+            seen.add(obj_id)
             return {
-                str(k): self._canonicalize(obj[k])
+                str(k): self._canonicalize(obj[k], seen)
                 for k in sorted(obj, key=lambda x: f"{type(x).__name__}:{str(x)}")
             }
         if isinstance(obj, (list, tuple)):
-            return [self._canonicalize(v) for v in obj]
+            seen.add(obj_id)
+            return [self._canonicalize(v, seen) for v in obj]
         if isinstance(obj, (set, frozenset)):
-            canonical_values = [self._canonicalize(v) for v in obj]
+            seen.add(obj_id)
+            canonical_values = [self._canonicalize(v, seen) for v in obj]
             return sorted(canonical_values, key=self._canonical_sort_key)
         if isinstance(obj, np.ndarray):
-            return [self._canonicalize(v) for v in obj.tolist()]
+            seen.add(obj_id)
+            return [self._canonicalize(v, seen) for v in obj.tolist()]
         if isinstance(obj, np.generic):
-            return self._canonicalize(obj.item())
+            return self._canonicalize(obj.item(), seen)
         if isinstance(obj, float):
             if not np.isfinite(obj):
                 if np.isnan(obj):
@@ -316,27 +310,33 @@ class ReplayEngine:
     def _normalize_rng_state(self, engine: Any):
         try:
             if engine is None:
-                return None
+                return {"status": "ENGINE_NONE"}
 
             rng = getattr(engine, "_rng", None)
             if rng is None and hasattr(engine, "bit_generator"):
                 rng = engine
             if rng is None:
-                return None
+                return {"status": "MISSING"}
 
             bitgen = getattr(rng, "bit_generator", None)
             if bitgen is None:
-                return None
+                return {"status": "INVALID_BIT_GENERATOR", "rng_type": f"{type(rng).__module__}.{type(rng).__qualname__}"}
 
             state = bitgen.state
             return {
+                "status": "OK",
                 "bit_generator": type(bitgen).__name__,
                 "bit_generator_module": type(bitgen).__module__,
                 "numpy_version": np.__version__,
                 "internal_state": self._canonicalize(state),
             }
-        except Exception:
-            return None
+        except Exception as exc:
+            return {
+                "status": "ERROR",
+                "error_type": type(exc).__name__,
+                "error_msg": str(exc)[:200],
+                "engine_type": f"{type(engine).__module__}.{type(engine).__qualname__}",
+            }
 
     def _state_hash(self, state: Dict[str, Any]) -> str:
         try:
@@ -359,7 +359,20 @@ class ReplayEngine:
                 LOGGER.error("State hash canonicalization failed", exc_info=True)
             except Exception:
                 pass
-            return hashlib.sha256(b"STATE_HASH_ERROR").hexdigest()
+            fallback = {
+                "namespace": self._HASH_NAMESPACE,
+                "error": "STATE_HASH_ERROR",
+                "payload_type": f"{type(state).__module__}.{type(state).__qualname__}",
+                "payload": self._safe_payload(state, depth=6),
+            }
+            s = json.dumps(
+                fallback,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                default=self._json_default,
+            )
+            return hashlib.sha256(f"{self._HASH_NAMESPACE}|{s}".encode()).hexdigest()
 
     # ==========================================
     # RECORDING
@@ -369,9 +382,12 @@ class ReplayEngine:
             return
 
         with self._lock:
+            event_type = str(event_type or "").strip()
+            if not event_type:
+                raise ValueError("event_type must be a non-empty string")
             if len(self._events) == self._events.maxlen:
                 self._dropped_events += 1
-                if self._dropped_events % 1000 == 0:
+                if self._dropped_events == 1 or self._dropped_events % 1000 == 0:
                     try:
                         LOGGER.warning("[ReplayEngine] Dropped events=%d", self._dropped_events)
                     except Exception:
@@ -379,25 +395,31 @@ class ReplayEngine:
             event = {
                 "id": self._event_id,
                 "type": event_type,
-                # Defensive copy prevents post-record mutation from corrupting replay history.
-                "payload": copy.deepcopy(payload) if isinstance(payload, dict) else {},
+                "ts_ns": int(time.time_ns()),
+                "source": "advanced_regime_engine",
+                "dropped_events_before": int(self._dropped_events),
+                # Defensive isolation prevents post-record mutation from corrupting replay history.
+                "payload": self._copy_any(payload),
             }
             self._event_id += 1
             self._events.append(event)
 
     def snapshot(self, state: Dict[str, Any]) -> None:
+        # Snapshot correctness must never depend on unsafe replay mode.
+        snapshot_state = self._copy_any(state) if isinstance(state, dict) else {}
+        # unified checksum (single domain)
+        tmp = self._copy_any(snapshot_state)
+        tmp.pop("_checksum", None)
+        snapshot_state["_checksum"] = self._state_hash(tmp)
         with self._lock:
-            # Snapshot correctness must never depend on unsafe replay mode.
-            snapshot_state = copy.deepcopy(state) if isinstance(state, dict) else {}
-            snapshot_state.setdefault("schema_version", "1.0")
-            # unified checksum (single domain)
-            tmp = copy.deepcopy(snapshot_state)
-            tmp.pop("_checksum", None)
-            snapshot_state["_checksum"] = self._state_hash(tmp)
             self._snapshots.append({
                 "id": self._event_id,
                 "state": snapshot_state
             })
+            if len(self._snapshots) > self._max_snapshots:
+                over_by = len(self._snapshots) - self._max_snapshots
+                del self._snapshots[:over_by]
+                self._dropped_snapshot_count += int(over_by)
 
     # ==========================================
     # REPLAY
@@ -408,34 +430,34 @@ class ReplayEngine:
         """
         with self._lock:
             self._emit_unsafe_mode_warning()
-            if self._unsafe_no_copy:
-                events = [
-                    {
-                        "id": e.get("id"),
-                        "type": e.get("type"),
-                        "payload": self._safe_payload(e.get("payload", {})),
-                    }
-                    for e in self._events
-                ]
-            else:
-                events = copy.deepcopy(list(self._events))
+            source_events = list(self._events)
+            unsafe_mode = bool(self._unsafe_no_copy)
+        if unsafe_mode:
+            events = []
+            for e in source_events:
+                event_copy = self._copy_any(e)
+                if isinstance(event_copy, dict):
+                    event_copy["payload"] = self._safe_payload(event_copy.get("payload", {}), depth=64)
+                events.append(event_copy)
+        else:
+            events = self._copy_any(source_events)
         for e in events:
             yield e
 
     def replay_from(self, event_id: int):
         with self._lock:
             self._emit_unsafe_mode_warning()
-            if self._unsafe_no_copy:
-                events = [
-                    {
-                        "id": e.get("id"),
-                        "type": e.get("type"),
-                        "payload": self._safe_payload(e.get("payload", {})),
-                    }
-                    for e in self._events
-                ]
-            else:
-                events = copy.deepcopy(list(self._events))
+            source_events = list(self._events)
+            unsafe_mode = bool(self._unsafe_no_copy)
+        if unsafe_mode:
+            events = []
+            for e in source_events:
+                event_copy = self._copy_any(e)
+                if isinstance(event_copy, dict):
+                    event_copy["payload"] = self._safe_payload(event_copy.get("payload", {}), depth=64)
+                events.append(event_copy)
+        else:
+            events = self._copy_any(source_events)
         for e in events:
             if e.get("id", 0) >= int(event_id):
                 yield e
@@ -447,14 +469,20 @@ class ReplayEngine:
     def rewind(self, steps: int = 100):
         with self._lock:
             idx = max(len(self._events) - steps, 0)
-            return copy.deepcopy(list(self._events)[idx:])
+            events_slice = list(self._events)[idx:]
+        return self._copy_any(events_slice)
 
     # ==========================================
     # DEBUG UTILITIES
     # ==========================================
     def last_events(self, n: int = 50) -> List[Dict[str, Any]]:
         with self._lock:
-            return copy.deepcopy(list(self._events)[-n:])
+            events_slice = list(self._events)[-n:]
+        return self._copy_any(events_slice)
+
+    def dropped_snapshots(self) -> int:
+        with self._lock:
+            return int(self._dropped_snapshot_count)
 
     def clear(self):
         with self._lock:
@@ -466,11 +494,15 @@ class ReplayEngine:
         last_event = None
         valid_transitions = {
             None: {"update_start"},
-            "update_start": {"update_end", "circuit_breaker", "self_heal"},
+            "update_start": {"update_end", "circuit_breaker", "self_heal", "error"},
             "update_end": {"update_start"},
             "circuit_breaker": {"update_start"},
             "self_heal": {"update_start"},
+            "error": {"error", "update_end", "circuit_breaker", "self_heal", "update_start"},
         }
+        supported_event_types = {"update_start", "update_end", "circuit_breaker", "self_heal", "error"}
+        replay_timeout_s = float(getattr(self, "_replay_timeout_seconds", 5.0))
+        replay_deadline = time.perf_counter() + replay_timeout_s if replay_timeout_s > 0 else None
         try:
             setattr(engine, "_is_replay", True)
             setattr(engine, "_fsm_error", None)
@@ -480,6 +512,13 @@ class ReplayEngine:
                 etype = e.get("type")
                 payload = e.get("payload", {})
                 prev_event = last_event
+                if etype not in supported_event_types:
+                    err = {"last_event": prev_event, "event": etype, "reason": "EVENT_TYPE_UNSUPPORTED"}
+                    self._fsm_error = err
+                    setattr(engine, "_fsm_error", err)
+                    if getattr(engine, "_strict_replay", True):
+                        raise RuntimeError(f"Unsupported replay event type: {etype}")
+                    return
 
                 # STRICT FSM VALIDATION
                 if prev_event not in valid_transitions or etype not in valid_transitions.get(prev_event, {}):
@@ -492,31 +531,68 @@ class ReplayEngine:
                         return
 
                 last_event = etype
+                if replay_deadline is not None and time.perf_counter() > replay_deadline:
+                    err = {"last_event": prev_event, "event": etype, "reason": "REPLAY_TIMEOUT"}
+                    self._fsm_error = err
+                    setattr(engine, "_fsm_error", err)
+                    raise RuntimeError("Replay timeout exceeded")
 
                 try:
+                    engine_lock = getattr(engine, "_lock", None)
                     if etype == "update_start":
-                        if isinstance(payload, dict):
-                            engine.update(dict(payload))
+                        if not isinstance(payload, dict):
+                            raise RuntimeError("update_start payload must be dict")
+                        if engine_lock is not None:
+                            with engine_lock:
+                                engine.update(self._copy_any(payload))
+                        else:
+                            engine.update(self._copy_any(payload))
 
                     elif etype == "circuit_breaker":
                         reason = "replay"
                         if isinstance(payload, dict):
                             reason = payload.get("reason", "replay")
-                        engine._trigger_circuit_breaker(reason)
+                        if engine_lock is not None:
+                            with engine_lock:
+                                engine._trigger_circuit_breaker(reason)
+                        else:
+                            engine._trigger_circuit_breaker(reason)
 
                     elif etype == "self_heal":
                         error = None
                         if isinstance(payload, dict):
                             error = payload.get("error")
-                        engine._self_heal(error)
+                        if engine_lock is not None:
+                            with engine_lock:
+                                engine._self_heal(error)
+                        else:
+                            engine._self_heal(error)
                     elif etype == "update_end":
                         # Replay marker event; no action required.
                         pass
+                    elif etype == "error":
+                        # Observability-only event in live mode; deterministic no-op in replay.
+                        pass
+                    else:
+                        err = {"last_event": prev_event, "event": etype, "reason": "EVENT_TYPE_UNSUPPORTED"}
+                        self._fsm_error = err
+                        setattr(engine, "_fsm_error", err)
+                        raise RuntimeError(f"Unsupported replay event type: {etype}")
+                    if replay_deadline is not None and time.perf_counter() > replay_deadline:
+                        err = {"last_event": prev_event, "event": etype, "reason": "REPLAY_TIMEOUT"}
+                        self._fsm_error = err
+                        setattr(engine, "_fsm_error", err)
+                        raise RuntimeError("Replay timeout exceeded")
                 except Exception as exc:
                     try:
                         LOGGER.debug("Replay error for event_type=%s payload=%s err=%s", etype, payload, exc)
                     except Exception:
                         pass
+                    existing_err = getattr(engine, "_fsm_error", None)
+                    if isinstance(existing_err, dict) and existing_err.get("reason") in {"REPLAY_TIMEOUT", "EVENT_TYPE_UNSUPPORTED"}:
+                        if getattr(engine, "_strict_replay", True):
+                            raise
+                        return
                     err = {
                         "last_event": prev_event,
                         "event": etype,
@@ -563,7 +639,9 @@ class ReplayEngine:
                         pass
                     snapshot = None
                 else:
-                    snapshot = copy.deepcopy(self._snapshots[snap_idx])
+                    snapshot = self._snapshots[snap_idx]
+        if snapshot is not None:
+            snapshot = self._copy_any(snapshot)
 
         if snapshot is None:
             self.apply_events(engine, start_id=0)
@@ -616,13 +694,16 @@ class ReplayEngine:
         except Exception as exc:
             # rollback engine to pre-replay state
             if backup:
+                rollback_error = None
                 try:
                     if hasattr(engine, "load_state") and backup_mode == "state":
                         engine.load_state(backup)
                     elif hasattr(engine, "load_snapshot"):
                         engine.load_snapshot({"state": backup})
-                except Exception:
-                    pass
+                except Exception as rollback_exc:
+                    rollback_error = rollback_exc
+                if rollback_error is not None:
+                    raise RuntimeError("SNAPSHOT_ROLLBACK_FAILED") from rollback_error
 
             if getattr(engine, "_strict_replay", True):
                 raise
@@ -649,101 +730,120 @@ class ReplayEngine:
         with self._lock:
             if self._unsafe_no_copy:
                 raise RuntimeError("validate_replay cannot run with _unsafe_no_copy=True")
-            result = {
-                "diverged": False,
-                "reason": None,
-                "final_equity": 0.0,
-                "final_regime": "",
+            cloned_events = self._copy_any(list(self._events))
+            cloned_snapshots = self._copy_any(self._snapshots)
+            cloned_event_id = int(self._event_id)
+
+        local_replay = ReplayEngine(
+            max_events=max(1, len(cloned_events) + 1),
+            max_snapshots=max(1, len(cloned_snapshots) + 1),
+        )
+        local_replay._events = deque(cloned_events, maxlen=max(1, len(cloned_events) + 1))
+        local_replay._snapshots = cloned_snapshots
+        local_replay._event_id = cloned_event_id
+        local_replay._HASH_NAMESPACE = self._HASH_NAMESPACE
+
+        result = {
+            "diverged": False,
+            "reason": None,
+            "final_equity": 0.0,
+            "final_regime": "",
+        }
+
+        try:
+            baseline_engine = engine_factory()
+            replay_engine = engine_factory()
+            baseline_engine._fsm_error = None
+            replay_engine._fsm_error = None
+
+            local_replay.apply_events(baseline_engine, start_id=0)
+            local_replay.replay_from_snapshot(replay_engine, snapshot_index=snapshot_index)
+
+            baseline_equity = float(getattr(baseline_engine, "_equity", 0.0))
+            baseline_regime = str(getattr(baseline_engine, "_confirmed_regime", "") or "")
+            replay_equity = float(getattr(replay_engine, "_equity", 0.0))
+            replay_regime = str(getattr(replay_engine, "_confirmed_regime", "") or "")
+
+            if getattr(baseline_engine, "_fsm_error", None):
+                result["diverged"] = True
+                result["reason"] = "FSM_CORRUPTION_BASELINE"
+                result["fsm_error"] = baseline_engine._fsm_error
+                return result
+            if getattr(replay_engine, "_fsm_error", None):
+                result["diverged"] = True
+                result["reason"] = "FSM_CORRUPTION"
+                result["fsm_error"] = replay_engine._fsm_error
+                return result
+
+            baseline_state = baseline_engine.serialize_state() if hasattr(baseline_engine, "serialize_state") else {}
+            replay_state = replay_engine.serialize_state() if hasattr(replay_engine, "serialize_state") else {}
+
+            baseline_hash_payload = {
+                "engine": baseline_state,
+                "rng": self._normalize_rng_state(baseline_engine),
+                "schema_version": str(baseline_state.get("schema_version", "2.3")) if isinstance(baseline_state, dict) else "2.3",
+            }
+            replay_hash_payload = {
+                "engine": replay_state,
+                "rng": self._normalize_rng_state(replay_engine),
+                "schema_version": str(replay_state.get("schema_version", "2.3")) if isinstance(replay_state, dict) else "2.3",
             }
 
-            try:
-                baseline_engine = engine_factory()
-                replay_engine = engine_factory()
-                baseline_engine._fsm_error = None
-                replay_engine._fsm_error = None
-
-                self.apply_events(baseline_engine, start_id=0)
-                self.replay_from_snapshot(replay_engine, snapshot_index=snapshot_index)
-
-                baseline_equity = float(getattr(baseline_engine, "_equity", 0.0))
-                baseline_regime = str(getattr(baseline_engine, "_confirmed_regime", "") or "")
-                replay_equity = float(getattr(replay_engine, "_equity", 0.0))
-                replay_regime = str(getattr(replay_engine, "_confirmed_regime", "") or "")
-
-                if getattr(baseline_engine, "_fsm_error", None):
-                    result["diverged"] = True
-                    result["reason"] = "FSM_CORRUPTION_BASELINE"
-                    result["fsm_error"] = baseline_engine._fsm_error
-                    return result
-                if getattr(replay_engine, "_fsm_error", None):
-                    result["diverged"] = True
-                    result["reason"] = "FSM_CORRUPTION"
-                    result["fsm_error"] = replay_engine._fsm_error
-                    return result
-
-                baseline_state = baseline_engine.serialize_state() if hasattr(baseline_engine, "serialize_state") else {}
-                replay_state = replay_engine.serialize_state() if hasattr(replay_engine, "serialize_state") else {}
-
-                baseline_hash_payload = {
-                    "engine": baseline_state,
-                    "rng": self._normalize_rng_state(baseline_engine),
-                    "schema_version": str(baseline_state.get("schema_version", "2.3")) if isinstance(baseline_state, dict) else "2.3",
-                }
-                replay_hash_payload = {
-                    "engine": replay_state,
-                    "rng": self._normalize_rng_state(replay_engine),
-                    "schema_version": str(replay_state.get("schema_version", "2.3")) if isinstance(replay_state, dict) else "2.3",
-                }
-
-                baseline_hash = self._state_hash(baseline_hash_payload)
-                replay_hash = self._state_hash(replay_hash_payload)
-
-                result["final_equity"] = replay_equity
-                result["final_regime"] = replay_regime
-                result["baseline_hash"] = baseline_hash
-                result["replay_hash"] = replay_hash
-
-                if baseline_hash != replay_hash:
-                    result["diverged"] = True
-                    result["reason"] = "STATE_HASH_MISMATCH"
-                    return result
-
-                def _vec(values):
-                    return np.asarray(values, dtype=float)
-
-                def _close(a, b):
-                    return np.allclose(_vec(a), _vec(b), atol=1e-12)
-
-                baseline_garch = getattr(baseline_engine, "garch_prob", [0.5, 0.5])
-                replay_garch = getattr(replay_engine, "garch_prob", [0.5, 0.5])
-                baseline_nhhmm = getattr(baseline_engine, "nhhmm_prior", [1 / 3, 1 / 3, 1 / 3])
-                replay_nhhmm = getattr(replay_engine, "nhhmm_prior", [1 / 3, 1 / 3, 1 / 3])
-                baseline_smooth = getattr(baseline_engine, "_smoothed_garch_prob", [0.5, 0.5])
-                replay_smooth = getattr(replay_engine, "_smoothed_garch_prob", [0.5, 0.5])
-                baseline_state_probs = getattr(baseline_engine, "_regime_state_probs", [0.25, 0.25, 0.25, 0.25])
-                replay_state_probs = getattr(replay_engine, "_regime_state_probs", [0.25, 0.25, 0.25, 0.25])
-                baseline_range = float(getattr(baseline_engine, "range_ticks", 0.0))
-                replay_range = float(getattr(replay_engine, "range_ticks", 0.0))
-                baseline_pos = float(getattr(baseline_engine, "last_signed_position_size", 0.0))
-                replay_pos = float(getattr(replay_engine, "last_signed_position_size", 0.0))
-                baseline_vol = float(getattr(baseline_engine, "_last_valid_vol", 0.0))
-                replay_vol = float(getattr(replay_engine, "_last_valid_vol", 0.0))
-
-                if not (
-                    abs(baseline_equity - replay_equity) < 1e-12
-                    and baseline_regime == replay_regime
-                    and _close(baseline_garch, replay_garch)
-                    and _close(baseline_nhhmm, replay_nhhmm)
-                    and _close(baseline_smooth, replay_smooth)
-                    and _close(baseline_state_probs, replay_state_probs)
-                    and abs(baseline_range - replay_range) < 1e-12
-                    and abs(baseline_pos - replay_pos) < 1e-12
-                    and abs(baseline_vol - replay_vol) < 1e-12
-                ):
-                    result["diverged"] = True
-                    result["reason"] = "FULL_STATE_MISMATCH"
-            except Exception as exc:
+            baseline_hash = self._state_hash(baseline_hash_payload)
+            replay_hash = self._state_hash(replay_hash_payload)
+            if baseline_hash_payload["rng"].get("status") == "ERROR" or replay_hash_payload["rng"].get("status") == "ERROR":
                 result["diverged"] = True
-                result["reason"] = str(exc)
+                result["reason"] = "RNG_STATE_UNAVAILABLE"
+                result["rng_baseline"] = baseline_hash_payload["rng"]
+                result["rng_replay"] = replay_hash_payload["rng"]
+                return result
 
-            return result
+            result["final_equity"] = replay_equity
+            result["final_regime"] = replay_regime
+            result["baseline_hash"] = baseline_hash
+            result["replay_hash"] = replay_hash
+
+            if baseline_hash != replay_hash:
+                result["diverged"] = True
+                result["reason"] = "STATE_HASH_MISMATCH"
+                return result
+
+            def _vec(values):
+                return np.asarray(values, dtype=float)
+
+            def _close(a, b):
+                return np.allclose(_vec(a), _vec(b), atol=1e-12)
+
+            baseline_garch = getattr(baseline_engine, "garch_prob", [0.5, 0.5])
+            replay_garch = getattr(replay_engine, "garch_prob", [0.5, 0.5])
+            baseline_nhhmm = getattr(baseline_engine, "nhhmm_prior", [1 / 3, 1 / 3, 1 / 3])
+            replay_nhhmm = getattr(replay_engine, "nhhmm_prior", [1 / 3, 1 / 3, 1 / 3])
+            baseline_smooth = getattr(baseline_engine, "_smoothed_garch_prob", [0.5, 0.5])
+            replay_smooth = getattr(replay_engine, "_smoothed_garch_prob", [0.5, 0.5])
+            baseline_state_probs = getattr(baseline_engine, "_regime_state_probs", [0.25, 0.25, 0.25, 0.25])
+            replay_state_probs = getattr(replay_engine, "_regime_state_probs", [0.25, 0.25, 0.25, 0.25])
+            baseline_range = float(getattr(baseline_engine, "range_ticks", 0.0))
+            replay_range = float(getattr(replay_engine, "range_ticks", 0.0))
+            baseline_pos = float(getattr(baseline_engine, "last_signed_position_size", 0.0))
+            replay_pos = float(getattr(replay_engine, "last_signed_position_size", 0.0))
+            baseline_vol = float(getattr(baseline_engine, "_last_valid_vol", 0.0))
+            replay_vol = float(getattr(replay_engine, "_last_valid_vol", 0.0))
+
+            if not (
+                abs(baseline_equity - replay_equity) < 1e-12
+                and baseline_regime == replay_regime
+                and _close(baseline_garch, replay_garch)
+                and _close(baseline_nhhmm, replay_nhhmm)
+                and _close(baseline_smooth, replay_smooth)
+                and _close(baseline_state_probs, replay_state_probs)
+                and abs(baseline_range - replay_range) < 1e-12
+                and abs(baseline_pos - replay_pos) < 1e-12
+                and abs(baseline_vol - replay_vol) < 1e-12
+            ):
+                result["diverged"] = True
+                result["reason"] = "FULL_STATE_MISMATCH"
+        except Exception as exc:
+            result["diverged"] = True
+            result["reason"] = str(exc)
+
+        return result

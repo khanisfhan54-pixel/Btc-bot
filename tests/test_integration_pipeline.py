@@ -1,6 +1,7 @@
 import main
 import engine
 import inspect
+from replay_engine import ReplayEngine
 
 
 def _pipeline_once(price: float = 100000.0):
@@ -78,3 +79,28 @@ def test_deprecated_helper_not_exported_and_live_path_uses_signal_engine():
     source = inspect.getsource(main.run_analysis_cycle)
     assert "signal_engine.generate(" in source
     assert "compute_score(" not in source
+
+
+def test_replay_engine_snapshot_buffer_is_bounded_in_pipeline_context():
+    replay = ReplayEngine(max_snapshots=3)
+    for i in range(8):
+        replay.snapshot({"schema_version": "2.3", "equity": float(i)})
+    assert len(replay._snapshots) == 3
+    assert replay.dropped_snapshots() == 5
+
+
+def test_replay_engine_rejects_unknown_event_type_fail_closed():
+    replay = ReplayEngine()
+    replay.record_event("unknown_type", {"x": 1})
+
+    class T:
+        _strict_replay = False
+        _fsm_error = None
+        _is_replay = False
+        def update(self, _): return None
+        def _trigger_circuit_breaker(self, _): return None
+        def _self_heal(self, _=None): return None
+
+    target = T()
+    replay.apply_events(target)
+    assert target._fsm_error["reason"] == "EVENT_TYPE_UNSUPPORTED"

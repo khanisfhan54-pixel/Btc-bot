@@ -1,6 +1,7 @@
 import numpy as np
 
 import engine
+from replay_engine import ReplayEngine
 
 
 def test_open_interest_missing_does_not_use_phantom_values():
@@ -59,3 +60,22 @@ def test_market_state_invalid_payload_fails_closed():
     )
     assert result["allow_trade"] is False
     assert result["market_state"]["reason"] == "market_state_allow_trade_invalid"
+
+
+def test_replay_payload_with_non_finite_values_is_stored_without_alias():
+    replay = ReplayEngine()
+    arr = np.array([1.0, np.nan, np.inf], dtype=float)
+    replay.record_event("update_start", {"vec": arr})
+    arr[0] = 99.0
+    ev = list(replay.replay())[0]
+    out = np.array(ev["payload"]["vec"], dtype=object)
+    assert out.shape == (3,)
+    assert out[0] != 99.0
+
+
+def test_replay_float_payload_retains_numeric_dtype():
+    replay = ReplayEngine()
+    replay.record_event("update_start", {"vec": np.array([0.1, 0.2], dtype=np.float64)})
+    vec = list(replay.replay())[0]["payload"]["vec"]
+    assert vec.dtype == np.float64
+    assert np.isfinite(vec).all()
