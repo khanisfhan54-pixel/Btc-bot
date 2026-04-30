@@ -3,3 +3,4 @@ scipy>=1.11,<2
 pytest>=9,<10
 prometheus-client>=0.20,<1
 websocket-client>=1.8,<2
+ccxt>=4.0.0
