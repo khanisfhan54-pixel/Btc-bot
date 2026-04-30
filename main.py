@@ -70,6 +70,65 @@ _reconciliation_blocks: Dict[str, float] = {}
 _ORDERBOOK_SNAPSHOTS: Deque[Dict[str, Any]] = deque(maxlen=8)
 _ORDERBOOK_SNAPSHOTS_LOCK = threading.RLock()
 
+def _validate_startup_constants() -> None:
+    """
+    Validate numeric configuration constants at startup.
+    Raises ValueError with a descriptive message if any constant is
+    outside its valid operating range.
+    """
+    errors: list[str] = []
+
+    if not (0.0 < RISK_PERCENT_PER_TRADE <= 5.0):
+        errors.append(
+            f"RISK_PERCENT_PER_TRADE={RISK_PERCENT_PER_TRADE} "
+            f"must be in (0.0, 5.0]"
+        )
+    if not (1.0 <= EXCHANGE_MIN_NOTIONAL_USD < EXCHANGE_MAX_NOTIONAL_USD):
+        errors.append(
+            f"EXCHANGE_MIN_NOTIONAL_USD={EXCHANGE_MIN_NOTIONAL_USD} must "
+            f"be >= 1.0 and < EXCHANGE_MAX_NOTIONAL_USD="
+            f"{EXCHANGE_MAX_NOTIONAL_USD}"
+        )
+    if not (0.0 < BASIS_HALT_THRESHOLD_PCT <= 10.0):
+        errors.append(
+            f"BASIS_HALT_THRESHOLD_PCT={BASIS_HALT_THRESHOLD_PCT} "
+            f"must be in (0.0, 10.0]"
+        )
+    if not (1 <= MAX_CONSECUTIVE_CYCLE_ERRORS <= 1000):
+        errors.append(
+            f"MAX_CONSECUTIVE_CYCLE_ERRORS={MAX_CONSECUTIVE_CYCLE_ERRORS} "
+            f"must be in [1, 1000]"
+        )
+    if not (10.0 <= CIRCUIT_BREAKER_SLEEP_SECONDS <= 86400.0):
+        errors.append(
+            f"CIRCUIT_BREAKER_SLEEP_SECONDS={CIRCUIT_BREAKER_SLEEP_SECONDS}"
+            f" must be in [10.0, 86400.0]"
+        )
+    if not (1.0 <= FETCH_TIMEOUT_SECONDS <= 300.0):
+        errors.append(
+            f"FETCH_TIMEOUT_SECONDS={FETCH_TIMEOUT_SECONDS} "
+            f"must be in [1.0, 300.0]"
+        )
+    if not (30.0 <= MAX_REGIME_STALENESS_SECONDS <= 3600.0):
+        errors.append(
+            f"MAX_REGIME_STALENESS_SECONDS={MAX_REGIME_STALENESS_SECONDS} "
+            f"must be in [30.0, 3600.0]"
+        )
+    if not (5.0 <= MAX_FEATURE_STALENESS_SECONDS <= 600.0):
+        errors.append(
+            f"MAX_FEATURE_STALENESS_SECONDS={MAX_FEATURE_STALENESS_SECONDS}"
+            f" must be in [5.0, 600.0]"
+        )
+
+    if errors:
+        msg = "[BOOT] Invalid configuration constants:\n" + "\n".join(
+            f"  • {e}" for e in errors
+        )
+        logger.critical(msg)
+        raise ValueError(msg)
+
+_validate_startup_constants()
+
 _COLD_START_LOCK = threading.Lock()
 _RECONCILIATION_LOCK = threading.Lock()
 _SHARED_FETCH_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="market-fetch")
@@ -131,7 +190,7 @@ except Exception as _fe_import_err:
     class FeatureEngine:
         _FEATURE_ENGINE_IS_FALLBACK = True
 
-        def update(self, orderbook: dict, trades: list) -> dict:
+        def update(self, orderbook: dict, trades: list, **kwargs) -> dict:
             bids = (orderbook.get("bids") or [])[:10]
             asks = (orderbook.get("asks") or [])[:10]
             bid_vol = sum(_safe_float(b[1]) for b in bids)
@@ -417,7 +476,35 @@ try:
     )
     _ENGINE_IMPORT_SUCCEEDED = True
 except Exception as _e:
-    logger.warning("Engines import failed: %s", _e)
+    logger.critical(
+        "[BOOT] engine import failed — system running in analytical fallback "
+        "mode. All signals will be HOLD until engine is restored. err=%s",
+        _e,
+        exc_info=True,
+    )
+    _engine_boot_msg = (
+        f"[BOOT] CRITICAL: engine import failed\n"
+        f"timestamp={datetime.now(timezone.utc).isoformat()}\n"
+        f"hostname={socket.gethostname()}\n"
+        f"exception={type(_e).__name__}: {_e}\n"
+        f"impact=all signals HOLD, analytical core unavailable"
+    )
+    try:
+        _alert_fn = globals().get("send_telegram_message", lambda _m: False)
+        _tg_thread = threading.Thread(
+            target=_alert_fn, args=(_engine_boot_msg,), daemon=True
+        )
+        _tg_thread.start()
+        _tg_thread.join(timeout=10.0)
+    except Exception as _eng_tg_exc:
+        logger.error(
+            "[BOOT] Telegram alert failed for engine import failure: %s",
+            _eng_tg_exc,
+        )
+    try:
+        sys.stderr.write(_engine_boot_msg + "\n")
+    except Exception:
+        pass
 
     def _default_alpha() -> dict:
         return {
@@ -2012,7 +2099,7 @@ def run_analysis_cycle(
             logger.critical("[FEATURE] repeated TypeErrors detected; halting execution mode")
             regime_context["execution_mode"] = "halt_feature_errors"
         try:
-            features = feature_engine.update(snapshot, trades)
+            features = feature_engine.update(snapshot, trades, regime_context=regime_context)
             with _ANALYSIS_STATE_LOCK:
                 _last_valid_features = dict(features)
                 _last_valid_features_ts = time.time()
@@ -3354,4 +3441,3 @@ if __name__ == "__main__":
         run_backtest()
     else:
         run_live()
-    _SHARED_FETCH_EXECUTOR.shutdown(wait=False, cancel_futures=True)
