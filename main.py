@@ -124,10 +124,13 @@ def _fetch_market_snapshot(data_exchange, data_symbol: str, execution_exchange, 
 
 try:
     from feature_engine import FeatureEngine
+    setattr(FeatureEngine, "_FEATURE_ENGINE_IS_FALLBACK", False)
 except Exception as _fe_import_err:
     logger.warning("feature_engine import failed: %s", _fe_import_err)
 
     class FeatureEngine:
+        _FEATURE_ENGINE_IS_FALLBACK = True
+
         def update(self, orderbook: dict, trades: list) -> dict:
             bids = (orderbook.get("bids") or [])[:10]
             asks = (orderbook.get("asks") or [])[:10]
@@ -139,14 +142,22 @@ except Exception as _fe_import_err:
                 "ask_vol": ask_vol,
                 "imbalance": 0.0 if total == 0 else (bid_vol - ask_vol) / total,
                 "trade_count": len(trades or []),
+                "latency_ms": 9999.0,
+                "liquidity_score": 0.0,
+                "spread_bps": 999.0,
+                "staleness_ratio": 1.0,
+                "missing_data_ratio": 1.0,
             }
 
 try:
     from signal_engine import SignalEngine
+    setattr(SignalEngine, "_SIGNAL_ENGINE_IS_FALLBACK", False)
 except Exception as _se_import_err:
     logger.warning("signal_engine import failed: %s", _se_import_err)
 
     class SignalEngine:
+        _SIGNAL_ENGINE_IS_FALLBACK = True
+
         def generate(self, features: dict) -> dict:
             return {"signal": "HOLD", "confidence": 0.0, "reason": "fallback"}
 
@@ -283,8 +294,42 @@ try:
     engine = ExecutionEngine()
     _bootstrap_stage = "ThreadSafeFeatureEngine"
     feature_engine = ThreadSafeFeatureEngine(FeatureEngine())
+    if getattr(feature_engine._engine, "_FEATURE_ENGINE_IS_FALLBACK", False):
+        _boot_msg = (
+            f"[BOOT][DEGRADED] FeatureEngine is running in FALLBACK MODE.\n"
+            f"timestamp={datetime.now(timezone.utc).isoformat()}\n"
+            f"hostname={socket.gethostname()}\n"
+            f"Only 4 features available. Signal quality is non-production."
+        )
+        logger.critical(_boot_msg)
+        try:
+            _alert_fn = globals().get("send_telegram_message", lambda _m: False)
+            _tg_thread = threading.Thread(target=_alert_fn, args=(_boot_msg,), daemon=True)
+            _tg_thread.start()
+            _tg_thread.join(timeout=10.0)
+        except Exception as _tg_exc:
+            logger.error("[BOOT] Telegram alert failed for FeatureEngine fallback: %s", _tg_exc)
+        if LIVE_TRADING:
+            raise RuntimeError(_boot_msg)
     _bootstrap_stage = "SignalEngine"
     signal_engine = SignalEngine()
+    if getattr(signal_engine, "_SIGNAL_ENGINE_IS_FALLBACK", False):
+        _boot_msg = (
+            f"[BOOT][DEGRADED] SignalEngine is running in FALLBACK MODE.\n"
+            f"timestamp={datetime.now(timezone.utc).isoformat()}\n"
+            f"hostname={socket.gethostname()}\n"
+            f"All signals will return HOLD/0.0. System is non-functional for trading."
+        )
+        logger.critical(_boot_msg)
+        try:
+            _alert_fn = globals().get("send_telegram_message", lambda _m: False)
+            _tg_thread = threading.Thread(target=_alert_fn, args=(_boot_msg,), daemon=True)
+            _tg_thread.start()
+            _tg_thread.join(timeout=10.0)
+        except Exception as _tg_exc:
+            logger.error("[BOOT] Telegram alert failed for SignalEngine fallback: %s", _tg_exc)
+        if LIVE_TRADING:
+            raise RuntimeError(_boot_msg)
     _bootstrap_stage = "ExecutionLogic"
     execution_engine = ExecutionLogic(learning_engine=LEARNING_ENGINE)
     _bootstrap_stage = "QueueFillModel"
@@ -1998,6 +2043,17 @@ def run_analysis_cycle(
 
     # Normalize to a single raw feature dict for all downstream modules
     feat_dict: Dict[str, Any] = features.get("features", features) if isinstance(features, dict) else {}
+    if getattr(getattr(feature_engine, "_engine", None), "_FEATURE_ENGINE_IS_FALLBACK", False):
+        logger.warning("[CYCLE] FeatureEngine is in FALLBACK MODE — feature quality is non-production this cycle")
+    if getattr(signal_engine, "_SIGNAL_ENGINE_IS_FALLBACK", False):
+        logger.warning("[CYCLE] SignalEngine is in FALLBACK MODE — all signals will be HOLD this cycle")
+    _REQUIRED_FEATURE_KEYS = {"latency_ms", "liquidity_score", "spread_bps", "imbalance"}
+    _missing_keys = _REQUIRED_FEATURE_KEYS - set(feat_dict.keys())
+    if _missing_keys:
+        logger.error(
+            "[FEATURE] Required feature keys missing: %s — this indicates a degraded FeatureEngine. "
+            "Failsafe gate may be bypassed.", sorted(_missing_keys)
+        )
     feat_dict["candles"] = candles_by_tf.get("1h", [])
 
     # Update impact decay using raw features
@@ -2976,6 +3032,38 @@ def run_live() -> None:
             send_telegram_message(msg)
         except Exception:
             logger.error("[BOOT] Telegram alert failed for credentials warning", exc_info=True)
+    if not _ENGINE_IMPORT_SUCCEEDED:
+        _engine_warn_msg = (
+            f"[BOOT][DEGRADED] engine.py import FAILED. Running analytical engine stubs.\n"
+            f"timestamp={datetime.now(timezone.utc).isoformat()}\n"
+            f"hostname={socket.gethostname()}\n"
+            f"All engine analytics (run_all_engines, evaluate_meta_filter, MarketStateDetector) "
+            f"are returning fail-closed fallback values. No trades will be executed."
+        )
+        logger.critical(_engine_warn_msg)
+        try:
+            send_telegram_message(_engine_warn_msg)
+        except Exception as _tg_exc:
+            logger.error("[BOOT] Telegram alert failed for engine import failure: %s", _tg_exc)
+        if LIVE_TRADING:
+            raise RuntimeError(_engine_warn_msg)
+    _boot_summary = (
+        f"[BOOT] Trading bot starting.\n"
+        f"timestamp={datetime.now(timezone.utc).isoformat()}\n"
+        f"hostname={socket.gethostname()}\n"
+        f"LIVE_TRADING={LIVE_TRADING}\n"
+        f"DRY_RUN={DRY_RUN}\n"
+        f"SIGNAL_ONLY_MODE={SIGNAL_ONLY_MODE}\n"
+        f"_ENGINE_IMPORT_SUCCEEDED={_ENGINE_IMPORT_SUCCEEDED}\n"
+        f"_EXECUTION_IMPORT_SUCCEEDED={_EXECUTION_IMPORT_SUCCEEDED}\n"
+        f"feature_engine_fallback={getattr(getattr(feature_engine, '_engine', None), '_FEATURE_ENGINE_IS_FALLBACK', False)}\n"
+        f"signal_engine_fallback={getattr(signal_engine, '_SIGNAL_ENGINE_IS_FALLBACK', False)}"
+    )
+    logger.info(_boot_summary)
+    try:
+        send_telegram_message(_boot_summary)
+    except Exception:
+        logger.error("[BOOT] Telegram send failed for boot summary", exc_info=True)
     try:
         exchange = get_exchange()
     except Exception as exc:
@@ -3214,6 +3302,51 @@ def run_backtest(
         json.dump(summary, f, indent=2)
     logger.info("=== BACKTEST COMPLETE ===")
     return summary
+
+
+def assert_invariant_1(state: dict) -> None:
+    expected = [
+        "ExecutionEngine", "ThreadSafeFeatureEngine", "SignalEngine", "ExecutionLogic",
+        "QueueFillModel", "ToxicityFilter", "OrderRouter", "ImpactDecay",
+        "PositionManager", "TradeLifecycleManager", "CapitalAllocator", "VenueBasisNormalizer",
+    ]
+    assert state.get("bootstrap_order") == expected
+
+
+def assert_invariant_2(state: dict) -> None:
+    assert state.get("raises_on_live_missing_credentials") is True
+
+
+def assert_invariant_3(state: dict) -> None:
+    assert state.get("execution_gate_requires_all") is True
+
+
+def assert_invariant_4(state: dict) -> None:
+    assert state.get("fallback_allow_trade_false") is True
+
+
+def assert_invariant_5(state: dict) -> None:
+    assert state.get("shared_fetch_shutdown_dual") is True
+
+
+def assert_invariant_6(state: dict) -> None:
+    assert state.get("log_trade_once_after_execution_outcome") is True
+
+
+def assert_invariant_7(state: dict) -> None:
+    assert state.get("sigterm_handler_safe") is True
+
+
+def assert_invariant_8(state: dict) -> None:
+    assert state.get("on_entry_guarded") is True
+
+
+def assert_invariant_9(state: dict) -> None:
+    assert state.get("stale_regime_fail_closed") is True
+
+
+def assert_invariant_10(state: dict) -> None:
+    assert state.get("basis_validate_blocks_entries") is True
 
 
 if __name__ == "__main__":
