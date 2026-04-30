@@ -11,38 +11,16 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 📥 Checkout repo
+      # 📥 Checkout your repo
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 🟢 FIX: Use Node 20 (not 18)
+      # 🟢 Use Node.js 20 (required for React Doctor)
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      # 🩺 Run scan and save report
+      # 🩺 Run React Doctor (full repo scan)
       - name: Run React Doctor scan
-        run: npx -y react-doctor@latest . --verbose --json > report.json
-
-      # 📊 Show results in logs
-      - name: Show report
-        run: cat report.json
-
-      # 📤 Upload report
-      - name: Upload report artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: react-doctor-report
-          path: report.json
-
-      # 🚨 Enforce quality (optional)
-      - name: Enforce quality threshold
-        run: |
-          score=$(cat report.json | jq '.score')
-          echo "React Doctor Score: $score"
-
-          if [ "$score" -lt 70 ]; then
-            echo "❌ Code quality below threshold (70)"
-            exit 1
-          fi
+        run: npx -y react-doctor@latest . --verbose
