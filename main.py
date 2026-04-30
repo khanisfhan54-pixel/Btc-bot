@@ -17,6 +17,7 @@ import threading
 import traceback
 import socket
 import concurrent.futures
+import atexit
 import uuid
 from collections import deque
 from datetime import datetime, timezone
@@ -72,8 +73,25 @@ _ORDERBOOK_SNAPSHOTS_LOCK = threading.RLock()
 _COLD_START_LOCK = threading.Lock()
 _RECONCILIATION_LOCK = threading.Lock()
 _SHARED_FETCH_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="market-fetch")
+def _shutdown_shared_fetch_executor() -> None:
+    try:
+        _SHARED_FETCH_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+    except TypeError:
+        _SHARED_FETCH_EXECUTOR.shutdown(wait=False)
 
-_RETRYABLE_EXCHANGE_ERRORS = (Exception,)
+atexit.register(_shutdown_shared_fetch_executor)
+
+try:
+    import ccxt as _ccxt
+    _RETRYABLE_EXCHANGE_ERRORS = (
+        _ccxt.NetworkError,
+        _ccxt.RequestTimeout,
+        _ccxt.ExchangeNotAvailable,
+        _ccxt.DDoSProtection,
+        _ccxt.RateLimitExceeded,
+    )
+except ImportError:
+    _RETRYABLE_EXCHANGE_ERRORS = (OSError, TimeoutError)
 
 def _retry_exchange_call(func, *args, max_retries: int = 3, base_delay: float = 0.5, call_name: str = "exchange_call", **kwargs):
     last_exc = None
@@ -132,6 +150,7 @@ except Exception as _se_import_err:
         def generate(self, features: dict) -> dict:
             return {"signal": "HOLD", "confidence": 0.0, "reason": "fallback"}
 
+_EXECUTION_IMPORT_SUCCEEDED: bool = False
 try:
     from execution import (
         ExecutionLogic,
@@ -139,42 +158,31 @@ try:
         calculate_position_size,
         calculate_liquidity_sl_tp,
     )
+    _EXECUTION_IMPORT_SUCCEEDED = True
 except Exception as _exec_import_err:
-    logger.warning("execution import failed: %s", _exec_import_err)
-
-    class ExecutionLogic:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def decide(self, signal_payload: dict, features_payload: dict, snapshot: dict, account_equity: float, meta_result=None) -> dict:
-            return {"execute": False, "side": "buy", "sl": 0.0, "tp": 0.0, "position_size": 0.0, "reason": "fallback"}
-
-    class ExecutionEngine:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def get_balance(self):
-            return 0.0
-
-        def place_market_order(self, *args, **kwargs):
-            return {"id": None, "status": "skipped"}
-
-        def place_limit_order(self, *args, **kwargs):
-            return {"id": None, "status": "skipped"}
-
-        def place_order_with_sl_tp(self, *args, **kwargs):
-            return {"id": None, "status": "skipped"}
-
-    def calculate_position_size(balance, risk_percent, stop_loss_distance):
-        try:
-            risk_amount = float(balance) * (float(risk_percent) / 100.0)
-            d = abs(float(stop_loss_distance))
-            return 0.0 if d <= 0 else risk_amount / d
-        except Exception:
-            return 0.0
-
-    def calculate_liquidity_sl_tp(signal, price, data):
-        raise RuntimeError("execution.py is unavailable")
+    _tb_lines = traceback.format_exc().splitlines()[-3:]
+    _failed_mod = getattr(_exec_import_err, "name", None) or "execution"
+    _boot_msg = (
+        f"[BOOT] Critical module import failed\n"
+        f"timestamp={datetime.now(timezone.utc).isoformat()}\n"
+        f"hostname={socket.gethostname()}\n"
+        f"module={_failed_mod}\n"
+        f"exception={type(_exec_import_err).__name__}: {_exec_import_err}\n"
+        f"traceback_last_frames={' | '.join(_tb_lines)}"
+    )
+    logger.critical("%s", _boot_msg, exc_info=True)
+    try:
+        _alert_fn = globals().get("send_telegram_message", lambda _m: False)
+        _tg_thread = threading.Thread(target=_alert_fn, args=(_boot_msg,), daemon=True)
+        _tg_thread.start()
+        _tg_thread.join(timeout=10.0)
+    except Exception as _tg_exc:
+        logger.error("[BOOT] Telegram alert failed during import error: %s", _tg_exc, exc_info=True)
+    try:
+        sys.stderr.write(_boot_msg + "\n")
+    except Exception:
+        pass
+    raise RuntimeError(_boot_msg) from _exec_import_err
 
 try:
     from telegram_bot import send_telegram_message
@@ -185,11 +193,7 @@ except Exception as _tg_import_err:
         logger.info("TELEGRAM (fallback): %s", message)
         return False
 
-ENGINE_IS_FALLBACK: bool
-if "execution" in getattr(ExecutionEngine, "__module__", ""):
-    ENGINE_IS_FALLBACK = False
-else:
-    ENGINE_IS_FALLBACK = True
+ENGINE_IS_FALLBACK: bool = not _EXECUTION_IMPORT_SUCCEEDED
 CREDENTIALS_MISSING: bool = False
 _cold_start_complete: bool = False
 
@@ -213,7 +217,8 @@ except Exception as _new_module_import_err:
     )
     logger.critical("%s", _boot_msg, exc_info=True)
     try:
-        _tg_thread = threading.Thread(target=send_telegram_message, args=(_boot_msg,), daemon=True)
+        _alert_fn = globals().get("send_telegram_message", lambda _m: False)
+        _tg_thread = threading.Thread(target=_alert_fn, args=(_boot_msg,), daemon=True)
         _tg_thread.start()
         _tg_thread.join(timeout=10.0)
     except Exception as _tg_exc:
@@ -224,81 +229,6 @@ except Exception as _new_module_import_err:
         pass
     raise RuntimeError(_boot_msg) from _new_module_import_err
 
-if False:
-
-    class QueueFillModel:
-        def enrich(self, fp):
-            return fp
-
-    class ToxicityFilter:
-        def enrich(self, fp):
-            return fp
-
-    class OrderRouter:
-        def route(self, signal, fp, snapshot):
-            return {
-                "execute": True,
-                "order_type": "market",
-                "urgency": "high",
-                "reason": "stub_passthrough",
-                "details": "",
-                "slippage_budget_bps": 0.0,
-                "route_confidence": 1.0,
-                "fill_prob_dir": 1.0,
-                "toxicity_score": 0.0,
-                "liq_score": 1.0,
-            }
-
-    class ImpactDecay:
-        def record_entry(self, *a, **kw):
-            pass
-
-        def update(self, *a, **kw):
-            return {
-                "impact_bps": 0.0,
-                "decay_factor": 0.0,
-                "residual_impact": 0.0,
-                "half_life_s": 0.0,
-                "fully_decayed": True,
-                "elapsed_s": 0.0,
-                "price_move_bps": 0.0,
-                "direction": "LONG",
-            }
-
-        def reset(self):
-            pass
-
-    class PositionManager:
-        def has_position(self) -> bool:
-            return False
-
-        def on_entry(self, **kw) -> None:
-            pass
-
-        def on_exit(self, **kw) -> None:
-            pass
-
-        def update(self, price: float, features: dict) -> dict:
-            return {"action": "NO_POSITION"}
-
-    class TradeLifecycleManager:
-        def update(self, price: float, features: dict) -> dict:
-            return {"action": "HOLD", "block_new_entries": False, "risk_scale": 1.0, "reason": "stub"}
-
-        def can_open_new_trade(self, features: dict) -> bool:
-            return True
-
-        def on_entry(self, **kw) -> None:
-            pass
-
-        def on_exit(self, **kw) -> None:
-            pass
-
-        def session_guard(self) -> dict:
-            return {"action": "ALLOW", "block_new_entries": False}
-
-        def get_correlation_id(self) -> str:
-            return ""
 
 try:
     from learning_engine import LEARNING_ENGINE
@@ -348,18 +278,47 @@ except ImportError as _ca_err:
     logger.critical("[BOOT] Critical module import failed: %s — HALTING", _ca_err, exc_info=True)
     raise
 
-engine           = ExecutionEngine()
-feature_engine   = ThreadSafeFeatureEngine(FeatureEngine())
-signal_engine    = SignalEngine()
-execution_engine = ExecutionLogic(learning_engine=LEARNING_ENGINE)
-fill_model       = QueueFillModel()
-tox_filter       = ToxicityFilter()
-order_router     = OrderRouter()
-impact_tracker   = ImpactDecay()
-position_manager = PositionManager()
-trade_lifecycle  = TradeLifecycleManager()
-capital_allocator = CapitalAllocator()
-basis_normalizer = VenueBasisNormalizer(halt_threshold_pct=BASIS_HALT_THRESHOLD_PCT)
+try:
+    _bootstrap_stage = "ExecutionEngine"
+    engine = ExecutionEngine()
+    _bootstrap_stage = "ThreadSafeFeatureEngine"
+    feature_engine = ThreadSafeFeatureEngine(FeatureEngine())
+    _bootstrap_stage = "SignalEngine"
+    signal_engine = SignalEngine()
+    _bootstrap_stage = "ExecutionLogic"
+    execution_engine = ExecutionLogic(learning_engine=LEARNING_ENGINE)
+    _bootstrap_stage = "QueueFillModel"
+    fill_model = QueueFillModel()
+    _bootstrap_stage = "ToxicityFilter"
+    tox_filter = ToxicityFilter()
+    _bootstrap_stage = "OrderRouter"
+    order_router = OrderRouter()
+    _bootstrap_stage = "ImpactDecay"
+    impact_tracker = ImpactDecay()
+    _bootstrap_stage = "PositionManager"
+    position_manager = PositionManager()
+    _bootstrap_stage = "TradeLifecycleManager"
+    trade_lifecycle = TradeLifecycleManager()
+    _bootstrap_stage = "CapitalAllocator"
+    capital_allocator = CapitalAllocator()
+    _bootstrap_stage = "VenueBasisNormalizer"
+    basis_normalizer = VenueBasisNormalizer(halt_threshold_pct=BASIS_HALT_THRESHOLD_PCT)
+except Exception as _bootstrap_exc:
+    _boot_msg = f"Bootstrap singleton construction failed at {_bootstrap_stage}: {_bootstrap_exc}"
+    logger.critical(_boot_msg, exc_info=True)
+    try:
+        _alert_fn = globals().get("send_telegram_message", lambda _m: False)
+        _tg_thread = threading.Thread(target=_alert_fn, args=(_boot_msg,), daemon=True)
+        _tg_thread.start()
+        _tg_thread.join(timeout=10.0)
+    except Exception as _tg_exc:
+        logger.error("[BOOT] Telegram alert failed during singleton bootstrap error: %s", _tg_exc, exc_info=True)
+    try:
+        sys.stderr.write(_boot_msg + "\n")
+    except Exception:
+        pass
+    raise RuntimeError(_boot_msg) from _bootstrap_exc
+
 SIGNAL_PIPELINE_CONFIG: Dict[str, Any] = {
     "enable_regime_engine": True,
     "signal_only_mode": SIGNAL_ONLY_MODE,
@@ -397,10 +356,12 @@ except Exception as _ao_exc:
     raise
 alpha_orchestrator = AlphaOrchestrator(OrchestratorConfig(signal_weights={"signal_engine": 1.0}))
 
+_ENGINE_IMPORT_SUCCEEDED: bool = False
 try:
     from engine import (
         run_all_engines,
         analyze_volume_intelligence,
+        compute_score,
         get_cascade_probability,
         MarketStateDetector,
         evaluate_meta_filter,
@@ -409,6 +370,7 @@ try:
         _default_alpha,
         SniperExecutionEngine,
     )
+    _ENGINE_IMPORT_SUCCEEDED = True
 except Exception as _e:
     logger.warning("Engines import failed: %s", _e)
 
@@ -629,6 +591,8 @@ if globals().get("SniperExecutionEngine") is not None:
         logger.warning("Signal pipeline engine init failed (non-fatal): %s", _spe_err)
         _signal_pipeline_engine = None
 
+logger.info("[BOOT] All bootstrap singletons constructed successfully")
+logger.info("[BOOT] Entry-point wiring complete")
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     return safe_float(value, default=default)
@@ -1987,17 +1951,19 @@ def run_analysis_cycle(
             _last_valid_features = dict(features)
             _last_valid_features_ts = time.time()
     except TypeError as _te_exc:
-        _feature_type_error_count += 1
+        with _ANALYSIS_STATE_LOCK:
+            _feature_type_error_count += 1
+            _local_error_count = _feature_type_error_count
         logger.error(
             "[FEATURE] TypeError in update | exc_type=%s exc=%s args=%s tick_ts=%.6f count=%d",
             type(_te_exc).__name__,
             str(_te_exc),
             json.dumps({"snapshot": snapshot, "trades_count": len(trades or []), "regime_context": regime_context}, default=str)[:2000],
             time.time(),
-            _feature_type_error_count,
+            _local_error_count,
             exc_info=True,
         )
-        if _feature_type_error_count > 3:
+        if _local_error_count > 3:
             logger.critical("[FEATURE] repeated TypeErrors detected; halting execution mode")
             regime_context["execution_mode"] = "halt_feature_errors"
         try:
@@ -2999,6 +2965,7 @@ def run_live() -> None:
     logger.info("Mode: %s", "DRY RUN" if DRY_RUN else "LIVE")
     logger.info(f"[BOOT] LIVE_TRADING resolved to: {LIVE_TRADING}")
     logger.info(f"[BOOT] SIGNAL_ONLY_MODE resolved to: {SIGNAL_ONLY_MODE}")
+    logger.info(f"[BOOT] _ENGINE_IMPORT_SUCCEEDED={_ENGINE_IMPORT_SUCCEEDED} _EXECUTION_IMPORT_SUCCEEDED={_EXECUTION_IMPORT_SUCCEEDED}")
     if LIVE_TRADING and (not BINANCE_API_KEY.strip() or not BINANCE_SECRET.strip()):
         raise RuntimeError("LIVE_TRADING=True but credentials not configured")
     if (not LIVE_TRADING) and (not DRY_RUN) and (not BINANCE_API_KEY.strip() or not BINANCE_SECRET.strip()):
