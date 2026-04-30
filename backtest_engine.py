@@ -7,30 +7,35 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from venue_basis import VenueBasisNormalizer
 
-try:
-    from feature_engine import FeatureEngine
-    from signal_engine import SignalEngine
-    from execution import ExecutionLogic
-    from meta_filter import MetaFilter
-    from learning_engine import LEARNING_ENGINE
-    from queue_fill_model import QueueFillModel
-    from toxicity_filter import ToxicityFilter
-    from position_manager import PositionManager
-    from trade_lifecycle_manager import TradeLifecycleManager
-    from capital_allocator import CapitalAllocator
-except Exception as _be_import_err:
-    import logging as _be_log
-    _be_log.getLogger(__name__).warning("backtest_engine: module import failed (%s) — BacktestEngine unusable", _be_import_err)
-    FeatureEngine = None  # type: ignore[assignment,misc]
-    SignalEngine = None  # type: ignore[assignment,misc]
-    ExecutionLogic = None  # type: ignore[assignment,misc]
-    MetaFilter = None  # type: ignore[assignment,misc]
-    LEARNING_ENGINE = None  # type: ignore[assignment,misc]
-    QueueFillModel = None  # type: ignore
-    ToxicityFilter = None  # type: ignore
-    PositionManager = None  # type: ignore
-    TradeLifecycleManager = None  # type: ignore
-    CapitalAllocator = None  # type: ignore
+FeatureEngine = None  # type: ignore[assignment,misc]
+SignalEngine = None  # type: ignore[assignment,misc]
+ExecutionLogic = None  # type: ignore[assignment,misc]
+MetaFilter = None  # type: ignore[assignment,misc]
+LEARNING_ENGINE = None  # type: ignore[assignment,misc]
+QueueFillModel = None  # type: ignore
+ToxicityFilter = None  # type: ignore
+PositionManager = None  # type: ignore
+TradeLifecycleManager = None  # type: ignore
+CapitalAllocator = None  # type: ignore
+LiquiditySweepAlpha = None  # type: ignore
+for _mod in (
+    ("feature_engine", "FeatureEngine"),
+    ("signal_engine", "SignalEngine"),
+    ("execution", "ExecutionLogic"),
+    ("meta_filter", "MetaFilter"),
+    ("learning_engine", "LEARNING_ENGINE"),
+    ("queue_fill_model", "QueueFillModel"),
+    ("toxicity_filter", "ToxicityFilter"),
+    ("position_manager", "PositionManager"),
+    ("trade_lifecycle_manager", "TradeLifecycleManager"),
+    ("capital_allocator", "CapitalAllocator"),
+    ("alpha_liquidity_sweep_predictor", "LiquiditySweepAlpha"),
+):
+    try:
+        _m = __import__(_mod[0], fromlist=[_mod[1]])
+        globals()[_mod[1]] = getattr(_m, _mod[1])
+    except Exception as _be_import_err:
+        logging.getLogger(__name__).warning("backtest_engine: optional import failed %s.%s (%s)", _mod[0], _mod[1], _be_import_err)
 
 logger = logging.getLogger(__name__)
 
@@ -114,26 +119,60 @@ class BacktestConfig:
 
 
 class BacktestEngine:
-    def __init__(self, config: BacktestConfig | None = None, learning_engine: Any = None) -> None:
+    def __init__(self, config: BacktestConfig | None = None, learning_engine: Any = None, signal_only: bool = True) -> None:
         self.cfg = config or BacktestConfig()
+        self.signal_only = bool(signal_only)
         self.learning_engine = learning_engine if learning_engine is not None else LEARNING_ENGINE
         self.feature_engine = FeatureEngine() if FeatureEngine is not None else _FallbackFeatureEngine()
         self.signal_engine = SignalEngine() if SignalEngine is not None else _FallbackSignalEngine()
-        self.execution_logic = ExecutionLogic() if ExecutionLogic is not None else _FallbackExecutionLogic()
+        self.execution_logic = None if self.signal_only else (ExecutionLogic() if ExecutionLogic is not None else _FallbackExecutionLogic())
         self.meta_filter = MetaFilter() if MetaFilter is not None else _FallbackMetaFilter()
         self.fill_model = QueueFillModel() if QueueFillModel is not None else None
         self.tox_filter = ToxicityFilter() if ToxicityFilter is not None else None
         self.position_manager = PositionManager() if PositionManager is not None else None
         self.trade_lifecycle = TradeLifecycleManager() if TradeLifecycleManager is not None else None
         self.capital_allocator = CapitalAllocator() if CapitalAllocator is not None else None
+        self.alpha_predictor = LiquiditySweepAlpha() if LiquiditySweepAlpha is not None else None
         self.basis = VenueBasisNormalizer(halt_threshold_pct=0.5)
         self.basis.set_venues("backtest", "backtest")
         self._analysis_cache: Dict[Tuple[int, float], Dict[str, Any]] = {}
 
-    def run_backtest(self, ohlcv_data: List[list], initial_balance: float | None = None) -> Dict[str, Any]:
+    def run_backtest(
+        self,
+        ohlcv_data: List[list],
+        initial_balance: float | None = None,
+        *,
+        signal_quality_required: bool = True,
+        allow_ohlcv_synthetic: bool = False,
+    ) -> Dict[str, Any]:
         cache_hits = 0
         cache_misses = 0
         data = [row for row in (ohlcv_data or []) if isinstance(row, (list, tuple)) and len(row) >= 6]
+        has_microstructure_rows = any(
+            isinstance(row, dict) and isinstance(row.get("snapshot"), dict) and "bids" in row.get("snapshot", {}) and "asks" in row.get("snapshot", {})
+            for row in (ohlcv_data or [])
+        )
+        if signal_quality_required and (not has_microstructure_rows) and (not allow_ohlcv_synthetic):
+            return {
+                "total_trades": 0,
+                "win_rate": 0.0,
+                "pnl": 0.0,
+                "max_drawdown": 0.0,
+                "sharpe": 0.0,
+                "expectancy": 0.0,
+                "trade_log": [],
+                "signal_only_mode": self.signal_only,
+                "signal_coverage": 0.0,
+                "long_signals": 0,
+                "short_signals": 0,
+                "hold_signals": 0,
+                "avg_return_per_trade": 0.0,
+                "avg_holding_bars": 0.0,
+                "alpha_non_empty_count": 0,
+                "regime_state": "explicit_fallback",
+                "signal_quality_valid": False,
+                "signal_quality_reason": "signal_quality_requires_microstructure_replay_data",
+            }
         if len(data) < 50:
             logger.info("[BACKTEST CACHE] hits=%d misses=%d", cache_hits, cache_misses)
             return {
@@ -144,6 +183,8 @@ class BacktestEngine:
                 "sharpe": 0.0,
                 "expectancy": 0.0,
                 "trade_log": [],
+                "signal_quality_valid": False,
+                "signal_quality_reason": "insufficient_data",
             }
 
         balance = float(initial_balance if initial_balance is not None else self.cfg.initial_balance)
@@ -153,6 +194,11 @@ class BacktestEngine:
         trade_log: List[Dict[str, Any]] = []
 
         position: Optional[Dict[str, Any]] = None
+        signal_counts: Dict[str, int] = {"LONG": 0, "SHORT": 0, "HOLD": 0}
+        non_hold_signals = 0
+        bars_processed = 0
+        alpha_non_empty_count = 0
+        synthetic_microstructure = True
         for i in range(25, len(data)):
             window = data[: i + 1]
             candle = window[-1]
@@ -171,13 +217,34 @@ class BacktestEngine:
                 trades = _simulate_trades_from_candle(candle)
                 features = self.feature_engine.update(snapshot, trades)
                 self._analysis_cache[cache_key] = {"snapshot": snapshot, "trades": trades, "features": dict(features)}
+            bars_processed += 1
 
             if self.fill_model is not None:
                 features = self.fill_model.enrich(features)
             if self.tox_filter is not None:
                 features = self.tox_filter.enrich(features)
+            if isinstance(features, dict) and "regime" in features and isinstance(features.get("regime"), dict):
+                synthetic_microstructure = False
+            alpha = {}
+            if self.alpha_predictor is not None:
+                alpha = self.alpha_predictor.predict({"features": features}) or {}
+                if isinstance(alpha, dict) and alpha:
+                    alpha_non_empty_count += 1
+            if isinstance(features, dict):
+                features["alpha"] = alpha
             signal = self.signal_engine.generate(features)
+            sig_name = str(signal.get("signal", "HOLD")).upper()
+            if "LONG" in sig_name:
+                signal_counts["LONG"] += 1
+                non_hold_signals += 1
+            elif "SHORT" in sig_name:
+                signal_counts["SHORT"] += 1
+                non_hold_signals += 1
+            else:
+                signal_counts["HOLD"] += 1
             meta = self.meta_filter.evaluate(features=features, signal=signal, decision=None, router_decision=None, snapshot=snapshot, trades=trades)
+            if self.signal_only:
+                continue
 
             analysis_mid = _safe_float(snapshot["bids"][0][0] + snapshot["asks"][0][0], 0.0) / 2.0
             basis_mode = str(getattr(self.cfg, "basis_mode", "none")).strip().lower()
@@ -332,6 +399,10 @@ class BacktestEngine:
         expectancy = (avg_win * win_rate) - (avg_loss * (1.0 - win_rate))
 
         logger.info("[BACKTEST CACHE] hits=%d misses=%d", cache_hits, cache_misses)
+        signal_coverage = (non_hold_signals / bars_processed) if bars_processed > 0 else 0.0
+        coverage_reason = "" if signal_coverage > 0 else "no_non_hold_signals"
+        if synthetic_microstructure:
+            coverage_reason = "ohlcv_synthetic_microstructure_not_valid_for_live_signal_quality"
         return {
             "total_trades": total_trades,
             "win_rate": round(win_rate, 6),
@@ -340,4 +411,15 @@ class BacktestEngine:
             "sharpe": round(_compute_sharpe(returns), 6),
             "expectancy": round(expectancy, 6),
             "trade_log": trade_log,
+            "signal_only_mode": self.signal_only,
+            "signal_coverage": round(signal_coverage, 6),
+            "long_signals": signal_counts["LONG"],
+            "short_signals": signal_counts["SHORT"],
+            "hold_signals": signal_counts["HOLD"],
+            "avg_return_per_trade": round((sum(returns) / len(returns)) if returns else 0.0, 6),
+            "avg_holding_bars": round((sum((t["exit_index"] - t["entry_index"]) for t in trade_log) / total_trades) if total_trades else 0.0, 6),
+            "alpha_non_empty_count": alpha_non_empty_count,
+            "regime_state": "explicit_fallback" if synthetic_microstructure else "feature_derived",
+            "signal_quality_valid": (signal_coverage > 0.0) and (not synthetic_microstructure),
+            "signal_quality_reason": coverage_reason,
         }
