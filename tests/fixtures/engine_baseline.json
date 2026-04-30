@@ -1,0 +1,163 @@
+{
+  "apply_meta_to_decision_normal_allow": {
+    "execute": true,
+    "position_size": 1.0,
+    "risk_scale": 1.0,
+    "meta_result": {
+      "allow_trade": true,
+      "risk_scale": 1.0
+    }
+  },
+  "apply_meta_to_decision_block": {
+    "execute": false,
+    "position_size": 1.0,
+    "reason": "test_block",
+    "risk_scale": 0.0,
+    "meta_result": {
+      "allow_trade": false,
+      "risk_scale": 0.0,
+      "reason": "test_block"
+    }
+  },
+  "apply_meta_to_decision_hi": {
+    "execute": true,
+    "position_size": 0.5,
+    "risk_scale": 1.0,
+    "meta_result": {
+      "allow_trade": true,
+      "risk_scale": 2.0
+    }
+  },
+  "apply_meta_to_decision_lo": {
+    "execute": true,
+    "position_size": 0.0,
+    "risk_scale": 0.0,
+    "meta_result": {
+      "allow_trade": true,
+      "risk_scale": -1.0
+    }
+  },
+  "_get_meta_filter_same": true,
+  "_validate_alpha": [
+    {
+      "confidence": 0.7,
+      "prob_above": 0.6,
+      "prob_below": 0.4,
+      "direction": "LONG",
+      "micro_prob": 0.8,
+      "macro_prob": 0.3
+    },
+    {
+      "confidence": 0.5,
+      "prob_above": 0.5,
+      "prob_below": 0.5,
+      "direction": "NEUTRAL",
+      "micro_prob": 0.5,
+      "macro_prob": 0.5
+    },
+    {
+      "confidence": 0.9,
+      "prob_above": 1.0,
+      "prob_below": 0.0,
+      "direction": "LONG",
+      "micro_prob": 0.5,
+      "macro_prob": 0.5
+    },
+    {
+      "confidence": 0.5,
+      "prob_above": 0.5,
+      "prob_below": 0.5,
+      "direction": "NEUTRAL",
+      "micro_prob": 0.5,
+      "macro_prob": 0.5
+    },
+    {
+      "direction": "NEUTRAL",
+      "confidence": 0.5,
+      "prob_above": 0.5,
+      "prob_below": 0.5,
+      "micro_prob": 0.5,
+      "macro_prob": 0.5
+    }
+  ],
+  "compute_sma_signal_valid": {
+    "signal": "BUY",
+    "sma_fast": 44.5,
+    "sma_slow": 34.5,
+    "bias": 1.0
+  },
+  "_trade_side": [
+    "BUY",
+    "SELL",
+    "BUY",
+    "",
+    ""
+  ],
+  "_best_bid_ask": [
+    [
+      84100.0,
+      84200.0
+    ],
+    [
+      84100.0,
+      84200.0
+    ],
+    [
+      0.0,
+      0.0
+    ]
+  ],
+  "detect_liquidity_sweep": {
+    "sweep": true,
+    "side": "BUY",
+    "size_usd": 50400.0,
+    "trade": {
+      "price": 84000,
+      "amount": 0.6,
+      "side": "BUY"
+    },
+    "reason": "single_large_taker",
+    "buy_usd": 50400.0,
+    "sell_usd": 0.0
+  },
+  "liquidation_stream_processor": {
+    "long_liquidations": 300000.0,
+    "short_liquidations": 500000.0,
+    "total_liquidations": 800000.0,
+    "dominant_side": "short_liquidations",
+    "pressure": 0.25,
+    "events": [
+      {
+        "side": "BUY",
+        "usd": 500000
+      },
+      {
+        "side": "SELL",
+        "usd": 300000
+      }
+    ]
+  },
+  "_enforce_entry_fee_metadata": [
+    [
+      10.0,
+      "pct"
+    ],
+    [
+      10.0,
+      "quote"
+    ],
+    [
+      10.0,
+      "pct"
+    ],
+    [
+      10.0,
+      "pct"
+    ]
+  ],
+  "_clamp": [
+    5.0,
+    0.0,
+    10.0
+  ]
+}
