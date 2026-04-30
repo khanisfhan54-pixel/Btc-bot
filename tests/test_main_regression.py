@@ -34,7 +34,7 @@ def main_mod():
     _stub_module("backtest_engine", BacktestEngine=type("BacktestEngine", (), {}), BacktestConfig=type("BacktestConfig", (), {}))
     _stub_module("alpha_orchestrator", AlphaOrchestrator=lambda cfg: object(), OrchestratorConfig=lambda **k: object(), AlphaSignal=object, RegimeContext=object, FeatureQuality=object, ExecutionState=object)
     _stub_module("venue_basis", VenueBasisNormalizer=lambda halt_threshold_pct: type("VB", (), {"validate": lambda self, x: {"ok": True}})())
-    _stub_module("thread_safe_wrappers", ThreadSafeFeatureEngine=lambda e: type("W", (), {"_engine": e, "update": e.update})(), ThreadSafeAlphaPredictor=lambda x: x)
+    _stub_module("thread_safe_wrappers", ThreadSafeFeatureEngine=lambda e: type("W", (), {"_wrapped": e, "update": e.update})(), ThreadSafeAlphaPredictor=lambda x: x)
     _stub_module("trading_utils", safe_float=lambda v, default=0.0: float(v) if v not in (None, "") else default, clamp=lambda x,a,b:max(a,min(b,x)), validate_alpha=lambda x:x)
 
     return importlib.import_module("main")
@@ -65,3 +65,10 @@ class TestIssueD_ExecutorShutdown:
     def test_no_explicit_shutdown_in_main_block(self):
         text = Path("main.py").read_text()
         assert "_SHARED_FETCH_EXECUTOR.shutdown(wait=False, cancel_futures=True)" not in text.split('if __name__ == "__main__":',1)[1]
+
+
+class TestFeatureEngineWrapperContract:
+    def test_main_uses_wrapped_feature_engine_reference(self):
+        text = Path("main.py").read_text()
+        assert "feature_engine._engine" not in text
+        assert "feature_engine._wrapped" in text
