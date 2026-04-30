@@ -1234,8 +1234,22 @@ def detect_stop_hunt(orderbook: dict, trades: List[dict], recent_candles: Any = 
 
 def detect_smart_money_absorption(orderbook: dict, trades: List[dict]) -> Dict[str, Any]:
     try:
-        bids = (orderbook.get("bids") or [])[:10]
-        asks = (orderbook.get("asks") or [])[:10]
+        raw_bids = orderbook.get("bids") or []
+        raw_asks = orderbook.get("asks") or []
+        try:
+            bids = sorted(
+                [b for b in raw_bids if isinstance(b, (list, tuple)) and len(b) >= 2],
+                key=lambda x: _safe_float(x[0]),
+                reverse=True,
+            )[:10]
+            asks = sorted(
+                [a for a in raw_asks if isinstance(a, (list, tuple)) and len(a) >= 2],
+                key=lambda x: _safe_float(x[0]),
+                reverse=False,
+            )[:10]
+        except Exception:
+            bids = raw_bids[:10]
+            asks = raw_asks[:10]
         bids_vol = sum(_safe_float(b[1]) for b in bids)
         asks_vol = sum(_safe_float(a[1]) for a in asks)
         buy_usd = 0.0
@@ -1334,8 +1348,22 @@ def calculate_liquidity_score(
     recent_candles: Any = None,
 ) -> float:
     try:
-        bids = (orderbook.get("bids") or [])[:10]
-        asks = (orderbook.get("asks") or [])[:10]
+        raw_bids = orderbook.get("bids") or []
+        raw_asks = orderbook.get("asks") or []
+        try:
+            bids = sorted(
+                [b for b in raw_bids if isinstance(b, (list, tuple)) and len(b) >= 2],
+                key=lambda x: _safe_float(x[0]),
+                reverse=True,
+            )[:10]
+            asks = sorted(
+                [a for a in raw_asks if isinstance(a, (list, tuple)) and len(a) >= 2],
+                key=lambda x: _safe_float(x[0]),
+                reverse=False,
+            )[:10]
+        except Exception:
+            bids = raw_bids[:10]
+            asks = raw_asks[:10]
         bid_vol = sum(_safe_float(b[1]) for b in bids)
         ask_vol = sum(_safe_float(a[1]) for a in asks)
         total_depth = bid_vol + ask_vol
@@ -1371,8 +1399,22 @@ def get_market_data(
     orderbook_snapshots: Optional[List[dict]] = None,
 ) -> Dict[str, Any]:
     try:
-        bids = (orderbook.get("bids") or [])[:10]
-        asks = (orderbook.get("asks") or [])[:10]
+        raw_bids = orderbook.get("bids") or []
+        raw_asks = orderbook.get("asks") or []
+        try:
+            bids = sorted(
+                [b for b in raw_bids if isinstance(b, (list, tuple)) and len(b) >= 2],
+                key=lambda x: _safe_float(x[0]),
+                reverse=True,
+            )[:10]
+            asks = sorted(
+                [a for a in raw_asks if isinstance(a, (list, tuple)) and len(a) >= 2],
+                key=lambda x: _safe_float(x[0]),
+                reverse=False,
+            )[:10]
+        except Exception:
+            bids = raw_bids[:10]
+            asks = raw_asks[:10]
         bid_vol = sum(_safe_float(b[1]) for b in bids)
         ask_vol = sum(_safe_float(a[1]) for a in asks)
         total_vol = bid_vol + ask_vol
@@ -1442,7 +1484,15 @@ def smart_money_detection_engine(orderbook: dict, trades: List[dict], price: flo
         sweep = detect_liquidity_sweep(trades, price)
         z = []
         for side in ("bids", "asks"):
-            levels = (orderbook.get(side) or [])[:10]
+            raw_levels = orderbook.get(side) or []
+            try:
+                levels = sorted(
+                    [lvl for lvl in raw_levels if isinstance(lvl, (list, tuple)) and len(lvl) >= 2],
+                    key=lambda x: _safe_float(x[0]),
+                    reverse=(side == "bids"),
+                )[:10]
+            except Exception:
+                levels = raw_levels[:10]
             if levels:
                 sizes = [_safe_float(x[1]) for x in levels]
                 thresh = _mean(sizes, 0.0) + (statistics.pstdev(sizes) if len(sizes) > 2 else 0.0)
@@ -1468,7 +1518,15 @@ def smart_money_absorption_engine(orderbook: dict, trades: List[dict], price: fl
         res = detect_smart_money_absorption(orderbook, trades)
         zones = []
         for side in ("bids", "asks"):
-            levels = (orderbook.get(side) or [])[:10]
+            raw_levels = orderbook.get(side) or []
+            try:
+                levels = sorted(
+                    [lvl for lvl in raw_levels if isinstance(lvl, (list, tuple)) and len(lvl) >= 2],
+                    key=lambda x: _safe_float(x[0]),
+                    reverse=(side == "bids"),
+                )[:10]
+            except Exception:
+                levels = raw_levels[:10]
             if levels:
                 sizes = [_safe_float(x[1]) for x in levels]
                 thresh = _mean(sizes, 0.0) + (statistics.pstdev(sizes) if len(sizes) > 2 else 0.0)
@@ -3908,8 +3966,8 @@ def run_all_engines(
                     "trades_count": len(trades),
                     "curr_depth": bid_vol + ask_vol,
                     "atr": atr_for_alpha,
-                    "ema_fast": compute_sma([_safe_float(r[4]) for r in _to_rows(primary_1m)[-12:]], 9),
-                    "ema_slow": compute_sma([_safe_float(r[4]) for r in _to_rows(primary_1m)[-26:]], 21),
+                    "ema_fast": compute_sma([_safe_float(r[4]) for r in _to_rows(primary_1m)[-12:]], 9) or _safe_float(primary_1m[-1][4], price) if primary_1m else price,
+                    "ema_slow": compute_sma([_safe_float(r[4]) for r in _to_rows(primary_1m)[-26:]], 21) or _safe_float(primary_1m[-1][4], price) if primary_1m else price,
                     "macro_liquidity": liquidity_intent,
                     "macro_market_state": market_state,
                     "macro_volume_intel": vol_intel,
@@ -4368,6 +4426,10 @@ def run_all_engines(
                 "alignment_score": 0.0,
             },
             "funding_rate": 0.0,
+            "price": round(float(_safe_float(price, 0.0)), 8),
+            "market_data": {"price": round(float(_safe_float(price, 0.0)), 8), "allow_trade": False, "reason": "run_all_engines_error", "spoof_detected": False, "spoof_details": {"spoof": False, "evidence": [], "reliable": False, "reason": "fallback"}, "spread_pct": 0.0, "imbalance": 0.0},
+            "spread_pct": 0.0,
+            "imbalance": 0.0,
             "orderbook_imbalance": 0.0,
             "orderflow": {"delta": 0.0, "absorption": False, "aggression": "buy", "strength": 0.0},
             "fvg": {"exists": False, "filled": False, "entry_zone": (None, None), "strength": 0.0, "direction": None},
@@ -4410,6 +4472,7 @@ def run_all_engines(
             },
             "alpha": _default_alpha(),
         }
+        return _fallback
 
 
 class MarketStateDetector:
@@ -5846,13 +5909,14 @@ def _build_run_all_engines_cache_key(
 ) -> tuple:
     local_orderbook = orderbook or {}
     norm_price = _safe_float(price, 0.0)
-    best_bid = _safe_float((local_orderbook.get("bids") or [[norm_price]])[0][0], norm_price)
-    best_ask = _safe_float((local_orderbook.get("asks") or [[norm_price]])[0][0], norm_price)
+    orderbook_fp = _fingerprint_for_cache({
+        "bids": (local_orderbook.get("bids") or [])[:20],
+        "asks": (local_orderbook.get("asks") or [])[:20],
+    })
     return (
         str(symbol or ""),
         round(norm_price, 8),
-        round(best_bid, 8),
-        round(best_ask, 8),
+        orderbook_fp,
         _fingerprint_for_cache(recent_candles),
         _fingerprint_for_cache(trades or []),
         round(_safe_float(open_interest, 0.0), 8),
