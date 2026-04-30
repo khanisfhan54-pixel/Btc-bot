@@ -353,7 +353,7 @@ try:
     engine = ExecutionEngine()
     _bootstrap_stage = "ThreadSafeFeatureEngine"
     feature_engine = ThreadSafeFeatureEngine(FeatureEngine())
-    if getattr(feature_engine._engine, "_FEATURE_ENGINE_IS_FALLBACK", False):
+    if getattr(feature_engine._wrapped, "_FEATURE_ENGINE_IS_FALLBACK", False):
         _boot_msg = (
             f"[BOOT][DEGRADED] FeatureEngine is running in FALLBACK MODE.\n"
             f"timestamp={datetime.now(timezone.utc).isoformat()}\n"
@@ -2130,7 +2130,7 @@ def run_analysis_cycle(
 
     # Normalize to a single raw feature dict for all downstream modules
     feat_dict: Dict[str, Any] = features.get("features", features) if isinstance(features, dict) else {}
-    if getattr(getattr(feature_engine, "_engine", None), "_FEATURE_ENGINE_IS_FALLBACK", False):
+    if getattr(getattr(feature_engine, "_wrapped", None), "_FEATURE_ENGINE_IS_FALLBACK", False):
         logger.warning("[CYCLE] FeatureEngine is in FALLBACK MODE — feature quality is non-production this cycle")
     if getattr(signal_engine, "_SIGNAL_ENGINE_IS_FALLBACK", False):
         logger.warning("[CYCLE] SignalEngine is in FALLBACK MODE — all signals will be HOLD this cycle")
@@ -3143,7 +3143,7 @@ def run_live() -> None:
         f"SIGNAL_ONLY_MODE={SIGNAL_ONLY_MODE}\n"
         f"_ENGINE_IMPORT_SUCCEEDED={_ENGINE_IMPORT_SUCCEEDED}\n"
         f"_EXECUTION_IMPORT_SUCCEEDED={_EXECUTION_IMPORT_SUCCEEDED}\n"
-        f"feature_engine_fallback={getattr(getattr(feature_engine, '_engine', None), '_FEATURE_ENGINE_IS_FALLBACK', False)}\n"
+        f"feature_engine_fallback={getattr(getattr(feature_engine, '_wrapped', None), '_FEATURE_ENGINE_IS_FALLBACK', False)}\n"
         f"signal_engine_fallback={getattr(signal_engine, '_SIGNAL_ENGINE_IS_FALLBACK', False)}"
     )
     logger.info(_boot_summary)
