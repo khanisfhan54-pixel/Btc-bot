@@ -45,6 +45,18 @@ _ALPHA_STATE_LOCK = threading.Lock()
 _LIQUIDITY_UPDATE_LOCK = threading.RLock()
 _BACKTEST_CACHE_LOCK = threading.RLock()
 _SMC_CACHE_LOCK = threading.RLock()
+_META_FILTER_INIT_LOCK = threading.Lock()
+
+
+def reset_alpha_state(symbol: Optional[str] = None) -> None:
+    # FIX-10 (AUDIT): provide explicit alpha state lifecycle reset for backtest determinism
+    with ordered_lock(_ALPHA_STATE_LOCK, "_ALPHA_STATE_LOCK"):
+        if symbol is not None:
+            _ALPHA_STATE.pop(symbol.replace("/", "").upper(), None)
+            logger.info("[ALPHA_STATE] Reset for symbol %s", symbol)
+        else:
+            _ALPHA_STATE.clear()
+            logger.info("[ALPHA_STATE] Full reset performed (backtest boundary)")
 
 
 def _debug_import_integrity() -> None:
@@ -71,21 +83,34 @@ try:
 
     _META_FILTER_CLS = _MetaFilter
 except Exception as _meta_import_exc:
-    pass
+    # FIX-1 (AUDIT): surface optional meta_filter import failure instead of silent swallow
+    try:
+        logger.warning(
+            "[META_FILTER] Import failed — MetaFilter unavailable. Trades will be fail-closed until resolved. Reason: %s",
+            _meta_import_exc,
+        )
+    except Exception:
+        pass
 
 META_FILTER = None
 
 
 def _get_meta_filter() -> Any:
     global META_FILTER
+    # FIX-2 (AUDIT): protect lazy singleton initialization with double-checked locking
     if META_FILTER is not None:
         return META_FILTER
     if _META_FILTER_CLS is None:
         return None
-    try:
-        META_FILTER = _META_FILTER_CLS(learning_engine=globals().get("LEARNING_ENGINE"))
-    except Exception:
-        META_FILTER = None
+    with _META_FILTER_INIT_LOCK:
+        if META_FILTER is not None:
+            return META_FILTER
+        try:
+            META_FILTER = _META_FILTER_CLS(learning_engine=globals().get("LEARNING_ENGINE"))
+            logger.info("[META_FILTER] Singleton initialized successfully.")
+        except Exception as exc:
+            META_FILTER = None
+            logger.error("[META_FILTER] Initialization failed: %s", exc)
     return META_FILTER
 
 
@@ -152,7 +177,24 @@ def apply_meta_to_decision(
         decision["meta_result"] = meta_result
         return decision
 
-    risk_scale = float(meta_result.get("risk_scale", 1.0))
+    # FIX-3 (AUDIT): clamp unbounded/invalid risk_scale from meta filter
+    try:
+        raw_risk_scale = float(meta_result.get("risk_scale", 1.0))
+    except Exception:
+        logger.warning(
+            "[META] Invalid risk_scale=%r received; clamping to 0.0",
+            meta_result.get("risk_scale", 1.0),
+        )
+        raw_risk_scale = 0.0
+    if not math.isfinite(raw_risk_scale):
+        logger.warning("[META] Non-finite risk_scale=%.6g received; clamping to 0.0", raw_risk_scale)
+        raw_risk_scale = 0.0
+    if raw_risk_scale < 0.0 or raw_risk_scale > 1.0:
+        logger.warning(
+            "[META] risk_scale=%.6g out of [0.0, 1.0]; clamping. Upstream meta_filter is violating contract.",
+            raw_risk_scale,
+        )
+    risk_scale = max(0.0, min(1.0, raw_risk_scale))
     if "position_size" in decision and decision["position_size"] is not None:
         try:
             decision["position_size"] = max(0.0, float(decision["position_size"]) * risk_scale)
@@ -185,9 +227,16 @@ def _enforce_entry_fee_metadata(fees, fee_type, trade_id=None):
 
 def _clamp(value: Any, low: float, high: float) -> float:
     try:
-        return max(low, min(high, float(value)))
+        v = float(value)
+        if not math.isfinite(v):
+            raise ValueError("non-finite")
+        return max(low, min(high, v))
     except Exception:
-        return low
+        logger.warning("_clamp received invalid value=%r; using neutral bounded fallback", value)
+        neutral = 0.0
+        if low <= neutral <= high:
+            return neutral
+        return float(low)
 
 
 def _default_alpha() -> Dict[str, Any]:
@@ -233,6 +282,15 @@ def _validate_alpha(alpha: Dict[str, Any]) -> Dict[str, Any]:
         if direction not in ("LONG", "SHORT", "NEUTRAL"):
             direction = "NEUTRAL"
             adjusted = True
+        # FIX-4 (AUDIT): sanitize micro_prob/macro_prob that previously bypassed validation
+        micro_p = float(alpha.get("micro_prob", 0.5))
+        macro_p = float(alpha.get("macro_prob", 0.5))
+        if not math.isfinite(micro_p) or not (0.0 <= micro_p <= 1.0):
+            micro_p = 0.5
+            adjusted = True
+        if not math.isfinite(macro_p) or not (0.0 <= macro_p <= 1.0):
+            macro_p = 0.5
+            adjusted = True
 
         validated = {
             **alpha,
@@ -240,6 +298,8 @@ def _validate_alpha(alpha: Dict[str, Any]) -> Dict[str, Any]:
             "prob_above": max(0.0, min(1.0, p_up)),
             "prob_below": max(0.0, min(1.0, p_dn)),
             "direction": direction,
+            "micro_prob": max(0.0, min(1.0, micro_p)),
+            "macro_prob": max(0.0, min(1.0, macro_p)),
         }
         if adjusted:
             logger.warning("Alpha validation adjusted: %s", alpha)
@@ -283,7 +343,24 @@ def compute_sma(values: Any, period: int = 14) -> float | None:
 
 
 def compute_sma_signal(values: Any, fast: int = 10, slow: int = 30) -> Dict[str, Any]:
+    # FIX-5 (AUDIT): keep orchestration fail-closed by returning NEUTRAL instead of raising
     try:
+        fast = int(fast)
+        slow = int(slow)
+        if fast <= 0 or slow <= 0:
+            logger.warning(
+                "compute_sma_signal invalid periods: fast=%s slow=%s; returning NEUTRAL",
+                fast,
+                slow,
+            )
+            return {"signal": "NEUTRAL", "sma_fast": 0.0, "sma_slow": 0.0, "bias": 0.0}
+        if fast >= slow:
+            logger.warning(
+                "compute_sma_signal invalid ordering: fast=%s slow=%s; returning NEUTRAL",
+                fast,
+                slow,
+            )
+            return {"signal": "NEUTRAL", "sma_fast": 0.0, "sma_slow": 0.0, "bias": 0.0}
         vals = [float(v) for v in (values or []) if v is not None]
         if len(vals) < 2:
             return {"signal": "NEUTRAL", "sma_fast": 0.0, "sma_slow": 0.0, "bias": 0.0}
@@ -352,9 +429,27 @@ def _wick_ratio(candle: list) -> float:
     return max(0.0, 1.0 - _body_ratio(candle))
 
 
+_SIDE_NORMALIZE_MAP = {
+    "BUY": "BUY", "B": "BUY", "1": "BUY", "LONG": "BUY", "BID": "BUY",
+    "SELL": "SELL", "S": "SELL", "-1": "SELL", "SHORT": "SELL", "ASK": "SELL",
+}
+_trade_side_unknown_count = 0
+_trade_side_unknown_lock = threading.Lock()
 def _trade_side(t: dict) -> str:
-    side = t.get("side") or t.get("S") or t.get("takerSide") or ""
-    return str(side).upper()
+    # FIX-6 (AUDIT): normalize feed variants and warn on unknown schema/values
+    global _trade_side_unknown_count
+    raw = t.get("side") or t.get("S") or t.get("takerSide") or ""
+    normalized = _SIDE_NORMALIZE_MAP.get(str(raw).upper().strip(), "")
+    if not normalized:
+        with _trade_side_unknown_lock:
+            _trade_side_unknown_count += 1
+            count = _trade_side_unknown_count
+        if count == 1 or count % 100 == 0:
+            logger.warning(
+                "[TRADE_SIDE] Unrecognized trade side value %r — buy/sell classification will be wrong for this trade. Check upstream feed schema. (occurrence #%d)",
+                raw, count,
+            )
+    return normalized
 
 
 def _trade_price(t: dict, fallback: float = 0.0) -> float:
@@ -370,17 +465,43 @@ def _trade_usd(t: dict, fallback_price: float = 0.0) -> float:
 
 
 def _best_bid_ask(orderbook: dict) -> Tuple[float, float]:
+    # FIX-7 (AUDIT): sort orderbook levels to avoid incorrect best bid/ask on unsorted feeds
     bids = orderbook.get("bids") or []
     asks = orderbook.get("asks") or []
-    bid = _safe_float(bids[0][0]) if bids else 0.0
-    ask = _safe_float(asks[0][0]) if asks else 0.0
+    try:
+        sorted_bids = sorted(bids, key=lambda x: _safe_float(x[0]), reverse=True)
+        sorted_asks = sorted(asks, key=lambda x: _safe_float(x[0]), reverse=False)
+    except Exception:
+        sorted_bids = bids
+        sorted_asks = asks
+    bid = _safe_float(sorted_bids[0][0]) if sorted_bids else 0.0
+    ask = _safe_float(sorted_asks[0][0]) if sorted_asks else 0.0
     return bid, ask
 
 
 def _book_volumes(orderbook: dict, depth: int = 20) -> Tuple[float, float]:
-    bids = orderbook.get("bids") or []
-    asks = orderbook.get("asks") or []
-    return sum(_safe_float(b[1]) for b in bids[:depth]), sum(_safe_float(a[1]) for a in asks[:depth])
+    bids = orderbook.get("bids") if isinstance(orderbook, dict) else []
+    asks = orderbook.get("asks") if isinstance(orderbook, dict) else []
+    bids = bids if isinstance(bids, list) else []
+    asks = asks if isinstance(asks, list) else []
+    try:
+        sorted_bids = sorted(
+            [b for b in bids if isinstance(b, (list, tuple)) and len(b) >= 2],
+            key=lambda x: _safe_float(x[0]),
+            reverse=True,
+        )
+        sorted_asks = sorted(
+            [a for a in asks if isinstance(a, (list, tuple)) and len(a) >= 2],
+            key=lambda x: _safe_float(x[0]),
+            reverse=False,
+        )
+    except Exception:
+        sorted_bids = []
+        sorted_asks = []
+    return (
+        sum(_safe_float(b[1]) for b in sorted_bids[:depth]),
+        sum(_safe_float(a[1]) for a in sorted_asks[:depth]),
+    )
 
 
 def _ohlcv_to_closes(recent_candles: Any) -> List[float]:
@@ -440,7 +561,11 @@ def _spread_pct(orderbook: dict, price: float) -> float:
         if bid <= 0 or ask <= 0:
             return 0.0
         mid = (bid + ask) / 2.0
-        return max(0.0, (ask - bid) / max(mid, 1e-9))
+        px = _safe_float(price, mid)
+        if not math.isfinite(px) or px <= 0.0:
+            px = mid
+        anchor = max(mid, px, 1e-9)
+        return max(0.0, (ask - bid) / anchor)
     except Exception:
         return 0.0
 
@@ -727,8 +852,12 @@ def analyze_volume_intelligence(
 
 def order_flow_pressure_engine(orderbook: dict, trades: List[dict], price: float) -> Dict[str, Any]:
     try:
+        px = _safe_float(price, 0.0)
+        if not math.isfinite(px) or px <= 0.0:
+            px = 0.0
         bid_vol, ask_vol = _book_volumes(orderbook, depth=10)
-        buy_usd, sell_usd = _volume_side(trades)
+        buy_usd = sum(_trade_usd(t, px) for t in (trades or []) if _trade_side(t) == "BUY")
+        sell_usd = sum(_trade_usd(t, px) for t in (trades or []) if _trade_side(t) == "SELL")
         total_flow = buy_usd + sell_usd + 1e-9
         trade_delta = (buy_usd - sell_usd) / total_flow
         book_delta = (bid_vol - ask_vol) / (bid_vol + ask_vol + 1e-9)
@@ -782,6 +911,7 @@ def detect_liquidity_sweep(
     threshold_usd: float = 0.0,
     atr_value: Optional[float] = None,
     lookback: int = 40,
+    min_threshold_usd: float = 10_000.0,
 ) -> Dict[str, Any]:
     try:
         px = _safe_float(price, 0.0)
@@ -798,11 +928,8 @@ def detect_liquidity_sweep(
         atr_val = _safe_float(atr_value, 0.0)
         if atr_val <= 0.0 or not math.isfinite(atr_val):
             atr_val = max(px * 0.001, 1e-8)
-        dynamic_threshold_usd = max(
-            _safe_float(threshold_usd, 0.0),
-            px * 0.25,
-            atr_val * 400.0,
-        )
+        # FIX-9 (AUDIT): remove BTC-specific px*0.25 floor in favor of ATR + static floor
+        dynamic_threshold_usd = max(_safe_float(threshold_usd, 0.0), atr_val * 400.0, min_threshold_usd)
         recent = (trades or [])[-lookback:]
         if not recent:
             return {
@@ -900,7 +1027,18 @@ def track_liquidations(trades: List[dict], price: float, lookback: int = 100) ->
         return {"buy_liq": 0.0, "sell_liq": 0.0, "total_liq": 0.0, "spikes": []}
 
 
-def liquidation_stream_processor(liquidation_events: List[dict]) -> Dict[str, Any]:
+_LIQ_SIDE_CONVENTION_LOGGED = False
+_LIQ_SIDE_CONVENTION_LOCK = threading.Lock()
+def liquidation_stream_processor(liquidation_events: List[dict], side_convention: str = "BINANCE_PERP") -> Dict[str, Any]:
+    # FIX-8 (AUDIT): make liquidation side semantics explicit and configurable
+    global _LIQ_SIDE_CONVENTION_LOGGED
+    with _LIQ_SIDE_CONVENTION_LOCK:
+        if not _LIQ_SIDE_CONVENTION_LOGGED:
+            logger.warning(
+                "[LIQUIDATION] Using side convention '%s'. Verify this matches your upstream feed. Pass side_convention='DIRECT' to invert.",
+                side_convention,
+            )
+            _LIQ_SIDE_CONVENTION_LOGGED = True
     try:
         long_liq = 0.0
         short_liq = 0.0
@@ -908,10 +1046,16 @@ def liquidation_stream_processor(liquidation_events: List[dict]) -> Dict[str, An
         for e in liquidation_events or []:
             side = str(e.get("side", "")).upper()
             usd = _safe_float(e.get("usd", e.get("size_usd", 0.0)))
-            if side == "BUY":
-                short_liq += usd
-            elif side == "SELL":
-                long_liq += usd
+            if str(side_convention).upper() == "BINANCE_PERP":
+                if side == "BUY":
+                    short_liq += usd
+                elif side == "SELL":
+                    long_liq += usd
+            else:
+                if side == "BUY":
+                    long_liq += usd
+                elif side == "SELL":
+                    short_liq += usd
             events.append(e)
         total = long_liq + short_liq
         dominant = "neutral"
@@ -992,7 +1136,7 @@ def get_cascade_probability(
         return 0.0
 
 
-def funding_trap_detector(funding_rate: float, price: float, cascade_prob: float) -> Dict[str, Any]:
+def funding_trap_detector(funding_rate: float, cascade_prob: float) -> Dict[str, Any]:
     try:
         fr = _safe_float(funding_rate)
         trap = abs(fr) > 0.02 and _safe_float(cascade_prob) > 0.4
@@ -3459,7 +3603,10 @@ def run_all_engines(
     oi_history: Optional[List[float]] = None,
     current_oi: Optional[float] = None,
     market_state_detector: Optional[Any] = None,
+    reset_state_on_entry: bool = False,
 ) -> Dict[str, Any]:
+    if reset_state_on_entry:
+        reset_alpha_state()
     if not getattr(run_all_engines, "_import_checked", False):
         _debug_import_integrity()
         run_all_engines._import_checked = True
@@ -4050,7 +4197,7 @@ def run_all_engines(
             "stop_hunt": stop_hunt,
             "trap": trap,
             "absorption": absorption,
-            "funding_trap": funding_trap_detector(fr, price, cprob),
+            "funding_trap": funding_trap_detector(fr, cprob),
             "spoof": spoof,
             "market_data": market_data,
             "liquidity_score": market_data.get("liquidity_score", 0.0),
@@ -5768,6 +5915,7 @@ __all__ = [
     "BinanceRestData",
     "TelegramAlertSystem",
     "run_all_engines",
+    "reset_alpha_state",
     "get_shared_alpha_predictor",
     "_freeze_for_cache",
     "_build_run_all_engines_cache_key",
