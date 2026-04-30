@@ -69,6 +69,41 @@ _reconciliation_blocks: Dict[str, float] = {}
 _ORDERBOOK_SNAPSHOTS: Deque[Dict[str, Any]] = deque(maxlen=8)
 _ORDERBOOK_SNAPSHOTS_LOCK = threading.RLock()
 
+_COLD_START_LOCK = threading.Lock()
+_RECONCILIATION_LOCK = threading.Lock()
+_SHARED_FETCH_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="market-fetch")
+
+_RETRYABLE_EXCHANGE_ERRORS = (Exception,)
+
+def _retry_exchange_call(func, *args, max_retries: int = 3, base_delay: float = 0.5, call_name: str = "exchange_call", **kwargs):
+    last_exc = None
+    for attempt in range(max_retries + 1):
+        try:
+            return func(*args, **kwargs)
+        except _RETRYABLE_EXCHANGE_ERRORS as exc:
+            last_exc = exc
+            if attempt >= max_retries:
+                break
+            delay = min(base_delay * (2 ** attempt), 8.0)
+            logger.warning("[RETRY] %s failed attempt=%d/%d sleeping=%.2fs err=%s", call_name, attempt + 1, max_retries + 1, delay, exc)
+            time.sleep(delay)
+    raise RuntimeError(f"{call_name} failed after {max_retries + 1} attempts: {last_exc}")
+
+def _fetch_market_snapshot(data_exchange, data_symbol: str, execution_exchange, execution_symbol: str = SYMBOL) -> Dict[str, Any]:
+    ts = time.time()
+    candles_by_tf = _fetch_multi_tf(data_exchange, data_symbol)
+    analysis_orderbook = _retry_exchange_call(fetch_orderbook, data_exchange, data_symbol, call_name="analysis_orderbook")
+    execution_orderbook = _retry_exchange_call(fetch_orderbook, execution_exchange, execution_symbol, call_name="execution_orderbook")
+    trades = _retry_exchange_call(fetch_recent_trades, data_exchange, data_symbol, call_name="recent_trades")
+    return {
+        "snapshot_ts": ts,
+        "candles_by_tf": candles_by_tf,
+        "analysis_orderbook": analysis_orderbook,
+        "execution_orderbook": execution_orderbook,
+        "trades": trades,
+    }
+
+
 try:
     from feature_engine import FeatureEngine
 except Exception as _fe_import_err:
@@ -956,26 +991,25 @@ def send_telegram(message: str) -> None:
 
 
 def fetch_ohlcv(exchange, symbol=SYMBOL, timeframe="1h", limit=200):
-    return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    return _retry_exchange_call(exchange.fetch_ohlcv, symbol, timeframe=timeframe, limit=limit, call_name=f"fetch_ohlcv[{timeframe}]")
 
 
 def fetch_orderbook(exchange, symbol=SYMBOL, limit=50):
-    return exchange.fetch_order_book(symbol, limit=limit)
+    return _retry_exchange_call(exchange.fetch_order_book, symbol, limit=limit, call_name="fetch_orderbook")
 
 
 def fetch_recent_trades(exchange, symbol=SYMBOL, limit=200):
-    return exchange.fetch_trades(symbol, limit=limit)
+    return _retry_exchange_call(exchange.fetch_trades, symbol, limit=limit, call_name="fetch_recent_trades")
 
 
 def _fetch_multi_tf(exchange, symbol: str = SYMBOL) -> Dict[str, list]:
     out: Dict[str, list] = {"1m": [], "5m": [], "15m": [], "1h": []}
     # ccxt enableRateLimit=True is shared across concurrent calls on same exchange instance.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {
-            tf: executor.submit(fetch_ohlcv, exchange, symbol, tf, 240)
-            for tf in ("1m", "5m", "15m", "1h")
-        }
-        for tf, fut in futures.items():
+    futures = {
+        tf: _SHARED_FETCH_EXECUTOR.submit(fetch_ohlcv, exchange, symbol, tf, 240)
+        for tf in ("1m", "5m", "15m", "1h")
+    }
+    for tf, fut in futures.items():
             try:
                 out[tf] = fut.result(timeout=FETCH_TIMEOUT_SECONDS)
             except Exception as exc:
@@ -989,10 +1023,11 @@ def _fetch_multi_tf(exchange, symbol: str = SYMBOL) -> Dict[str, list]:
 def _prune_reconciliation_blocks() -> None:
     now = time.time()
     removed = 0
-    for sym, expiry in list(_reconciliation_blocks.items()):
-        if float(expiry) <= now:
-            _reconciliation_blocks.pop(sym, None)
-            removed += 1
+    with _RECONCILIATION_LOCK:
+        for sym, expiry in list(_reconciliation_blocks.items()):
+            if float(expiry) <= now:
+                _reconciliation_blocks.pop(sym, None)
+                removed += 1
     logger.debug("[RECONCILIATION] pruned %d expired block(s)", removed)
 
 
@@ -1760,30 +1795,21 @@ def run_analysis_cycle(
     _validate_exchange_symbol_format(_dex, _dsym)
     _validate_exchange_symbol_format(exchange, SYMBOL)
     try:
-        candles_by_tf = _fetch_multi_tf(_dex, _dsym)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            try:
-                analysis_orderbook = ex.submit(fetch_orderbook, _dex, _dsym).result(timeout=FETCH_TIMEOUT_SECONDS)
-            except Exception:
-                logger.error("[FETCH] %s timed out after %.0fs", "analysis_orderbook", FETCH_TIMEOUT_SECONDS, exc_info=True)
-                analysis_orderbook = {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            try:
-                execution_orderbook = ex.submit(fetch_orderbook, exchange, SYMBOL).result(timeout=FETCH_TIMEOUT_SECONDS)
-            except Exception:
-                logger.error("[FETCH] %s timed out after %.0fs", "execution_orderbook", FETCH_TIMEOUT_SECONDS, exc_info=True)
-                execution_orderbook = {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            try:
-                trades = ex.submit(fetch_recent_trades, _dex, _dsym).result(timeout=FETCH_TIMEOUT_SECONDS)
-            except Exception:
-                logger.error("[FETCH] %s timed out after %.0fs", "fetch_recent_trades", FETCH_TIMEOUT_SECONDS, exc_info=True)
-                trades = []
+        snapshot = _fetch_market_snapshot(_dex, _dsym, exchange, SYMBOL)
+        candles_by_tf = snapshot["candles_by_tf"]
+        analysis_orderbook = snapshot["analysis_orderbook"]
+        execution_orderbook = snapshot["execution_orderbook"]
+        trades = snapshot["trades"]
+        snapshot_ts = float(snapshot["snapshot_ts"])
+        if not (candles_by_tf and isinstance(analysis_orderbook, dict) and isinstance(execution_orderbook, dict) and isinstance(trades, list)):
+            logger.warning("[SNAPSHOT] inconsistent payload types; skipping cycle")
+            return {"signal_output": {"signal": "HOLD", "confidence": 0.0, "reason": "snapshot_inconsistent"}}
     except Exception as exc:
         logger.error("Data fetch error: %s", exc)
         return {}
 
     SIGNAL_STATE["cycle"] += 1
+    _prune_reconciliation_blocks()
 
     primary_1m = candles_by_tf.get("1m", [])
     primary_15m = candles_by_tf.get("15m", [])
@@ -1835,7 +1861,7 @@ def run_analysis_cycle(
     )
 
     liq_events = liq_monitor.get_events() if liq_monitor else []
-    _append_orderbook_snapshot(analysis_orderbook, timestamp=time.time())
+    _append_orderbook_snapshot(analysis_orderbook, timestamp=snapshot_ts)
     snapshot_history = _get_orderbook_snapshot_history()
     if len(snapshot_history) < 3:
         logger.info(
@@ -1953,9 +1979,10 @@ def run_analysis_cycle(
             "timestamp": time.time(),
         }
         features = feature_engine.update(snapshot, trades, regime_context=regime_context)
-        if features is not None and not _cold_start_complete:
-            _cold_start_complete = True
-            logger.info("[BOOT] Cold start complete — feature engine warmed up")
+        with _COLD_START_LOCK:
+            if features is not None and not _cold_start_complete:
+                _cold_start_complete = True
+                logger.info("[BOOT] Cold start complete — feature engine warmed up")
         with _ANALYSIS_STATE_LOCK:
             _last_valid_features = dict(features)
             _last_valid_features_ts = time.time()
@@ -1991,7 +2018,9 @@ def run_analysis_cycle(
             last_valid_features_ts = _last_valid_features_ts
         feature_staleness = time.time() - last_valid_features_ts
         if last_valid_features is None or feature_staleness > MAX_FEATURE_STALENESS_SECONDS:
-            if not _cold_start_complete:
+            with _COLD_START_LOCK:
+                cold_start_complete = _cold_start_complete
+            if not cold_start_complete:
                 logger.warning("[BOOT] Cold start feature engine failure on tick 1 — no warm-up data available. Returning HOLD.")
             else:
                 logger.warning("[FEATURE] No valid features available (staleness=%.1fs, limit=%.1fs) — skipping signal generation", feature_staleness, MAX_FEATURE_STALENESS_SECONDS)
@@ -3021,37 +3050,46 @@ def run_live() -> None:
     interval = int(os.environ.get("POLL_INTERVAL_SECONDS", "60"))
     _consecutive_errors = 0
 
-    while not _shutdown_requested.is_set():
-        try:
-            run_analysis_cycle(exchange, liq_monitor, data_exchange, data_symbol)
-            _consecutive_errors = 0
-            logger.info("Cycle complete. Next poll in %ds …", interval)
-        except KeyboardInterrupt:
-            logger.info("Interrupted. Exiting.")
-            _shutdown_requested.set()
-            break
-        except Exception as exc:
-            logger.error("Cycle error: %s", exc, exc_info=True)
-            _consecutive_errors += 1
-            if _consecutive_errors >= MAX_CONSECUTIVE_CYCLE_ERRORS:
-                msg = f"[CIRCUIT BREAKER] {_consecutive_errors} consecutive cycle failures. Pausing for {CIRCUIT_BREAKER_SLEEP_SECONDS}s before retry. Last error: {exc}"
-                logger.critical(msg)
-                try:
-                    send_telegram_message(msg)
-                except Exception:
-                    logger.error("[CIRCUIT BREAKER] Telegram send failed", exc_info=True)
-                time.sleep(CIRCUIT_BREAKER_SLEEP_SECONDS)
+    try:
+        while not _shutdown_requested.is_set():
+            try:
+                run_analysis_cycle(exchange, liq_monitor, data_exchange, data_symbol)
                 _consecutive_errors = 0
-        time.sleep(interval)
-    if position_manager.has_position():
-        msg = f"[SHUTDOWN] Open position detected at shutdown. LIVE_TRADING={LIVE_TRADING}. Manual review required."
-        logger.critical(msg)
+                logger.info("Cycle complete. Next poll in %ds …", interval)
+            except KeyboardInterrupt:
+                logger.info("Interrupted. Exiting.")
+                _shutdown_requested.set()
+                break
+            except Exception as exc:
+                logger.error("Cycle error: %s", exc, exc_info=True)
+                _consecutive_errors += 1
+                if _consecutive_errors >= MAX_CONSECUTIVE_CYCLE_ERRORS:
+                    msg = f"[CIRCUIT BREAKER] {_consecutive_errors} consecutive cycle failures. Pausing for {CIRCUIT_BREAKER_SLEEP_SECONDS}s before retry. Last error: {exc}"
+                    logger.critical(msg)
+                    try:
+                        send_telegram_message(msg)
+                    except Exception:
+                        logger.error("[CIRCUIT BREAKER] Telegram send failed", exc_info=True)
+                    time.sleep(CIRCUIT_BREAKER_SLEEP_SECONDS)
+                    _consecutive_errors = 0
+            time.sleep(interval)
+    except Exception as fatal_exc:
+        logger.critical("[FATAL] run_live crashed: %s", fatal_exc, exc_info=True)
         try:
-            send_telegram_message(msg)
+            send_telegram_message(f"[FATAL] run_live crashed: {fatal_exc}")
         except Exception:
-            logger.error("[SHUTDOWN] Telegram send failed for open position warning", exc_info=True)
-    logger.info("[SHUTDOWN] Shutdown sequence complete")
-    liq_monitor.stop()
+            logger.error("[FATAL] telegram alert failed", exc_info=True)
+        _shutdown_requested.set()
+    finally:
+        if position_manager.has_position():
+            msg = f"[SHUTDOWN] Open position detected at shutdown. LIVE_TRADING={LIVE_TRADING}. Manual review required."
+            logger.critical(msg)
+            try:
+                send_telegram_message(msg)
+            except Exception:
+                logger.error("[SHUTDOWN] Telegram send failed for open position warning", exc_info=True)
+        logger.info("[SHUTDOWN] Shutdown sequence complete")
+        liq_monitor.stop()
 
 
 def _compute_sharpe(returns: List[float]) -> float:
@@ -3216,4 +3254,4 @@ if __name__ == "__main__":
         run_backtest()
     else:
         run_live()
-    _prune_reconciliation_blocks()
+    _SHARED_FETCH_EXECUTOR.shutdown(wait=False, cancel_futures=True)
