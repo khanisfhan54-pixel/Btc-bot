@@ -22,7 +22,8 @@ def test_pnl_baseline_anchoring():
 
     mismatch_tick = _valid_market_data(price=110.0, ret=0.0, ts=2.0)
     out1 = eng.update(mismatch_tick)
-    assert out1["risk_metrics"]["feed_status"] == "PRICE_RETURN_MISMATCH"
+    assert out1["risk_metrics"]["feed_status"]["primary"] == "OK"
+    assert "PNL_TIMESTAMP_POLICY_BLOCKED" in out1["risk_metrics"]["feed_status"]["flags"]
     assert eng._last_price == 110.0
     assert eng._last_price_timestamp == 2.0
 
