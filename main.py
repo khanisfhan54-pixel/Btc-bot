@@ -3370,8 +3370,17 @@ def run_backtest(
             logger.error("Backtest fetch error: %s", exc)
             return {}
 
-    bt = BacktestEngine(config=BacktestConfig(initial_balance=capital), learning_engine=LEARNING_ENGINE)
-    result = bt.run_backtest(ohlcv_all, initial_balance=capital)
+    bt = BacktestEngine(
+        config=BacktestConfig(initial_balance=capital),
+        learning_engine=LEARNING_ENGINE,
+        signal_only=SIGNAL_PIPELINE_CONFIG.get("signal_only_mode", SIGNAL_ONLY_MODE),
+    )
+    result = bt.run_backtest(
+        ohlcv_all,
+        initial_balance=capital,
+        signal_quality_required=True,
+        allow_ohlcv_synthetic=False,
+    )
     summary = {
         "symbol": symbol,
         "timeframe": timeframe,
@@ -3384,6 +3393,17 @@ def run_backtest(
         "max_drawdown_pct": round(_safe_float(result.get("max_drawdown", 0.0)) * 100.0, 4),
         "sharpe_ratio": round(_safe_float(result.get("sharpe", 0.0)), 4),
         "trades": result.get("trade_log", []),
+        "signal_coverage": _safe_float(result.get("signal_coverage", 0.0)),
+        "long_signals": int(result.get("long_signals", 0)),
+        "short_signals": int(result.get("short_signals", 0)),
+        "hold_signals": int(result.get("hold_signals", 0)),
+        "avg_return_per_trade": _safe_float(result.get("avg_return_per_trade", 0.0)),
+        "avg_holding_bars": _safe_float(result.get("avg_holding_bars", 0.0)),
+        "alpha_non_empty_count": int(result.get("alpha_non_empty_count", 0)),
+        "regime_state": result.get("regime_state", "unknown"),
+        "signal_quality_valid": bool(result.get("signal_quality_valid", False)),
+        "signal_quality_reason": result.get("signal_quality_reason", ""),
+        "signal_only_mode": bool(result.get("signal_only_mode", True)),
     }
     with open(BACKTEST_RESULT_PATH, "w") as f:
         json.dump(summary, f, indent=2)
