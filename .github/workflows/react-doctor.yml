@@ -1,4 +1,4 @@
-name: React Doctor Full Scan
+name: React Doctor + Tests
 
 on:
   push:
@@ -7,20 +7,36 @@ on:
     branches: ["**"]
 
 jobs:
-  react-doctor:
+  react-doctor-and-tests:
     runs-on: ubuntu-latest
 
     steps:
-      # 📥 Checkout your repo
+      # 📥 1. Checkout repo
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 🟢 Use Node.js 20 (required for React Doctor)
+      # 🟢 2. Node (for React Doctor)
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      # 🩺 Run React Doctor (full repo scan)
+      # 🩺 3. React Doctor
       - name: Run React Doctor scan
         run: npx -y react-doctor@latest . --verbose
+
+      # 🐍 4. Python setup
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 📦 5. 👉 ADD YOUR CODE HERE
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # 🧪 6. Run tests
+      - name: Run tests
+        run: pytest -v --maxfail=1 --disable-warnings
