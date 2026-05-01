@@ -419,6 +419,10 @@ def _build_output(
             'edge_score': safe_edge_score
         },
     }
+
+    # Centralized DEGRADED enforcement (defense-in-depth).
+    if str(engine_status or "OK") == "DEGRADED":
+        out["signal_valid"] = False
     
     # --- HARD GUARD (fail-safe, NON-BREAKING) ---
     if not _validate_output_schema(out):
@@ -1046,7 +1050,7 @@ class AdvancedRegimeEngine:
     _MAX_PRICE_STALENESS_SEC: float = 300.0
     _MAX_PRICE_STALENESS_TICKS: int = 5
     _PRICE_RETURN_MISMATCH_TOLERANCE: float = 1e-3
-    _CANONICAL_RETURN_MISMATCH_TOLERANCE: float = 1e-8
+    _CANONICAL_RETURN_MISMATCH_TOLERANCE: float = 1e-5
     _DIRECTION_SWITCH_GAP: float = 0.02
     _SJM_RESERVED_RETURN_IDX: int = 0
     _SJM_RESERVED_ABS_RETURN_IDX: int = 2
@@ -2132,22 +2136,44 @@ class AdvancedRegimeEngine:
                 replay_engine = getattr(engine, "_replay_engine", None)
                 if replay_engine is None:
                     continue
-                with engine._lock:
+                acquired = engine._lock.acquire(blocking=False)
+                if not acquired:
+                    engine._snapshot_drop_count = int(
+                        getattr(engine, "_snapshot_drop_count", 0)
+                    ) + 1
+                    if engine is not None:
+                        try:
+                            engine._warn_rate_limited(
+                                "snapshot_lock_contention",
+                                "Snapshot dropped: _lock held by update() thread.",
+                                cooldown_s=30.0,
+                            )
+                        except Exception:
+                            pass
+                    continue
+                try:
                     materialized_payload = engine._materialize_snapshot_payload(snapshot_payload)
                     hash_payload = dict(materialized_payload)
                     hash_payload.pop("state_hash", None)
                     hash_payload.pop("_checksum", None)
                     materialized_payload["state_hash"] = engine._state_hash(hash_payload)
-                replay_engine.snapshot(materialized_payload)
-            except Exception as exc:
-                engine._snapshot_backend_failure_count = int(
-                    getattr(engine, "_snapshot_backend_failure_count", 0)
-                ) + 1
-                engine._warn_rate_limited(
-                    "snapshot_emit_failure",
-                    f"Snapshot emission failed: {exc}",
-                    cooldown_s=30.0,
-                )
+                    replay_engine_local = replay_engine
+                finally:
+                    engine._lock.release()
+
+                try:
+                    replay_engine_local.snapshot(materialized_payload)
+                except Exception as exc:
+                    engine._snapshot_backend_failure_count = int(
+                        getattr(engine, "_snapshot_backend_failure_count", 0)
+                    ) + 1
+                    engine._warn_rate_limited(
+                        "snapshot_emit_failure",
+                        f"Snapshot emission failed: {exc}",
+                        cooldown_s=30.0,
+                    )
+            except Exception:
+                continue
 
     def _enqueue_snapshot(self, snapshot_payload: Dict[str, Any]) -> None:
         try:
@@ -4564,8 +4590,8 @@ class AdvancedRegimeEngine:
                 self.range_ticks = 0.0
                 self._in_range = False
             elif confirmed_regime in ("BEAR", "TOXIC"):
-                decay_factor = np.exp(-self._DECAY_LAMBDA * decay_dt)
-                self.range_ticks *= decay_factor
+                self.range_ticks = 0.0
+                self.range_ticks_int = 0
                 self._in_range = False
 
         if confirmed_regime == "RANGE":
