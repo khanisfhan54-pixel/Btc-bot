@@ -48,7 +48,7 @@ _VALID_ENGINE_STATUS = frozenset({
     "OK_WITH_HISTORY", "RNG_RESTORE_FAILED", "UNKNOWN",
 })
 _VALID_OPERATIONAL_MODES = frozenset({"LIVE", "PAPER", "HALTED", "SIMULATION"})
-_VALID_EXECUTION_STRATEGIES = frozenset({"trend_follow", "scalp", "mean_revert", "neutral", "risk_off_or_short_bias", "flat_or_hedge", "range_mean_revert", "fail_safe", "circuit_breaker"})
+_VALID_EXECUTION_STRATEGIES = frozenset({"trend_follow", "scalp", "mean_revert", "neutral", "risk_off_or_short_bias", "flat_or_hedge", "range_mean_revert", "fail_safe", "circuit_breaker", "halt", "halt_igarch"})
 _VALID_EXECUTION_SIDE = frozenset({"long", "short", "flat", "range_mean_revert"})
 _PROMETHEUS_ENGINE_ID_LIMIT = 50
 _prometheus_engine_ids: set[str] = set()
@@ -201,6 +201,13 @@ def _validate_output_schema(output: Dict[str, Any]) -> bool:
             raise ValueError(f"Invalid execution_mode: {output.get('execution_mode')}")
         if output.get("execution_side") not in _VALID_EXECUTION_SIDE:
             raise ValueError(f"Invalid execution_side: {output.get('execution_side')}")
+        if "signal_valid" not in output:
+            raise ValueError("missing required key: signal_valid")
+        if not isinstance(output["signal_valid"], bool):
+            raise ValueError(
+                f"signal_valid must be bool, got "
+                f"{type(output['signal_valid']).__name__}"
+            )
         if not isinstance(output["probabilities"], dict):
             raise ValueError("probabilities must be a dict")
         for pkey in ("bull", "bear", "crisis"):
@@ -659,7 +666,7 @@ def compute_hmm_regime(
     if not np.isfinite(score_sum) or score_sum <= 0.0:
         LOGGER.error("compute_hmm_regime: invalid score sum=%.6f using uniform fallback", score_sum)
         score_map = {"TREND": 0.25, "BEAR": 0.25, "RANGE": 0.25, "TOXIC": 0.25}
-    elif abs(score_sum - 1.0) > 0.25:
+    elif abs(score_sum - 1.0) > 0.10:
         LOGGER.warning("compute_hmm_regime: score sum out-of-band sum=%.6f", score_sum)
     max_score = max(score_map.values())
     tied_labels = [label for label, score in score_map.items() if abs(score - max_score) <= 1e-12]
@@ -733,7 +740,12 @@ class NHHMM_Engine:
                 "load_weights: beta contains values with |β| > 50. This may cause logit saturation. Consider re-normalizing features."
             )
         self.mu = mu_arr
-        self.sigma = np.clip(np.abs(sigma_arr), 1e-8, None)
+        if np.any(sigma_arr < 1e-4):
+            LOGGER.warning(
+                "load_weights: sigma contains values below 1e-4 (min=%.2e). Emission distributions may be over-concentrated. Consider recalibrating.",
+                float(np.min(sigma_arr))
+            )
+        self.sigma = np.clip(np.abs(sigma_arr), 1e-4, None)
 
     def _compute_transition_matrix(self, x_t: np.ndarray) -> np.ndarray:
         try:
@@ -777,7 +789,7 @@ class NHHMM_Engine:
         pred_prob = _normalize_prob_vector(np.dot(prior_prob, P_t))  # Chapman-Kolmogorov prediction
 
         # Vectorised log N(y_t | mu_k, sigma_k) across all K states.
-        sigma_safe = np.clip(np.abs(np.asarray(self.sigma, dtype=float)), 1e-8, None)
+        sigma_safe = np.clip(np.abs(np.asarray(self.sigma, dtype=float)), 1e-4, None)
         log_emission = (
             -0.5 * np.log(2.0 * np.pi)
             - np.log(sigma_safe)
@@ -3353,9 +3365,23 @@ class AdvancedRegimeEngine:
                 raise ValueError(f"price must be numeric, got {market_data.get('price')!r}") from exc
             if not np.isfinite(market_data["price"]):
                 raise ValueError(f"price must be finite, got {market_data.get('price')}")
+            if market_data["price"] <= 0.0:
+                raise ValueError(f"price must be positive, got {market_data['price']!r}")
         # NOTE: enforce globally across codebase:
         # ALL side effects must follow:
         # if not getattr(self, "_is_replay", False): LOGGER / metrics / hooks
+
+        if getattr(self, "_engine_status", "OK") == "DEGRADED":
+            self._warn_rate_limited(
+                key="update_while_degraded",
+                message=(
+                    "update() called while engine_status=DEGRADED. "
+                    "NHHMM parameters may be incoherent. "
+                    "Signal reliability is reduced. "
+                    "Reload a valid snapshot or retrain."
+                ),
+                cooldown_s=30.0,
+            )
 
         start_time = time.perf_counter()
         self._tick_id = int(getattr(self, "_tick_id", 0)) + 1
@@ -4929,6 +4955,9 @@ class AdvancedRegimeEngine:
             output["position_size"] = 0.0
             output["signed_position_size"] = 0.0
             output["feed_status"] = "UNCALIBRATED_WEIGHTS"
+            self.last_signed_position_size = 0.0
+        if str(getattr(self, "_engine_status", "OK")) == "DEGRADED":
+            output["signal_valid"] = False
         if obs_sample and not getattr(self, "_is_replay", False):
             self._replay_record("update_end", {"regime": confirmed_regime})
             if self._replay_engine is not None:
