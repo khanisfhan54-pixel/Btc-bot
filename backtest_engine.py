@@ -166,12 +166,19 @@ class BacktestEngine:
     ) -> Dict[str, Any]:
         cache_hits = 0
         cache_misses = 0
-        data = [row for row in (ohlcv_data or []) if isinstance(row, (list, tuple)) and len(row) >= 6]
-        has_microstructure_rows = any(
-            isinstance(row, dict) and isinstance(row.get("snapshot"), dict) and "bids" in row.get("snapshot", {}) and "asks" in row.get("snapshot", {})
-            for row in (ohlcv_data or [])
-        )
-        if signal_quality_required and (not has_microstructure_rows):
+        rows = list(ohlcv_data or [])
+        micro_rows = [
+            row
+            for row in rows
+            if isinstance(row, dict)
+            and isinstance(row.get("snapshot"), dict)
+            and "bids" in row.get("snapshot", {})
+            and "asks" in row.get("snapshot", {})
+            and isinstance(row.get("trades"), list)
+        ]
+        has_microstructure_rows = len(micro_rows) > 0
+        synthetic_mode = not has_microstructure_rows
+        if signal_quality_required and synthetic_mode:
             return {
                 "total_trades": 0,
                 "win_rate": 0.0,
@@ -190,7 +197,7 @@ class BacktestEngine:
                 "alpha_non_empty_count": 0,
                 "regime_state": "explicit_fallback",
                 "signal_quality_valid": False,
-                "signal_quality_reason": "production_parity_requires_regime_engine",
+                "signal_quality_reason": "signal_quality_requires_microstructure_replay_data",
                 "production_valid": False,
             }
         if signal_quality_required and has_microstructure_rows and self.alpha_orchestrator is None:
@@ -215,6 +222,31 @@ class BacktestEngine:
                 "signal_quality_reason": "production_parity_requires_regime_engine",
                 "production_valid": False,
             }
+
+        if signal_quality_required and not has_microstructure_rows:
+            return {
+                "total_trades": 0,
+                "win_rate": 0.0,
+                "pnl": 0.0,
+                "max_drawdown": 0.0,
+                "sharpe": 0.0,
+                "expectancy": 0.0,
+                "trade_log": [],
+                "signal_only_mode": self.signal_only,
+                "signal_coverage": 0.0,
+                "long_signals": 0,
+                "short_signals": 0,
+                "hold_signals": 0,
+                "avg_return_per_trade": 0.0,
+                "avg_holding_bars": 0.0,
+                "alpha_non_empty_count": 0,
+                "regime_state": "explicit_fallback",
+                "signal_quality_valid": False,
+                "signal_quality_reason": "signal_quality_requires_microstructure_replay_data",
+                "production_valid": False,
+            }
+
+        data = micro_rows if has_microstructure_rows else [row for row in rows if isinstance(row, (list, tuple)) and len(row) >= 6]
 
         if len(data) < 50:
             logger.info("[BACKTEST CACHE] hits=%d misses=%d", cache_hits, cache_misses)
@@ -242,25 +274,43 @@ class BacktestEngine:
         non_hold_signals = 0
         bars_processed = 0
         alpha_non_empty_count = 0
-        synthetic_microstructure = True
+        synthetic_microstructure = synthetic_mode
         for i in range(25, len(data)):
             window = data[: i + 1]
-            candle = window[-1]
-            current_price = _safe_float(candle[4])
+            row = window[-1]
 
-            cache_key = (int(candle[0]), float(current_price))
-            cached = self._analysis_cache.get(cache_key)
-            if cached is not None:
-                cache_hits += 1
-                snapshot = cached["snapshot"]
-                trades = cached["trades"]
-                features = dict(cached["features"])
+            if synthetic_mode:
+                candle = row
+                current_price = _safe_float(candle[4])
+                cache_key = (int(candle[0]), float(current_price))
+                cached = self._analysis_cache.get(cache_key)
+                if cached is not None:
+                    cache_hits += 1
+                    snapshot = cached["snapshot"]
+                    trades = cached["trades"]
+                    features = dict(cached["features"])
+                else:
+                    cache_misses += 1
+                    snapshot = _simulate_snapshot_from_candle(candle, window[-2][4] if len(window) > 1 else None)
+                    trades = _simulate_trades_from_candle(candle)
+                    features = self.feature_engine.update(snapshot, trades)
+                    self._analysis_cache[cache_key] = {"snapshot": snapshot, "trades": trades, "features": dict(features)}
+                candle_volume = _safe_float(candle[5])
+                prev_close = _safe_float(window[-2][4]) if len(window) > 1 else _safe_float(candle[1])
             else:
-                cache_misses += 1
-                snapshot = _simulate_snapshot_from_candle(candle, window[-2][4] if len(window) > 1 else None)
-                trades = _simulate_trades_from_candle(candle)
+                micro_row = row
+                snapshot = micro_row["snapshot"]
+                trades = micro_row.get("trades", [])
                 features = self.feature_engine.update(snapshot, trades)
-                self._analysis_cache[cache_key] = {"snapshot": snapshot, "trades": trades, "features": dict(features)}
+                current_price = _safe_float(micro_row.get("close", micro_row.get("price", micro_row.get("mid", 0.0))))
+                if current_price <= 0.0:
+                    current_price = _safe_float(snapshot.get("mid", 0.0))
+                if current_price <= 0.0:
+                    best_bid = _safe_float(snapshot.get("bids", [[0.0]])[0][0] if snapshot.get("bids") else 0.0)
+                    best_ask = _safe_float(snapshot.get("asks", [[0.0]])[0][0] if snapshot.get("asks") else 0.0)
+                    current_price = (best_bid + best_ask) / 2.0 if best_bid > 0.0 and best_ask > 0.0 else max(best_bid, best_ask, 0.0)
+                candle_volume = _safe_float(micro_row.get("volume", len(trades)))
+                prev_close = _safe_float(window[-2].get("close", current_price)) if len(window) > 1 and isinstance(window[-2], dict) else current_price
             bars_processed += 1
 
             if self.fill_model is not None:
@@ -290,8 +340,16 @@ class BacktestEngine:
                         "alpha_non_empty_count": 0, "regime_state": "explicit_fallback", "signal_quality_valid": False,
                         "signal_quality_reason": "production_parity_requires_regime_engine",
                     }
-                prev_close = _safe_float(window[-2][4]) if len(window) > 1 else _safe_float(candle[1])
-                cur_close = _safe_float(candle[4])
+                if self.alpha_predictor is None:
+                    return {
+                        "total_trades": 0, "win_rate": 0.0, "pnl": 0.0, "max_drawdown": 0.0, "sharpe": 0.0, "expectancy": 0.0,
+                        "trade_log": [], "signal_only_mode": self.signal_only, "signal_coverage": 0.0, "long_signals": 0,
+                        "short_signals": 0, "hold_signals": 0, "avg_return_per_trade": 0.0, "avg_holding_bars": 0.0,
+                        "alpha_non_empty_count": 0, "regime_state": "explicit_fallback", "signal_quality_valid": False,
+                        "signal_quality_reason": "production_parity_requires_alpha_orchestration",
+                        "production_valid": False,
+                    }
+                cur_close = _safe_float(current_price)
                 log_ret = 0.0 if prev_close <= 0.0 or cur_close <= 0.0 else math.log(cur_close / prev_close)
                 regime_features = [
                     _safe_float(features.get("imbalance", 0.0)) if isinstance(features, dict) else 0.0,
@@ -302,7 +360,7 @@ class BacktestEngine:
                     "return": log_ret,
                     "features": regime_features,
                     "price": current_price,
-                    "volume": _safe_float(candle[5]),
+                    "volume": candle_volume,
                     "orderbook": snapshot,
                     "trades": trades,
                     "require_calibration": True,
@@ -318,14 +376,26 @@ class BacktestEngine:
                     }
                 regime_context = reg_out
                 if not isinstance(alpha_raw, dict):
-                    continue
+                    return {
+                        "total_trades": 0, "win_rate": 0.0, "pnl": 0.0, "max_drawdown": 0.0, "sharpe": 0.0, "expectancy": 0.0,
+                        "trade_log": [], "signal_only_mode": self.signal_only, "signal_coverage": 0.0, "long_signals": 0,
+                        "short_signals": 0, "hold_signals": 0, "avg_return_per_trade": 0.0, "avg_holding_bars": 0.0,
+                        "alpha_non_empty_count": 0, "regime_state": "explicit_fallback", "signal_quality_valid": False,
+                        "signal_quality_reason": "production_parity_requires_alpha_orchestration", "production_valid": False,
+                    }
                 current_time = float(snapshot.get("timestamp", i) or i)
                 src = alpha_raw.get("source_id")
                 direction_raw = alpha_raw.get("direction")
                 conviction_raw = alpha_raw.get("confidence", alpha_raw.get("conviction"))
                 edge_raw = alpha_raw.get("expected_edge_bps", alpha_raw.get("edge_bps", alpha_raw.get("edge", 0.0)))
                 if src is None or direction_raw is None or conviction_raw is None:
-                    continue
+                    return {
+                        "total_trades": 0, "win_rate": 0.0, "pnl": 0.0, "max_drawdown": 0.0, "sharpe": 0.0, "expectancy": 0.0,
+                        "trade_log": [], "signal_only_mode": self.signal_only, "signal_coverage": 0.0, "long_signals": 0,
+                        "short_signals": 0, "hold_signals": 0, "avg_return_per_trade": 0.0, "avg_holding_bars": 0.0,
+                        "alpha_non_empty_count": 0, "regime_state": "explicit_fallback", "signal_quality_valid": False,
+                        "signal_quality_reason": "production_parity_requires_alpha_orchestration", "production_valid": False,
+                    }
                 direction_val = 1 if str(direction_raw).upper() in ("LONG", "BUY", "1") else (-1 if str(direction_raw).upper() in ("SHORT", "SELL", "-1") else 0)
                 conviction_val = _clamp(_safe_float(conviction_raw, 0.0), 0.0, 1.0)
                 edge_val = abs(_safe_float(edge_raw, 0.0))
