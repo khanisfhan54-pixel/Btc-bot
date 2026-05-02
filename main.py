@@ -2026,8 +2026,11 @@ def run_analysis_cycle(
                     "price": float(current_price),
                     "volume": float(candles_by_tf.get("1m", [[0,0,0,0,0,0]])[-1][5]) if candles_by_tf.get("1m") else 0.0,
                     "orderbook": analysis_orderbook,
+                    "trades": trades,
                     "open_interest": float(open_interest) if np.isfinite(float(open_interest)) else 0.0,
                     "funding_rate": float(funding_rate) if np.isfinite(float(funding_rate)) else 0.0,
+                    "require_calibration": True,
+                    "require_microstructure": True,
                 }
                 reg_out = regime_engine.update(regime_input) or {}
                 if not bool(reg_out.get("signal_valid", True)):
