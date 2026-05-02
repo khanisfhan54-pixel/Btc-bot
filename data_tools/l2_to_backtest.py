@@ -1,57 +1,81 @@
-import csv
-import json
-from collections import defaultdict
+import pandas as pd
+import os
 
-TRADE_FILE = "aggTrades.csv"
-DEPTH_FILE = "bookDepth.csv"
-OUTPUT_FILE = "l2_backtest_ready.json"
-TIME_BUCKET_MS = 1000
+# =========================
+# CONFIG
+# =========================
+DATA_PATH = "data"
+TRADES_FILE = os.path.join(DATA_PATH, "aggTrades.csv")
+DEPTH_FILE = os.path.join(DATA_PATH, "bookDepth.csv")
 
-trades_by_bucket = defaultdict(list)
+OUTPUT_TRADES = os.path.join(DATA_PATH, "aggTrades_clean.csv")
+OUTPUT_DEPTH = os.path.join(DATA_PATH, "bookDepth_clean.csv")
 
-with open(TRADE_FILE, "r") as f:
-    reader = csv.DictReader(f)
-    for row in reader:
-        ts = int(row["T"])
-        bucket = ts // TIME_BUCKET_MS
+# =========================
+# LOAD DATA
+# =========================
+print("Loading data...")
 
-        trades_by_bucket[bucket].append({
-            "price": float(row["p"]),
-            "qty": float(row["q"]),
-            "timestamp": ts
-        })
+df_trades = pd.read_csv(TRADES_FILE)
+df_depth = pd.read_csv(DEPTH_FILE)
 
-snapshots = {}
+# =========================
+# FIX TIMESTAMP (CRITICAL)
+# =========================
+print("Fixing timestamps...")
 
-with open(DEPTH_FILE, "r") as f:
-    reader = csv.DictReader(f)
-    for row in reader:
-        ts = int(row["timestamp"])
-        bucket = ts // TIME_BUCKET_MS
+# aggTrades already in ms → just rename for consistency
+df_trades = df_trades.rename(columns={"transact_time": "timestamp"})
 
-        bid_price = float(row["bidPrice"])
-        bid_qty = float(row["bidQty"])
-        ask_price = float(row["askPrice"])
-        ask_qty = float(row["askQty"])
+# convert bookDepth timestamp → milliseconds
+df_depth["timestamp"] = pd.to_datetime(df_depth["timestamp"], errors="coerce")
+df_depth = df_depth.dropna(subset=["timestamp"])
 
-        snapshots[bucket] = {
-            "timestamp": ts,
-            "bids": [[bid_price, bid_qty]],
-            "asks": [[ask_price, ask_qty]],
-        }
+df_depth["timestamp"] = df_depth["timestamp"].astype("int64") // 10**6
 
-output = []
+# =========================
+# SORT DATA (MANDATORY)
+# =========================
+print("Sorting data...")
 
-for bucket in sorted(snapshots.keys()):
-    snapshot = snapshots[bucket]
-    trades = trades_by_bucket.get(bucket, [])
+df_trades = df_trades.sort_values("timestamp").reset_index(drop=True)
+df_depth = df_depth.sort_values("timestamp").reset_index(drop=True)
 
-    output.append({
-        "snapshot": snapshot,
-        "trades": trades
-    })
+# =========================
+# VALIDATION CHECKS
+# =========================
+print("Running validation...")
 
-with open(OUTPUT_FILE, "w") as f:
-    json.dump(output, f)
+print("\nTrades Time Range:")
+print(df_trades["timestamp"].min(), "→", df_trades["timestamp"].max())
 
-print(f"Saved {len(output)} rows to {OUTPUT_FILE}")
+print("\nDepth Time Range:")
+print(df_depth["timestamp"].min(), "→", df_depth["timestamp"].max())
+
+# Check overlap
+overlap_start = max(df_trades["timestamp"].min(), df_depth["timestamp"].min())
+overlap_end = min(df_trades["timestamp"].max(), df_depth["timestamp"].max())
+
+if overlap_start >= overlap_end:
+    print("\n❌ ERROR: No overlapping time range!")
+else:
+    print("\n✅ Overlap OK:")
+    print(overlap_start, "→", overlap_end)
+
+# =========================
+# BASIC DATA QUALITY CHECKS
+# =========================
+print("\nChecking data quality...")
+
+print("Trades missing:", df_trades.isnull().sum().sum())
+print("Depth missing:", df_depth.isnull().sum().sum())
+
+# =========================
+# SAVE CLEAN DATA
+# =========================
+print("\nSaving cleaned data...")
+
+df_trades.to_csv(OUTPUT_TRADES, index=False)
+df_depth.to_csv(OUTPUT_DEPTH, index=False)
+
+print("\n✅ DONE — Data is now aligned and clean.")
