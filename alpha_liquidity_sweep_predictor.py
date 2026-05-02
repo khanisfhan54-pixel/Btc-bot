@@ -273,7 +273,14 @@ class LiquiditySweepAlpha:
     Production-grade logic for detecting Liquidity Sweeps, incorporating 
     normalized Order Flow Imbalance, Hawkes Processes, and LOB Resiliency.
     """
-    def __init__(self, depth_levels: int = 10, resiliency_threshold: float = 0.7, history_window: int = 100):
+    def __init__(
+        self,
+        depth_levels: int = 10,
+        resiliency_threshold: float = 0.7,
+        history_window: int = 100,
+        initial_high: Optional[float] = None,
+        initial_low: Optional[float] = None,
+    ):
         self.levels = depth_levels
         self.resiliency_threshold = resiliency_threshold
         self.history_window = history_window
@@ -292,9 +299,15 @@ class LiquiditySweepAlpha:
         # Hawkes Process State
         self.hawkes_lambda = 0.0
         self.last_trade_time = 0.0
-        self.hawkes_decay = 0.5 
-        self.hawkes_alpha = 0.1 
+        self.hawkes_decay = 0.5
+        self.hawkes_alpha = 0.1
         self._lock = threading.RLock()
+
+        # FIX L002: seed pools from constructor if provided
+        if initial_high is not None and _is_finite(float(initial_high)) and float(initial_high) > 0:
+            self.liquidity_pools["high"] = float(initial_high)
+        if initial_low is not None and _is_finite(float(initial_low)) and float(initial_low) > 0:
+            self.liquidity_pools["low"] = float(initial_low)
 
     @staticmethod
     def _normalize_timestamp(ts: float, fallback: float = 0.0) -> float:
