@@ -105,9 +105,16 @@ def _load_depth_ofi(path: str = "data/bookDepth_clean.csv"):
     import pandas as pd
 
     df = pd.read_csv(path)
-    df["ts_ms"] = (
-        pd.to_datetime(df["timestamp"], utc=True).astype("int64") // 1_000_000
-    )
+    # bookDepth_clean.csv has timestamp_ms column (already in milliseconds);
+    # raw bookDepth.csv has a parseable "timestamp" column. Handle both so the
+    # calibrator does not silently fall back on the wrong path.
+    ts_col = "timestamp_ms" if "timestamp_ms" in df.columns else "timestamp"
+    if ts_col == "timestamp_ms":
+        df["ts_ms"] = df["timestamp_ms"].astype("int64")
+    else:
+        df["ts_ms"] = (
+            pd.to_datetime(df[ts_col], utc=True).astype("int64") // 1_000_000
+        )
     snapshots = []
     for ts_ms, grp in df.groupby("ts_ms"):
         bids = grp[grp["percentage"] < 0]
@@ -307,9 +314,13 @@ def _verify(output_path: str) -> bool:
             _log("WARNING: weights file exists but did not load — check shapes")
             return False
         result = are.update({
-            "price": 69000.0,
-            "return": 0.0005,
+            "price":    69000.0,
+            "return":   0.0005,
             "timestamp": 1_774_580_000.0,
+            # Canonical 4-key payload required by AdvancedRegimeEngine.update()
+            # — the smoke test must include `features` so we exercise the same
+            # path the production BacktestEngine takes.
+            "features": np.array([0.0005, 0.0, 0.0], dtype=float),
         })
         label = result.get("regime_label", "N/A")
         conf  = result.get("confidence", -1.0)

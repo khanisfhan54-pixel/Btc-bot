@@ -1,5 +1,9 @@
-import pandas as pd
+import csv
+import json
 import os
+from collections import defaultdict
+
+import pandas as pd
 
 # =========================
 # CONFIG
@@ -10,6 +14,9 @@ DEPTH_FILE = os.path.join(DATA_PATH, "bookDepth.csv")
 
 OUTPUT_TRADES = os.path.join(DATA_PATH, "aggTrades_clean.csv")
 OUTPUT_DEPTH = os.path.join(DATA_PATH, "bookDepth_clean.csv")
+OUTPUT_JSON = os.path.join(DATA_PATH, "l2_backtest_ready.json")
+
+TIME_BUCKET_MS = 1000
 
 # =========================
 # LOAD DATA
@@ -30,7 +37,6 @@ df_trades = df_trades.rename(columns={"transact_time": "timestamp"})
 # convert bookDepth timestamp → milliseconds
 df_depth["timestamp"] = pd.to_datetime(df_depth["timestamp"], errors="coerce")
 df_depth = df_depth.dropna(subset=["timestamp"])
-
 df_depth["timestamp"] = df_depth["timestamp"].astype("int64") // 10**6
 
 # =========================
@@ -79,3 +85,50 @@ df_trades.to_csv(OUTPUT_TRADES, index=False)
 df_depth.to_csv(OUTPUT_DEPTH, index=False)
 
 print("\n✅ DONE — Data is now aligned and clean.")
+
+# =========================
+# CONVERT TO BACKTEST JSON
+# =========================
+print("\nConverting to backtest-ready JSON...")
+
+trades_by_bucket: defaultdict = defaultdict(list)
+
+with open(TRADES_FILE, "r") as f:
+    reader = csv.DictReader(f)
+    for row in reader:
+        ts_key = "T" if "T" in row else "timestamp"
+        ts = int(row[ts_key])
+        bucket = ts // TIME_BUCKET_MS
+        trades_by_bucket[bucket].append({
+            "price": float(row.get("p", row.get("price", 0))),
+            "qty": float(row.get("q", row.get("qty", 0))),
+            "timestamp": ts,
+        })
+
+snapshots: dict = {}
+
+with open(DEPTH_FILE, "r") as f:
+    reader = csv.DictReader(f)
+    for row in reader:
+        ts_raw = row["timestamp"]
+        ts = int(ts_raw) if ts_raw.isdigit() else int(pd.to_datetime(ts_raw).timestamp() * 1000)
+        bucket = ts // TIME_BUCKET_MS
+
+        snapshots[bucket] = {
+            "timestamp": ts,
+            "bids": [[float(row["bidPrice"]), float(row["bidQty"])]],
+            "asks": [[float(row["askPrice"]), float(row["askQty"])]],
+        }
+
+output = []
+for bucket in sorted(snapshots.keys()):
+    output.append({
+        "snapshot": snapshots[bucket],
+        "trades": trades_by_bucket.get(bucket, []),
+    })
+
+os.makedirs(DATA_PATH, exist_ok=True)
+with open(OUTPUT_JSON, "w") as f:
+    json.dump(output, f)
+
+print(f"Saved {len(output)} rows to {OUTPUT_JSON}")
