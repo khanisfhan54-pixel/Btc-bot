@@ -1325,6 +1325,7 @@ class AdvancedRegimeEngine:
         self._weights_checksum = ""
         self._igarch_hard_limit = 1.05
         self._weight_path = os.environ.get("REGIME_WEIGHT_PATH", "weights/advanced_regime_weights.npz")
+        self._require_calibrated_weights = True
         self._regime_smoother = RegimeMarkovSmoother()
         self._regime_state_probs = np.ones(4, dtype=float) / 4.0
         self._last_valid_sjm_probs: np.ndarray | None = None
@@ -2054,9 +2055,11 @@ class AdvancedRegimeEngine:
     def _load_model_weights(self) -> None:
         weights = ModelWeightManager.load_weights("advanced_regime", self._weight_path)
         if not weights:
-            LOGGER.warning("[REGIME] No trained weights found — regime outputs are UNTRUSTED. Run calibration pipeline before live deployment.")
             self._weights_loaded = False
             self._calibration_status = "missing"
+            self._engine_status = "DEGRADED"
+            msg = f"[REGIME] Missing trained weights at {self._weight_path}; blocking regime engine until calibration artifacts are available."
+            LOGGER.critical(msg)
             return
         try:
             canonical_blob = json.dumps({k: np.asarray(v).tolist() for k, v in weights.items()}, sort_keys=True, separators=(",", ":"))
@@ -2102,6 +2105,8 @@ class AdvancedRegimeEngine:
             LOGGER.critical("[REGIME] Failed to load trained weights", exc_info=True)
             self._weights_loaded = False
             self._calibration_status = "invalid"
+            self._engine_status = "DEGRADED"
+            return
 
     @staticmethod
     def _snapshot_emitter_loop(
@@ -3393,6 +3398,70 @@ class AdvancedRegimeEngine:
                 raise ValueError(f"price must be finite, got {market_data.get('price')}")
             if market_data["price"] <= 0.0:
                 raise ValueError(f"price must be positive, got {market_data['price']!r}")
+        require_microstructure = bool(market_data.get("require_microstructure", False))
+        has_orderbook = isinstance(market_data.get("orderbook"), dict) and bool(market_data.get("orderbook"))
+        has_trades = isinstance(market_data.get("trades"), list) and len(market_data.get("trades")) > 0
+        if require_microstructure and not (has_orderbook and has_trades):
+            self.last_signed_position_size = 0.0
+            self._engine_status = "DEGRADED"
+            blocked_label = "UNCALIBRATED" if not self._weights_loaded else "UNKNOWN"
+            blocked_feed = "UNCALIBRATED_WEIGHTS" if not self._weights_loaded else "INVALID_INPUT_MICROSTRUCTURE_REQUIRED"
+            return _build_output(
+                regime_idx=-1,
+                regime_label=blocked_label,
+                execution_mode="halt",
+                trend_strength=0.0,
+                risk_level=1.0,
+                confidence=0.0,
+                conviction=0.0,
+                edge_score=0.0,
+                probabilities={"bull": 0.0, "bear": 0.0, "crisis": 1.0},
+                macro_probs=[1 / 3, 1 / 3, 1 / 3],
+                position_size=0.0,
+                signed_position_size=0.0,
+                expected_vol=self._last_valid_vol,
+                raw_size=0.0,
+                is_toxic=True,
+                garch_regime_probs=[0.5, 0.5],
+                feed_status=blocked_feed,
+                engine_status="DEGRADED",
+                last_valid_vol=self._last_valid_vol,
+                switch_stability_ema=self._switch_stability_ema,
+                execution_side="flat",
+                include_signal_valid=True,
+                signal_valid=False,
+            )
+
+        require_calibration = bool(market_data.get("require_calibration", False))
+        if require_calibration and not self._weights_loaded:
+            self.last_signed_position_size = 0.0
+            self._engine_status = "DEGRADED"
+            return _build_output(
+                regime_idx=-1,
+                regime_label="UNCALIBRATED",
+                execution_mode="halt",
+                trend_strength=0.0,
+                risk_level=1.0,
+                confidence=0.0,
+                conviction=0.0,
+                edge_score=0.0,
+                probabilities={"bull": 0.0, "bear": 0.0, "crisis": 1.0},
+                macro_probs=[1 / 3, 1 / 3, 1 / 3],
+                position_size=0.0,
+                signed_position_size=0.0,
+                expected_vol=self._last_valid_vol,
+                raw_size=0.0,
+                is_toxic=True,
+                garch_regime_probs=[0.5, 0.5],
+                feed_status="UNCALIBRATED_WEIGHTS",
+                engine_status="DEGRADED",
+                last_valid_vol=self._last_valid_vol,
+                switch_stability_ema=self._switch_stability_ema,
+                execution_side="flat",
+                include_signal_valid=True,
+                signal_valid=False,
+            )
+
         # NOTE: enforce globally across codebase:
         # ALL side effects must follow:
         # if not getattr(self, "_is_replay", False): LOGGER / metrics / hooks
