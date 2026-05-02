@@ -7,49 +7,30 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from venue_basis import VenueBasisNormalizer
 
-FeatureEngine = None  # type: ignore[assignment,misc]
-SignalEngine = None  # type: ignore[assignment,misc]
-ExecutionLogic = None  # type: ignore[assignment,misc]
-MetaFilter = None  # type: ignore[assignment,misc]
-LEARNING_ENGINE = None  # type: ignore[assignment,misc]
-QueueFillModel = None  # type: ignore
-ToxicityFilter = None  # type: ignore
-PositionManager = None  # type: ignore
-TradeLifecycleManager = None  # type: ignore
-CapitalAllocator = None  # type: ignore
-LiquiditySweepAlpha = None  # type: ignore
-AlphaOrchestrator = None  # type: ignore
-OrchestratorConfig = None  # type: ignore
-AlphaSignal = None  # type: ignore
-RegimeContext = None  # type: ignore
-FeatureQuality = None  # type: ignore
-ExecutionState = None  # type: ignore
-AdvancedRegimeEngine = None  # type: ignore
-for _mod in (
-    ("feature_engine", "FeatureEngine"),
-    ("signal_engine", "SignalEngine"),
-    ("execution", "ExecutionLogic"),
-    ("meta_filter", "MetaFilter"),
-    ("learning_engine", "LEARNING_ENGINE"),
-    ("queue_fill_model", "QueueFillModel"),
-    ("toxicity_filter", "ToxicityFilter"),
-    ("position_manager", "PositionManager"),
-    ("trade_lifecycle_manager", "TradeLifecycleManager"),
-    ("capital_allocator", "CapitalAllocator"),
-    ("alpha_liquidity_sweep_predictor", "LiquiditySweepAlpha"),
-    ("alpha_orchestrator", "AlphaOrchestrator"),
-    ("alpha_orchestrator", "OrchestratorConfig"),
-    ("alpha_orchestrator", "AlphaSignal"),
-    ("alpha_orchestrator", "RegimeContext"),
-    ("alpha_orchestrator", "FeatureQuality"),
-    ("alpha_orchestrator", "ExecutionState"),
-    ("advanced_regime_engine", "AdvancedRegimeEngine"),
-):
-    try:
-        _m = __import__(_mod[0], fromlist=[_mod[1]])
-        globals()[_mod[1]] = getattr(_m, _mod[1])
-    except Exception as _be_import_err:
-        logging.getLogger(__name__).warning("backtest_engine: optional import failed %s.%s (%s)", _mod[0], _mod[1], _be_import_err)
+try:
+    from feature_engine import FeatureEngine
+    from signal_engine import SignalEngine
+    from execution import ExecutionLogic
+    from meta_filter import MetaFilter
+    from learning_engine import LEARNING_ENGINE
+    from queue_fill_model import QueueFillModel
+    from toxicity_filter import ToxicityFilter
+    from position_manager import PositionManager
+    from trade_lifecycle_manager import TradeLifecycleManager
+    from capital_allocator import CapitalAllocator
+except Exception as _be_import_err:
+    import logging as _be_log
+    _be_log.getLogger(__name__).warning("backtest_engine: module import failed (%s) — BacktestEngine unusable", _be_import_err)
+    FeatureEngine = None  # type: ignore[assignment,misc]
+    SignalEngine = None  # type: ignore[assignment,misc]
+    ExecutionLogic = None  # type: ignore[assignment,misc]
+    MetaFilter = None  # type: ignore[assignment,misc]
+    LEARNING_ENGINE = None  # type: ignore[assignment,misc]
+    QueueFillModel = None  # type: ignore
+    ToxicityFilter = None  # type: ignore
+    PositionManager = None  # type: ignore
+    TradeLifecycleManager = None  # type: ignore
+    CapitalAllocator = None  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -133,121 +114,26 @@ class BacktestConfig:
 
 
 class BacktestEngine:
-    def __init__(self, config: BacktestConfig | None = None, learning_engine: Any = None, signal_only: bool = True) -> None:
+    def __init__(self, config: BacktestConfig | None = None, learning_engine: Any = None) -> None:
         self.cfg = config or BacktestConfig()
-        self.signal_only = bool(signal_only)
         self.learning_engine = learning_engine if learning_engine is not None else LEARNING_ENGINE
         self.feature_engine = FeatureEngine() if FeatureEngine is not None else _FallbackFeatureEngine()
         self.signal_engine = SignalEngine() if SignalEngine is not None else _FallbackSignalEngine()
-        self.execution_logic = None if self.signal_only else (ExecutionLogic() if ExecutionLogic is not None else _FallbackExecutionLogic())
+        self.execution_logic = ExecutionLogic() if ExecutionLogic is not None else _FallbackExecutionLogic()
         self.meta_filter = MetaFilter() if MetaFilter is not None else _FallbackMetaFilter()
         self.fill_model = QueueFillModel() if QueueFillModel is not None else None
         self.tox_filter = ToxicityFilter() if ToxicityFilter is not None else None
         self.position_manager = PositionManager() if PositionManager is not None else None
         self.trade_lifecycle = TradeLifecycleManager() if TradeLifecycleManager is not None else None
         self.capital_allocator = CapitalAllocator() if CapitalAllocator is not None else None
-        self.alpha_predictor = LiquiditySweepAlpha() if LiquiditySweepAlpha is not None else None
-        self.alpha_orchestrator = (AlphaOrchestrator(OrchestratorConfig(signal_weights={"alpha_model": 1.0})) if (AlphaOrchestrator is not None and OrchestratorConfig is not None) else None)
-        try:
-            self.regime_engine = AdvancedRegimeEngine(enable_background_workers=False) if AdvancedRegimeEngine is not None else None
-        except Exception:
-            self.regime_engine = None
         self.basis = VenueBasisNormalizer(halt_threshold_pct=0.5)
         self.basis.set_venues("backtest", "backtest")
         self._analysis_cache: Dict[Tuple[int, float], Dict[str, Any]] = {}
 
-    def run_backtest(
-        self,
-        ohlcv_data: List[list],
-        initial_balance: float | None = None,
-        *,
-        signal_quality_required: bool = True,
-        allow_ohlcv_synthetic: bool = False,
-    ) -> Dict[str, Any]:
+    def run_backtest(self, ohlcv_data: List[list], initial_balance: float | None = None) -> Dict[str, Any]:
         cache_hits = 0
         cache_misses = 0
-        rows = list(ohlcv_data or [])
-        micro_rows = [
-            row
-            for row in rows
-            if isinstance(row, dict)
-            and isinstance(row.get("snapshot"), dict)
-            and "bids" in row.get("snapshot", {})
-            and "asks" in row.get("snapshot", {})
-            and isinstance(row.get("trades"), list)
-        ]
-        has_microstructure_rows = len(micro_rows) > 0
-        synthetic_mode = not has_microstructure_rows
-        if signal_quality_required and synthetic_mode:
-            return {
-                "total_trades": 0,
-                "win_rate": 0.0,
-                "pnl": 0.0,
-                "max_drawdown": 0.0,
-                "sharpe": 0.0,
-                "expectancy": 0.0,
-                "trade_log": [],
-                "signal_only_mode": self.signal_only,
-                "signal_coverage": 0.0,
-                "long_signals": 0,
-                "short_signals": 0,
-                "hold_signals": 0,
-                "avg_return_per_trade": 0.0,
-                "avg_holding_bars": 0.0,
-                "alpha_non_empty_count": 0,
-                "regime_state": "explicit_fallback",
-                "signal_quality_valid": False,
-                "signal_quality_reason": "signal_quality_requires_microstructure_replay_data",
-                "production_valid": False,
-            }
-        if signal_quality_required and has_microstructure_rows and self.alpha_orchestrator is None:
-            return {
-                "total_trades": 0,
-                "win_rate": 0.0,
-                "pnl": 0.0,
-                "max_drawdown": 0.0,
-                "sharpe": 0.0,
-                "expectancy": 0.0,
-                "trade_log": [],
-                "signal_only_mode": self.signal_only,
-                "signal_coverage": 0.0,
-                "long_signals": 0,
-                "short_signals": 0,
-                "hold_signals": 0,
-                "avg_return_per_trade": 0.0,
-                "avg_holding_bars": 0.0,
-                "alpha_non_empty_count": 0,
-                "regime_state": "explicit_fallback",
-                "signal_quality_valid": False,
-                "signal_quality_reason": "production_parity_requires_regime_engine",
-                "production_valid": False,
-            }
-
-        if signal_quality_required and not has_microstructure_rows:
-            return {
-                "total_trades": 0,
-                "win_rate": 0.0,
-                "pnl": 0.0,
-                "max_drawdown": 0.0,
-                "sharpe": 0.0,
-                "expectancy": 0.0,
-                "trade_log": [],
-                "signal_only_mode": self.signal_only,
-                "signal_coverage": 0.0,
-                "long_signals": 0,
-                "short_signals": 0,
-                "hold_signals": 0,
-                "avg_return_per_trade": 0.0,
-                "avg_holding_bars": 0.0,
-                "alpha_non_empty_count": 0,
-                "regime_state": "explicit_fallback",
-                "signal_quality_valid": False,
-                "signal_quality_reason": "signal_quality_requires_microstructure_replay_data",
-                "production_valid": False,
-            }
-
-        data = micro_rows if has_microstructure_rows else [row for row in rows if isinstance(row, (list, tuple)) and len(row) >= 6]
-
+        data = [row for row in (ohlcv_data or []) if isinstance(row, (list, tuple)) and len(row) >= 6]
         if len(data) < 50:
             logger.info("[BACKTEST CACHE] hits=%d misses=%d", cache_hits, cache_misses)
             return {
@@ -258,9 +144,6 @@ class BacktestEngine:
                 "sharpe": 0.0,
                 "expectancy": 0.0,
                 "trade_log": [],
-                "signal_quality_valid": False,
-                "signal_quality_reason": "insufficient_data",
-                "production_valid": False,
             }
 
         balance = float(initial_balance if initial_balance is not None else self.cfg.initial_balance)
@@ -270,183 +153,61 @@ class BacktestEngine:
         trade_log: List[Dict[str, Any]] = []
 
         position: Optional[Dict[str, Any]] = None
-        signal_counts: Dict[str, int] = {"LONG": 0, "SHORT": 0, "HOLD": 0}
-        non_hold_signals = 0
-        bars_processed = 0
-        alpha_non_empty_count = 0
-        synthetic_microstructure = synthetic_mode
         for i in range(25, len(data)):
             window = data[: i + 1]
-            row = window[-1]
+            candle = window[-1]
+            current_price = _safe_float(candle[4])
 
-            if synthetic_mode:
-                candle = row
-                current_price = _safe_float(candle[4])
-                cache_key = (int(candle[0]), float(current_price))
-                cached = self._analysis_cache.get(cache_key)
-                if cached is not None:
-                    cache_hits += 1
-                    snapshot = cached["snapshot"]
-                    trades = cached["trades"]
-                    features = dict(cached["features"])
-                else:
-                    cache_misses += 1
-                    snapshot = _simulate_snapshot_from_candle(candle, window[-2][4] if len(window) > 1 else None)
-                    trades = _simulate_trades_from_candle(candle)
-                    features = self.feature_engine.update(snapshot, trades)
-                    self._analysis_cache[cache_key] = {"snapshot": snapshot, "trades": trades, "features": dict(features)}
-                candle_volume = _safe_float(candle[5])
-                prev_close = _safe_float(window[-2][4]) if len(window) > 1 else _safe_float(candle[1])
+            cache_key = (int(candle[0]), float(current_price))
+            cached = self._analysis_cache.get(cache_key)
+            if cached is not None:
+                cache_hits += 1
+                snapshot = cached["snapshot"]
+                trades = cached["trades"]
+                features = dict(cached["features"])
             else:
-                micro_row = row
-                snapshot = micro_row["snapshot"]
-                trades = micro_row.get("trades", [])
+                cache_misses += 1
+                snapshot = _simulate_snapshot_from_candle(candle, window[-2][4] if len(window) > 1 else None)
+                trades = _simulate_trades_from_candle(candle)
                 features = self.feature_engine.update(snapshot, trades)
-                current_price = _safe_float(micro_row.get("close", micro_row.get("price", micro_row.get("mid", 0.0))))
-                if current_price <= 0.0:
-                    current_price = _safe_float(snapshot.get("mid", 0.0))
-                if current_price <= 0.0:
-                    best_bid = _safe_float(snapshot.get("bids", [[0.0]])[0][0] if snapshot.get("bids") else 0.0)
-                    best_ask = _safe_float(snapshot.get("asks", [[0.0]])[0][0] if snapshot.get("asks") else 0.0)
-                    current_price = (best_bid + best_ask) / 2.0 if best_bid > 0.0 and best_ask > 0.0 else max(best_bid, best_ask, 0.0)
-                candle_volume = _safe_float(micro_row.get("volume", len(trades)))
-                prev_close = _safe_float(window[-2].get("close", current_price)) if len(window) > 1 and isinstance(window[-2], dict) else current_price
-            bars_processed += 1
+                self._analysis_cache[cache_key] = {"snapshot": snapshot, "trades": trades, "features": dict(features)}
+
+            # FIX S004: inject OHLCV candle history so SignalEngine can pass the
+            # ≥3-candle guard and compute real LONG/SHORT signals.
+            # Build normalised candle dicts from the rolling window (last 20 bars).
+            ohlcv_window = window[-20:] if len(window) >= 20 else window
+            candle_list = [
+                {
+                    "open":   _safe_float(c[1]),
+                    "high":   _safe_float(c[2]),
+                    "low":    _safe_float(c[3]),
+                    "close":  _safe_float(c[4]),
+                    "volume": _safe_float(c[5]),
+                }
+                for c in ohlcv_window
+                if len(c) >= 6
+                    and _safe_float(c[4]) > 0
+                    and _safe_float(c[1]) > 0
+            ]
+            # Wire into the features dict that signal_engine.generate() receives.
+            feat_inner = features.get("features", features)
+            if isinstance(feat_inner, dict):
+                feat_inner["candles"] = candle_list
+                feat_inner["price"]   = _safe_float(candle[4])
+                feat_inner["close"]   = _safe_float(candle[4])
+                feat_inner["volume"]  = _safe_float(candle[5])
+                # Expose OFI z-score and Hawkes signals already computed by FeatureEngine
+                feat_inner["ofi_zscore"]        = feat_inner.get("ofi_norm", feat_inner.get("ofi", 0.0))
+                feat_inner["flow_imbalance"]    = feat_inner.get("aggressor_imbalance", 0.0)
+                feat_inner["hawkes_intensity"]  = feat_inner.get("trade_burst", 0.0)
+            features = feat_inner  # unwrap so signal_engine.generate() sees the flat dict
 
             if self.fill_model is not None:
                 features = self.fill_model.enrich(features)
             if self.tox_filter is not None:
                 features = self.tox_filter.enrich(features)
-            alpha = {}
-            if self.alpha_predictor is not None:
-                alpha_raw = self.alpha_predictor.predict({"features": features}) or {}
-            else:
-                alpha_raw = {}
-
-            if signal_quality_required:
-                if self.regime_engine is None:
-                    return {
-                        "total_trades": 0, "win_rate": 0.0, "pnl": 0.0, "max_drawdown": 0.0, "sharpe": 0.0, "expectancy": 0.0,
-                        "trade_log": [], "signal_only_mode": self.signal_only, "signal_coverage": 0.0, "long_signals": 0,
-                        "short_signals": 0, "hold_signals": 0, "avg_return_per_trade": 0.0, "avg_holding_bars": 0.0,
-                        "alpha_non_empty_count": 0, "regime_state": "explicit_fallback", "signal_quality_valid": False,
-                        "signal_quality_reason": "production_parity_requires_regime_engine",
-                    }
-                if not (self.alpha_orchestrator is not None and AlphaSignal is not None and RegimeContext is not None and FeatureQuality is not None and ExecutionState is not None):
-                    return {
-                        "total_trades": 0, "win_rate": 0.0, "pnl": 0.0, "max_drawdown": 0.0, "sharpe": 0.0, "expectancy": 0.0,
-                        "trade_log": [], "signal_only_mode": self.signal_only, "signal_coverage": 0.0, "long_signals": 0,
-                        "short_signals": 0, "hold_signals": 0, "avg_return_per_trade": 0.0, "avg_holding_bars": 0.0,
-                        "alpha_non_empty_count": 0, "regime_state": "explicit_fallback", "signal_quality_valid": False,
-                        "signal_quality_reason": "production_parity_requires_regime_engine",
-                    }
-                if self.alpha_predictor is None:
-                    return {
-                        "total_trades": 0, "win_rate": 0.0, "pnl": 0.0, "max_drawdown": 0.0, "sharpe": 0.0, "expectancy": 0.0,
-                        "trade_log": [], "signal_only_mode": self.signal_only, "signal_coverage": 0.0, "long_signals": 0,
-                        "short_signals": 0, "hold_signals": 0, "avg_return_per_trade": 0.0, "avg_holding_bars": 0.0,
-                        "alpha_non_empty_count": 0, "regime_state": "explicit_fallback", "signal_quality_valid": False,
-                        "signal_quality_reason": "production_parity_requires_alpha_orchestration",
-                        "production_valid": False,
-                    }
-                cur_close = _safe_float(current_price)
-                log_ret = 0.0 if prev_close <= 0.0 or cur_close <= 0.0 else math.log(cur_close / prev_close)
-                regime_features = [
-                    _safe_float(features.get("imbalance", 0.0)) if isinstance(features, dict) else 0.0,
-                    _safe_float(features.get("bid_vol", 0.0)) if isinstance(features, dict) else 0.0,
-                    _safe_float(features.get("trade_count", len(trades))) if isinstance(features, dict) else float(len(trades)),
-                ]
-                reg_out = self.regime_engine.update({
-                    "return": log_ret,
-                    "features": regime_features,
-                    "price": current_price,
-                    "volume": candle_volume,
-                    "orderbook": snapshot,
-                    "trades": trades,
-                    "require_calibration": True,
-                    "require_microstructure": True,
-                }) or {}
-                if not bool(reg_out.get("signal_valid", True)):
-                    return {
-                        "total_trades": 0, "win_rate": 0.0, "pnl": 0.0, "max_drawdown": 0.0, "sharpe": 0.0, "expectancy": 0.0,
-                        "trade_log": [], "signal_only_mode": self.signal_only, "signal_coverage": 0.0, "long_signals": 0,
-                        "short_signals": 0, "hold_signals": 0, "avg_return_per_trade": 0.0, "avg_holding_bars": 0.0,
-                        "alpha_non_empty_count": 0, "regime_state": "explicit_fallback", "signal_quality_valid": False,
-                        "signal_quality_reason": "production_parity_requires_regime_engine",
-                    }
-                regime_context = reg_out
-                if not isinstance(alpha_raw, dict):
-                    return {
-                        "total_trades": 0, "win_rate": 0.0, "pnl": 0.0, "max_drawdown": 0.0, "sharpe": 0.0, "expectancy": 0.0,
-                        "trade_log": [], "signal_only_mode": self.signal_only, "signal_coverage": 0.0, "long_signals": 0,
-                        "short_signals": 0, "hold_signals": 0, "avg_return_per_trade": 0.0, "avg_holding_bars": 0.0,
-                        "alpha_non_empty_count": 0, "regime_state": "explicit_fallback", "signal_quality_valid": False,
-                        "signal_quality_reason": "production_parity_requires_alpha_orchestration", "production_valid": False,
-                    }
-                current_time = float(snapshot.get("timestamp", i) or i)
-                src = alpha_raw.get("source_id")
-                direction_raw = alpha_raw.get("direction")
-                conviction_raw = alpha_raw.get("confidence", alpha_raw.get("conviction"))
-                edge_raw = alpha_raw.get("expected_edge_bps", alpha_raw.get("edge_bps", alpha_raw.get("edge", 0.0)))
-                if src is None or direction_raw is None or conviction_raw is None:
-                    return {
-                        "total_trades": 0, "win_rate": 0.0, "pnl": 0.0, "max_drawdown": 0.0, "sharpe": 0.0, "expectancy": 0.0,
-                        "trade_log": [], "signal_only_mode": self.signal_only, "signal_coverage": 0.0, "long_signals": 0,
-                        "short_signals": 0, "hold_signals": 0, "avg_return_per_trade": 0.0, "avg_holding_bars": 0.0,
-                        "alpha_non_empty_count": 0, "regime_state": "explicit_fallback", "signal_quality_valid": False,
-                        "signal_quality_reason": "production_parity_requires_alpha_orchestration", "production_valid": False,
-                    }
-                direction_val = 1 if str(direction_raw).upper() in ("LONG", "BUY", "1") else (-1 if str(direction_raw).upper() in ("SHORT", "SELL", "-1") else 0)
-                conviction_val = _clamp(_safe_float(conviction_raw, 0.0), 0.0, 1.0)
-                edge_val = abs(_safe_float(edge_raw, 0.0))
-                signal_obj = AlphaSignal(
-                    source_id=str(src),
-                    direction=direction_val,
-                    conviction=conviction_val,
-                    expected_edge_bps=edge_val,
-                    timestamp=max(current_time, 1.0),
-                )
-                rc = RegimeContext(
-                    regime_name=str(regime_context.get("regime_label", "unknown")),
-                    volatility_score=_clamp(_safe_float(regime_context.get("confidence", 0.5), 0.5), 0.0, 1.0),
-                    liquidity_score=_clamp(_safe_float(regime_context.get("risk_level", 0.5), 0.5), 0.0, 1.0),
-                )
-                fq_payload = features.get("quality", {}) if isinstance(features, dict) else {}
-                if not isinstance(fq_payload, dict):
-                    fq_payload = {}
-                fq = FeatureQuality(
-                    staleness_ratio=_clamp(_safe_float(fq_payload.get("staleness_ratio", 0.0), 0.0), 0.0, 1.0),
-                    missing_data_ratio=_clamp(_safe_float(fq_payload.get("missing_data_ratio", 0.0), 0.0), 0.0, 1.0),
-                )
-                orch_action = self.alpha_orchestrator.orchestrate(
-                    signals=[signal_obj],
-                    regime_context=rc,
-                    feature_quality=fq,
-                    execution_state=ExecutionState(current_exposure_usd=0.0, max_exposure_usd=max(balance, 0.0), current_drawdown_pct=0.0),
-                    current_time=max(current_time, 1.0),
-                )
-                if orch_action.action.name == "BUY":
-                    alpha = {"direction": "LONG", "confidence": float(orch_action.net_conviction), "prob_above": 1.0, "prob_below": 0.0}
-                elif orch_action.action.name == "SELL":
-                    alpha = {"direction": "SHORT", "confidence": float(orch_action.net_conviction), "prob_above": 0.0, "prob_below": 1.0}
-                else:
-                    alpha = {"direction": "NEUTRAL", "confidence": float(orch_action.net_conviction), "prob_above": 0.5, "prob_below": 0.5}
-                alpha_non_empty_count += 1
-            if isinstance(features, dict):
-                features["alpha"] = alpha
             signal = self.signal_engine.generate(features)
-            sig_name = str(signal.get("signal", "HOLD")).upper()
-            if "LONG" in sig_name:
-                signal_counts["LONG"] += 1
-                non_hold_signals += 1
-            elif "SHORT" in sig_name:
-                signal_counts["SHORT"] += 1
-                non_hold_signals += 1
-            else:
-                signal_counts["HOLD"] += 1
             meta = self.meta_filter.evaluate(features=features, signal=signal, decision=None, router_decision=None, snapshot=snapshot, trades=trades)
-            if self.signal_only:
-                continue
 
             analysis_mid = _safe_float(snapshot["bids"][0][0] + snapshot["asks"][0][0], 0.0) / 2.0
             basis_mode = str(getattr(self.cfg, "basis_mode", "none")).strip().lower()
@@ -601,10 +362,6 @@ class BacktestEngine:
         expectancy = (avg_win * win_rate) - (avg_loss * (1.0 - win_rate))
 
         logger.info("[BACKTEST CACHE] hits=%d misses=%d", cache_hits, cache_misses)
-        signal_coverage = (non_hold_signals / bars_processed) if bars_processed > 0 else 0.0
-        coverage_reason = "" if signal_coverage > 0 else "no_non_hold_signals"
-        if synthetic_microstructure:
-            coverage_reason = "ohlcv_synthetic_microstructure_not_valid_for_live_signal_quality"
         return {
             "total_trades": total_trades,
             "win_rate": round(win_rate, 6),
@@ -613,16 +370,4 @@ class BacktestEngine:
             "sharpe": round(_compute_sharpe(returns), 6),
             "expectancy": round(expectancy, 6),
             "trade_log": trade_log,
-            "signal_only_mode": self.signal_only,
-            "signal_coverage": round(signal_coverage, 6),
-            "long_signals": signal_counts["LONG"],
-            "short_signals": signal_counts["SHORT"],
-            "hold_signals": signal_counts["HOLD"],
-            "avg_return_per_trade": round((sum(returns) / len(returns)) if returns else 0.0, 6),
-            "avg_holding_bars": round((sum((t["exit_index"] - t["entry_index"]) for t in trade_log) / total_trades) if total_trades else 0.0, 6),
-            "alpha_non_empty_count": alpha_non_empty_count,
-            "regime_state": "explicit_fallback" if synthetic_microstructure else "feature_derived",
-            "signal_quality_valid": (signal_coverage > 0.0) and (not synthetic_microstructure),
-            "signal_quality_reason": coverage_reason,
-            "production_valid": bool(signal_quality_required and (not synthetic_microstructure) and (signal_coverage > 0.0)),
         }
