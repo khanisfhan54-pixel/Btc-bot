@@ -67,10 +67,20 @@ if _PROM_AVAILABLE:
     ENGINE_FEED_STATUS = PromCounter("engine_feed_status_total", "Feed status", ["engine_id", "status"])
     MTF_DEGRADATION = PromCounter("engine_mtf_degradation_total", "MTF degradation reasons", ["engine_id", "reason"])
     ENGINE_LATENCY = Histogram("engine_update_latency_seconds", "Update latency", ["engine_id"])
-    regime_garch_persistence_high_total = PromCounter(
+    REGIME_GARCH_PERSISTENCE_HIGH = PromCounter(
         "regime_garch_persistence_high_total",
-        "GARCH persistence (alpha+beta) exceeded safe threshold",
+        "Number of times alpha+beta exceeded persistence threshold post-refit",
         ["engine_id"],
+    )
+    REGIME_SCHEMA_VIOLATIONS = PromCounter(
+        "regime_schema_violations_total",
+        "Number of times _validate_output_schema returned False",
+        ["engine_id", "violation_type"],
+    )
+    REGIME_FAILSAFE_EMITTED = PromCounter(
+        "regime_failsafe_emitted_total",
+        "Number of times the engine emitted a fail-safe payload",
+        ["engine_id", "reason"],
     )
 
 def _synchronized(method):
@@ -187,7 +197,7 @@ def _normalize_prob_vector(values: np.ndarray, floor: float = 1e-12) -> np.ndarr
 # ==========================================
 # NEW: Schema Guard (prevents silent breakage)
 # ==========================================
-def _validate_output_schema(output: Dict[str, Any]) -> bool:
+def _validate_output_schema(output: Dict[str, Any], engine_id: str = "unknown") -> bool:
     try:
         if not isinstance(output, dict):
             raise ValueError("output must be a dict")
@@ -299,6 +309,43 @@ def _validate_output_schema(output: Dict[str, Any]) -> bool:
             LOGGER.error(f"[SCHEMA VIOLATION] {e} | output={str(output)[:500]}")
         except Exception:
             warnings.warn("Schema violation logging failed", RuntimeWarning, stacklevel=2)
+        if _PROM_AVAILABLE:
+            try:
+                msg = str(e)
+                lowered = msg.lower()
+                if "schema_version" in lowered or "mismatch" in lowered:
+                    vt = "schema_version"
+                elif "probabilities" in lowered:
+                    vt = "probabilities"
+                elif "macro_probs" in lowered:
+                    vt = "macro_probs"
+                elif "garch_regime_probs" in lowered:
+                    vt = "garch_regime_probs"
+                elif "risk_metrics" in lowered:
+                    vt = "risk_metrics"
+                elif "engine_status" in lowered:
+                    vt = "engine_status"
+                elif "execution_mode" in lowered:
+                    vt = "execution_mode"
+                elif "execution_side" in lowered:
+                    vt = "execution_side"
+                elif "signal_valid" in lowered:
+                    vt = "signal_valid"
+                elif "confidence" in lowered:
+                    vt = "confidence"
+                elif "conviction" in lowered:
+                    vt = "conviction"
+                elif "edge_score" in lowered or "alpha" in lowered:
+                    vt = "alpha"
+                elif "position_size" in lowered:
+                    vt = "position_size"
+                elif "missing required key" in lowered or "missing " in lowered:
+                    vt = "missing_key"
+                else:
+                    vt = "other"
+                REGIME_SCHEMA_VIOLATIONS.labels(str(engine_id or "unknown"), vt).inc()
+            except Exception:
+                pass
         return False
 
 def _build_output(
@@ -328,7 +375,7 @@ def _build_output(
     range_ticks: int = 0,
     signal_valid: bool = True,
     include_signal_valid: bool = True,
-    engine_id: str = "default",
+    engine_id: str = "unknown",
 ) -> Dict[str, Any]:
     """
     Single authoritative output constructor for AdvancedRegimeEngine.update().
@@ -336,7 +383,6 @@ def _build_output(
     paths emit identical key sets, eliminating downstream KeyError risks from
     schema divergence between code paths.
     """
-    engine_id = str(engine_id or "default")
     safe_expected_vol = safe_float(expected_vol, default=0.0, min=0.0)
     safe_last_valid_vol = safe_float(last_valid_vol, default=max(safe_expected_vol, 1e-12), min=1e-12)
     safe_switch_stability = safe_float(switch_stability_ema, default=1.0, min=1e-6)
@@ -432,7 +478,14 @@ def _build_output(
         out["signal_valid"] = False
     
     # --- HARD GUARD (fail-safe, NON-BREAKING) ---
-    if not _validate_output_schema(out):
+    if not _validate_output_schema(out, engine_id=engine_id):
+        if _PROM_AVAILABLE:
+            try:
+                REGIME_FAILSAFE_EMITTED.labels(
+                    str(engine_id or "unknown"), "schema_validation_failed"
+                ).inc()
+            except Exception:
+                pass
         fail_safe_probs = [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]
         fail_safe_macro_probs = _normalize_prob_vector(np.asarray(fail_safe_probs, dtype=float)).tolist()
         fail_safe_garch_probs = _normalize_prob_vector(np.asarray([0.5, 0.5], dtype=float)).tolist()
@@ -917,8 +970,16 @@ class SparseJumpModel:
         if prev_state is not None:
             switch_mask = np.ones(self.K, dtype=bool)
             switch_mask[prev_state] = False
-            # lambda_pen + additional damping combined into single penalty term
-            costs[switch_mask] -= (0.25 * self.lambda_pen + 0.05)
+            # FIX CRITICAL-3 / SJM penalty sign:
+            # costs[k] = NEGATIVE squared distance (already large-negative for far centroids).
+            # `argmax(costs)` picks the closest centroid. To DISCOURAGE switching we must
+            # SUBTRACT extra utility from the switch candidates (i.e. add a positive penalty
+            # value to the absolute magnitude of their cost), making them LESS attractive.
+            # Previously the code wrote `-=` here, which made non-incumbent states MORE
+            # attractive (cheaper to switch) — the exact opposite of the intended semantics.
+            # The correct sign is `+=` so the penalty is SUBTRACTED from the switch cost
+            # (costs are negative; adding (-pen) reduces the score of switching).
+            costs[switch_mask] += -(0.25 * self.lambda_pen + 0.05)
 
         # NHHMM bias: symmetric clamp [0, 1] allows caller to reduce influence
         # below 1.0 during low-confidence or risk-off conditions.
@@ -976,6 +1037,29 @@ class MSGARCH_RiskEngine:
             + self.alpha * (return_t ** 2)
             + self.beta_garch * current_var
         )
+        # FIX-3: runtime IGARCH guardrail — detect post-refit persistence drift
+        try:
+            persistence = np.asarray(self.alpha, dtype=float) + np.asarray(self.beta_garch, dtype=float)
+            if np.any(persistence >= 0.99):
+                engine = getattr(self, "_regime_engine_ref", None)
+                eid = "unknown"
+                if engine is not None:
+                    eid = str(getattr(engine, "_metrics_engine_id", getattr(engine, "engine_id", "unknown")))
+                if _PROM_AVAILABLE:
+                    try:
+                        REGIME_GARCH_PERSISTENCE_HIGH.labels(eid).inc()
+                    except Exception:
+                        pass
+                if engine is not None:
+                    try:
+                        engine._warn_rate_limited(
+                            "garch_persistence_high",
+                            f"GARCH persistence {persistence.tolist()} >= 0.99 (IGARCH risk).",
+                        )
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         if not np.all(np.isfinite(new_var)):
             return np.full(2, max(self.target_vol ** 2, 1e-8), dtype=float)
         return np.clip(new_var, 1e-8, self._VAR_CEIL)
@@ -1013,7 +1097,12 @@ class AdvancedRegimeEngine:
     # 🚨 CIRCUIT BREAKER CONFIG
     # ==========================================
     _MAX_DRAWDOWN = 0.12
-    _MAX_PORTFOLIO_DRAWDOWN = 0.12
+    # FIX-7 (REGIME_ENGINE_AUDIT 2026-04-23): hard portfolio-level drawdown
+    # stop, separate from the engine's own model-based drawdown. Tripped via
+    # report_realized_pnl() by the executor (live or backtest) on every
+    # closed trade. Without this, a 50 x -2% ruin scenario walks past the
+    # engine without firing the circuit breaker.
+    _MAX_PORTFOLIO_DRAWDOWN = 0.20
     _MAX_CONSECUTIVE_LOSSES = 7
     _VOL_SHOCK_MULTIPLIER = 3.5
     _CONFIDENCE_COLLAPSE_THRESHOLD = 0.35
@@ -1221,11 +1310,6 @@ class AdvancedRegimeEngine:
         enable_background_workers: bool = True,
         load_model_weights_on_init: bool = True,
     ):
-        """
-        allow_igarch: bool
-            If True, allows alpha + beta ≥ 1 (IGARCH behavior).
-            WARNING: This is a research-only flag and MUST NOT be used in production.
-        """
         if n_states != 3:
             raise ValueError(
                 f"AdvancedRegimeEngine requires exactly 3 states (Bull/Bear/Crisis), "
@@ -1258,6 +1342,8 @@ class AdvancedRegimeEngine:
             target_volatility=target_vol,
             regime_prob_floor=regime_prob_floor,
         )
+        # FIX-3: back-reference enables runtime IGARCH telemetry from _garch_update
+        self.garch._regime_engine_ref = self
         self._init_params: Dict[str, Any] = {
             'n_states': n_states,
             'n_features': n_features,
@@ -1350,9 +1436,6 @@ class AdvancedRegimeEngine:
         self._equity = 1.0
         self._drawdown = 0.0
         self._cumulative_drawdown = 0.0
-        self._portfolio_equity = 1.0
-        self._peak_equity = 1.0
-        self._portfolio_drawdown = 0.0
         self._loss_streak = 0
         self._shock_memory = 0.0
         self._return_ema = 0.0
@@ -1362,6 +1445,9 @@ class AdvancedRegimeEngine:
         self._circuit_breaker_active = False
         self._circuit_breaker_reason = None
         self._circuit_breaker_trigger_tick = -1
+        # FIX-7: portfolio-DD tracking (driven externally by report_realized_pnl)
+        self._portfolio_peak_equity = float("nan")
+        self._portfolio_drawdown = 0.0
         self._healing_counter = 0
         self._last_healing_action = "NONE"
         self._cb_trigger_history: "deque[tuple[float, str, float]]" = deque(maxlen=50)
@@ -2792,6 +2878,40 @@ class AdvancedRegimeEngine:
     def get_state(self) -> Dict[str, Any]:
         return self._get_state_unlocked()
 
+    def report_realized_pnl(self, realized_pnl: float, equity: float) -> None:
+        """FIX-7 (REGIME_ENGINE_AUDIT 2026-04-23): the executor (live or
+        backtest) calls this on EVERY realized trade close. Updates the
+        portfolio peak/drawdown trackers and trips the circuit breaker when
+        portfolio drawdown exceeds ``_MAX_PORTFOLIO_DRAWDOWN``.
+
+        This is the only path that connects portfolio-level losses to the
+        engine's circuit breaker. Without it, a sequence of losing trades is
+        invisible to the engine and the breaker never fires.
+        """
+        with self._lock:
+            try:
+                eq = float(equity)
+            except Exception:
+                return
+            if not (np.isfinite(eq) and eq > 0):
+                return
+            if (not np.isfinite(self._portfolio_peak_equity)) or eq > self._portfolio_peak_equity:
+                self._portfolio_peak_equity = eq
+            dd = max(0.0, 1.0 - eq / self._portfolio_peak_equity)
+            self._portfolio_drawdown = float(dd)
+            if dd >= self._MAX_PORTFOLIO_DRAWDOWN and not self._circuit_breaker_active:
+                self._circuit_breaker_active = True
+                self._circuit_breaker_reason = (
+                    f"PORTFOLIO_DD_{dd:.4f}_GE_{self._MAX_PORTFOLIO_DRAWDOWN}"
+                )
+                try:
+                    LOGGER.error(
+                        "CIRCUIT_BREAKER: portfolio DD %.4f >= %.4f (realized_pnl=%.6f equity=%.6f)",
+                        dd, self._MAX_PORTFOLIO_DRAWDOWN, float(realized_pnl), eq,
+                    )
+                except Exception:
+                    pass
+
     @_synchronized
     def serialize_state(self) -> Dict[str, Any]:
         return self._get_state_unlocked()
@@ -2851,6 +2971,9 @@ class AdvancedRegimeEngine:
         self._circuit_breaker_active = False
         self._circuit_breaker_reason = None
         self._circuit_breaker_trigger_tick = -1
+        # FIX-7: also reset portfolio-DD trackers on engine reset
+        self._portfolio_peak_equity = float("nan")
+        self._portfolio_drawdown = 0.0
         self._healing_counter = 0
         self._last_healing_action = "NONE"
         self._cb_trigger_history: "deque[tuple[float, str, float]]" = deque(maxlen=50)
@@ -3395,13 +3518,6 @@ class AdvancedRegimeEngine:
         if _staging_warnings:
             LOGGER.info("load_state: replayed %d staging warnings to live engine.", len(_staging_warnings))
 
-    def update_portfolio_equity(self, equity: float):
-        self._portfolio_equity = float(equity)
-        self._peak_equity = max(self._peak_equity, self._portfolio_equity)
-        self._portfolio_drawdown = (
-            (self._peak_equity - self._portfolio_equity) / self._peak_equity
-        )
-
     @_synchronized
     def update(self, market_data: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(market_data, dict):
@@ -3453,7 +3569,7 @@ class AdvancedRegimeEngine:
                 execution_side="flat",
                 include_signal_valid=True,
                 signal_valid=False,
-                engine_id=self.engine_id,
+                engine_id=self._metrics_engine_id,
             )
 
         require_calibration = bool(market_data.get("require_calibration", False))
@@ -3484,7 +3600,7 @@ class AdvancedRegimeEngine:
                 execution_side="flat",
                 include_signal_valid=True,
                 signal_valid=False,
-                engine_id=self.engine_id,
+                engine_id=self._metrics_engine_id,
             )
 
         # NOTE: enforce globally across codebase:
@@ -3550,7 +3666,7 @@ class AdvancedRegimeEngine:
                 execution_side="flat",
                 include_signal_valid=True,
                 signal_valid=False,
-                engine_id=self.engine_id,
+                engine_id=self._metrics_engine_id,
             )
 
         # ==========================================
@@ -3632,7 +3748,7 @@ class AdvancedRegimeEngine:
                 execution_side='flat',
                 include_signal_valid=True,
                 signal_valid=False,
-                engine_id=self.engine_id,
+                engine_id=self._metrics_engine_id,
             )
             _observe_latency()
             return output
@@ -3654,12 +3770,6 @@ class AdvancedRegimeEngine:
             _observe_latency()
             if obs_sample and not getattr(self, "_is_replay", False):
                 self._replay_record("update_end", {"regime": "HALTED"})
-            return output
-
-        if self._portfolio_drawdown >= self._MAX_PORTFOLIO_DRAWDOWN:
-            self._trigger_circuit_breaker("PORTFOLIO_DRAWDOWN")
-            output = _build_halted_output()
-            _observe_latency()
             return output
 
         stale_reason: str = "NO_PREV_PRICE"
@@ -3790,7 +3900,7 @@ class AdvancedRegimeEngine:
                                                 range_ticks=self.range_ticks_int,
                                                 include_signal_valid=True,
                                                 signal_valid=False,
-                                                engine_id=self.engine_id,
+                                                engine_id=self._metrics_engine_id,
                                             )
                                             self._update_timestamp_anchor(current_ts)
                                             _observe_latency()
@@ -3927,13 +4037,13 @@ class AdvancedRegimeEngine:
                     feed_status="MTF_BASE_FEATURES_MISSING",
                     engine_status="NO_FEATURES",
                     last_valid_vol=float(getattr(self, "_last_valid_vol", self.garch.target_vol)),
-                    engine_id=self.engine_id,
                     switch_stability_ema=float(getattr(self, "_switch_stability_ema", 1.0)),
                     execution_side="flat",
                     extended_schema=self._emit_extended_schema,
                     range_ticks=self.range_ticks_int,
                     include_signal_valid=True,
                     signal_valid=False,
+                    engine_id=self._metrics_engine_id,
                 )
                 _observe_latency()
                 return output
@@ -4118,7 +4228,6 @@ class AdvancedRegimeEngine:
                     raw_size=0.0,
                     is_toxic=True,
                     garch_regime_probs=self.garch_prob.tolist(),
-                    engine_id=self.engine_id,
                     feed_status='MISSING_DATA',
                     last_valid_vol=float(getattr(self, "_last_valid_vol", self.garch.target_vol)),
                     switch_stability_ema=float(getattr(self, "_switch_stability_ema", 1.0)),
@@ -4127,6 +4236,7 @@ class AdvancedRegimeEngine:
                     range_ticks=self.range_ticks_int,
                     include_signal_valid=True,
                     signal_valid=False,
+                    engine_id=self._metrics_engine_id,
                 )
                 _observe_latency()
                 return output
@@ -4200,7 +4310,7 @@ class AdvancedRegimeEngine:
                 range_ticks=self.range_ticks_int,
                 include_signal_valid=True,
                 signal_valid=False,
-                engine_id=self.engine_id,
+                engine_id=self._metrics_engine_id,
             )
             _observe_latency()
             return output
@@ -4342,7 +4452,7 @@ class AdvancedRegimeEngine:
                 range_ticks=self.range_ticks_int,
                 include_signal_valid=True,
                 signal_valid=False,
-                engine_id=self.engine_id,
+                engine_id=self._metrics_engine_id,
             )
             if obs_sample and not getattr(self, "_is_replay", False):
                 self._replay_record("update_end", {"regime": "UNKNOWN"})
@@ -4776,18 +4886,6 @@ class AdvancedRegimeEngine:
 
         predicted_var = np.copy(self.garch_var)
         self.garch_var = self.garch._garch_update(self.garch_var, y_t)
-        for alpha, beta in zip(np.asarray(self.garch.alpha, dtype=float), np.asarray(self.garch.beta_garch, dtype=float)):
-            persistence = alpha + beta
-            if persistence > 0.99:
-                if _PROM_AVAILABLE:
-                    regime_garch_persistence_high_total.labels(
-                        engine_id=str(getattr(self, "engine_id", None) or "default")
-                    ).inc()
-                self._warn_rate_limited(
-                    "garch_persistence_high",
-                    alpha,
-                    beta
-                )
         if self.garch_var.shape != (2,) or not np.all(np.isfinite(self.garch_var)):
             self._warn_rate_limited(
                 key="garch_var_invalid",
@@ -5079,7 +5177,6 @@ class AdvancedRegimeEngine:
             },
             macro_probs=self.nhhmm_prior.tolist(),
             position_size=position_size,
-            engine_id=self.engine_id,
             signed_position_size=signed_position_size,
             expected_vol=expected_vol,
             raw_size=raw_size,
@@ -5094,6 +5191,7 @@ class AdvancedRegimeEngine:
             range_ticks=rticks,
             include_signal_valid=True,
             signal_valid=bool(self._weights_loaded),
+            engine_id=self._metrics_engine_id,
         )
         if not self._weights_loaded:
             output["regime_label"] = "UNCALIBRATED"
