@@ -1470,6 +1470,12 @@ class AdvancedRegimeEngine:
         # FIX-7: portfolio-DD tracking (driven externally by report_realized_pnl)
         self._portfolio_peak_equity = float("nan")
         self._portfolio_drawdown = 0.0
+        # FIX-6 (consumer): calibration-time feature normalisation moments.
+        # Populated by _load_model_weights when present in the .npz; otherwise
+        # remain None and _normalize_features falls back to an identity pass.
+        self._feature_mean: Optional[np.ndarray] = None
+        self._feature_std:  Optional[np.ndarray] = None
+        self._feature_norm_source: str = "rolling"
         self._healing_counter = 0
         self._last_healing_action = "NONE"
         self._cb_trigger_history: "deque[tuple[float, str, float]]" = deque(maxlen=50)
@@ -2255,6 +2261,24 @@ class AdvancedRegimeEngine:
             if not np.all(np.isfinite(w)) or float(np.sum(np.abs(w))) <= 0.0:
                 raise ValueError("sjm_feature_weights must be finite and non-zero")
             self.sjm.load_weights(means, w)
+
+            # FIX-6 (consumer): consume calibration-time normalisation moments
+            # if the .npz includes them (saver in calibrate_regime.py writes
+            # feature_mean(3,) and feature_std(3,)). Falls back gracefully on
+            # legacy artefacts.
+            if "feature_mean" in weights and "feature_std" in weights:
+                fm = np.asarray(weights["feature_mean"], dtype=np.float64)
+                fs = np.asarray(weights["feature_std"],  dtype=np.float64)
+                # guard against zero-std degeneracy (calibration on flat feature)
+                fs = np.where(fs > 1e-12, fs, 1.0)
+                self._feature_mean = fm
+                self._feature_std  = fs
+                self._feature_norm_source = "calibrated"
+            else:
+                self._feature_mean = None
+                self._feature_std  = None
+                self._feature_norm_source = "rolling"
+
             self._weights_loaded = True
             self._calibration_status = "calibrated"
         except Exception:
@@ -2263,6 +2287,22 @@ class AdvancedRegimeEngine:
             self._calibration_status = "invalid"
             self._engine_status = "DEGRADED"
             return
+
+    def _normalize_features(self, x: np.ndarray) -> np.ndarray:
+        """FIX-6 (consumer): apply calibration-time normalisation when
+        available. When no calibrated moments are loaded, returns ``x``
+        unchanged (the engine's downstream paths perform their own scaling).
+        Always returns a finite ndarray; NaN/Inf inputs propagate as-is so
+        upstream fail-closed checks can detect them.
+        """
+        arr = np.asarray(x, dtype=np.float64)
+        if (getattr(self, "_feature_mean", None) is not None
+                and getattr(self, "_feature_std", None) is not None):
+            try:
+                return (arr - self._feature_mean) / self._feature_std
+            except Exception:
+                return arr
+        return arr
 
     @staticmethod
     def _snapshot_emitter_loop(
@@ -3005,6 +3045,10 @@ class AdvancedRegimeEngine:
             "tick_id": int(getattr(self, "_tick_id", 0)),
             "healing_count": int(getattr(self, "_healing_count", 0)),
             "regime_downgrade_count": _downgrade,
+            # UPGRADE-5.7: surface the FIX-6 normalisation provenance so
+            # operators can verify at a glance whether a deployed engine is
+            # using calibrated or rolling-stats feature normalisation.
+            "feature_norm_source": str(getattr(self, "_feature_norm_source", "rolling")),
         }
 
     @staticmethod
@@ -3074,6 +3118,17 @@ class AdvancedRegimeEngine:
                     self._record_regime_downgrade("circuit_breaker")
                 except Exception:
                     pass
+                # UPGRADE-5.8: persist cb_trigger_history to disk so the
+                # operator can recover trip context after a crash. Replay-
+                # skipped (preserves determinism) and fail-soft on I/O.
+                if not getattr(self, "_is_replay", False):
+                    try:
+                        import pathlib as _pl
+                        _pl.Path("audit_engine_output").mkdir(exist_ok=True)
+                        with open("audit_engine_output/cb_trigger_history.json", "w") as _f:
+                            json.dump(list(self._cb_trigger_history)[-100:], _f)
+                    except Exception:
+                        pass  # never let persistence kill the engine
                 try:
                     LOGGER.error(
                         "CIRCUIT_BREAKER: portfolio DD %.4f >= %.4f (realized_pnl=%.6f equity=%.6f)",
