@@ -67,6 +67,11 @@ if _PROM_AVAILABLE:
     ENGINE_FEED_STATUS = PromCounter("engine_feed_status_total", "Feed status", ["engine_id", "status"])
     MTF_DEGRADATION = PromCounter("engine_mtf_degradation_total", "MTF degradation reasons", ["engine_id", "reason"])
     ENGINE_LATENCY = Histogram("engine_update_latency_seconds", "Update latency", ["engine_id"])
+    regime_garch_persistence_high_total = PromCounter(
+        "regime_garch_persistence_high_total",
+        "GARCH persistence (alpha+beta) exceeded safe threshold",
+        ["engine_id"],
+    )
 
 def _synchronized(method):
     @wraps(method)
@@ -1213,6 +1218,11 @@ class AdvancedRegimeEngine:
         enable_background_workers: bool = True,
         load_model_weights_on_init: bool = True,
     ):
+        """
+        allow_igarch: bool
+            If True, allows alpha + beta ≥ 1 (IGARCH behavior).
+            WARNING: This is a research-only flag and MUST NOT be used in production.
+        """
         if n_states != 3:
             raise ValueError(
                 f"AdvancedRegimeEngine requires exactly 3 states (Bull/Bear/Crisis), "
@@ -4738,6 +4748,18 @@ class AdvancedRegimeEngine:
 
         predicted_var = np.copy(self.garch_var)
         self.garch_var = self.garch._garch_update(self.garch_var, y_t)
+        for alpha, beta in zip(np.asarray(self.garch.alpha, dtype=float), np.asarray(self.garch.beta_garch, dtype=float)):
+            persistence = alpha + beta
+            if persistence > 0.99:
+                if _PROM_AVAILABLE:
+                    regime_garch_persistence_high_total.labels(
+                        engine_id=str(getattr(self, "engine_id", None) or "default")
+                    ).inc()
+                self._warn_rate_limited(
+                    "garch_persistence_high",
+                    alpha,
+                    beta
+                )
         if self.garch_var.shape != (2,) or not np.all(np.isfinite(self.garch_var)):
             self._warn_rate_limited(
                 key="garch_var_invalid",
