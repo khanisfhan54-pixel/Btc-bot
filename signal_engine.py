@@ -44,7 +44,9 @@ def _default_alpha():
 def _validate_alpha(alpha: Dict[str, Any]) -> Dict[str, Any]:
     try:
         if not isinstance(alpha, dict):
-            logger.warning("Alpha validation adjusted: %s", alpha)
+            # FIX-L2: downgrade vacuous "Alpha validation adjusted: {}" emissions
+            # to DEBUG so noisy non-dict / empty-dict inputs do not flood logs.
+            logger.debug("Alpha validation adjusted (non-dict input): %s", alpha)
             return _default_alpha()
 
         conf = float(alpha.get("confidence", 0.5))
@@ -81,11 +83,15 @@ def _validate_alpha(alpha: Dict[str, Any]) -> Dict[str, Any]:
             "prob_below": max(0.0, min(1.0, p_dn)),
             "direction": direction,
         }
-        if adjusted:
-            logger.warning("Alpha validation adjusted: %s", alpha)
+        if adjusted and alpha:
+            # FIX-L2: only emit when an actual non-empty alpha required adjustment.
+            # Suppress vacuous empty-dict warnings; downgrade to DEBUG.
+            logger.debug("Alpha validation adjusted: %s", alpha)
         return validated
     except Exception:
-        logger.warning("Alpha validation adjusted: %s", alpha)
+        # FIX-L2: downgrade exception path to DEBUG (the original alpha is
+        # logged for diagnosis but not at WARNING level).
+        logger.debug("Alpha validation adjusted (exception path): %s", alpha)
         return _default_alpha()
 
 
