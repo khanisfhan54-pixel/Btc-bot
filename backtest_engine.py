@@ -241,10 +241,9 @@ class BacktestConfig:
     initial_balance: float = 10_000.0
     basis_mode: str = "none"  # none|fixed
     fixed_basis: float = 0.0
-    # Phase 4: orchestrator action threshold (lower than production default of
-    # 0.6 because backtest convictions are clamped to (0.01, 0.99) and
-    # synthetic data does not produce extreme convictions).
-    orchestrator_action_threshold: float = 0.30
+    # Restored to production parity after FIX-1 (real microstructure integration).
+    # Date: 2026-05-03 | FIX-1 commit: UNKNOWN_AT_TIME_OF_EDIT
+    orchestrator_action_threshold: float = 0.6
     # When False: ARE/LSA/AlphaOrchestrator are required and run_backtest()
     # returns a fail-closed empty result if any are missing. When True: the
     # orchestrator path is skipped entirely (legacy diagnostic-only mode).
