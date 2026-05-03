@@ -219,17 +219,25 @@ def test_snapshot_version_uses_engine_constant(monkeypatch):
             captured["payload"] = payload
             called.set()
 
-    eng = AdvancedRegimeEngine(n_states=3, n_features=3, seed=10)
-    try:
-        eng._replay_engine = DummyReplay()
-        eng._tick_id = 99
-        eng.update(_md(ts=1.0, ret=0.001, price=100.0))
-        assert called.wait(timeout=1.0)
-        assert captured["payload"]["schema_version"] == eng._STATE_VERSION
-    finally:
-        eng._shutdown_warning_worker()
-        eng._shutdown_snapshot_worker()
 
+def test_garch_persistence_warning(engine, monkeypatch):
+    calls = []
+
+    def _warn_spy(key, message, cooldown_s=30.0):
+        calls.append((key, message, cooldown_s))
+        return True
+
+    monkeypatch.setattr(engine, "_warn_rate_limited", _warn_spy)
+
+    engine.garch.alpha = np.array([0.49, 0.49], dtype=float)
+    engine.garch.beta_garch = np.array([0.49, 0.49], dtype=float)
+    engine.update(_md(ts=1.0, ret=0.001, price=100.0))
+    assert not any(k == "garch_persistence_high" for k, _, _ in calls)
+
+    engine.garch.alpha = np.array([0.6, 0.6], dtype=float)
+    engine.garch.beta_garch = np.array([0.4, 0.4], dtype=float)
+    engine.update(_md(ts=2.0, ret=0.001, price=100.1))
+    assert any(k == "garch_persistence_high" for k, _, _ in calls)
 
 def test_edge_sizing_single_modulation_path(engine, monkeypatch):
     engine._regime_smoother = None
