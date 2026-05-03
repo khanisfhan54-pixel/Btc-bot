@@ -942,6 +942,8 @@ class BacktestEngine:
                 net_pnl_pct = gross_pnl_pct - total_fee_pct - slippage
                 pnl = balance * net_pnl_pct * 0.25
                 balance += pnl
+                if self.are is not None:
+                    self.are.update_portfolio_equity(balance)
                 peak = max(peak, balance)
                 dd = (peak - balance) / peak if peak > 0 else 0.0
                 max_dd = max(max_dd, dd)

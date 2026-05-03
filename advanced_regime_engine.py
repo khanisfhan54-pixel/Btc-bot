@@ -1013,6 +1013,7 @@ class AdvancedRegimeEngine:
     # 🚨 CIRCUIT BREAKER CONFIG
     # ==========================================
     _MAX_DRAWDOWN = 0.12
+    _MAX_PORTFOLIO_DRAWDOWN = 0.12
     _MAX_CONSECUTIVE_LOSSES = 7
     _VOL_SHOCK_MULTIPLIER = 3.5
     _CONFIDENCE_COLLAPSE_THRESHOLD = 0.35
@@ -1349,6 +1350,9 @@ class AdvancedRegimeEngine:
         self._equity = 1.0
         self._drawdown = 0.0
         self._cumulative_drawdown = 0.0
+        self._portfolio_equity = 1.0
+        self._peak_equity = 1.0
+        self._portfolio_drawdown = 0.0
         self._loss_streak = 0
         self._shock_memory = 0.0
         self._return_ema = 0.0
@@ -3391,6 +3395,13 @@ class AdvancedRegimeEngine:
         if _staging_warnings:
             LOGGER.info("load_state: replayed %d staging warnings to live engine.", len(_staging_warnings))
 
+    def update_portfolio_equity(self, equity: float):
+        self._portfolio_equity = float(equity)
+        self._peak_equity = max(self._peak_equity, self._portfolio_equity)
+        self._portfolio_drawdown = (
+            (self._peak_equity - self._portfolio_equity) / self._peak_equity
+        )
+
     @_synchronized
     def update(self, market_data: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(market_data, dict):
@@ -3643,6 +3654,12 @@ class AdvancedRegimeEngine:
             _observe_latency()
             if obs_sample and not getattr(self, "_is_replay", False):
                 self._replay_record("update_end", {"regime": "HALTED"})
+            return output
+
+        if self._portfolio_drawdown >= self._MAX_PORTFOLIO_DRAWDOWN:
+            self._trigger_circuit_breaker("PORTFOLIO_DRAWDOWN")
+            output = _build_halted_output()
+            _observe_latency()
             return output
 
         stale_reason: str = "NO_PREV_PRICE"
