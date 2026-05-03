@@ -303,12 +303,13 @@ for i in range(WARMUP, len(ohlcv)):
                         "expected_win_rate": 0.52,
                     },
                     feature_quality=fq,
-                    regime_context=rctx,
+                    regime=rctx,
                     event_time=ts_s,
                 )
                 update_perf_calls += 1
-            except Exception:
-                pass
+            except Exception as exc:
+                if update_perf_calls < 3:
+                    print(f"[update_performance] {type(exc).__name__}: {exc}")
             position = None
 
 elapsed = time.time() - start

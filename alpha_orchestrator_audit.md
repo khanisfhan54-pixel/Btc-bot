@@ -7,6 +7,8 @@
 **Outputs:** `audit_orchestrator_output/{orchestrator_audit.json, orchestrator_records.csv, orchestrator_trades.csv, adversarial_results.json}`
 **Verdict:** **FAIL with one CRITICAL and two HIGH findings.** Functional logic is sound (17/20 adversarial tests pass on first run); however the meta_info schema is **not** stable across HOLD paths — a documented contract violation that breaks downstream OMS routers and trade journals. Detail and remediation below.
 
+> **Audit revision note (post-architect-review).** The first harness run was re-executed after fixing one harness bug surfaced by the internal code review: `update_performance(...)` was being called with `regime_context=` (the original parameter name in some sibling modules) but the orchestrator's actual keyword is `regime=`. The mistake was masked by a `try/except: pass`, so the first run silently skipped 71 feedback updates. With the keyword fixed, the feedback loop now exercises correctly: `update_performance_calls=67`, `signal_engine.trade_count=67`, `signal_engine.current_multiplier=0.5` (correctly attenuated to floor after a strong loss streak). All numbers below reflect the corrected re-run. Conclusions are unchanged; the underlying schema bug (F-1) reproduced identically in both runs (33 632 bars / 84.79 % missing keys).
+
 ---
 
 ## 0. Executive summary
@@ -17,7 +19,8 @@
 | `orchestrate()` calls | 39 665 |
 | Loop runtime | 4.8 s (≈8 270 calls/s, single-threaded) |
 | Exceptions raised | **0** |
-| Trades round-tripped | 71 |
+| Trades round-tripped | 67 |
+| `update_performance()` calls (post-fix) | 67 |
 | Adversarial tests passing functionally | **17 / 20** |
 | Adversarial tests failing **purely** because of schema-parity bug | 3 (`TEST-1`, `TEST-7`, `TEST-20`) |
 | Findings: CRITICAL | **1** |
@@ -63,7 +66,9 @@ I instrumented the harness to check **every** required key on **every** of the 3
 
 In `TEST-20` (10 hand-crafted HOLD inputs × full schema check) the same three keys are missing in **6 / 10** HOLD paths: `no_valid_signals`, `invalid_current_time`, `unknown` (when all signals get rejected → `no_valid_signals`), `invalid_input_type`, `insufficient_liquidity`, `poor_feature_quality`. They **are** present in `dd_breach`, `zero_exp`, and `weak_score` — i.e., the HOLD paths that flow through `_generate_decision` after `meta_payload` has been built.
 
-**Root cause** (lines 1773–1788 vs 1974–2016): the early HOLD guards call `self._hold(reason, base_meta)`. `base_meta` only carries the pre-fusion observability block. The success-path `meta_payload` (built at 1974) is the **only** place where `final_conviction`, `risk_metrics`, `quality_metrics` are added to the dict, so any guard that returns before that line ships an incomplete `meta_info`. → **F-1 (CRITICAL)** below.
+**Root cause** (lines 1773–1788 vs 1974–2016): the early HOLD guards call `self._hold(reason, base_meta)`. `base_meta` only carries the pre-fusion observability block (it does call `**self._empty_signal_observability()` which injects `agreement_ratio`, `conflict_ratio`, `dominant_timeframe`, `signal_metrics`, `per_signal_breakdown`, `timeframe_breakdown` — those 6 keys are present in every HOLD). The success-path `meta_payload` (built at 1974) is the **only** place where `final_conviction`, `risk_metrics`, `quality_metrics` are added to the dict, so any guard that returns before that line ships an incomplete `meta_info`.
+
+A second instance of the same bug exists in the **invalid-current-time path** at line 1678: `_missing_time_meta` is hand-built and shipped to `_hold("invalid_current_time", _missing_time_meta)` at line 1713. It also lacks the same three keys (TEST-7 confirms). → **F-1 (CRITICAL)** below.
 
 ### 1.3 Configuration validation (Phase 1.3)
 
@@ -159,49 +164,55 @@ In `TEST-20` (10 hand-crafted HOLD inputs × full schema check) the same three k
 
 ```
 bars_processed             39665      exceptions_during_loop          0
-BUY_count                     86      BUY_pct                  0.2168 %
-SELL_count                    80      SELL_pct                 0.2017 %
-HOLD_count                 39499      HOLD_pct                99.5815 %
+BUY_count                     68      BUY_pct                  0.1714 %
+SELL_count                    77      SELL_pct                 0.1941 %
+HOLD_count                 39520      HOLD_pct                99.6344 %
 stale_rejections               0      duplicates_removed              0
 invalid_rejections             0      future_timestamp_rejections     0
 negative_edge_normalized       0
-avg_net_conviction        0.00202     std_net_conviction      0.02061
-avg_urgency               0.00187     std_urgency             0.01964
-avg_expected_edge_bps     0.00031     std_expected_edge_bps   0.04489
-action_threshold_hit_rate 0.4715 %    (only 187/39665 bars cleared 0.30)
+avg_net_conviction        0.00202     std_net_conviction      0.03631
+avg_urgency               0.00188     std_urgency             0.03372
+avg_expected_edge_bps    -0.00140     std_expected_edge_bps   0.51673
+action_threshold_hit_rate 0.3656 %    (only 145/39665 bars cleared 0.30)
+conviction_distribution
+   [0.0, 0.2)   39 520        [0.2, 0.4)        5
+   [0.4, 0.6)       90        [0.6, 0.8)       19
+   [0.8, 1.0]       31
 ```
 
 ### 3.3 Rationale breakdown (every HOLD has a rationale)
 
 ```
 insufficient_liquidity   33 632  (84.79 %)
-dd_breach                 5 765  (14.53 %)
-weak_score                  102  ( 0.26 %)
-pos_bias                     86  ( 0.22 %)   ← BUY
-neg_bias                     80  ( 0.20 %)   ← SELL
+dd_breach                 5 618  (14.16 %)
+weak_score                  270  ( 0.68 %)   ← grew vs first run because perf-multiplier
+                                              attenuated signal_engine after losses
+neg_bias                     77  ( 0.19 %)   ← SELL
+pos_bias                     68  ( 0.17 %)   ← BUY
 ```
 
 ### 3.4 Trade metrics (Dec 2023 walk-forward, real bars)
 
 ```
-total_trades                   71
-win_rate                  0.0845         (6 wins / 65 losses)
-avg_win_bps              +43.2
-avg_loss_bps             -29.0
-best_trade_bps           +74.6
-worst_trade_bps          -56.4
-expectancy_bps_per_trade -22.95
-profit_factor             0.0959
-max_consec_losses           23
-total_return_pct        -15.07 %
-final_equity              $8 493.38   (start $10 000)
-max_drawdown_pct         15.07 %
-round_trip_cost_drag     1 136 bps total (≈22 bps/trade × 2 sides)
-held_bars  mean=4.11  min=1  max=12
-sharpe_annualized_synthetic   −13.86
-sortino_annualized_synthetic   −7.20
-calmar_synthetic              −1.0
+total_trades                   67
+win_rate                  0.1194         (8 wins / 59 losses)
+avg_win_bps              +20.0
+avg_loss_bps             -30.5
+best_trade_bps           +52.3
+worst_trade_bps          -62.4
+expectancy_bps_per_trade -24.49
+profit_factor             0.0889
+max_consec_wins              3        max_consec_losses             19
+total_return_pct        -15.16 %
+final_equity              $8 483.57   (start $10 000)
+max_drawdown_pct         15.16 %
+round_trip_cost_drag     1 072 bps total (≈16 bps/trade × 2 sides)
+sharpe_annualized_synthetic    −280.4    (annualised from per-trade with very short holds)
+sortino_annualized_synthetic   −466.3
+calmar_synthetic                 −1.0
 ```
+
+> The Sharpe/Sortino are extremely large in magnitude because annualisation from per-trade with mean-hold ≈4 bars over Dec 2023 produces a massive scaling factor; report them only for completeness — only the **expectancy** and **profit factor** are meaningful at this sample size.
 
 These numbers reflect the **synthetic alpha sources** I built for the harness (the brief required real data; the alphas are unavoidably synthetic since the production alpha modules are out of scope). They are reported here for transparency and to exercise the orchestrator under realistic load. **They do not measure the orchestrator's predictive power; they measure that the orchestrator faithfully passes through bad signal.**
 
@@ -222,17 +233,17 @@ regime distribution
 
 **Note on empty `dominant_timeframe`:** the field is only populated by `_combine_timeframes` when ≥2 timeframes carry a non-zero score. With my synthetic alphas, `signal_engine` (1m) and `liquidity_sweep_alpha` (5m) frequently agree on direction and produce non-zero scores in only one bucket per call, so the multi-timeframe fusion path executes but does not consistently nominate a dominant timeframe. `TEST-19` confirms the field **is** populated when the inputs require it (see Test-19 result: `dominant_tf="5m"`).
 
-### 3.6 Feedback feedback metrics
+### 3.6 Feedback metrics (post-harness-fix)
 
 ```
-update_performance_calls          71
+update_performance_calls          67
 tracked_sources                ['signal_engine']
-performance_multiplier(signal_engine)  ≈ floor (the ledger turned strongly negative)
-trade_count(signal_engine)        71
-win_rate(signal_engine)           0.085
+performance_multiplier(signal_engine)  0.5   ← clamped to min_multiplier floor after loss streak
+trade_count(signal_engine)        67
+win_rate(signal_engine)           0.1194
 ```
 
-The performance multiplier correctly attenuates as the loss streak grows; no exceptions, no stuck mutex.
+The performance multiplier correctly attenuated to its floor (`min_multiplier=0.5`) after the loss streak — visible in the rationale shift between the original (broken-feedback) run and the corrected run: `weak_score` count rose from 102 → 270 because halved per-source weight pushed more bars below `action_threshold=0.30`. No exceptions, no stuck mutex, no `RuntimeError("fatal_transaction_rollback_failure")` — the rollback path was not exercised because no `update_performance` call failed.
 
 ---
 
@@ -279,7 +290,11 @@ The performance multiplier correctly attenuates as the loss streak grows; no exc
 
 **Impact.** Any downstream consumer (OMS router, trade journal, dashboard, replay tooling) that does `meta["risk_metrics"]["risk_pressure"]` on a HOLD will `KeyError`. In production this caused **84.8 % of bars** in the Dec 2023 audit to ship a partial schema. The brief explicitly classifies this as a contract violation.
 
-**Fix (~10 lines).** Materialise schema-stable defaults inside `base_meta`:
+**Two affected build sites:**
+- `base_meta` at lines 1773–1788 (covers `insufficient_liquidity`, `no_valid_signals`, `poor_feature_quality`, `decay_drift_limit_exceeded`, `regime_drift_safety_brake`)
+- `_missing_time_meta` at line 1678 (covers `invalid_current_time` — handled separately because the orchestration-time fields are not yet computable when current_time is invalid)
+
+**Fix (~10 lines per site).** Materialise schema-stable defaults inside both dicts:
 
 ```python
 base_meta: Dict[str, Any] = {
