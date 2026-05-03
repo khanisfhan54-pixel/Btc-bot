@@ -293,6 +293,7 @@ class LiquiditySweepAlpha:
         direction_mode: str = "continuation",         # FIX C-1 APPLIED
         active_sweep_lookback_bars: int = 30,         # FIX C-2 APPLIED
         pool_reset_atr_mult: float = 5.0,             # FIX H-3 APPLIED
+        enable_sweep_directional_fallback: bool = False,  # FIX-28 (M-2)
     ):
         self.levels = depth_levels
         self.resiliency_threshold = resiliency_threshold
@@ -344,6 +345,16 @@ class LiquiditySweepAlpha:
 
         # FIX H-3 APPLIED — independent per-side pool reset multiplier.
         self.pool_reset_atr_mult: float = float(pool_reset_atr_mult)
+
+        # FIX-28 (M-2) — opt-in directional fallback. When True and the
+        # primary path returns action="HOLD", predict() will consult
+        # predict_sweep() and surface a directional bias derived from
+        # ofi_zscore / hawkes_intensity instead of the bare HOLD. Default
+        # False preserves the strict prior behaviour for callers that
+        # treat HOLD as authoritative.
+        self.enable_sweep_directional_fallback: bool = bool(
+            enable_sweep_directional_fallback
+        )
 
         # FIX L-2 APPLIED — neutral / no-signal returns from
         # _predict_next_sweep, surfaced via get_state_metrics().
@@ -1280,6 +1291,43 @@ class LiquiditySweepAlpha:
             data = data["features"]
 
         out = self.get_signal(data, regime_context=regime_context) or {}
+
+        # FIX-28 (M-2): opt-in directional fallback. If the primary path
+        # returned HOLD AND the operator explicitly enabled the fallback,
+        # consult predict_sweep() and bias the action by ofi_zscore /
+        # hawkes_intensity. Fail-soft: any error keeps the original HOLD.
+        try:
+            if (
+                isinstance(out, dict)
+                and out.get("action") == "HOLD"
+                and getattr(self, "enable_sweep_directional_fallback", False)
+            ):
+                liq_state = {
+                    "pools": dict(self.liquidity_pools),
+                    "ofi_zscore": float(out.get("ofi_zscore", 0.0) or 0.0),
+                    "hawkes_intensity": float(out.get("hawkes_intensity", 0.0) or 0.0),
+                }
+                fallback = predict_sweep(
+                    liq_state,
+                    data if isinstance(data, dict) else {},
+                    data.get("volume_intel", {}) if isinstance(data, dict) else {},
+                ) or {}
+                fb_action = fallback.get("action")
+                if fb_action in ("BUY", "SELL"):
+                    out = dict(out)
+                    out["action"] = fb_action
+                    # Confidence is intentionally clamped low — fallback is
+                    # a hint, not a primary signal.
+                    out["confidence"] = float(
+                        max(0.0, min(0.5, float(fallback.get("confidence", 0.25) or 0.25)))
+                    )
+                    prev_logic = str(out.get("logic", "") or "")
+                    out["logic"] = (
+                        prev_logic + "|" if prev_logic else ""
+                    ) + "directional_fallback"
+        except Exception:
+            # Strictly fail-soft — keep the original HOLD output on any error.
+            pass
 
         # HARD GUARANTEE (never bypass safety contract)
         return self._safe_output(out)
