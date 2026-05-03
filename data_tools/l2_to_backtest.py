@@ -4,6 +4,7 @@ import os
 from collections import defaultdict
 
 import pandas as pd
+from l2_pipeline import align_book_to_bars
 
 # =========================
 # CONFIG
