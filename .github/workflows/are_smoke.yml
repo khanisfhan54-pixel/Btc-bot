@@ -14,3 +14,20 @@ jobs:
         run: pip install -r requirements.txt
       - name: Run ARE smoke tests
         run: make smoke
+
+  smoke-l2:
+    runs-on: ubuntu-latest
+    needs: smoke
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: |
+          pip install -r requirements.txt
+          pip install pytest-timeout
+      - name: Run real-L2 smoke gate (200 bars)
+        run: pytest -m smoke_l2 --tb=short --timeout=60
