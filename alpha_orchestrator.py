@@ -1029,6 +1029,57 @@ class AlphaOrchestrator:
             meta.update(partial_meta)
         return OrchestratedAction(Action.HOLD, 0.0, 0.0, 0.0, meta)
 
+    def _empty_post_fusion_observability(self) -> Dict[str, Any]:
+        """FIX-26 (H-1): zero-state post-fusion observability keys.
+
+        Guarantees schema parity for the 7 post-fusion keys across every
+        early-exit HOLD path (paths that never reach the fusion stage).
+        Spread BEFORE _empty_signal_observability() so the existing
+        richer schemas for overlapping keys (final_conviction,
+        risk_metrics, quality_metrics) take precedence; the 4 truly
+        post-fusion-only keys (mtf_metrics, regime_adjusted_threshold,
+        regime_assessment, tf_fusion_breakdown) are added unconditionally.
+        Downstream consumers can rely on `meta_info[<key>]` returning a
+        well-typed neutral default rather than raising KeyError.
+        """
+        return {
+            "final_conviction": 0.0,
+            "mtf_metrics": {
+                "active_timeframes": [],
+                "agreement_ratio": 0.0,
+                "conflict_ratio": 0.0,
+                "dominant_timeframe": None,
+                "dominant_basis": "none",
+            },
+            "quality_metrics": {
+                "stale_ratio": 0.0,
+                "missing_ratio": 0.0,
+                "vol_amplifier": 1.0,
+                "combined_multiplier": 1.0,
+                "conviction_pre_quality": 0.0,
+                "conviction_post_quality": 0.0,
+            },
+            "regime_adjusted_threshold": 0.0,
+            "regime_assessment": {
+                "regime": None,
+                "confidence": 0.0,
+                "trend_strength": 0.0,
+                "risk_level": 0.0,
+            },
+            "risk_metrics": {
+                "scaler": 0.0,
+                "utilization": 0.0,
+                "risk_pressure": 0.0,
+                "risk_penalty": 0.0,
+                "circuit_state": "CLOSED",
+            },
+            "tf_fusion_breakdown": {
+                "per_tf_conviction": {},
+                "per_tf_weight": {},
+                "fusion_method": "none",
+            },
+        }
+
     def _empty_signal_observability(self) -> Dict[str, Any]:
         """Zeroed observability fields for paths that exit before signal fusion.
 
@@ -1537,7 +1588,12 @@ class AlphaOrchestrator:
                 "orchestrate() failed with an unhandled exception; returning HOLD"
             )
             try:
-                _err_meta = {**self._empty_signal_observability()}
+                # FIX-26 (H-1): post-fusion zero-state spread first so existing
+                # signal-observability values (where richer) take precedence.
+                _err_meta = {
+                    **self._empty_post_fusion_observability(),
+                    **self._empty_signal_observability(),
+                }
             except Exception:
                 _err_meta = {}
             return self._hold("internal_error", _err_meta)
@@ -1826,6 +1882,8 @@ class AlphaOrchestrator:
                     "cumulative_rejection_telemetry": rejection_telemetry_snapshot,
                 },
                 "source_policy_summary": _pre_val_source_policy,
+                # FIX-26 (H-1): post-fusion zero-state precedes signal-obs.
+                **self._empty_post_fusion_observability(),
                 # FIX 17: Zeroed observability defaults for schema parity.
                 **self._empty_signal_observability(),
             }
@@ -1877,6 +1935,8 @@ class AlphaOrchestrator:
                     "cumulative_rejection_telemetry": rejection_telemetry_snapshot,
                 },
                 "source_policy_summary": _pre_val_source_policy,
+                # FIX-26 (H-1): post-fusion zero-state precedes signal-obs.
+                **self._empty_post_fusion_observability(),
                 **self._empty_signal_observability(),
             }
             logger.warning("Rejected orchestration call: missing current_time | action=hold")
@@ -1953,6 +2013,9 @@ class AlphaOrchestrator:
             "decision_telemetry": decision_telemetry,
             # FIX 9: Per-call source policy visibility.
             "source_policy_summary": source_policy_summary,
+            # FIX-26 (H-1): post-fusion zero-state precedes signal-obs so
+            # the latter's richer overlapping schemas still win.
+            **self._empty_post_fusion_observability(),
             # FIX 17: Zeroed observability defaults for schema parity.
             **self._empty_signal_observability(),
         }

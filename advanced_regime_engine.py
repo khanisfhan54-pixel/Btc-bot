@@ -40,6 +40,11 @@ except ImportError:
     _PROM_AVAILABLE = False
 
 LOGGER = logging.getLogger(__name__)
+
+# FIX-L1: module-level guard so the "errors.get_error unavailable" notice is
+# emitted at most once per process (was a WARNING fired on every ARE
+# construction). See AdvancedRegimeEngine.__init__ for the gated emission.
+_ERROR_MAP_WARN_EMITTED: bool = False
 _OUTPUT_SCHEMA_VERSION = "1.2.0"
 _POSITION_SIZE_CAP = 0.35
 _VALID_ENGINE_STATUS = frozenset({
@@ -1561,14 +1566,36 @@ class AdvancedRegimeEngine:
             self._errors_module_available = False
             self._error_category_resolver = None
             if not getattr(self, "_is_replay", False):
-                msg = (
-                    "errors.get_error unavailable; self-healing category mapping "
-                    "running in built-in fallback mode."
-                )
-                try:
-                    LOGGER.warning(msg)
-                except Exception:
-                    warnings.warn(msg, RuntimeWarning, stacklevel=2)
+                # FIX-L1: downgrade to INFO + once-per-process guard so
+                # constructing many ARE instances does not spam the log
+                # with the same fallback notice.
+                global _ERROR_MAP_WARN_EMITTED
+                if not _ERROR_MAP_WARN_EMITTED:
+                    msg = (
+                        "advanced_regime_engine: errors.get_error unavailable; "
+                        "self-healing category mapping running in built-in "
+                        "fallback mode."
+                    )
+                    try:
+                        LOGGER.info(msg)
+                    except Exception:
+                        warnings.warn(msg, RuntimeWarning, stacklevel=2)
+                    _ERROR_MAP_WARN_EMITTED = True
+
+        # FIX-27 (M-1): per-reason regime downgrade counter. Incremented at
+        # every _build_output() call site that emits execution_mode in
+        # {"halt","fail_safe","circuit_breaker"} via _record_regime_downgrade().
+        # Exposed verbatim through get_health(). Registered reason codes:
+        #   - "microstructure_required_but_missing"
+        #   - "uncalibrated_weights"
+        #   - "circuit_breaker"
+        #   - "nhhmm_warmup"
+        self._regime_downgrade_count: Dict[str, int] = {
+            "microstructure_required_but_missing": 0,
+            "uncalibrated_weights": 0,
+            "circuit_breaker": 0,
+            "nhhmm_warmup": 0,
+        }
 
         self._obs_counter = 0
         self._OBS_SAMPLE_RATE = 5  # update metrics every N ticks
@@ -2851,6 +2878,49 @@ class AdvancedRegimeEngine:
             raw["sjm_default_params_initialized"] = False
         return raw
 
+    # ------------------------------------------------------------------
+    # FIX-27 (M-1) — regime downgrade telemetry surface.
+    # ------------------------------------------------------------------
+    def _record_regime_downgrade(self, reason: str) -> None:
+        """Increment the per-reason regime downgrade counter.
+
+        Called at every _build_output() call site that emits
+        execution_mode in {"halt", "fail_safe", "circuit_breaker"}.
+        Fail-soft so observability never breaks the trading path.
+        """
+        try:
+            if not isinstance(reason, str) or not reason:
+                reason = "unspecified"
+            self._regime_downgrade_count[reason] = (
+                self._regime_downgrade_count.get(reason, 0) + 1
+            )
+        except Exception:
+            pass
+
+    def get_health(self) -> Dict[str, Any]:
+        """FIX-27 (M-1): public health snapshot.
+
+        Exposes regime_downgrade_count alongside the existing engine
+        status flags so operators can quantify how often (and why) the
+        engine is dropping into a degraded execution mode without
+        mining the structured logs.
+        """
+        try:
+            _downgrade = dict(getattr(self, "_regime_downgrade_count", {}) or {})
+        except Exception:
+            _downgrade = {}
+        return {
+            "engine_status": str(getattr(self, "_engine_status", "OK")),
+            "health_status": str(getattr(self, "_health_status", "OK")),
+            "determinism_status": str(getattr(self, "_determinism_status", "OK")),
+            "circuit_breaker_active": bool(getattr(self, "_circuit_breaker_active", False)),
+            "circuit_breaker_reason": getattr(self, "_circuit_breaker_reason", None),
+            "weights_loaded": bool(getattr(self, "_weights_loaded", False)),
+            "tick_id": int(getattr(self, "_tick_id", 0)),
+            "healing_count": int(getattr(self, "_healing_count", 0)),
+            "regime_downgrade_count": _downgrade,
+        }
+
     @staticmethod
     def _materialize_state_from_raw(raw_state: Dict[str, Any]) -> Dict[str, Any]:
         out = dict(raw_state)
@@ -3545,6 +3615,11 @@ class AdvancedRegimeEngine:
             self._engine_status = "DEGRADED"
             blocked_label = "UNCALIBRATED" if not self._weights_loaded else "UNKNOWN"
             blocked_feed = "UNCALIBRATED_WEIGHTS" if not self._weights_loaded else "INVALID_INPUT_MICROSTRUCTURE_REQUIRED"
+            # FIX-27 (M-1): bin this halt under the appropriate reason code.
+            self._record_regime_downgrade(
+                "uncalibrated_weights" if not self._weights_loaded
+                else "microstructure_required_but_missing"
+            )
             return _build_output(
                 regime_idx=-1,
                 regime_label=blocked_label,
@@ -3576,6 +3651,8 @@ class AdvancedRegimeEngine:
         if require_calibration and not self._weights_loaded:
             self.last_signed_position_size = 0.0
             self._engine_status = "DEGRADED"
+            # FIX-27 (M-1)
+            self._record_regime_downgrade("uncalibrated_weights")
             return _build_output(
                 regime_idx=-1,
                 regime_label="UNCALIBRATED",
@@ -3642,6 +3719,8 @@ class AdvancedRegimeEngine:
 
         def _build_halted_output() -> Dict[str, Any]:
             self.last_signed_position_size = 0.0
+            # FIX-27 (M-1): every circuit-breaker halt is tallied here.
+            self._record_regime_downgrade("circuit_breaker")
             return _build_output(
                 regime_idx=-1,
                 regime_label="HALTED",

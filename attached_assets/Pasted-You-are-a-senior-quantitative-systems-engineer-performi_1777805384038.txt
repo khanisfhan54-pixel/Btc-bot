@@ -1,0 +1,239 @@
+You are a senior quantitative systems engineer performing a targeted verification and remediation pass on a 9-module BTC algorithmic trading pipeline. You have access to the full codebase. Your job is to:
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 1 — VERIFY WHICH ISSUES ARE FIXED vs OPEN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Check the following 6 issues from the combined-pipeline audit report. For each one, inspect the relevant source file and determine definitively: FIXED or OPEN. Output a verification table before touching any code.
+
+--- ISSUE H-1 [HIGH] — alpha_orchestrator.py ---
+DESCRIPTION: OrchestratedAction.meta_info is NOT schema-parity-symmetric across early-exit paths. Three early-exit paths (empty signals, current_time=None, signals=str) omit 7 keys: final_conviction, mtf_metrics, quality_metrics, regime_adjusted_threshold, regime_assessment, risk_metrics, tf_fusion_breakdown. Downstream consumers doing meta_info["risk_metrics"]["risk_pressure"] raise KeyError on these paths.
+VERIFY BY: Search alpha_orchestrator.py for a helper named _empty_post_fusion_observability (or equivalent). Check whether _invalid_input_exit_meta, _invalid_time_exit_meta, _dd_breach_exit_meta, _no_signals_exit_meta all merge these 7 keys. Confirm by tracing the return dict of each early-exit builder.
+FIXED IF: All early-exit meta_info builders contain all 7 keys listed above, either directly or via a shared helper.
+
+--- ISSUE M-1 [MEDIUM] — advanced_regime_engine.py ---
+DESCRIPTION: ARE emits regime_label="UNKNOWN" on price-only feeds with no telemetry counter. There is no _regime_downgrade_count[reason] counter incremented in _build_output, and no exposure of this counter via get_health().
+VERIFY BY: Search advanced_regime_engine.py for _regime_downgrade_count. Check get_health() return dict for a downgrade_count or regime_downgrade_count field. Check _build_output for counter increment logic with reason codes: microstructure_required_but_missing, uncalibrated_weights, circuit_breaker, nhhmm_warmup.
+FIXED IF: _regime_downgrade_count dict exists, is incremented in _build_output with at least one reason code, and is exposed in get_health().
+
+--- ISSUE M-2 [MEDIUM] — alpha_liquidity_sweep_predictor.py ---
+DESCRIPTION: LiquiditySweepAlpha.predict() returns action=HOLD for 100% of bars while module-level predict_sweep() correctly returns directional sides. No fallback wiring exists connecting predict_sweep() output back into predict() when no fresh sweep candidate is found.
+VERIFY BY: Search alpha_liquidity_sweep_predictor.py for enable_sweep_directional_fallback config flag. Check the predict() method body for a fallback branch that calls predict_sweep() and maps side="above" -> action="BUY" with confidence=probability * downgrade_factor (~0.4). Verify the flag defaults to False to preserve existing default behaviour.
+FIXED IF: enable_sweep_directional_fallback config flag exists (default False), predict() has a fallback branch gated by it, and the branch calls predict_sweep() and maps the output to a weak directional AlphaSignal.
+
+--- ISSUE M-3 [MEDIUM] — requirements.txt / pyproject.toml + advanced_regime_engine.py ---
+DESCRIPTION: numpy 2.4.4 is present in the environment. advanced_regime_engine.py GARCH/NHHMM internals were written for numpy 1.x. No numpy version pin exists. No dtype-explicit array constructions or 2.x compatibility sweep has been applied.
+VERIFY BY: Check requirements.txt and pyproject.toml for numpy<2.0 pin. Search advanced_regime_engine.py for np.array(..., dtype=object) calls and verify they have explicit shape or are dtype-safe. Check for any deprecated 1.x APIs (np.bool, np.int, np.float, np.complex as bare dtypes).
+FIXED IF: Either numpy<2.0 is pinned, OR every np.array call in advanced_regime_engine.py that previously used ambiguous dtype=object now has an explicit shape/dtype and all deprecated 1.x type aliases are removed.
+
+--- ISSUE L-1 [LOW] — advanced_regime_engine.py ---
+DESCRIPTION: WARNING "advanced_regime_engine: errors.get_error unavailable; self-healing category mapping running in built-in fallback mode." is emitted at every ARE construction. Should be a once-per-process INFO at logger init, not a WARNING on every instantiation.
+VERIFY BY: Search advanced_regime_engine.py for the string "errors.get_error unavailable". Check the log level used (logging.WARNING vs logging.INFO). Check if a module-level flag (e.g. _error_map_warned = False) guards against repeated emission.
+FIXED IF: The message is logged at INFO level and only emitted once per process (guarded by a module-level boolean flag).
+
+--- ISSUE L-2 [LOW] — signal_engine.py ---
+DESCRIPTION: WARNING "Alpha validation adjusted: {}" is emitted when the adjustment dict is empty. An empty-dict warning is informationally vacant.
+VERIFY BY: Search signal_engine.py for "Alpha validation adjusted". Check whether the log call is guarded by if adjustment_dict: or equivalent, or if it is unconditionally emitted.
+FIXED IF: The WARNING is suppressed when the adjustment dict is empty (guarded by if adjustments: or len(adjustments) > 0 before the log call), or downgraded to DEBUG unconditionally.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 2 — APPLY FIXES FOR ALL OPEN ISSUES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+For every issue marked OPEN in Phase 1, apply the exact surgical fix below. Do NOT modify any logic unrelated to the fix. Do NOT change function signatures. Do NOT alter any FIX-1 through FIX-25 existing markers. Preserve all existing docstrings. Add a FIX-26 (H-1), FIX-27 (M-1), FIX-28 (M-2) marker comment for new additions.
+
+--- FIX FOR H-1 — alpha_orchestrator.py ---
+1. Add the following private method to AlphaOrchestrator, adjacent to the existing _empty_signal_observability() method:
+
+def _empty_post_fusion_observability(self) -> Dict[str, Any]:
+    """FIX-26: canonical zero-state for post-fusion keys.
+    Maintains schema parity with the successful-fusion path across all
+    early-exit routes. Mirrors FIX-17 for the pre-fusion observability block."""
+    return {
+        "final_conviction": 0.0,
+        "regime_adjusted_threshold": float(self.config.action_threshold),
+        "regime_assessment": {
+            "regime_name": "unknown",
+            "alignment_multiplier": 1.0,
+            "drift_score": 0.0,
+            "drift_penalty_applied": False,
+        },
+        "tf_fusion_breakdown": {
+            tf: {"directional_score": 0.0, "weight": 0.0, "n_signals": 0}
+            for tf in self.config.timeframe_order
+        },
+        "mtf_metrics": {
+            "alignment_bonus": 0.0,
+            "conflict_penalty": 0.0,
+            "dominant_tf": None,
+            "tf_count": 0,
+        },
+        "risk_metrics": {
+            "risk_pressure": 0.0,
+            "risk_penalty": 0.0,
+            "exposure_ratio": 0.0,
+            "dd_breach": False,
+        },
+        "quality_metrics": {
+            "staleness_ratio": 0.0,
+            "missing_data_ratio": 0.0,
+            "quality_factor": 1.0,
+        },
+    }
+
+2. In every early-exit meta_info builder (_invalid_input_exit_meta, _invalid_time_exit_meta, _dd_breach_exit_meta, _no_signals_exit_meta, and any other method whose name ends in _exit_meta), merge the output of _empty_post_fusion_observability() into the returned dict:
+   meta = { ...existing keys... }
+   meta.update(self._empty_post_fusion_observability())
+   return meta
+
+3. Verify the 7 keys are now present in the meta_info of every early-exit return path by searching for all return statements inside each _exit_meta method.
+
+--- FIX FOR M-1 — advanced_regime_engine.py ---
+1. At class-level __init__ of AdvancedRegimeEngine, add:
+   self._regime_downgrade_count: Dict[str, int] = {}   # FIX-27
+
+2. In _build_output (or wherever regime_label="UNKNOWN" / execution_mode in {"fail_safe","halt","circuit_breaker"} is set), add an increment before returning:
+   if output.get("execution_mode") in ("fail_safe", "halt", "circuit_breaker"):
+       reason = output.get("downgrade_reason", "unspecified")
+       self._regime_downgrade_count[reason] = self._regime_downgrade_count.get(reason, 0) + 1
+
+3. In get_health() return dict, add:
+   "regime_downgrade_count": dict(self._regime_downgrade_count),
+
+4. Identify the four reason codes to use and set them at their respective trigger sites:
+   - "microstructure_required_but_missing" — when price-only feed is detected
+   - "uncalibrated_weights" — when _weights_loaded is False
+   - "circuit_breaker" — when circuit breaker fires
+   - "nhhmm_warmup" — when NHHMM has insufficient bars
+
+--- FIX FOR M-2 — alpha_liquidity_sweep_predictor.py ---
+1. Add enable_sweep_directional_fallback: bool = False to the config dataclass or __init__ params of LiquiditySweepAlpha (with default False to preserve existing default behaviour). Add FIX-28 marker comment.
+
+2. In the predict() method, find the branch that returns action=HOLD due to no fresh sweep candidate. Immediately before that return, add:
+
+   if self.config.enable_sweep_directional_fallback:  # FIX-28
+       try:
+           sweep_result = predict_sweep(
+               self._liquidity_state,
+               market_state,
+               volume_intel,
+           )
+           side = sweep_result.get("side")
+           prob = float(sweep_result.get("probability", 0.0))
+           DOWNGRADE_FACTOR = 0.4
+           if side == "above" and prob > 0:
+               return self._safe_output("BUY", min(prob * DOWNGRADE_FACTOR, 0.99),
+                                        "sweep_directional_fallback")
+           elif side == "below" and prob > 0:
+               return self._safe_output("SELL", min(prob * DOWNGRADE_FACTOR, 0.99),
+                                        "sweep_directional_fallback")
+       except Exception as e:
+           self.logger.debug("sweep_directional_fallback error: %s", e)
+
+3. Preserve the original HOLD return immediately after this block as the final fallback.
+
+--- FIX FOR M-3 — requirements.txt AND advanced_regime_engine.py ---
+OPTION A (preferred — add numpy pin):
+In requirements.txt (or pyproject.toml dependencies), change any existing numpy line to:
+   numpy>=1.24.0,<2.0.0
+If no numpy line exists, add it.
+
+OPTION B (if numpy>=2.0 must be kept — compatibility sweep):
+In advanced_regime_engine.py:
+- Replace np.bool with np.bool_ everywhere
+- Replace np.int with np.int_ everywhere  
+- Replace np.float with np.float64 everywhere
+- Replace np.complex with np.complex128 everywhere
+- For every np.array(...) call where dtype is unspecified and the input is a Python list of mixed types, add an explicit dtype (e.g. dtype=np.float64 or dtype=object with ndmin/shape specified)
+Apply OPTION A unless the codebase has an explicit incompatibility with numpy<2.0.
+
+--- FIX FOR L-1 — advanced_regime_engine.py ---
+1. At module level (top of file, after imports), add:
+   _ERROR_MAP_WARN_EMITTED: bool = False
+
+2. Find the WARNING log line for "errors.get_error unavailable". Replace the block with:
+   global _ERROR_MAP_WARN_EMITTED
+   if not _ERROR_MAP_WARN_EMITTED:
+       logger.info(
+           "advanced_regime_engine: errors.get_error unavailable; "
+           "self-healing category mapping running in built-in fallback mode."
+       )
+       _ERROR_MAP_WARN_EMITTED = True
+
+--- FIX FOR L-2 — signal_engine.py ---
+Find the log call that emits "Alpha validation adjusted: %s" (or f-string equivalent).
+Wrap it with a guard:
+   if adjustments:   # suppress vacuous empty-dict warning
+       self.logger.warning("Alpha validation adjusted: %s", adjustments)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 3 — POST-FIX SELF-VERIFICATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+After applying all fixes, perform the following checks WITHOUT running the full harness:
+
+1. H-1: Search alpha_orchestrator.py. Assert that _empty_post_fusion_observability exists and that every method whose name ends in _exit_meta calls it or directly contains all 7 keys. List any gaps found.
+
+2. M-1: Search advanced_regime_engine.py. Assert _regime_downgrade_count is initialised in __init__, incremented in _build_output, and returned by get_health(). List the reason codes confirmed present.
+
+3. M-2: Search alpha_liquidity_sweep_predictor.py. Assert enable_sweep_directional_fallback exists with default False, and that predict() has the fallback branch gated by it. Confirm _safe_output is called in the BUY/SELL arms.
+
+4. M-3: Confirm numpy version pin in requirements.txt/pyproject.toml OR confirm all deprecated 1.x dtype aliases are purged from advanced_regime_engine.py.
+
+5. L-1: Confirm _ERROR_MAP_WARN_EMITTED module-level guard and INFO level in advanced_regime_engine.py.
+
+6. L-2: Confirm the "Alpha validation adjusted" log call in signal_engine.py is guarded by if adjustments:.
+
+Output a final VERIFICATION TABLE with columns: Issue | Status Before | Fix Applied | Status After | Evidence.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 4 — CREATE PULL REQUEST
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+After all fixes are verified:
+
+1. Stage only the modified files:
+   git add alpha_orchestrator.py advanced_regime_engine.py alpha_liquidity_sweep_predictor.py signal_engine.py requirements.txt
+
+2. Commit with the message:
+   fix: combined-pipeline audit remediation (H-1, M-1, M-2, M-3, L-1, L-2)
+   
+   - FIX-26 (H-1): Add _empty_post_fusion_observability() to AlphaOrchestrator;
+     merge 7 missing keys into all _exit_meta early-return paths. Closes ADV-19 FAIL.
+   - FIX-27 (M-1): Add _regime_downgrade_count telemetry to AdvancedRegimeEngine;
+     expose via get_health(). Reason codes: 4 categories.
+   - FIX-28 (M-2): Add enable_sweep_directional_fallback flag (default=False) to
+     LiquiditySweepAlpha.predict(); wire predict_sweep() as weak-conviction fallback.
+   - M-3: Pin numpy<2.0 in requirements.txt to prevent dtype regression risk.
+   - L-1: Downgrade ARE errors.get_error WARNING to once-per-process INFO.
+   - L-2: Suppress vacuous empty-dict Alpha validation WARNING in signal_engine.
+
+3. Push branch and open PR:
+   git checkout -b audit/combined-pipeline-remediation
+   git push origin audit/combined-pipeline-remediation
+
+4. PR title: "fix: Combined-pipeline audit remediation — H-1, M-1, M-2, M-3, L-1, L-2"
+
+5. PR body must include:
+   - The VERIFICATION TABLE from Phase 3
+   - For each fix: file changed, method/line affected, before/after diff summary
+   - Explicit statement: "No existing FIX-1..FIX-25 markers were modified. No function signatures were changed. enable_sweep_directional_fallback defaults to False — no change to default pipeline behaviour."
+   - Expected delta in combined_summary.json after re-running combined_backtest_harness.py:
+     * H-1: SCHEMA.missing == {} ; ADV-19 → PASS
+     * M-1: new regime_downgrade_count field non-zero on price-only feed
+     * M-2 (flag=False): no behavioural delta (default preserved)
+     * M-2 (flag=True): SIG.lsa_signals_total > 0, SIG.avg_conviction > 0
+     * M-3: no behavioural delta; resilience-only
+     * L-1/L-2: log output cleaner; no functional delta
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CONSTRAINTS — DO NOT VIOLATE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Do NOT modify engine.py or main.py (statically audited only; READ-ONLY contract).
+- Do NOT modify execution.py (monkey-patched; no logic changes needed).
+- Do NOT alter any existing FIX-1 through FIX-25 docstring markers.
+- Do NOT change any public method signature.
+- Do NOT set enable_sweep_directional_fallback=True as default.
+- Do NOT touch replay_engine.py (N/A findings; no fix required).
+- If any file is not found, report it explicitly and halt that fix rather than guessing paths.
+- Apply fixes atomically per file (one surgical edit per issue, not a rewrite).
