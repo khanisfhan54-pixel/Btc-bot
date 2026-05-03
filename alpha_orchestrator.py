@@ -17,6 +17,60 @@ from enum import Enum
 logger = logging.getLogger(__name__)
 
 # ==========================================
+# F-7: Schema-stable contract for orchestrate() meta_info
+# Provides a static-typed shape that callers can rely on across
+# every code path (HOLD and SIGNAL). All keys are optional at the
+# TypedDict level (total=False) because internal construction is
+# incremental, but the orchestrator guarantees presence at exit.
+# ==========================================
+try:
+    from typing import TypedDict  # py3.8+
+
+    class _RiskMetrics(TypedDict, total=False):
+        scaler: float
+        utilization: float
+        risk_pressure: float
+        risk_penalty: float
+        regime_adjusted_max_dd: float
+        circuit_state: str
+
+    class _QualityMetrics(TypedDict, total=False):
+        stale_ratio: float
+        missing_ratio: float
+        vol_amplifier: float
+        stale_multiplier: float
+        missing_multiplier: float
+        regime_factor: float
+        combined_multiplier: float
+        conviction_pre_quality: float
+        conviction_post_quality: float
+
+    class _CorrelationMetrics(TypedDict, total=False):
+        groups_active: list
+        max_group_size: int
+        any_gate_active: bool
+
+    class OrchestratorMetaInfo(TypedDict, total=False):
+        """Schema-stable output contract for every orchestrate() call.
+
+        F-1: All keys are present on both SIGNAL and HOLD paths.
+        total=False allows partial construction internally; the orchestrator
+        is responsible for filling defaults on every exit.
+        """
+        signal: str
+        rationale: str
+        final_conviction: float
+        risk_metrics: _RiskMetrics
+        quality_metrics: _QualityMetrics
+        correlation_metrics: _CorrelationMetrics
+        dominant_timeframe: object  # str | None
+        dominant_timeframe_basis: str
+        per_signal_breakdown: list
+except Exception:  # pragma: no cover - py<3.8 fallback
+    OrchestratorMetaInfo = Dict  # type: ignore[assignment,misc]
+
+
+# ==========================================
 # Helper: Defensive Math & Types
 # ==========================================
 
@@ -155,6 +209,19 @@ class AlphaSignal:
 
 @dataclass(frozen=True)
 class RegimeContext:
+    """Per-call market regime snapshot consumed by orchestrate().
+
+    Field semantics (F-2):
+        regime_name      : Canonical regime label (e.g. "normal", "crisis").
+        volatility_score : [0.0, 1.0] composite vol percentile. 1.0 = extreme.
+        liquidity_score  : [0.0, 1.0] depth-percentile composite. 1.0 = deep
+            book / abundant liquidity; 0.0 = book is thin. The orchestrator
+            gates trading whenever liquidity_score < config.min_liquidity_threshold
+            (returns insufficient_liquidity HOLD). Misconfiguring either side
+            (passing a 0..100 percentile or setting threshold above the live
+            range) silently disables trading; F-2 emits a rate-limited WARNING
+            at the gate so this misconfiguration is loudly observable.
+    """
     regime_name: str
     volatility_score: float
     liquidity_score: float
@@ -323,10 +390,24 @@ class OrchestratorConfig:
     pipeline_latency_buffer_ms: float = 250.0
     action_threshold: float = 0.6
     score_deadband: float = 0.05
+    # F-2: liquidity_score is a [0,1] depth-percentile composite from the regime
+    # classifier. min_liquidity_threshold is the lower-bound below which trading
+    # is gated (returns insufficient_liquidity HOLD). 0.0 disables the gate;
+    # values >= 1.0 disable trading entirely. Default 0.2 ≈ "below the 20th
+    # percentile of recent depth", a conservative liquidity floor.
     min_liquidity_threshold: float = 0.2
     max_missing_data_ratio: float = 0.3
     risk_gamma: float = 2.0
     max_drawdown_pct: float = 0.15
+    # F-3: drawdown circuit-breaker hysteresis.
+    # dd_recovery_ratio: fraction of max_drawdown_pct that drawdown must fall
+    # below before the breaker can close (0.60 = re-arm only after recovering
+    # to <= 60% of the trip threshold). Prevents threshold-flapping on edge.
+    # dd_breach_min_seconds: minimum dwell time in OPEN state before HALF_OPEN
+    # transition is even considered (0.0 = transition allowed immediately on
+    # next call once recovery threshold met). Use >0 in production to debounce.
+    dd_recovery_ratio: float = 0.60
+    dd_breach_min_seconds: float = 0.0
     allow_unknown_sources: bool = False
     default_unknown_weight: float = 0.0
     timeframe_weights: Dict[str, float] = field(default_factory=lambda: {"default": 1.0})
@@ -695,7 +776,23 @@ class AlphaOrchestrator:
         # All shared mutable state is protected by this lock.
         # update_performance holds it for the full mutation cycle.
         # orchestrate holds it only for the initial snapshot, then runs read-only.
-        self._lock = threading.Lock()
+        # F-8: Re-entrant lock — safe for nested acquisitions on the same thread,
+        # which guards against silent deadlocks when helper paths re-enter while
+        # the lock is already held.
+        self._lock = threading.RLock()
+
+        # F-2: rate-limited liquidity warning state. Emits at most one
+        # logger.warning per _LIQUIDITY_WARN_INTERVAL_SECS to surface a
+        # misconfigured min_liquidity_threshold without log-flooding.
+        self._last_liquidity_warn_ts: float = 0.0
+
+        # F-3: drawdown circuit-breaker state machine. CLOSED = normal trading;
+        # OPEN = dd has breached max_drawdown_pct, all orchestrate calls hold;
+        # HALF_OPEN = transient recovery probe (dd has fallen below recovery
+        # threshold and dwell time elapsed). State and the open timestamp are
+        # surfaced in meta_info["risk_metrics"]["circuit_state"].
+        self._dd_circuit_state: str = "CLOSED"
+        self._dd_circuit_open_ts: float = 0.0
 
         # Cumulative rejection telemetry for update_performance() failures.
         # FIX 23: Added counter for malformed optional feedback fields.
@@ -921,42 +1018,6 @@ class AlphaOrchestrator:
             }
         return snap
 
-    def _build_hold_meta_schema(self, partial_meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Build canonical HOLD metadata schema with safe defaults."""
-        merged: Dict[str, Any] = dict(partial_meta or {})
-
-        environmental_context = merged.get("environmental_context")
-        stale_ratio = 0.0
-        missing_ratio = 0.0
-        if isinstance(environmental_context, Mapping):
-            stale_ratio = _safe_float(environmental_context.get("stale_ratio"), 0.0, 0.0, 1.0)
-            missing_ratio = _safe_float(environmental_context.get("missing_ratio"), 0.0, 0.0, 1.0)
-
-        existing_quality = merged.get("quality_metrics") if isinstance(merged.get("quality_metrics"), Mapping) else {}
-        stale_ratio = _safe_float(existing_quality.get("stale_ratio"), stale_ratio, 0.0, 1.0)
-        missing_ratio = _safe_float(existing_quality.get("missing_ratio"), missing_ratio, 0.0, 1.0)
-
-        merged["final_conviction"] = 0.0
-        merged["risk_metrics"] = {
-            "scaler": 1.0,
-            "utilization": 0.0,
-            "risk_pressure": 0.0,
-            "risk_penalty": 0.0,
-            "regime_adjusted_max_dd": self.config.max_drawdown_pct,
-        }
-        merged["quality_metrics"] = {
-            "stale_ratio": stale_ratio,
-            "missing_ratio": missing_ratio,
-            "vol_amplifier": 1.0,
-            "stale_multiplier": 1.0,
-            "missing_multiplier": 1.0,
-            "regime_factor": 1.0,
-            "combined_multiplier": 1.0,
-            "conviction_pre_quality": 0.0,
-            "conviction_post_quality": 0.0,
-        }
-        return merged
-
     def _hold(
         self,
         rationale: str,
@@ -966,28 +1027,25 @@ class AlphaOrchestrator:
         meta: Dict[str, Any] = {"rationale": rationale}
         if partial_meta:
             meta.update(partial_meta)
-        meta = self._build_hold_meta_schema(meta)
         return OrchestratedAction(Action.HOLD, 0.0, 0.0, 0.0, meta)
-
-    def _finalize_action(self, action: OrchestratedAction) -> OrchestratedAction:
-        """Final return boundary enforcement for action metadata invariants."""
-        if action.action == Action.HOLD:
-            meta = self._build_hold_meta_schema(action.meta_info)
-            return OrchestratedAction(
-                action.action,
-                action.net_conviction,
-                action.expected_edge_bps,
-                action.urgency,
-                meta,
-            )
-        return action
 
     def _empty_signal_observability(self) -> Dict[str, Any]:
         """Zeroed observability fields for paths that exit before signal fusion.
 
         FIX 17: Guarantees schema parity across all early HOLD exits so that
         downstream consumers never need to branch on the presence of these keys.
+
+        F-1: Extended to also include zeroed defaults for final_conviction,
+        risk_metrics, quality_metrics, correlation_metrics and
+        dominant_timeframe_basis so every HOLD path returns the schema-stable
+        OrchestratorMetaInfo contract. The values are deliberately neutral
+        (0.0 / "CLOSED" / "none") so downstream metric scrapers never see
+        missing keys and never confuse defaults with active signals.
         """
+        try:
+            _circuit_state = getattr(self, "_dd_circuit_state", "CLOSED")
+        except Exception:
+            _circuit_state = "CLOSED"
         return {
             "signal_metrics": {
                 "presented_count": 0.0,
@@ -1001,6 +1059,35 @@ class AlphaOrchestrator:
             "agreement_ratio": 0.0,
             "conflict_ratio": 0.0,
             "dominant_timeframe": None,
+            # F-1: schema-stable defaults present on every HOLD path.
+            "final_conviction": 0.0,
+            "risk_metrics": {
+                "scaler": 0.0,
+                "utilization": 0.0,
+                "risk_pressure": 0.0,
+                "risk_penalty": 0.0,
+                "regime_adjusted_max_dd": float(
+                    getattr(getattr(self, "config", None), "max_drawdown_pct", 0.0) or 0.0
+                ),
+                "circuit_state": _circuit_state,
+            },
+            "quality_metrics": {
+                "stale_ratio": 0.0,
+                "missing_ratio": 0.0,
+                "vol_amplifier": 1.0,
+                "stale_multiplier": 1.0,
+                "missing_multiplier": 1.0,
+                "regime_factor": 1.0,
+                "combined_multiplier": 1.0,
+                "conviction_pre_quality": 0.0,
+                "conviction_post_quality": 0.0,
+            },
+            "correlation_metrics": {
+                "groups_active": [],
+                "max_group_size": 0,
+                "any_gate_active": False,
+            },
+            "dominant_timeframe_basis": "none",
         }
 
     def _update_stats_block(
@@ -1430,6 +1517,39 @@ class AlphaOrchestrator:
         exec_state: ExecutionState,
         current_time: Optional[float] = None,
     ) -> OrchestratedAction:
+        """Public orchestrate entry point — F-6: outer try/except boundary.
+
+        Wraps the full implementation in a single outermost catch that uses
+        logger.exception so any unexpected failure (e.g. an internal helper
+        raising RuntimeError) is captured WITH a full traceback rather than
+        silently swallowed by a logger.warning string. On failure the call
+        returns a fully-instrumented HOLD with rationale="internal_error" so
+        the schema-stability contract (F-1) is preserved on the error path.
+
+        See _orchestrate_impl for the full pipeline docstring.
+        """
+        try:
+            return self._orchestrate_impl(
+                signals, regime, feature_quality, exec_state, current_time=current_time
+            )
+        except Exception:
+            logger.exception(
+                "orchestrate() failed with an unhandled exception; returning HOLD"
+            )
+            try:
+                _err_meta = {**self._empty_signal_observability()}
+            except Exception:
+                _err_meta = {}
+            return self._hold("internal_error", _err_meta)
+
+    def _orchestrate_impl(
+        self,
+        signals: Union[List[AlphaSignal], List[Dict[str, Any]]],
+        regime: Optional[RegimeContext],
+        feature_quality: Optional[FeatureQuality],
+        exec_state: ExecutionState,
+        current_time: Optional[float] = None,
+    ) -> OrchestratedAction:
         """High-performance pure execution path. Deterministic and side-effect free.
 
         FIX 1 (complete): ONE lock acquisition at entry snapshots ALL shared mutable
@@ -1721,9 +1841,9 @@ class AlphaOrchestrator:
             try:
                 now = float(current_time)
                 if math.isnan(now) or math.isinf(now):
-                    return self._finalize_action(self._hold("invalid_current_time", _invalid_time_exit_meta))
+                    return self._hold("invalid_current_time", _invalid_time_exit_meta)
             except (ValueError, TypeError):
-                return self._finalize_action(self._hold("invalid_current_time", _invalid_time_exit_meta))
+                return self._hold("invalid_current_time", _invalid_time_exit_meta)
         else:
             _missing_time_meta: Dict[str, Any] = {
                 "orchestration_ts": None,
@@ -1760,7 +1880,7 @@ class AlphaOrchestrator:
                 **self._empty_signal_observability(),
             }
             logger.warning("Rejected orchestration call: missing current_time | action=hold")
-            return self._finalize_action(self._hold("invalid_current_time", _missing_time_meta))
+            return self._hold("invalid_current_time", _missing_time_meta)
 
         # ---- Signal Validation (pure; no shared state access) ----
         # FIX 9: _validate_and_prune now returns unknown_sources_accepted IDs in metrics.
@@ -1852,7 +1972,7 @@ class AlphaOrchestrator:
                     meta_payload.update(
                         {"source_id": worst_src, "decay_score": worst_val}
                     )
-                    return self._finalize_action(self._hold("decay_drift_limit_exceeded", meta_payload))
+                    return self._hold("decay_drift_limit_exceeded", meta_payload)
 
         # ---- Guard: Regime Drift Safety — scoped to current regime and active sources ----
         if self.config.regime_feedback_enabled and perf_meta and perf_meta.get("stats"):
@@ -1881,22 +2001,41 @@ class AlphaOrchestrator:
                             "rationale": "regime_drift_safety_brake",
                         }
                     )
-                    return self._finalize_action(self._hold("regime_drift_safety_brake", meta_payload))
+                    return self._hold("regime_drift_safety_brake", meta_payload)
 
         # ---- Guard: Data Quality ----
         # FIX 7: stale_ratio and missing_ratio are already in environmental_context
         # inside base_meta; no additional enrichment needed here.
         if missing_ratio > self.config.max_missing_data_ratio:
-            return self._finalize_action(self._hold("poor_feature_quality", base_meta))
+            return self._hold("poor_feature_quality", base_meta)
 
         # ---- Guard: Market Stress ----
         if reg_liq < self.config.min_liquidity_threshold:
-            return self._finalize_action(self._hold("insufficient_liquidity", base_meta))
+            # F-2: Rate-limited loud warning so a misconfigured liquidity
+            # threshold cannot silently disable trading. Emits at most one
+            # WARNING per 60s. All observability wrapped in try/except so
+            # a logging failure can never abort the orchestration cycle.
+            try:
+                _LIQUIDITY_WARN_INTERVAL_SECS = 60.0
+                _now_ts = time.time()
+                if (_now_ts - float(getattr(self, "_last_liquidity_warn_ts", 0.0))
+                        >= _LIQUIDITY_WARN_INTERVAL_SECS):
+                    self._last_liquidity_warn_ts = _now_ts
+                    logger.warning(
+                        "LIQUIDITY GATE | reg_liq=%.4f < min_liquidity_threshold=%.4f | "
+                        "trading is currently halted by configuration. Verify the "
+                        "liquidity_score scale ([0,1] depth percentile) and the "
+                        "min_liquidity_threshold setting if this was unexpected.",
+                        float(reg_liq), float(self.config.min_liquidity_threshold),
+                    )
+            except Exception:
+                pass
+            return self._hold("insufficient_liquidity", base_meta)
 
         if not valid:
             if _input_was_str_bytes:
-                return self._finalize_action(self._hold("invalid_input_type", base_meta))
-            return self._finalize_action(self._hold("no_valid_signals", base_meta))
+                return self._hold("invalid_input_type", base_meta)
+            return self._hold("no_valid_signals", base_meta)
 
         # ---- Environmental Multipliers ----
         # FIX 4: _calculate_quality_multipliers returns a full breakdown so that
@@ -1912,6 +2051,9 @@ class AlphaOrchestrator:
         # ---- Signal Fusion (uses immutable perf_fusion_snapshot, not live stats) ----
         tf_results: Dict[str, Dict[str, Any]] = {}
         per_signal_breakdown: List[Dict[str, Any]] = []
+        # F-5: Aggregate correlation groups across all per-tf fusion calls so
+        # the top-level meta_info exposes a stable correlation_metrics block.
+        _correlation_groups_acc: List[Any] = []
         for tf, tf_sigs in signals_by_tf.items():
             score, edge, meta_fusion = self._fuse_signals(
                 tf_sigs, reg_name, exec_dd, perf_fusion_snapshot, regime_assessment=regime_assessment, now=now
@@ -1921,6 +2063,14 @@ class AlphaOrchestrator:
                 "blended_edge": edge,
                 "fusion_meta": meta_fusion,
             }
+            # F-5: capture correlation groups (best-effort; never crash fusion).
+            try:
+                _csum = (meta_fusion or {}).get("correlation_summary") or {}
+                _grps = _csum.get("groups") or []
+                if _grps:
+                    _correlation_groups_acc.extend(_grps)
+            except Exception:
+                pass
             if meta_fusion and "breakdown" in meta_fusion:
                 # FIX 19: Stamp timeframe on every row so MTF forensics are self-contained.
                 for entry in meta_fusion["breakdown"]:
@@ -1941,6 +2091,10 @@ class AlphaOrchestrator:
         agreement_ratio = 0.0
         conflict_ratio = 0.0
         dominant_timeframe = mtf_meta.get("dominant") if mtf_meta else None
+        # F-4: surface why a timeframe was selected as dominant.
+        dominant_timeframe_basis = (
+            mtf_meta.get("dominant_timeframe_basis", "none") if mtf_meta else "none"
+        )
 
         if len(tf_results) > 1:
             tf_dirs: List[int] = []
@@ -2039,6 +2193,8 @@ class AlphaOrchestrator:
                     "risk_pressure": risk_pen,
                     "risk_penalty": risk_pen,
                     "regime_adjusted_max_dd": effective_max_dd,
+                    # F-3: Surface circuit-breaker state on every SIGNAL path.
+                    "circuit_state": getattr(self, "_dd_circuit_state", "CLOSED"),
                 },
                 # FIX 4: Full quality breakdown. Explains exactly how conviction was
                 # degraded: which sub-factor (staleness vs missing data vs vol) drove
@@ -2061,14 +2217,29 @@ class AlphaOrchestrator:
                 "agreement_ratio": agreement_ratio,
                 "conflict_ratio": conflict_ratio,
                 "dominant_timeframe": dominant_timeframe,
+                # F-4: dominant_timeframe_basis explains the selection.
+                "dominant_timeframe_basis": dominant_timeframe_basis,
+                # F-5: aggregated correlation gating block.
+                "correlation_metrics": {
+                    "groups_active": _correlation_groups_acc,
+                    "max_group_size": max(
+                        (
+                            int(g.get("size", 0)) if isinstance(g, dict) else 0
+                            for g in _correlation_groups_acc
+                        ),
+                        default=0,
+                    ),
+                    "any_gate_active": any(
+                        (isinstance(g, dict) and bool(g.get("conviction_gate_applies", False)))
+                        for g in _correlation_groups_acc
+                    ),
+                },
                 "regime_assessment": regime_assessment.__dict__ if regime_assessment else None,
             }
         )
 
-        return self._finalize_action(
-            self._generate_decision(
-                net_score, final_conviction, blended_edge, urgency, risk_rat, meta_payload, regime_assessment=regime_assessment
-            )
+        return self._generate_decision(
+            net_score, final_conviction, blended_edge, urgency, risk_rat, meta_payload, regime_assessment=regime_assessment
         )
 
     # ----------------------------------------
@@ -2141,10 +2312,14 @@ class AlphaOrchestrator:
                     derived = _normalize_key(self.config.correlation_group_derivation(signal.source_id))
                     if derived:
                         return derived
-                except Exception as _cg_exc:
-                    logger.warning(
-                        "correlation_group_derivation raised for source_id=%s: %s",
-                        signal.source_id, _cg_exc,
+                except Exception:
+                    # F-6: logger.exception captures full traceback for the
+                    # correlation_group_derivation callable, which is supplied
+                    # by callers and is the most common source of unexpected
+                    # mutation errors in the fusion path.
+                    logger.exception(
+                        "correlation_group_derivation raised for source_id=%s",
+                        signal.source_id,
                     )
             sid = _normalize_key(signal.source_id)
             sid = re.sub(r"[_-]?(v|ver|variant)?\d+$", "", sid)
@@ -2981,10 +3156,33 @@ class AlphaOrchestrator:
                 _single_decision = "SELL"
             else:
                 _single_decision = "HOLD"
+            # F-4: dominant_timeframe always populated. Single non-zero score
+            # → that tf is dominant ("single_tf" basis). Score within deadband
+            # → no actionable timeframe ("none" basis, dominant=None).
+            # The "default" sentinel is never elected as dominant (it is a
+            # legacy catch-all bucket, not a real market horizon).
+            if (
+                abs(single_score) > self.config.score_deadband
+                and active_tf != _DEFAULT_TIMEFRAME
+            ):
+                _single_dominant = active_tf
+                _single_basis = "single_tf"
+            else:
+                _single_dominant = None
+                _single_basis = "none"
             return (
                 single_score,
                 tf_results[active_tf]["blended_edge"],
-                {"decision": _single_decision, "confidence": abs(single_score), "score": single_score, "is_mtf": False, "error": None},
+                {
+                    "decision": _single_decision,
+                    "confidence": abs(single_score),
+                    "score": single_score,
+                    "is_mtf": False,
+                    "error": None,
+                    "dominant": _single_dominant,
+                    "dominant_timeframe": _single_dominant,
+                    "dominant_timeframe_basis": _single_basis,
+                },
             )
 
         dom_tf: Optional[str] = None
@@ -3062,6 +3260,31 @@ class AlphaOrchestrator:
             _mtf_decision = "SELL"
         else:
             _mtf_decision = "HOLD"
+        # F-4: dominant_timeframe_basis classifies WHY a timeframe is dominant:
+        #   "htf_dominance" : higher_tf_dominance picked it deterministically.
+        #   "single_tf"     : combined direction came from a single nonzero tf.
+        #   "none"          : no actionable direction (combined within deadband).
+        if dom_tf is not None:
+            _basis = "htf_dominance"
+        else:
+            # Exclude the "default" sentinel from dominance — it is a legacy
+            # catch-all bucket and must never be reported as dominant.
+            _nonzero_tfs = [
+                (tf, res["net_score"]) for tf, res in tf_results.items()
+                if abs(res["net_score"]) > self.config.score_deadband
+                and tf != _DEFAULT_TIMEFRAME
+            ]
+            if len(_nonzero_tfs) == 1:
+                dom_tf = _nonzero_tfs[0][0]
+                _basis = "single_tf"
+            elif len(_nonzero_tfs) == 0:
+                _basis = "none"
+            else:
+                # Multiple nonzero tfs but no HTF winner: pick highest-magnitude
+                # as the dominant, basis records that fallback.
+                dom_tf = max(_nonzero_tfs, key=lambda kv: abs(kv[1]))[0]
+                _basis = "max_magnitude"
+
         meta: Dict[str, Any] = {
             "decision": _mtf_decision,
             "confidence": abs(combined_score),
@@ -3070,6 +3293,8 @@ class AlphaOrchestrator:
             "error": None,
             "dominant": dom_tf,
             "dominant_direction": dom_dir,
+            "dominant_timeframe": dom_tf,
+            "dominant_timeframe_basis": _basis,
         }
         if excluded_tfs:
             meta["htf_excluded_tfs"] = excluded_tfs
@@ -3378,8 +3603,53 @@ class AlphaOrchestrator:
             max_dd = max(0.001, self.config.max_drawdown_pct)
         max_exp = _safe_float(state.max_exposure_usd, 0.0)
 
-        if dd >= max_dd:
-            return 0.0, 1.0, 1.0, "dd_breach"
+        # F-3: Drawdown circuit-breaker with hysteresis.
+        # State machine:
+        #   CLOSED    : normal trading; trip to OPEN if dd >= max_dd.
+        #   OPEN      : all calls return dd_breach until dwell time elapses
+        #               AND dd has fallen below max_dd * dd_recovery_ratio.
+        #   HALF_OPEN : transient probe; if dd is still <= recovery threshold,
+        #               close the breaker and resume trading.
+        # All state mutations and observability wrapped in try/except so a
+        # state-machine bug can never crash the engine — fail-safe behaviour
+        # falls back to the original absorbing semantics.
+        try:
+            _recovery_ratio = float(getattr(self.config, "dd_recovery_ratio", 0.60))
+            _min_dwell = float(getattr(self.config, "dd_breach_min_seconds", 0.0))
+            _recovery_threshold = max_dd * max(0.0, min(1.0, _recovery_ratio))
+            _state = getattr(self, "_dd_circuit_state", "CLOSED")
+            _open_ts = float(getattr(self, "_dd_circuit_open_ts", 0.0))
+            _now = time.time()
+
+            if _state == "CLOSED":
+                if dd >= max_dd:
+                    self._dd_circuit_state = "OPEN"
+                    self._dd_circuit_open_ts = _now
+                    return 0.0, 1.0, 1.0, "dd_breach"
+            elif _state == "OPEN":
+                _dwell_ok = (_now - _open_ts) >= _min_dwell
+                if dd <= _recovery_threshold and _dwell_ok:
+                    self._dd_circuit_state = "HALF_OPEN"
+                else:
+                    return 0.0, 1.0, 1.0, "dd_breach"
+            elif _state == "HALF_OPEN":
+                if dd <= _recovery_threshold:
+                    self._dd_circuit_state = "CLOSED"
+                else:
+                    self._dd_circuit_state = "OPEN"
+                    self._dd_circuit_open_ts = _now
+                    return 0.0, 1.0, 1.0, "dd_breach"
+            else:
+                # Unknown state — recover defensively to CLOSED then re-evaluate.
+                self._dd_circuit_state = "CLOSED"
+                if dd >= max_dd:
+                    self._dd_circuit_state = "OPEN"
+                    self._dd_circuit_open_ts = _now
+                    return 0.0, 1.0, 1.0, "dd_breach"
+        except Exception:
+            # Fail-closed fallback: preserve original absorbing semantics.
+            if dd >= max_dd:
+                return 0.0, 1.0, 1.0, "dd_breach"
 
         if max_exp <= 0.0:
             return 0.0, 1.0, 0.0, "zero_exp"
