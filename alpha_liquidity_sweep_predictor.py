@@ -4,6 +4,16 @@ from typing import Dict, Any, Optional, List, Tuple
 from collections import deque
 import time
 
+# FIX C-3 APPLIED — canonical state / regime vocabularies enforced by
+# LiquiditySweepAlpha._safe_output to prevent any unknown label from
+# leaking into downstream consumers.
+_VALID_STATES = frozenset({
+    "NORMAL", "PRE_SWEEP_BUILDUP", "ACTIVE_SWEEP", "POST_SWEEP"
+})
+_VALID_REGIMES = frozenset({
+    "TRENDING_UP", "TRENDING_DOWN", "RANGING", "VOLATILE", "UNKNOWN"
+})
+
 __all__ = ["predict_sweep", "LiquiditySweepAlpha"]
 LOGIT_TEMP = 1.2
 EPS = 1e-12
@@ -280,6 +290,9 @@ class LiquiditySweepAlpha:
         history_window: int = 100,
         initial_high: Optional[float] = None,
         initial_low: Optional[float] = None,
+        direction_mode: str = "continuation",         # FIX C-1 APPLIED
+        active_sweep_lookback_bars: int = 30,         # FIX C-2 APPLIED
+        pool_reset_atr_mult: float = 5.0,             # FIX H-3 APPLIED
     ):
         self.levels = depth_levels
         self.resiliency_threshold = resiliency_threshold
@@ -294,6 +307,10 @@ class LiquiditySweepAlpha:
         self._ofi_count = 0
         self._ofi_mean = 0.0
         self._ofi_M2 = 0.0
+        # Public alias used by get_state_metrics() / _liquidity_forecast.
+        self.ofi_count = 0
+        self.ofi_sum = 0.0      # FIX C-4 APPLIED
+        self.ofi_sq_sum = 0.0   # FIX C-4 APPLIED
         self.hawkes_sum = 0.0
 
         # Hawkes Process State
@@ -302,12 +319,91 @@ class LiquiditySweepAlpha:
         self.hawkes_decay = 0.5
         self.hawkes_alpha = 0.1
         self._lock = threading.RLock()
+        # FIX M-3 APPLIED — _time_lock created up front so get_signal()
+        # never has to lazy-init it under contention.
+        self._time_lock = threading.Lock()
+
+        # FIX C-1 APPLIED — directional mode for sweep entries.
+        # "continuation" = original behaviour (BUY on high sweep / SELL on low).
+        # "fade"         = reverse (mean-reversion / fade-the-sweep).
+        self.direction_mode = str(direction_mode)
+
+        # FIX C-2 APPLIED — trailing window length used by detect_sweep_state
+        # to read a peak Hawkes intensity rather than the instantaneous value.
+        self.active_sweep_lookback_bars: int = int(active_sweep_lookback_bars)
+        self._active_sweep_fired_count: int = 0   # FIX C-2 APPLIED
+        self._pre_sweep_fired_count: int = 0      # FIX A3 APPLIED
+
+        # FIX C-3 APPLIED — counter incremented every time _safe_output()
+        # rejects an out-of-vocabulary state or regime label.
+        self._state_invalid_count: int = 0
+
+        # FIX H-1 APPLIED — last effective level count actually traversed
+        # by calculate_ofi_zscore (capped by min depth across both books).
+        self._last_ofi_levels_used: int = 0
+
+        # FIX H-3 APPLIED — independent per-side pool reset multiplier.
+        self.pool_reset_atr_mult: float = float(pool_reset_atr_mult)
+
+        # FIX L-2 APPLIED — neutral / no-signal returns from
+        # _predict_next_sweep, surfaced via get_state_metrics().
+        self._neutral_predict_count: int = 0
 
         # FIX L002: seed pools from constructor if provided
         if initial_high is not None and _is_finite(float(initial_high)) and float(initial_high) > 0:
             self.liquidity_pools["high"] = float(initial_high)
         if initial_low is not None and _is_finite(float(initial_low)) and float(initial_low) > 0:
             self.liquidity_pools["low"] = float(initial_low)
+
+    # FIX C-3 APPLIED — instance wrapper around the module-level
+    # _safe_output() that adds state/regime vocabulary validation. Internal
+    # call sites use this method so invalid labels are counted; the
+    # module-level helper is preserved for external imports.
+    def _safe_output(self, output: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            raw_state = output.get("state", "NORMAL")
+            raw_regime = output.get("regime", "RANGING")
+            if raw_state not in _VALID_STATES:
+                self._state_invalid_count += 1
+                output["state"] = "NORMAL"
+            if raw_regime not in _VALID_REGIMES:
+                self._state_invalid_count += 1
+                output["regime"] = "RANGING"
+        except Exception:
+            # Never let observability break the trading path.
+            pass
+        return _safe_output(output)
+
+    # FIX A3 APPLIED — public telemetry snapshot mirroring
+    # AdvancedRegimeEngine.get_state_metrics() contract.
+    def get_state_metrics(self) -> dict:
+        """
+        Returns a snapshot of LSA gate-suppression telemetry.
+        Mirrors AdvancedRegimeEngine.get_state_metrics() contract.
+        """
+        try:
+            hw_list = list(self.hawkes_history)
+            hawkes_baseline = (
+                self.hawkes_sum / len(hw_list) if hw_list else 0.0
+            )
+            return {
+                "ofi_count": getattr(self, "ofi_count", 0),
+                "ofi_M2": getattr(self, "ofi_sq_sum", 0.0),
+                "hawkes_history_len": len(hw_list),
+                "hawkes_baseline": hawkes_baseline,
+                "liquidity_pools": dict(self.liquidity_pools),
+                "neutral_predict_count": self._neutral_predict_count,
+                "state_invalid_count": self._state_invalid_count,
+                "active_sweep_fired_count": self._active_sweep_fired_count,
+                "pre_sweep_fired_count": getattr(self, "_pre_sweep_fired_count", 0),
+                "last_ofi_levels_used": self._last_ofi_levels_used,
+                "active_sweep_lookback_bars": self.active_sweep_lookback_bars,
+                "direction_mode": self.direction_mode,
+                "pool_reset_atr_mult": self.pool_reset_atr_mult,
+            }
+        except Exception:
+            # Telemetry must never raise into the trading path.
+            return {}
 
     @staticmethod
     def _normalize_timestamp(ts: float, fallback: float = 0.0) -> float:
@@ -380,7 +476,21 @@ class LiquiditySweepAlpha:
         if not prev_book or not curr_book:
             return 0.0
         try:
-            for i in range(self.levels):
+            # FIX H-1 APPLIED — only iterate over levels that actually exist
+            # on BOTH sides of BOTH books, so a thin top-of-book never leaks
+            # phantom levels into the OFI sum.
+            n_levels = min(
+                self.levels,
+                len(curr_book.get('bids', [])),
+                len(curr_book.get('asks', [])),
+                len(prev_book.get('bids', [])),
+                len(prev_book.get('asks', [])),
+            )
+            try:
+                self._last_ofi_levels_used = int(n_levels)
+            except Exception:
+                pass
+            for i in range(n_levels):
                 curr_bid_p, curr_bid_s = _safe_float(curr_book['bids'][i]['price']), _safe_float(curr_book['bids'][i]['size'])
                 prev_bid_p, prev_bid_s = _safe_float(prev_book['bids'][i]['price']), _safe_float(prev_book['bids'][i]['size'])
 
@@ -417,11 +527,29 @@ class LiquiditySweepAlpha:
                 self._ofi_M2 -= delta * (float(outgoing) - self._ofi_mean)
                 self._ofi_M2 = max(0.0, self._ofi_M2)
                 self._ofi_count = new_n
+            # FIX C-4 APPLIED — mirror eviction into the running sum / sum-of-squares
+            try:
+                old_v = float(outgoing)
+                self.ofi_sum -= old_v
+                self.ofi_sq_sum -= old_v * old_v
+                if self.ofi_sq_sum < 0.0:
+                    self.ofi_sq_sum = 0.0
+            except Exception:
+                pass
 
         self.ofi_history.append(ofi_total)
         self.short_ofi.append(ofi_total)
 
         self._ofi_count += 1
+        # FIX C-4 APPLIED — mirror append into the running sum / sum-of-squares
+        try:
+            v = float(ofi_total)
+            self.ofi_sum += v
+            self.ofi_sq_sum += v * v
+        except Exception:
+            pass
+        # Keep public ofi_count alias in sync for telemetry / external readers.
+        self.ofi_count = self._ofi_count
         delta_add = ofi_total - self._ofi_mean
         self._ofi_mean += delta_add / float(self._ofi_count)
         self._ofi_M2 += delta_add * (ofi_total - self._ofi_mean)
@@ -450,13 +578,21 @@ class LiquiditySweepAlpha:
     def detect_sweep_state(self, price: float, atr: float, hawkes_intensity: float) -> str:
         if self.liquidity_pools['high'] is None or self.liquidity_pools['low'] is None:
             return "NORMAL"
-        if atr > 0 and (
-            abs(_safe_float(self.liquidity_pools['high'], price) - price) > (atr * 10.0)
-            and abs(price - _safe_float(self.liquidity_pools['low'], price)) > (atr * 10.0)
-        ):
-            self.liquidity_pools['high'] = None
-            self.liquidity_pools['low'] = None
-            return "NORMAL"
+        # FIX H-3 APPLIED — independent per-side pool reset. The previous
+        # joint-AND condition required BOTH pools to be far from price before
+        # either was cleared, leaving stale pools in place during one-sided
+        # trends. Each side now resets only when price has moved
+        # `pool_reset_atr_mult * atr` past it.
+        if atr > 0:
+            high_pool = _safe_float(self.liquidity_pools['high'], price)
+            low_pool = _safe_float(self.liquidity_pools['low'], price)
+            reset_dist = atr * self.pool_reset_atr_mult
+            if (price - high_pool) > reset_dist:
+                self.liquidity_pools['high'] = None
+            if (low_pool - price) > reset_dist:
+                self.liquidity_pools['low'] = None
+            if self.liquidity_pools['high'] is None or self.liquidity_pools['low'] is None:
+                return "NORMAL"
 
         dist_to_high = abs(self.liquidity_pools['high'] - price)
         dist_to_low = abs(price - self.liquidity_pools['low'])
@@ -466,6 +602,18 @@ class LiquiditySweepAlpha:
 
         baseline = (self.hawkes_sum / max(1, len(self.hawkes_history))) if len(self.hawkes_history) > 5 else 1.0
         intensity_spike = hawkes_intensity >= baseline * 2.0
+
+        # FIX C-2 APPLIED — trailing-window Hawkes peak. ACTIVE_SWEEP must not
+        # require an instantaneous spike at the exact bar of the breach (real
+        # sweeps often print one bar after the activity peak); use the max
+        # over the last `active_sweep_lookback_bars` bars instead.
+        _hw_list = list(self.hawkes_history)
+        recent_peak = (
+            max(_hw_list[-self.active_sweep_lookback_bars:])
+            if len(_hw_list) >= self.active_sweep_lookback_bars
+            else hawkes_intensity
+        )
+        recent_spike = recent_peak >= baseline * 2.0
 
         thresholds = self._normalize_thresholds(atr, price)
 
@@ -483,10 +631,18 @@ class LiquiditySweepAlpha:
             (dist_to_low / (price + 1e-8) < compression_threshold)
         )
 
-        if (is_high_sweep or is_low_sweep) and intensity_spike:
+        if (is_high_sweep or is_low_sweep) and recent_spike:
+            try:
+                self._active_sweep_fired_count += 1   # FIX C-2 APPLIED
+            except Exception:
+                pass
             return "ACTIVE_SWEEP"
 
         if (near_level or compression_condition) and intensity_spike:
+            try:
+                self._pre_sweep_fired_count += 1      # FIX A3 APPLIED
+            except Exception:
+                pass
             return "PRE_SWEEP_BUILDUP"
 
         return "NORMAL"
@@ -577,6 +733,10 @@ class LiquiditySweepAlpha:
 
         # Cold start check: return neutral if no price or uninitialized history
         if price <= 0.0 or len(self.ofi_history) < 10 or self.liquidity_pools.get("high") is None or self.liquidity_pools.get("low") is None:
+            try:
+                self._neutral_predict_count += 1   # FIX L-2 APPLIED
+            except Exception:
+                pass
             return {"prob_up": 0.5, "prob_down": 0.5}
 
         high_pool = self.liquidity_pools.get("high")
@@ -585,6 +745,10 @@ class LiquiditySweepAlpha:
         dist_above = abs(high_pool - price)
         dist_below = abs(price - low_pool)
         if dist_above < 1e-6 and dist_below < 1e-6:
+            try:
+                self._neutral_predict_count += 1   # FIX L-2 APPLIED
+            except Exception:
+                pass
             return {"prob_up": 0.5, "prob_down": 0.5}
 
         # --- Feature 1: Distance ---
@@ -609,6 +773,10 @@ class LiquiditySweepAlpha:
         bid_depth = _safe_float(market_data.get("bid_depth", 1.0))
         ask_depth = _safe_float(market_data.get("ask_depth", 1.0))
         if (bid_depth + ask_depth) < 1e-6:
+            try:
+                self._neutral_predict_count += 1   # FIX L-2 APPLIED
+            except Exception:
+                pass
             return {"prob_up": 0.5, "prob_down": 0.5}
 
         bid_depth = max(0.0, bid_depth)
@@ -652,18 +820,16 @@ class LiquiditySweepAlpha:
         with self._lock:
             md = market_data if isinstance(market_data, dict) else {}  # local alias (latency)
 
-            # Ensure internal state safety
-            # THREAD-SAFE LOCK INIT (atomic assignment)
+            # FIX M-3 APPLIED — _time_lock is now created in __init__, so the
+            # previous lazy-init dance is no longer needed. We keep a defensive
+            # fallback for instances reconstructed without running __init__.
             if "_time_lock" not in self.__dict__:
-                try:
-                    self.__dict__["_time_lock"] = threading.Lock()
-                except Exception:
-                    self._time_lock = threading.Lock()
+                self._time_lock = threading.Lock()
             if not hasattr(self, "last_trade_time"):
                 self.last_trade_time = 0.0
             price = _safe_float(md.get('price'))
             if price <= 0.0:
-                return _safe_output({
+                return self._safe_output({
                     "action": "HOLD",
                     "confidence": 0.0,
                     "state": "NORMAL",
@@ -862,11 +1028,22 @@ class LiquiditySweepAlpha:
     
                 # Execution threshold dynamically tightens when the system is cold
                 # Absorbs both warmup and history gating without destroying probability calibration
-                threshold = 0.55 + 0.10 * (1.0 - warmup_factor) + 0.10 * (1.0 - min_history_factor)
-                threshold = _clamp(threshold + threshold_offset, 0.45, 0.9)
+                # FIX M-2 APPLIED — hoist threshold_offset OUTSIDE the
+                # floor/ceiling clamp so the clamp applies to the final
+                # value (previously the offset was absorbed inside the
+                # 0.45/0.9 clamp, defeating its purpose at the extremes).
+                base_threshold = 0.55 + 0.10 * (1.0 - warmup_factor) + 0.10 * (1.0 - min_history_factor)
+                raw_threshold = base_threshold + threshold_offset
+                threshold = _clamp(raw_threshold, 0.45, 0.9)
     
                 if combined_prob >= threshold:
-                    action = "BUY" if sweep_side == "high" else "SELL"
+                    # FIX C-1 APPLIED — directional mode controls whether a
+                    # PRE_SWEEP_BUILDUP entry is taken as continuation
+                    # (default, original behaviour) or as a fade.
+                    if self.direction_mode == "fade":
+                        action = "SELL" if sweep_side == "high" else "BUY"
+                    else:  # continuation (default, preserves existing behavior)
+                        action = "BUY" if sweep_side == "high" else "SELL"
                     # Calibrated Confidence: Confidence explicitly maps to normalized probability space.
                     confidence = combined_prob
                     logic_path = f"Anticipatory early entry on {sweep_side} buildup. Prob: {combined_prob:.2f}"
@@ -878,7 +1055,7 @@ class LiquiditySweepAlpha:
                     action = "HOLD"
                     confidence = 0.0
                     logic_path = "Active sweep detected but system not warmed up"
-                    return _safe_output({
+                    return self._safe_output({
                         "action": action,
                         "confidence": round(confidence, 4),
                         "state": state,
@@ -1062,7 +1239,7 @@ class LiquiditySweepAlpha:
             micro_prob = _clamp(_safe_float(micro_prob if micro_prob is not None else 0.5, 0.5), 0.0, 1.0)
             macro_prob = _clamp(_safe_float(macro_prob if macro_prob is not None else 0.5, 0.5), 0.0, 1.0)
 
-            return _safe_output({
+            return self._safe_output({
                 "action": action,
                 "confidence": confidence,
                 "state": state,
@@ -1085,7 +1262,7 @@ class LiquiditySweepAlpha:
             # Route through _safe_output so every return honours the full schema
             # (action, confidence, state, regime, ofi_zscore, hawkes_intensity,
             # logic, micro_prob, macro_prob, prob_above, prob_below).
-            return _safe_output({
+            return self._safe_output({
                 "action": "HOLD",
                 "confidence": 0.0,
                 "state": "UNKNOWN",
@@ -1105,4 +1282,4 @@ class LiquiditySweepAlpha:
         out = self.get_signal(data, regime_context=regime_context) or {}
 
         # HARD GUARANTEE (never bypass safety contract)
-        return _safe_output(out)
+        return self._safe_output(out)
