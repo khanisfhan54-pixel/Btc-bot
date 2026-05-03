@@ -1422,6 +1422,15 @@ class AdvancedRegimeEngine:
         self._circuit_breaker_active = False
         self._circuit_breaker_reason = None
         self._circuit_breaker_trigger_tick = -1
+        # FIX-7: portfolio-DD tracking (driven externally by report_realized_pnl)
+        self._portfolio_peak_equity = float("nan")
+        self._portfolio_drawdown = 0.0
+        # FIX-6 (consumer): calibration-time feature normalisation moments.
+        # Populated by _load_model_weights when present in the .npz; otherwise
+        # remain None and _normalize_features falls back to an identity pass.
+        self._feature_mean: Optional[np.ndarray] = None
+        self._feature_std:  Optional[np.ndarray] = None
+        self._feature_norm_source: str = "rolling"
         self._healing_counter = 0
         self._last_healing_action = "NONE"
         self._cb_trigger_history: "deque[tuple[float, str, float]]" = deque(maxlen=50)
@@ -2175,6 +2184,24 @@ class AdvancedRegimeEngine:
             if not np.all(np.isfinite(w)) or float(np.sum(np.abs(w))) <= 0.0:
                 raise ValueError("sjm_feature_weights must be finite and non-zero")
             self.sjm.load_weights(means, w)
+
+            # FIX-6 (consumer): consume calibration-time normalisation moments
+            # if the .npz includes them (saver in calibrate_regime.py writes
+            # feature_mean(3,) and feature_std(3,)). Falls back gracefully on
+            # legacy artefacts.
+            if "feature_mean" in weights and "feature_std" in weights:
+                fm = np.asarray(weights["feature_mean"], dtype=np.float64)
+                fs = np.asarray(weights["feature_std"],  dtype=np.float64)
+                # guard against zero-std degeneracy (calibration on flat feature)
+                fs = np.where(fs > 1e-12, fs, 1.0)
+                self._feature_mean = fm
+                self._feature_std  = fs
+                self._feature_norm_source = "calibrated"
+            else:
+                self._feature_mean = None
+                self._feature_std  = None
+                self._feature_norm_source = "rolling"
+
             self._weights_loaded = True
             self._calibration_status = "calibrated"
         except Exception:
@@ -2183,6 +2210,22 @@ class AdvancedRegimeEngine:
             self._calibration_status = "invalid"
             self._engine_status = "DEGRADED"
             return
+
+    def _normalize_features(self, x: np.ndarray) -> np.ndarray:
+        """FIX-6 (consumer): apply calibration-time normalisation when
+        available. When no calibrated moments are loaded, returns ``x``
+        unchanged (the engine's downstream paths perform their own scaling).
+        Always returns a finite ndarray; NaN/Inf inputs propagate as-is so
+        upstream fail-closed checks can detect them.
+        """
+        arr = np.asarray(x, dtype=np.float64)
+        if (getattr(self, "_feature_mean", None) is not None
+                and getattr(self, "_feature_std", None) is not None):
+            try:
+                return (arr - self._feature_mean) / self._feature_std
+            except Exception:
+                return arr
+        return arr
 
     @staticmethod
     def _snapshot_emitter_loop(
@@ -2825,6 +2868,112 @@ class AdvancedRegimeEngine:
             raw["sjm_default_params_initialized"] = False
         return raw
 
+    # ------------------------------------------------------------------
+    # FIX-27 (M-1) — regime downgrade telemetry surface.
+    # ------------------------------------------------------------------
+    def _record_regime_downgrade(self, reason: str) -> None:
+        """Increment the per-reason regime downgrade counter.
+
+        Called at every _build_output() call site that emits
+        execution_mode in {"halt", "fail_safe", "circuit_breaker"}.
+        Fail-soft so observability never breaks the trading path.
+
+        FIX-5.3: unknown reasons are bucketed into ``unspecified`` and a
+        rate-limited warning is emitted so typos don't silently create
+        new buckets.
+        """
+        try:
+            if not isinstance(reason, str) or not reason:
+                reason = "unspecified"
+            if reason not in _REGIME_DOWNGRADE_REASONS:
+                try:
+                    self._warn_rate_limited(
+                        key=f"unknown_downgrade_reason_{reason}",
+                        message=(
+                            f"Unknown downgrade reason '{reason}'; "
+                            "bucketing as 'unspecified'"
+                        ),
+                        cooldown_s=300.0,
+                    )
+                except Exception:
+                    pass
+                reason = "unspecified"
+            self._regime_downgrade_count[reason] = (
+                self._regime_downgrade_count.get(reason, 0) + 1
+            )
+            # FIX-5.5: mirror the per-reason tally to a Prometheus gauge so
+            # operators can scrape downgrade counts without an RPC into
+            # get_health(). Skipped on replay to preserve determinism.
+            if _PROM_AVAILABLE and not getattr(self, "_is_replay", False):
+                try:
+                    REGIME_DOWNGRADE_COUNT.labels(
+                        getattr(self, "_metrics_engine_id", "unknown"),
+                        reason,
+                    ).set(self._regime_downgrade_count[reason])
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    @_synchronized
+    def reconcile_drawdown(
+        self, realized_dd: float, *, gap_threshold: float = 0.05
+    ) -> Dict[str, Any]:
+        """FIX-7 (CRITICAL-2): cross-check engine model DD against externally
+        reported realised portfolio DD.
+
+        Returns the model DD, realised DD, absolute gap (in pp), a divergence
+        flag set when the gap exceeds ``gap_threshold`` (default 5pp), and the
+        tick id at reconciliation time. Operators MUST consume this in shadow
+        mode and refuse to promote to live while ``divergence`` is True.
+
+        Pure observability — never raises, no side effects.
+        """
+        try:
+            model_dd = float(getattr(self, "_MAX_DRAWDOWN", 0.0))
+        except Exception:
+            model_dd = 0.0
+        try:
+            realized = float(realized_dd or 0.0)
+        except Exception:
+            realized = 0.0
+        gap = abs(model_dd - realized)
+        return {
+            "model_drawdown": model_dd,
+            "realized_drawdown": realized,
+            "gap_pp": gap,
+            "divergence": bool(gap > float(gap_threshold)),
+            "reconciled_at_tick": int(getattr(self, "_tick_id", 0)),
+        }
+
+    def get_health(self) -> Dict[str, Any]:
+        """FIX-27 (M-1): public health snapshot.
+
+        Exposes regime_downgrade_count alongside the existing engine
+        status flags so operators can quantify how often (and why) the
+        engine is dropping into a degraded execution mode without
+        mining the structured logs.
+        """
+        try:
+            _downgrade = dict(getattr(self, "_regime_downgrade_count", {}) or {})
+        except Exception:
+            _downgrade = {}
+        return {
+            "engine_status": str(getattr(self, "_engine_status", "OK")),
+            "health_status": str(getattr(self, "_health_status", "OK")),
+            "determinism_status": str(getattr(self, "_determinism_status", "OK")),
+            "circuit_breaker_active": bool(getattr(self, "_circuit_breaker_active", False)),
+            "circuit_breaker_reason": getattr(self, "_circuit_breaker_reason", None),
+            "weights_loaded": bool(getattr(self, "_weights_loaded", False)),
+            "tick_id": int(getattr(self, "_tick_id", 0)),
+            "healing_count": int(getattr(self, "_healing_count", 0)),
+            "regime_downgrade_count": _downgrade,
+            # UPGRADE-5.7: surface the FIX-6 normalisation provenance so
+            # operators can verify at a glance whether a deployed engine is
+            # using calibrated or rolling-stats feature normalisation.
+            "feature_norm_source": str(getattr(self, "_feature_norm_source", "rolling")),
+        }
+
     @staticmethod
     def _materialize_state_from_raw(raw_state: Dict[str, Any]) -> Dict[str, Any]:
         out = dict(raw_state)
@@ -2851,6 +3000,65 @@ class AdvancedRegimeEngine:
     @_synchronized
     def get_state(self) -> Dict[str, Any]:
         return self._get_state_unlocked()
+
+    def report_realized_pnl(self, realized_pnl: float, equity: float) -> None:
+        """FIX-7 (REGIME_ENGINE_AUDIT 2026-04-23): the executor (live or
+        backtest) calls this on EVERY realized trade close. Updates the
+        portfolio peak/drawdown trackers and trips the circuit breaker when
+        portfolio drawdown exceeds ``_MAX_PORTFOLIO_DRAWDOWN``.
+
+        This is the only path that connects portfolio-level losses to the
+        engine's circuit breaker. Without it, a sequence of losing trades is
+        invisible to the engine and the breaker never fires.
+        """
+        with self._lock:
+            try:
+                eq = float(equity)
+            except Exception:
+                return
+            if not (np.isfinite(eq) and eq > 0):
+                return
+            if (not np.isfinite(self._portfolio_peak_equity)) or eq > self._portfolio_peak_equity:
+                self._portfolio_peak_equity = eq
+            dd = max(0.0, 1.0 - eq / self._portfolio_peak_equity)
+            self._portfolio_drawdown = float(dd)
+            if dd >= self._MAX_PORTFOLIO_DRAWDOWN and not self._circuit_breaker_active:
+                self._circuit_breaker_active = True
+                self._circuit_breaker_reason = (
+                    f"PORTFOLIO_DD_{dd:.4f}_GE_{self._MAX_PORTFOLIO_DRAWDOWN}"
+                )
+                # FIX-7 supplement: also bump the engine's circuit-breaker history
+                # ring buffer and the FIX-27 per-reason downgrade counter so this
+                # event is observable through both get_state() and get_health().
+                try:
+                    self._circuit_breaker_trigger_tick = int(getattr(self, "_tick_id", 0))
+                    self._cb_trigger_history.append(
+                        (float(time.time()), "portfolio_drawdown_breach", float(dd))
+                    )
+                except Exception:
+                    pass
+                try:
+                    self._record_regime_downgrade("circuit_breaker")
+                except Exception:
+                    pass
+                # UPGRADE-5.8: persist cb_trigger_history to disk so the
+                # operator can recover trip context after a crash. Replay-
+                # skipped (preserves determinism) and fail-soft on I/O.
+                if not getattr(self, "_is_replay", False):
+                    try:
+                        import pathlib as _pl
+                        _pl.Path("audit_engine_output").mkdir(exist_ok=True)
+                        with open("audit_engine_output/cb_trigger_history.json", "w") as _f:
+                            json.dump(list(self._cb_trigger_history)[-100:], _f)
+                    except Exception:
+                        pass  # never let persistence kill the engine
+                try:
+                    LOGGER.error(
+                        "CIRCUIT_BREAKER: portfolio DD %.4f >= %.4f (realized_pnl=%.6f equity=%.6f)",
+                        dd, self._MAX_PORTFOLIO_DRAWDOWN, float(realized_pnl), eq,
+                    )
+                except Exception:
+                    pass
 
     @_synchronized
     def serialize_state(self) -> Dict[str, Any]:

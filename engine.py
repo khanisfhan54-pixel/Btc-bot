@@ -3310,7 +3310,10 @@ def _evaluate_smc_sniper_internal(
 
     orderflow = analyze_orderflow(trades, orderbook)
     regime = detect_market_regime(c15m if c15m else c1m, _estimate_volatility_from_ohlcv(c1m))
-    liquidity_magnet = compute_liquidity_magnet(liquidity_intent.get("liquidity_zones", []), price)
+    # NEW-MED-1 (engine audit pass #3): guard chained .get() against
+    # liquidity_intent==None (analyze_liquidity_intent may legitimately
+    # return None on degraded inputs).
+    liquidity_magnet = compute_liquidity_magnet(((liquidity_intent or {}).get("liquidity_zones") or []), price)
 
     # Order block proxy from last opposite candle before impulse
     ob = {}
@@ -3319,9 +3322,9 @@ def _evaluate_smc_sniper_internal(
         ob = {
             "freshness": 1.0,
             "imbalance": 1.0 if _body_ratio(base_candle) >= 0.55 else 0.6,
-            "distance_to_liquidity": liquidity_intent.get("nearest_above", {}).get("distance", 0.0)
+            "distance_to_liquidity": ((liquidity_intent or {}).get("nearest_above") or {}).get("distance", 0.0)
             if direction == "LONG"
-            else liquidity_intent.get("nearest_below", {}).get("distance", 0.0),
+            else ((liquidity_intent or {}).get("nearest_below") or {}).get("distance", 0.0),
             "atr": _atr(c1m[-30:], 14),
         }
     ob_score = score_order_block(ob, volume=_safe_float(volume_intel.get("volume_strength", 0.0) if volume_intel else 0.0), reaction=_safe_float(fvg.get("strength", 0.0)))
