@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+_DEBUG_VETO = os.getenv("DEBUG_VETO", "0") == "1"  # FIX A3: gate-veto diagnostics
 
 
 def _safe_get(d: Any, key: str, default: Any = None) -> Any:
@@ -44,9 +47,8 @@ def _default_alpha():
 def _validate_alpha(alpha: Dict[str, Any]) -> Dict[str, Any]:
     try:
         if not isinstance(alpha, dict):
-            # FIX-L2: downgrade vacuous "Alpha validation adjusted: {}" emissions
-            # to DEBUG so noisy non-dict / empty-dict inputs do not flood logs.
-            logger.debug("Alpha validation adjusted (non-dict input): %s", alpha)
+            if alpha:  # FIX B4: suppress empty/None payload spam
+                logger.debug("Alpha validation adjusted: %s", alpha)
             return _default_alpha()
 
         conf = float(alpha.get("confidence", 0.5))
@@ -83,15 +85,12 @@ def _validate_alpha(alpha: Dict[str, Any]) -> Dict[str, Any]:
             "prob_below": max(0.0, min(1.0, p_dn)),
             "direction": direction,
         }
-        if adjusted and alpha:
-            # FIX-L2: only emit when an actual non-empty alpha required adjustment.
-            # Suppress vacuous empty-dict warnings; downgrade to DEBUG.
+        if adjusted and alpha:  # FIX B4: suppress empty-dict log flood
             logger.debug("Alpha validation adjusted: %s", alpha)
         return validated
     except Exception:
-        # FIX-L2: downgrade exception path to DEBUG (the original alpha is
-        # logged for diagnosis but not at WARNING level).
-        logger.debug("Alpha validation adjusted (exception path): %s", alpha)
+        if alpha:  # FIX B4: suppress empty-dict log flood
+            logger.debug("Alpha validation adjusted: %s", alpha)
         return _default_alpha()
 
 
@@ -246,6 +245,9 @@ class SignalEngine:
                 candles = fallback_candles
 
         if len(candles) < 3:
+            if _DEBUG_VETO:  # FIX A3: gate-veto diagnostics
+                logger.warning("[VETO] Gate '%s' killed signal. candles_count=%d",
+                               "insufficient_candles", len(candles))
             return {
                 "action": "HOLD",
                 "signal": "HOLD",
@@ -310,6 +312,11 @@ class SignalEngine:
         price_ref = _safe_float(_safe_get(features, "price", _safe_get(features, "close", 0.0)), 0.0)
         volatility_guard = (atr_val / price_ref) if (atr_val > 0.0 and price_ref > 0.0) else None
         if volatility_guard is not None and volatility_guard > 0.05:
+            if _DEBUG_VETO:  # FIX A3: gate-veto diagnostics
+                logger.warning(
+                    "[VETO] Gate '%s' killed signal. volatility_guard=%.6f atr=%.6f price=%.6f",
+                    "volatility_circuit_breaker", volatility_guard, atr_val, price_ref,
+                )
             return {
                 "action": "HOLD",
                 "signal": "HOLD",
@@ -351,6 +358,13 @@ class SignalEngine:
             reasons += ["trend", "momentum"]
 
         else:
+            if _DEBUG_VETO:  # FIX A3: gate-veto diagnostics
+                logger.warning(
+                    "[VETO] Gate '%s' killed signal. regime=%s stop_hunt=%s "
+                    "displacement=%.4f volume_confirmed=%s vol_score=%.4f",
+                    "no_setup_match", regime_type, stop_hunt,
+                    displacement, volume_confirmed, vol_score,
+                )
             return {
                 "action": "HOLD",
                 "signal": "HOLD",
@@ -425,9 +439,22 @@ class SignalEngine:
         if signal not in ("LONG", "SHORT"):
             signal = "HOLD"
 
-        return {
+        # FIX B1 (revised, non-breaking): publish BOTH vocabularies.
+        # Legacy `signal` field stays LONG/SHORT/HOLD because execution.py and
+        # backtest_engine.py have ~30 hard equality checks on those literals;
+        # we expose the canonical BUY/SELL/HOLD vocabulary on a NEW `action`
+        # field so the audit (and any new consumer) can assert the canonical
+        # contract without breaking the legacy execution path.
+        _DIR_TO_ACTION = {"LONG": "BUY", "SHORT": "SELL", "HOLD": "HOLD"}
+        canonical_action = _DIR_TO_ACTION.get(
+            signal.upper() if isinstance(signal, str) else "HOLD", "HOLD"
+        )
+
+        out = {
             **result,
-            "signal": signal,
+            "signal": signal,  # legacy LONG/SHORT/HOLD vocabulary
             "confidence": result.get("confidence", 0.0),
             "reason": ", ".join(result.get("reasons", [])) or "HOLD",
         }
+        out["action"] = canonical_action  # FIX B1: canonical BUY/SELL/HOLD
+        return out

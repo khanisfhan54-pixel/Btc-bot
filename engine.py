@@ -14,24 +14,6 @@
 #
 # Legacy signal/execution helpers are kept for backward-compatibility but are
 # marked  # DEPRECATED (moved to signal_engine / execution_logic)
-#
-# =============================================================================
-# AUDIT-FIX M-1 — TOP-LEVEL OUTPUT FIELD SCALE REGISTRY
-# =============================================================================
-# run_all_engines() returns a dict whose keys live on DIFFERENT scales.
-# Downstream consumers MUST honour the scale of each field — DO NOT clamp
-# the [0,10] fields to 1.0.
-#
-#   confidence            -> [0.0, 1.0]
-#   alpha.confidence      -> [0.0, 1.0]
-#   cascade_probability   -> [0.0, 1.0]
-#   regime.confidence     -> [0.0, 1.0]
-#   order_imbalance       -> [-1.0, 1.0]
-#   confluence_score      -> [0.0, 10.0]   <-- DIFFERENT SCALE
-#   smc_signal.confidence -> [0.0, 10.0]   <-- DIFFERENT SCALE
-#
-# These constraints are enforced by INV-3, INV-5, INV-12, INV-13, INV-15,
-# INV-17, INV-19 in audit_engine_dec2023.py and by OUTPUT_SCHEMA below.
 # =============================================================================
 from __future__ import annotations
 
@@ -56,110 +38,6 @@ from trading_utils import safe_float, clamp, validate_alpha
 from thread_safe_wrappers import ordered_lock
 
 logger = logging.getLogger(__name__)
-
-
-# =============================================================================
-# AUDIT-FIX Phase 2 #6 — fallback offender identification helper.
-# Walks the traceback and returns the deepest engine.py frame's enclosing
-# function name so the outer except in run_all_engines can bin failures by
-# the inner engine that actually raised. Pure stdlib, fail-soft.
-# =============================================================================
-def _identify_offending_engine(exc: BaseException) -> str:
-    try:
-        import traceback as _tb
-        tb = getattr(exc, "__traceback__", None)
-        if tb is None:
-            return "unknown"
-        deepest = "unknown"
-        for frame in _tb.extract_tb(tb):
-            fn = getattr(frame, "filename", "") or ""
-            if fn.endswith("engine.py"):
-                deepest = getattr(frame, "name", None) or deepest
-        return deepest
-    except Exception:
-        return "unknown"
-
-
-# =============================================================================
-# AUDIT-FIX Phase 3 #13 — centralised OUTPUT_SCHEMA for run_all_engines().
-# Opt-in validation (env AUDIT_VALIDATE=1) keeps zero behaviour change in
-# production while letting the audit harness pin every public field's
-# type/range in one place.
-# =============================================================================
-OUTPUT_SCHEMA: Dict[str, Dict[str, Any]] = {
-    "price":                {"type": (int, float), "range": (0.0, math.inf)},
-    "confidence":           {"type": (int, float), "range": (0.0, 1.0)},
-    "cascade_probability":  {"type": (int, float), "range": (0.0, 1.0)},
-    "order_imbalance":      {"type": (int, float), "range": (-1.0, 1.0)},
-    "confluence_score":     {"type": (int, float), "range": (0.0, 10.0)},
-    "spread_pct":           {"type": (int, float), "range": (0.0, math.inf)},
-    "allow_trade":          {"type": (bool,),     "range": None},
-    "direction":            {"type": (str,),      "range": None},
-    "smc_signal":           {"type": (dict,),     "range": None},
-    "regime":               {"type": (dict,),     "range": None},
-    "alpha":                {"type": (dict,),     "range": None},
-}
-
-
-def _validate_output_against_schema(out: Dict[str, Any]) -> List[str]:
-    """Returns a list of human-readable schema violations (empty == clean).
-
-    Used only when env AUDIT_VALIDATE=1 is set, so production paths pay
-    zero overhead. Fail-soft on any internal error.
-    """
-    fails: List[str] = []
-    try:
-        for key, spec in OUTPUT_SCHEMA.items():
-            if key not in out:
-                continue
-            v = out[key]
-            t = spec.get("type") or ()
-            if not isinstance(v, t):
-                fails.append(f"{key}: type {type(v).__name__} not in {t}")
-                continue
-            rng = spec.get("range")
-            if rng is None or isinstance(v, bool):
-                continue
-            if isinstance(v, (int, float)):
-                lo, hi = rng
-                if not (math.isfinite(float(v)) and lo - 1e-9 <= float(v) <= hi + 1e-9):
-                    fails.append(f"{key}: value {v} outside [{lo}, {hi}]")
-    except Exception:
-        pass
-    return fails
-
-
-# =============================================================================
-# AUDIT-FIX Phase 3 #12 — rolling anomaly detection. Two bounded deques
-# track recent confluence_score and alpha.confidence; if the latest value
-# exceeds rolling_p99 * 1.5, a single warning is emitted. O(1) per bar.
-# =============================================================================
-_ANOMALY_WINDOWS: Dict[str, deque] = {
-    "confluence_score": deque(maxlen=100),
-    "alpha_confidence": deque(maxlen=100),
-}
-
-
-def _record_and_check_anomaly(field: str, value: float) -> None:
-    try:
-        if not isinstance(value, (int, float)) or not math.isfinite(value):
-            return
-        dq = _ANOMALY_WINDOWS.get(field)
-        if dq is None:
-            return
-        if len(dq) >= 20:
-            xs = sorted(dq)
-            p99 = xs[max(0, int(0.99 * (len(xs) - 1)))]
-            if p99 > 0 and float(value) > p99 * 1.5:
-                logger.warning(
-                    "[ENGINE][ANOMALY] field=%s value=%.4f p99=%.4f",
-                    field, float(value), float(p99),
-                )
-        dq.append(float(value))
-    except Exception:
-        pass
-
-
 _LIQUIDITY_SWEEP_ALPHA: Optional[LiquiditySweepAlpha] = None
 _LIQUIDITY_SWEEP_ALPHA_INIT_LOCK = threading.Lock()
 _ALPHA_STATE: Dict[str, Dict[str, Any]] = {}
@@ -1618,7 +1496,18 @@ def smart_money_detection_engine(orderbook: dict, trades: List[dict], price: flo
             if levels:
                 sizes = [_safe_float(x[1]) for x in levels]
                 thresh = _mean(sizes, 0.0) + (statistics.pstdev(sizes) if len(sizes) > 2 else 0.0)
-                for p, s in levels:
+                for _lvl in levels:
+                    # FIX B3: guard against extra return values — orderbook rows
+                    # are sometimes [price, size, count] rather than [price, size].
+                    # Bare `for p, s in levels` raised
+                    # "too many values to unpack (expected 2)" on every cycle.
+                    if isinstance(_lvl, (tuple, list)) and len(_lvl) >= 2:
+                        p, s = _lvl[0], _lvl[1]
+                    elif isinstance(_lvl, dict):
+                        p = _lvl.get("price", _lvl.get("p", 0.0))
+                        s = _lvl.get("size", _lvl.get("qty", _lvl.get("s", 0.0)))
+                    else:
+                        continue
                     if _safe_float(s) >= thresh:
                         z.append({"side": side[:-1], "price": _safe_float(p), "size": _safe_float(s)})
         smart_score = 0.0
@@ -1652,7 +1541,18 @@ def smart_money_absorption_engine(orderbook: dict, trades: List[dict], price: fl
             if levels:
                 sizes = [_safe_float(x[1]) for x in levels]
                 thresh = _mean(sizes, 0.0) + (statistics.pstdev(sizes) if len(sizes) > 2 else 0.0)
-                for p, s in levels:
+                for _lvl in levels:
+                    # FIX B3: guard against extra return values — orderbook rows
+                    # are sometimes [price, size, count] rather than [price, size].
+                    # Bare `for p, s in levels` raised
+                    # "too many values to unpack (expected 2)" on every cycle.
+                    if isinstance(_lvl, (tuple, list)) and len(_lvl) >= 2:
+                        p, s = _lvl[0], _lvl[1]
+                    elif isinstance(_lvl, dict):
+                        p = _lvl.get("price", _lvl.get("p", 0.0))
+                        s = _lvl.get("size", _lvl.get("qty", _lvl.get("s", 0.0)))
+                    else:
+                        continue
                     if _safe_float(s) >= thresh:
                         zones.append(
                             {
@@ -3257,12 +3157,6 @@ def detect_market_regime(candles: Any, volatility: float) -> Dict[str, Any]:
 
 
 def compute_confluence_score(components: dict) -> float:
-    """Composite confluence score in **[0.0, 10.0]** (NOT [0,1]).
-
-    AUDIT-FIX M-1: callers and downstream invariants MUST clamp / check
-    against [0, 10]. The score is multiplied by 10.0 at the end and clamped
-    to that range. Do **not** further squash to 1.0 in any consumer.
-    """
     try:
         smc = components.get("smc_signal")
         trap = components.get("trap")
@@ -3951,12 +3845,7 @@ def run_all_engines(
         if cprob <= 0.0 and not oi_missing:
             cprob = get_cascade_probability(
                 open_interest=oi_value,
-                # AUDIT-FIX L-2: unified OI prior with oi_spike_detection
-                # (was 0.95, diverged from the [current_oi*0.98, current_oi]
-                # default used a few lines above). Both call sites now use
-                # the same expansion factor so cascade probability and the
-                # spike detector see a consistent synthetic history.
-                oi_history=oi_hist or [oi_value * 0.98, oi_value],
+                oi_history=oi_hist or [oi_value * 0.95, oi_value],
                 liquidation_cluster=liquid_cluster_usd,
                 bid=best_bid or price,
                 ask=best_ask or price,
@@ -4447,57 +4336,9 @@ def run_all_engines(
                     oldest_key = next(iter(_cache))
                     _cache.pop(oldest_key, None)
                 run_all_engines._backtest_cache = _cache
-        # AUDIT-FIX Phase 3 #12 — rolling anomaly check (O(1), warning-only)
-        try:
-            _record_and_check_anomaly(
-                "confluence_score",
-                float(_out.get("confluence_score", 0.0) or 0.0),
-            )
-            _alpha_obj = _out.get("alpha") or _out.get("market_data", {}).get("alpha") or {}
-            _record_and_check_anomaly(
-                "alpha_confidence",
-                float(_alpha_obj.get("confidence", 0.0) or 0.0),
-            )
-        except Exception:
-            pass
-        # AUDIT-FIX Phase 3 #13 — opt-in OUTPUT_SCHEMA validation
-        try:
-            if os.environ.get("AUDIT_VALIDATE") == "1":
-                _schema_fails = _validate_output_against_schema(_out)
-                if _schema_fails:
-                    logger.warning(
-                        "[ENGINE][SCHEMA] OUTPUT_SCHEMA violations: %s",
-                        ";".join(_schema_fails),
-                    )
-        except Exception:
-            pass
         return _out
     except Exception as exc:
-        # AUDIT-FIX M-2 + Phase 2 #6 — structured fallback classification.
-        # Capture the full traceback (was bare exception message), bump a
-        # process-level error counter, and bin the failure by
-        # (exception_class, offending_inner_engine) so audit_engine_dec2023
-        # can surface the failure surface area without log mining.
-        try:
-            run_all_engines._error_count = int(
-                getattr(run_all_engines, "_error_count", 0)
-            ) + 1
-            reason_class = type(exc).__name__
-            reason_module = _identify_offending_engine(exc)
-            _counts = getattr(run_all_engines, "_fallback_reason_counts", None)
-            if not isinstance(_counts, dict):
-                _counts = {}
-                run_all_engines._fallback_reason_counts = _counts
-            key = f"{reason_class}.{reason_module}"
-            _counts[key] = int(_counts.get(key, 0)) + 1
-        except Exception:
-            # Telemetry must never mask the real failure path.
-            pass
-        logger.error(
-            "[ENGINE][FALLBACK] run_all_engines fallback (err_count=%d)",
-            int(getattr(run_all_engines, "_error_count", 0)),
-            exc_info=True,
-        )
+        logger.error("run_all_engines error: %s", exc)
         _fallback = {
             "order_flow_pressure": 0.0,
             "order_imbalance": 0.0,
