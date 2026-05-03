@@ -921,6 +921,42 @@ class AlphaOrchestrator:
             }
         return snap
 
+    def _build_hold_meta_schema(self, partial_meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Build canonical HOLD metadata schema with safe defaults."""
+        merged: Dict[str, Any] = dict(partial_meta or {})
+
+        environmental_context = merged.get("environmental_context")
+        stale_ratio = 0.0
+        missing_ratio = 0.0
+        if isinstance(environmental_context, Mapping):
+            stale_ratio = _safe_float(environmental_context.get("stale_ratio"), 0.0, 0.0, 1.0)
+            missing_ratio = _safe_float(environmental_context.get("missing_ratio"), 0.0, 0.0, 1.0)
+
+        existing_quality = merged.get("quality_metrics") if isinstance(merged.get("quality_metrics"), Mapping) else {}
+        stale_ratio = _safe_float(existing_quality.get("stale_ratio"), stale_ratio, 0.0, 1.0)
+        missing_ratio = _safe_float(existing_quality.get("missing_ratio"), missing_ratio, 0.0, 1.0)
+
+        merged["final_conviction"] = 0.0
+        merged["risk_metrics"] = {
+            "scaler": 1.0,
+            "utilization": 0.0,
+            "risk_pressure": 0.0,
+            "risk_penalty": 0.0,
+            "regime_adjusted_max_dd": self.config.max_drawdown_pct,
+        }
+        merged["quality_metrics"] = {
+            "stale_ratio": stale_ratio,
+            "missing_ratio": missing_ratio,
+            "vol_amplifier": 1.0,
+            "stale_multiplier": 1.0,
+            "missing_multiplier": 1.0,
+            "regime_factor": 1.0,
+            "combined_multiplier": 1.0,
+            "conviction_pre_quality": 0.0,
+            "conviction_post_quality": 0.0,
+        }
+        return merged
+
     def _hold(
         self,
         rationale: str,
@@ -930,7 +966,21 @@ class AlphaOrchestrator:
         meta: Dict[str, Any] = {"rationale": rationale}
         if partial_meta:
             meta.update(partial_meta)
+        meta = self._build_hold_meta_schema(meta)
         return OrchestratedAction(Action.HOLD, 0.0, 0.0, 0.0, meta)
+
+    def _finalize_action(self, action: OrchestratedAction) -> OrchestratedAction:
+        """Final return boundary enforcement for action metadata invariants."""
+        if action.action == Action.HOLD:
+            meta = self._build_hold_meta_schema(action.meta_info)
+            return OrchestratedAction(
+                action.action,
+                action.net_conviction,
+                action.expected_edge_bps,
+                action.urgency,
+                meta,
+            )
+        return action
 
     def _empty_signal_observability(self) -> Dict[str, Any]:
         """Zeroed observability fields for paths that exit before signal fusion.
@@ -1671,9 +1721,9 @@ class AlphaOrchestrator:
             try:
                 now = float(current_time)
                 if math.isnan(now) or math.isinf(now):
-                    return self._hold("invalid_current_time", _invalid_time_exit_meta)
+                    return self._finalize_action(self._hold("invalid_current_time", _invalid_time_exit_meta))
             except (ValueError, TypeError):
-                return self._hold("invalid_current_time", _invalid_time_exit_meta)
+                return self._finalize_action(self._hold("invalid_current_time", _invalid_time_exit_meta))
         else:
             _missing_time_meta: Dict[str, Any] = {
                 "orchestration_ts": None,
@@ -1710,7 +1760,7 @@ class AlphaOrchestrator:
                 **self._empty_signal_observability(),
             }
             logger.warning("Rejected orchestration call: missing current_time | action=hold")
-            return self._hold("invalid_current_time", _missing_time_meta)
+            return self._finalize_action(self._hold("invalid_current_time", _missing_time_meta))
 
         # ---- Signal Validation (pure; no shared state access) ----
         # FIX 9: _validate_and_prune now returns unknown_sources_accepted IDs in metrics.
@@ -1802,7 +1852,7 @@ class AlphaOrchestrator:
                     meta_payload.update(
                         {"source_id": worst_src, "decay_score": worst_val}
                     )
-                    return self._hold("decay_drift_limit_exceeded", meta_payload)
+                    return self._finalize_action(self._hold("decay_drift_limit_exceeded", meta_payload))
 
         # ---- Guard: Regime Drift Safety — scoped to current regime and active sources ----
         if self.config.regime_feedback_enabled and perf_meta and perf_meta.get("stats"):
@@ -1831,22 +1881,22 @@ class AlphaOrchestrator:
                             "rationale": "regime_drift_safety_brake",
                         }
                     )
-                    return self._hold("regime_drift_safety_brake", meta_payload)
+                    return self._finalize_action(self._hold("regime_drift_safety_brake", meta_payload))
 
         # ---- Guard: Data Quality ----
         # FIX 7: stale_ratio and missing_ratio are already in environmental_context
         # inside base_meta; no additional enrichment needed here.
         if missing_ratio > self.config.max_missing_data_ratio:
-            return self._hold("poor_feature_quality", base_meta)
+            return self._finalize_action(self._hold("poor_feature_quality", base_meta))
 
         # ---- Guard: Market Stress ----
         if reg_liq < self.config.min_liquidity_threshold:
-            return self._hold("insufficient_liquidity", base_meta)
+            return self._finalize_action(self._hold("insufficient_liquidity", base_meta))
 
         if not valid:
             if _input_was_str_bytes:
-                return self._hold("invalid_input_type", base_meta)
-            return self._hold("no_valid_signals", base_meta)
+                return self._finalize_action(self._hold("invalid_input_type", base_meta))
+            return self._finalize_action(self._hold("no_valid_signals", base_meta))
 
         # ---- Environmental Multipliers ----
         # FIX 4: _calculate_quality_multipliers returns a full breakdown so that
@@ -2015,8 +2065,10 @@ class AlphaOrchestrator:
             }
         )
 
-        return self._generate_decision(
-            net_score, final_conviction, blended_edge, urgency, risk_rat, meta_payload, regime_assessment=regime_assessment
+        return self._finalize_action(
+            self._generate_decision(
+                net_score, final_conviction, blended_edge, urgency, risk_rat, meta_payload, regime_assessment=regime_assessment
+            )
         )
 
     # ----------------------------------------
