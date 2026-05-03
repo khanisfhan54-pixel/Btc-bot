@@ -2952,6 +2952,7 @@ class AdvancedRegimeEngine:
         except Exception:
             pass
 
+    @_synchronized
     def reconcile_drawdown(
         self, realized_dd: float, *, gap_threshold: float = 0.05
     ) -> Dict[str, Any]:
