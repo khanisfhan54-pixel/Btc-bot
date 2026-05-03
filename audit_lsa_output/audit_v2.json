@@ -1,0 +1,119 @@
+{
+  "version": "v2_real_trades_count",
+  "total_records_after_warmup": 37428,
+  "action_distribution": {
+    "HOLD": 36044,
+    "BUY": 811,
+    "SELL": 573
+  },
+  "state_distribution": {
+    "NORMAL": 35857,
+    "PRE_SWEEP_BUILDUP": 1571
+  },
+  "regime_distribution": {
+    "RANGING": 33727,
+    "UPTREND": 1937,
+    "DOWNTREND": 1764
+  },
+  "hawkes_max": 32.1,
+  "hawkes_mean": 0.9572432403548145,
+  "trades_count_stats": {
+    "min": 1,
+    "p10": 1,
+    "p50": 6,
+    "p90": 25,
+    "p99": 78,
+    "max": 669
+  },
+  "total_trades": 1384,
+  "win_rate": 0.109827,
+  "buy_count": 811,
+  "sell_count": 573,
+  "buy_hit_rate": 0.10111,
+  "sell_hit_rate": 0.122164,
+  "expectancy_per_trade_pct": -0.220971,
+  "profit_factor": 0.091998,
+  "best_trade_pct": 2.800371,
+  "worst_trade_pct": -1.916926,
+  "avg_holding_bars": 12.0,
+  "sharpe_daily_annualized": -50.783566,
+  "trading_days": 31,
+  "final_equity": 0.046634,
+  "max_drawdown": 0.953378,
+  "state_breakdown": {
+    "PRE_SWEEP_BUILDUP": {
+      "signals": 1384,
+      "win_rate": 0.1098,
+      "avg_return_pct": -0.220971,
+      "avg_confidence": 0.7264,
+      "avg_ofi_z": -0.0009,
+      "avg_hawkes": 2.9533
+    }
+  },
+  "confidence_calibration": {
+    "0.0-0.3": {
+      "count": 0,
+      "win_rate": 0.0,
+      "avg_return_pct": 0.0
+    },
+    "0.3-0.5": {
+      "count": 0,
+      "win_rate": 0.0,
+      "avg_return_pct": 0.0
+    },
+    "0.5-0.7": {
+      "count": 463,
+      "win_rate": 0.108,
+      "avg_return_pct": -0.211128
+    },
+    "0.7-1.01": {
+      "count": 921,
+      "win_rate": 0.1107,
+      "avg_return_pct": -0.225919
+    }
+  },
+  "ofi_predictive": {
+    "0-1": {
+      "count": 1178,
+      "win_rate": 0.1087,
+      "avg_return_pct": -0.223303
+    },
+    "1-2": {
+      "count": 83,
+      "win_rate": 0.1205,
+      "avg_return_pct": -0.221464
+    },
+    "2-4": {
+      "count": 123,
+      "win_rate": 0.1138,
+      "avg_return_pct": -0.198303
+    },
+    "4-999": {
+      "count": 0,
+      "win_rate": 0.0,
+      "avg_return_pct": 0.0
+    }
+  },
+  "hawkes_predictive": {
+    "0-0.1": {
+      "count": 0,
+      "win_rate": 0.0,
+      "avg_return_pct": 0.0
+    },
+    "0.1-1.0": {
+      "count": 34,
+      "win_rate": 0.0588,
+      "avg_return_pct": -0.240717
+    },
+    "1.0-5.0": {
+      "count": 1195,
+      "win_rate": 0.1046,
+      "avg_return_pct": -0.218851
+    },
+    "5.0-999": {
+      "count": 155,
+      "win_rate": 0.1613,
+      "avg_return_pct": -0.232984
+    }
+  }
+}
