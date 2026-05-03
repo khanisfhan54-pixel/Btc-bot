@@ -328,6 +328,7 @@ def _build_output(
     range_ticks: int = 0,
     signal_valid: bool = True,
     include_signal_valid: bool = True,
+    engine_id: str = "default",
 ) -> Dict[str, Any]:
     """
     Single authoritative output constructor for AdvancedRegimeEngine.update().
@@ -335,6 +336,7 @@ def _build_output(
     paths emit identical key sets, eliminating downstream KeyError risks from
     schema divergence between code paths.
     """
+    engine_id = str(engine_id or "default")
     safe_expected_vol = safe_float(expected_vol, default=0.0, min=0.0)
     safe_last_valid_vol = safe_float(last_valid_vol, default=max(safe_expected_vol, 1e-12), min=1e-12)
     safe_switch_stability = safe_float(switch_stability_ema, default=1.0, min=1e-6)
@@ -3440,6 +3442,7 @@ class AdvancedRegimeEngine:
                 execution_side="flat",
                 include_signal_valid=True,
                 signal_valid=False,
+                engine_id=self.engine_id,
             )
 
         require_calibration = bool(market_data.get("require_calibration", False))
@@ -3470,6 +3473,7 @@ class AdvancedRegimeEngine:
                 execution_side="flat",
                 include_signal_valid=True,
                 signal_valid=False,
+                engine_id=self.engine_id,
             )
 
         # NOTE: enforce globally across codebase:
@@ -3535,6 +3539,7 @@ class AdvancedRegimeEngine:
                 execution_side="flat",
                 include_signal_valid=True,
                 signal_valid=False,
+                engine_id=self.engine_id,
             )
 
         # ==========================================
@@ -3616,6 +3621,7 @@ class AdvancedRegimeEngine:
                 execution_side='flat',
                 include_signal_valid=True,
                 signal_valid=False,
+                engine_id=self.engine_id,
             )
             _observe_latency()
             return output
@@ -3767,6 +3773,7 @@ class AdvancedRegimeEngine:
                                                 range_ticks=self.range_ticks_int,
                                                 include_signal_valid=True,
                                                 signal_valid=False,
+                                                engine_id=self.engine_id,
                                             )
                                             self._update_timestamp_anchor(current_ts)
                                             _observe_latency()
@@ -3903,6 +3910,7 @@ class AdvancedRegimeEngine:
                     feed_status="MTF_BASE_FEATURES_MISSING",
                     engine_status="NO_FEATURES",
                     last_valid_vol=float(getattr(self, "_last_valid_vol", self.garch.target_vol)),
+                    engine_id=self.engine_id,
                     switch_stability_ema=float(getattr(self, "_switch_stability_ema", 1.0)),
                     execution_side="flat",
                     extended_schema=self._emit_extended_schema,
@@ -4093,6 +4101,7 @@ class AdvancedRegimeEngine:
                     raw_size=0.0,
                     is_toxic=True,
                     garch_regime_probs=self.garch_prob.tolist(),
+                    engine_id=self.engine_id,
                     feed_status='MISSING_DATA',
                     last_valid_vol=float(getattr(self, "_last_valid_vol", self.garch.target_vol)),
                     switch_stability_ema=float(getattr(self, "_switch_stability_ema", 1.0)),
@@ -4174,6 +4183,7 @@ class AdvancedRegimeEngine:
                 range_ticks=self.range_ticks_int,
                 include_signal_valid=True,
                 signal_valid=False,
+                engine_id=self.engine_id,
             )
             _observe_latency()
             return output
@@ -4315,6 +4325,7 @@ class AdvancedRegimeEngine:
                 range_ticks=self.range_ticks_int,
                 include_signal_valid=True,
                 signal_valid=False,
+                engine_id=self.engine_id,
             )
             if obs_sample and not getattr(self, "_is_replay", False):
                 self._replay_record("update_end", {"regime": "UNKNOWN"})
@@ -5051,6 +5062,7 @@ class AdvancedRegimeEngine:
             },
             macro_probs=self.nhhmm_prior.tolist(),
             position_size=position_size,
+            engine_id=self.engine_id,
             signed_position_size=signed_position_size,
             expected_vol=expected_vol,
             raw_size=raw_size,
