@@ -1,0 +1,158 @@
+{
+  "elapsed_sec": 0.1,
+  "total": 25,
+  "passed": 25,
+  "failed": 0,
+  "results": [
+    {
+      "id": "TEST-1",
+      "name": "negative price \u2192 fail-closed",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "id": "TEST-2",
+      "name": "zero price \u2192 fail-closed",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "id": "TEST-3",
+      "name": "NaN price \u2192 fail-closed",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "id": "TEST-4",
+      "name": "Inf price \u2192 fail-closed",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "id": "TEST-5",
+      "name": "missing OI \u2192 fail-closed",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "id": "TEST-6",
+      "name": "unsorted book accepted",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "id": "TEST-7",
+      "name": "empty book \u2192 finite output, fail-closed",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "id": "TEST-8",
+      "name": "alpha probabilities sum to 1",
+      "passed": true,
+      "detail": "pa=0.5 pb=0.5"
+    },
+    {
+      "id": "TEST-9",
+      "name": "alpha direction valid",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "id": "TEST-10",
+      "name": "fully deterministic on identical inputs (top+state+alpha)",
+      "passed": true,
+      "detail": "top=True state=True alpha=True"
+    },
+    {
+      "id": "TEST-11",
+      "name": "reset_alpha_state empties dict",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "id": "TEST-12",
+      "name": "extreme funding does not crash & alpha conf bounded",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "id": "TEST-13",
+      "name": "negative extreme funding produces finite output",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "id": "TEST-14",
+      "name": "large trade list does not crash & ofp finite",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "id": "TEST-15",
+      "name": "no trades \u2192 sm=False, ofp=0, imb=0 (trade-derived signals zeroed)",
+      "passed": true,
+      "detail": "sm=False ofp=0.0 imb=0.0"
+    },
+    {
+      "id": "TEST-16",
+      "name": "very short candle history \u2192 fail-closed",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "id": "TEST-17",
+      "name": "NaN in candle close survives without crashing",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "id": "TEST-18",
+      "name": "cache returns distinct object (deepcopy)",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "id": "TEST-19",
+      "name": "oi_missing forces allow_trade=False regardless of alpha",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "id": "TEST-20",
+      "name": "order_imbalance \u2208 [-1,1]",
+      "passed": true,
+      "detail": "imb=0.0"
+    },
+    {
+      "id": "TEST-21",
+      "name": "cascade_probability \u2208 [0,1]",
+      "passed": true,
+      "detail": "cp=0.32645"
+    },
+    {
+      "id": "TEST-22",
+      "name": "smc confidence \u2208 [0,10]",
+      "passed": true,
+      "detail": "cfd=2.0"
+    },
+    {
+      "id": "TEST-23",
+      "name": "orderbook_snapshots=None \u2192 full schema, no None scalars",
+      "passed": true,
+      "detail": "missing=[] none=[]"
+    },
+    {
+      "id": "TEST-24",
+      "name": "empty oi_history \u2192 finite cascade, alpha populated, not fallback",
+      "passed": true,
+      "detail": "cp=0.32645 alpha_keys=['confidence', 'direction', 'macro_prob', 'micro_prob', 'prob_above'] reason=ok"
+    },
+    {
+      "id": "TEST-25",
+      "name": "no network + no BINANCE_API_* read when exchange=None",
+      "passed": true,
+      "detail": "accessed={'key': False, 'secret': False, 'net': False}"
+    }
+  ]
+}
