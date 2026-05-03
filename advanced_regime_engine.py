@@ -87,6 +87,23 @@ if _PROM_AVAILABLE:
         "Number of times the engine emitted a fail-safe payload",
         ["engine_id", "reason"],
     )
+    # FIX-5.5: per-reason regime downgrade gauge (mirrors get_health()).
+    REGIME_DOWNGRADE_COUNT = Gauge(
+        "regime_downgrade_count",
+        "Per-reason regime downgrade tally (mirrors get_health()['regime_downgrade_count'])",
+        ["engine_id", "reason"],
+    )
+
+# FIX-5.3: pluggable downgrade-reason registry. Unknown reasons are bucketed
+# into "unspecified" by AdvancedRegimeEngine._record_regime_downgrade so typos
+# don't silently create new buckets.
+_REGIME_DOWNGRADE_REASONS: frozenset = frozenset({
+    "microstructure_required_but_missing",
+    "uncalibrated_weights",
+    "circuit_breaker",
+    "nhhmm_warmup",
+    "unspecified",
+})
 
 def _synchronized(method):
     @wraps(method)
@@ -1595,6 +1612,7 @@ class AdvancedRegimeEngine:
             "uncalibrated_weights": 0,
             "circuit_breaker": 0,
             "nhhmm_warmup": 0,
+            "unspecified": 0,  # FIX-5.3: registry-validated catch-all bucket
         }
 
         self._obs_counter = 0
@@ -1969,6 +1987,15 @@ class AdvancedRegimeEngine:
 
     def _shock_threshold(self, baseline_vol: float, current_ts: float | None) -> tuple[float, float]:
         warmup = self._warmup_progress(current_ts)
+        # FIX-5.4: surface NHHMM warmup as a regime downgrade reason whenever
+        # the warmup fraction is below 1.0 (i.e. the engine is still in its
+        # initial post-construction stabilisation window). Fires at most once
+        # per tick because _shock_threshold is called once per tick.
+        if warmup < 1.0:
+            try:
+                self._record_regime_downgrade("nhhmm_warmup")
+            except Exception:
+                pass
         floor_mult = (
             self._shock_startup_vol_floor_mult
             + (1.5 - self._shock_startup_vol_floor_mult) * warmup
@@ -2887,15 +2914,74 @@ class AdvancedRegimeEngine:
         Called at every _build_output() call site that emits
         execution_mode in {"halt", "fail_safe", "circuit_breaker"}.
         Fail-soft so observability never breaks the trading path.
+
+        FIX-5.3: unknown reasons are bucketed into ``unspecified`` and a
+        rate-limited warning is emitted so typos don't silently create
+        new buckets.
         """
         try:
             if not isinstance(reason, str) or not reason:
                 reason = "unspecified"
+            if reason not in _REGIME_DOWNGRADE_REASONS:
+                try:
+                    self._warn_rate_limited(
+                        key=f"unknown_downgrade_reason_{reason}",
+                        message=(
+                            f"Unknown downgrade reason '{reason}'; "
+                            "bucketing as 'unspecified'"
+                        ),
+                        cooldown_s=300.0,
+                    )
+                except Exception:
+                    pass
+                reason = "unspecified"
             self._regime_downgrade_count[reason] = (
                 self._regime_downgrade_count.get(reason, 0) + 1
             )
+            # FIX-5.5: mirror the per-reason tally to a Prometheus gauge so
+            # operators can scrape downgrade counts without an RPC into
+            # get_health(). Skipped on replay to preserve determinism.
+            if _PROM_AVAILABLE and not getattr(self, "_is_replay", False):
+                try:
+                    REGIME_DOWNGRADE_COUNT.labels(
+                        getattr(self, "_metrics_engine_id", "unknown"),
+                        reason,
+                    ).set(self._regime_downgrade_count[reason])
+                except Exception:
+                    pass
         except Exception:
             pass
+
+    @_synchronized
+    def reconcile_drawdown(
+        self, realized_dd: float, *, gap_threshold: float = 0.05
+    ) -> Dict[str, Any]:
+        """FIX-7 (CRITICAL-2): cross-check engine model DD against externally
+        reported realised portfolio DD.
+
+        Returns the model DD, realised DD, absolute gap (in pp), a divergence
+        flag set when the gap exceeds ``gap_threshold`` (default 5pp), and the
+        tick id at reconciliation time. Operators MUST consume this in shadow
+        mode and refuse to promote to live while ``divergence`` is True.
+
+        Pure observability — never raises, no side effects.
+        """
+        try:
+            model_dd = float(getattr(self, "_MAX_DRAWDOWN", 0.0))
+        except Exception:
+            model_dd = 0.0
+        try:
+            realized = float(realized_dd or 0.0)
+        except Exception:
+            realized = 0.0
+        gap = abs(model_dd - realized)
+        return {
+            "model_drawdown": model_dd,
+            "realized_drawdown": realized,
+            "gap_pp": gap,
+            "divergence": bool(gap > float(gap_threshold)),
+            "reconciled_at_tick": int(getattr(self, "_tick_id", 0)),
+        }
 
     def get_health(self) -> Dict[str, Any]:
         """FIX-27 (M-1): public health snapshot.
@@ -2974,6 +3060,20 @@ class AdvancedRegimeEngine:
                 self._circuit_breaker_reason = (
                     f"PORTFOLIO_DD_{dd:.4f}_GE_{self._MAX_PORTFOLIO_DRAWDOWN}"
                 )
+                # FIX-7 supplement: also bump the engine's circuit-breaker history
+                # ring buffer and the FIX-27 per-reason downgrade counter so this
+                # event is observable through both get_state() and get_health().
+                try:
+                    self._circuit_breaker_trigger_tick = int(getattr(self, "_tick_id", 0))
+                    self._cb_trigger_history.append(
+                        (float(time.time()), "portfolio_drawdown_breach", float(dd))
+                    )
+                except Exception:
+                    pass
+                try:
+                    self._record_regime_downgrade("circuit_breaker")
+                except Exception:
+                    pass
                 try:
                     LOGGER.error(
                         "CIRCUIT_BREAKER: portfolio DD %.4f >= %.4f (realized_pnl=%.6f equity=%.6f)",

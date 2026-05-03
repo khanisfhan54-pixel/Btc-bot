@@ -237,7 +237,7 @@ class BacktestConfig:
     # Phase 4: orchestrator action threshold (lower than production default of
     # 0.6 because backtest convictions are clamped to (0.01, 0.99) and
     # synthetic data does not produce extreme convictions).
-    orchestrator_action_threshold: float = 0.30
+    orchestrator_action_threshold: float = 0.60  # FIX-2: raised from 0.30 per audit
     # When False: ARE/LSA/AlphaOrchestrator are required and run_backtest()
     # returns a fail-closed empty result if any are missing. When True: the
     # orchestrator path is skipped entirely (legacy diagnostic-only mode).
