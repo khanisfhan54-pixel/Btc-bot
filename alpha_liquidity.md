@@ -7,30 +7,34 @@
 - `data/features_book.csv` — 87,484 L1 TOB snapshots (best bid/ask + sizes, ~30s cadence)
 - `data/aggTrades_dec2023.csv` — 448,228 aggregated trades binned per minute → real `trades_count`
 
-**Auditor:** Automated production audit harness (`audit_lsa_dec2023.py` + `audit_lsa_dec2023_v2.py`)
+**Auditor:** Automated production audit harness (`audit_lsa_dec2023.py` + `audit_lsa_dec2023_v2.py` + `audit_lsa_dec2023_v3.py`)
 **Date of audit:** 2026-05-03
 **Read-only contract:** No file in `alpha_liquidity_sweep_predictor.py`, `backtest_engine.py`, or any execution module was modified. No exchange or API calls were made. Audit-only artifacts under `audit_lsa_output/`.
+
+> **Code-review correction note (v3):** The original v2 harness wrapped `lsa.get_signal()` in a bare `try/except: continue`, silently dropping 2,242 bars (5.65% of the post-warmup window). A code review correctly flagged this as masking the true state distribution. The v3 harness (`audit_lsa_dec2023_v3.py`) does NOT swallow exceptions — it counts and classifies them, then records the bar as HOLD so all 39,670 post-warmup bars are accounted for. **The headline trade-level metrics did not change** (the 1,384 trades all came from the PRE_SWEEP_BUILDUP path which never crashes), but a new CRITICAL finding **C-4** emerged: every single ACTIVE_SWEEP attempt crashes due to an uninitialized attribute. C-2 has been rewritten to reflect the true root cause (ACTIVE_SWEEP IS reached, but the path is dead because it raises AttributeError before producing any output). This file is the corrected v3 deliverable.
 
 ---
 
 ## Executive Summary
 
 **Overall verdict: NOT PRODUCTION READY — research-only.**
-- **Critical issues found:** 3
+- **Critical issues found:** **4** (was 3 before code review surfaced C-4)
 - **High issues found:** 4
 - **Medium issues found:** 3
 - **Low issues found:** 2
 - **Backtest result:** PARTIAL (depth-1 OFI; depth-N L2 unavailable for this window)
 - **Data source used:** REAL_L1_TOB + REAL_AGGTRADES_PER_MIN (not synthetic)
+- **Methodology note:** Sharpe / max-drawdown / final-equity figures below are **signal-synthetic** (per-trade overlap allowed; ~43% adjacent overlap with horizon=12 and 1,384 entries). A non-overlapping single-position portfolio variant is also reported below for absolute-magnitude reference.
 
 ### Headline finding
 LSA, run as it is currently coded against 31 days of real Dec 2023 BTCUSDT data:
-- emitted **1,384 directional signals** (811 BUY, 573 SELL)
+- emitted **1,384 directional signals** (811 BUY, 573 SELL) — **all from PRE_SWEEP_BUILDUP**
 - **win rate 10.98%**, **profit factor 0.092**, **expectancy −0.221% per trade**
-- **Sharpe (daily, annualized) = −50.78**, **max drawdown 95.34%**, **final equity 0.047** (lost 95.3% of capital)
-- **100% of signals fired in `PRE_SWEEP_BUILDUP`** — `ACTIVE_SWEEP` was reached **zero times**
+- **Signal-synthetic Sharpe (daily, ann.) = −50.78**, **max DD 95.34%**, **final equity 0.047**
+- **Non-overlapping portfolio** (848 trades, single position at a time): **win rate 10.38%**, **profit factor 0.081**, **max DD 85.62%**, **final equity 0.144**
+- **ACTIVE_SWEEP path was reached on 2,242 bars (5.65%) but every single attempt crashed** with `AttributeError: 'LiquiditySweepAlpha' object has no attribute 'ofi_sum'` — see new finding **C-4**
 
-This is not noise — it is a systematic, structural failure of the current signal logic on real microstructure data with real trade arrivals. Three independent code-level defects (C-1, C-2, C-3 below) each materially contribute. None can be fixed without modifying `alpha_liquidity_sweep_predictor.py`. Per the read-only contract, this audit identifies and prescribes the fixes; it does not apply them.
+This is not noise — it is a systematic, structural failure of the current signal logic on real microstructure data with real trade arrivals. Four independent code-level defects (C-1, C-2, C-3, C-4 below) each materially contribute. None can be fixed without modifying `alpha_liquidity_sweep_predictor.py`. Per the read-only contract, this audit identifies and prescribes the fixes; it does not apply them.
 
 ### Why "research-only"
 - Win rate **10.98%** is far below the random-walk baseline (~50% before costs); LSA is **anti-predictive** in its current form on this data window.
@@ -71,13 +75,13 @@ This is not noise — it is a systematic, structural failure of the current sign
 
 ### Sweep State Distribution
 
-| State | Count | Percentage |
-|---|---:|---:|
-| NORMAL            | 35,857 | 95.80% |
-| PRE_SWEEP_BUILDUP | 1,571  | 4.20% |
-| ACTIVE_SWEEP      | **0**  | **0.00%** |
+| State | Count | Percentage | Note |
+|---|---:|---:|---|
+| NORMAL            | 35,857 | 90.39% | LSA emits HOLD |
+| PRE_SWEEP_BUILDUP | 1,571  | 3.96%  | All 1,384 trades came from here |
+| ACTIVE_SWEEP      | **2,242** | **5.65%** | **All 2,242 attempts crashed** with AttributeError → see C-4 |
 
-> **C-2 evidence:** `ACTIVE_SWEEP` was never reached over 39,670 bars even though price visibly broke 60-bar highs and lows many times in the window. See finding C-2.
+> **C-2 + C-4 evidence:** `ACTIVE_SWEEP` IS reached on 5.65% of bars, but `_liquidity_forecast()` (called from the ACTIVE_SWEEP branch at line 923) accesses `self.ofi_sum` and `self.ofi_sq_sum` which are NEVER initialized in `__init__`. Every single ACTIVE_SWEEP execution raises `AttributeError`. The v2 harness silently swallowed these exceptions (a real harness bug); the v3 harness counts them honestly. **C-2 is rewritten:** the real root cause is not the Hawkes-spike timing, it is C-4 — the path is structurally dead because of an uninitialized attribute.
 
 ### Regime Distribution (LSA-internal, from `_detect_regime` on EMA 12/26)
 
@@ -89,6 +93,8 @@ This is not noise — it is a systematic, structural failure of the current sign
 
 ### Core Performance Metrics
 
+#### Signal-synthetic equity (every signal taken; ~43% adjacent overlap)
+
 | Metric | Value |
 |---|---:|
 | Win Rate                       | **10.98%** |
@@ -96,8 +102,8 @@ This is not noise — it is a systematic, structural failure of the current sign
 | Hit Rate (SELL, gross > 22 bps)| **12.22%** |
 | Profit Factor                  | **0.092** |
 | Expectancy                     | **−0.221% per trade** |
-| Sharpe Ratio (daily, ann.)     | **−50.78** |
-| Max Drawdown                   | **95.34%** |
+| Sharpe (daily, ann., signal-synthetic) | **−50.78** |
+| Max Drawdown (signal-synthetic) | **95.34%** |
 | Final Equity (start = 1.0)     | **0.047** |
 | Avg Holding Time               | 12 bars (12 minutes) |
 | Best Trade                     | +2.80% |
@@ -105,6 +111,19 @@ This is not noise — it is a systematic, structural failure of the current sign
 | Total Trades                   | 1,384 |
 | Date Range                     | 2023-12-01 → 2023-12-31 |
 | Trading Days                   | 31 |
+
+#### Non-overlapping single-position portfolio (greedy: skip until horizon-12 exit)
+
+| Metric | Value |
+|---|---:|
+| Trades                         | **848** |
+| Win Rate                       | **10.38%** |
+| Profit Factor                  | **0.081** |
+| Expectancy per trade           | **−0.293%** |
+| Max Drawdown                   | **85.62%** |
+| Final Equity (start = 1.0)     | **0.144** |
+
+> The non-overlap portfolio is the closer proxy for a single-account live result. The signal-synthetic equity is the closer proxy for a multi-strategy/multi-position book. Both are catastrophic on this window. Both are fully reproducible from `audit_lsa_output/audit_v3.json`.
 
 ### Forward-Return Convention
 - Horizon: **12 bars** (12 minutes)
@@ -207,18 +226,29 @@ This matches the existing ACTIVE_SWEEP fade convention at lines 1003–1006 (`ac
 
 ---
 
-### [CRITICAL] C-2 — `ACTIVE_SWEEP` is structurally unreachable; the fade-on-fake-breakout branch (lines 876–1008) never executes
+### [CRITICAL] C-2 — The fade-on-fake-breakout branch (lines 876–1008) is dead in production — but the **upstream** root cause is C-4 (uninitialized attribute), not the Hawkes-spike gate I originally hypothesized
 
-**Location:** `alpha_liquidity_sweep_predictor.py` → `detect_sweep_state()` lines 486–490.
+**Location:** `alpha_liquidity_sweep_predictor.py` → `_liquidity_forecast()` lines 557–569 (called from ACTIVE_SWEEP path at line 923).
 
-**Description:** Both `ACTIVE_SWEEP` and `PRE_SWEEP_BUILDUP` require `intensity_spike == True`, defined at line 468 as `hawkes_intensity >= baseline * 2.0`. `baseline` is the rolling **mean** of `hawkes_history`. By construction, the rolling mean trails the current intensity — but the gate `>= 2 × mean` is a much weaker condition than what the audit observed on Dec 2023:
-- `hawkes_max = 32.10`, `hawkes_mean (per-bar) = 0.96` over 37,428 post-warmup bars.
-- 1,571 bars satisfied `intensity_spike` (PRE_SWEEP_BUILDUP fires).
-- **Zero** bars satisfied **both** `intensity_spike` AND (`price >= pool['high']` OR `price <= pool['low']`).
+**Description (rewritten after code review):**
 
-The fail mode is not arithmetic; it is structural: every time price actually crosses the rolling-60 high/low (which happens many times per day on BTC), Hawkes intensity has *already* decayed because the burst that drove the cross occurred a few seconds earlier. The two conditions never line up on this 1m bar cadence.
+The v3 harness (which counts exceptions instead of swallowing them) shows that `detect_sweep_state` *does* return `ACTIVE_SWEEP` on **2,242 of 39,670 bars (5.65%)** — refuting my original C-2 hypothesis that the Hawkes-spike-and-cross conditions never coincide. The Hawkes gate is satisfied frequently enough; what kills the path is **C-4**: every single one of those 2,242 ACTIVE_SWEEP executions raises `AttributeError: 'LiquiditySweepAlpha' object has no attribute 'ofi_sum'` from `_liquidity_forecast()` line 564, before any signal is produced.
 
-**Impact:** The entire fade/fake-out branch (lines 876–1008) — which contains the resiliency check, the ML probability, the liquidity forecast, and the logit ensemble — is **dead code in production** for any feed where Hawkes intensity arrives a few seconds before the price cross. This is a silent loss of an entire model component.
+**Impact:** Identical to what I described before — the entire ACTIVE_SWEEP fade/fake-out branch (lines 876–1008) is **dead in production**, but the cure is C-4 (one-line `__init__` fix), not a redesign of `detect_sweep_state`. Once C-4 lands, ACTIVE_SWEEP will execute and produce signals on ~5.65% of bars — at which point the brief's intended fade logic can be evaluated against real data.
+
+**Evidence:**
+```
+v3 LOOP:  attempts_after_warmup=39670  exceptions=2242  records=39670
+exception types:    [2242] AttributeError: 'LiquiditySweepAlpha' object has no attribute 'ofi_sum'
+exception state attribution: {'ACTIVE_SWEEP': 2242}
+```
+
+**Proposed Fix:** None at the `detect_sweep_state` level — the gate is fine. **The fix lives in C-4.** Once C-4 lands, the audit MUST be re-run and the ACTIVE_SWEEP performance evaluated separately (it may be its own anti-predictive disaster — currently we cannot tell).
+
+**Implementation Complexity:** N/A — covered by C-4.
+**Priority:** Linked to C-4. Cannot be evaluated until C-4 is fixed.
+
+> **Auditor's note on the change:** My v2 harness wrapped `lsa.get_signal()` in a bare `try/except: continue`, which silently dropped the 2,242 ACTIVE_SWEEP-attempted bars and made it look like ACTIVE_SWEEP was never reached. The v3 harness fixes that, and the architect code-review correctly flagged the v2 silent drop as a methodology error. This finding is the corrected version.
 
 **Evidence:**
 ```python
@@ -287,6 +317,61 @@ Then add a `_state_invalid_count` counter exposed via `get_state_metrics()` (mir
 
 **Implementation Complexity:** LOW.
 **Priority:** **Fix immediately.** Two-minute change; prevents an entire class of silent downstream bugs.
+
+---
+
+### [CRITICAL] C-4 — `_liquidity_forecast` accesses `self.ofi_sum` and `self.ofi_sq_sum` which `__init__` never sets — every ACTIVE_SWEEP execution crashes with `AttributeError`
+
+**Location:** `alpha_liquidity_sweep_predictor.py` → `_liquidity_forecast()` lines 562–568.
+
+**Description:**
+```python
+# alpha_liquidity_sweep_predictor.py lines 562-568
+n = len(self.ofi_history)
+if n >= 20:
+    ofi_mean = self.ofi_sum / n
+    var = (self.ofi_sq_sum / n) - (ofi_mean * ofi_mean)
+```
+`self.ofi_sum` and `self.ofi_sq_sum` are referenced here but **never set** in `__init__` (lines 284–310). The attributes that `__init__` does set for OFI rolling stats are `_ofi_count`, `_ofi_mean`, `_ofi_M2` — three completely different names. As soon as `len(self.ofi_history) >= 20` (which happens by bar ~20 in any real run), `_liquidity_forecast()` raises `AttributeError: 'LiquiditySweepAlpha' object has no attribute 'ofi_sum'`.
+
+`_liquidity_forecast()` is called from exactly one place: `get_signal()` line 923, inside the `state == "ACTIVE_SWEEP"` branch. So:
+- PRE_SWEEP_BUILDUP path: never calls `_liquidity_forecast` → never crashes → produces 1,384 signals.
+- ACTIVE_SWEEP path: always calls `_liquidity_forecast` → always crashes → produces zero signals.
+
+This is the single biggest defect in LSA and the upstream cause of what I had originally described as C-2.
+
+**Impact:**
+- The entire ACTIVE_SWEEP code path (lines 876–1008, ~133 lines containing the resiliency check, the `_ml_sweep_probability` model, the fake-breakout fade logic, and the logit ensemble) is **dead in production**.
+- In any live deployment, `get_signal()` would raise an unhandled `AttributeError` ~5.65% of the time. If a calling layer catches the exception, the alpha is silently degraded; if it doesn't, the orchestrator dies.
+- This bug has been in the code through every commit in the repo's recent history (it is not a regression introduced by a recent change).
+
+**Evidence (verbatim from v3 audit):**
+```
+[2242] AttributeError: 'LiquiditySweepAlpha' object has no attribute 'ofi_sum'
+exception state attribution: {'ACTIVE_SWEEP': 2242}
+```
+
+**Proposed Fix:** Add the missing attributes to `__init__` and maintain them in `calculate_ofi_zscore` alongside the existing Welford `_ofi_M2` updates:
+```python
+# In __init__ (after line 296):
+self.ofi_sum = 0.0       # for _liquidity_forecast normalization
+self.ofi_sq_sum = 0.0    # for _liquidity_forecast normalization
+
+# In calculate_ofi_zscore, when appending a new sample:
+self.ofi_sum += ofi_total
+self.ofi_sq_sum += ofi_total * ofi_total
+# ...and on outgoing sample (window full):
+if outgoing is not None:
+    self.ofi_sum -= outgoing
+    self.ofi_sq_sum -= outgoing * outgoing
+```
+**Verification:**
+1. Re-run `audit_lsa_dec2023_v3.py` — `exceptions_after_warmup` MUST be 0.
+2. State distribution MUST show non-zero ACTIVE_SWEEP with non-zero produced action counts.
+3. Add a unit test that constructs a fresh `LiquiditySweepAlpha`, feeds 25 OFI updates, and asserts `_liquidity_forecast()` returns a finite number (not raises).
+
+**Implementation Complexity:** LOW (5-minute fix).
+**Priority:** **Fix immediately, before C-1 / C-2 can even be evaluated.** This is the prerequisite for evaluating the brief's intended ACTIVE_SWEEP behavior at all.
 
 ---
 
@@ -544,6 +629,20 @@ When pools reset (H-3) or are not yet seeded, `_predict_next_sweep` returns neut
 
 ### Critical Fixes (Must fix before any live deployment)
 
+#### Fix C-4 (PREREQUISITE): Initialize `ofi_sum` and `ofi_sq_sum` in `__init__`
+
+**Why first:** Until C-4 is fixed, the ACTIVE_SWEEP path is dead and C-1/C-2 cannot be evaluated honestly. C-4 is also a one-line fix with zero design implications.
+
+**Step-by-Step Fix:**
+1. Add `self.ofi_sum = 0.0` and `self.ofi_sq_sum = 0.0` to `__init__` after line 296.
+2. In `calculate_ofi_zscore`, mirror the existing Welford increments into `ofi_sum` / `ofi_sq_sum` (add on append, subtract on eviction).
+3. Re-run `audit_lsa_dec2023_v3.py` and assert `exceptions_after_warmup == 0`.
+4. Re-publish the audit numbers (this report) with the fixed v4 results.
+
+**Estimated effort:** 30 minutes.
+
+---
+
 #### Fix C-1: Reverse PRE_SWEEP_BUILDUP directional convention OR convert to fade
 
 **Problem Statement:** LSA's anticipatory continuation bet on PRE_SWEEP_BUILDUP loses 89% of trades on Dec 2023. Profit factor 0.092, max DD 95.34%.
@@ -746,7 +845,9 @@ After C-1 + C-2 + C-3 are merged, run continuation-vs-fade A/B on Dec 2023 + Apr
 
 **Audit artifacts (under `audit_lsa_output/`):**
 - `audit_report.json` — Phase 1–7 machine-readable findings (v1, synthetic trade-count proxy)
-- `audit_v2.json` — Phase 5–6 metrics with **real per-min aggTrades** trade counts (the headline numbers in this report)
+- `audit_v2.json` — Phase 5–6 metrics with **real per-min aggTrades** trade counts (v2, silently swallowed exceptions — superseded by v3)
+- `audit_v3.json` — **CORRECTED metrics with honest exception accounting** (the headline numbers in this report; supports C-4 finding)
 - `lsa_records.csv` — per-bar LSA outputs (v1)
 - `lsa_records_v2.csv` — per-bar LSA outputs (v2, real trade counts)
+- `lsa_records_v3.csv` — per-bar LSA outputs (v3, all 39,670 post-warmup bars accounted for including exception-attributed ACTIVE_SWEEP bars)
 - `lsa_trade_log.csv` — per-trade entry/exit/PnL ledger

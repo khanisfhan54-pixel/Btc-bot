@@ -1,0 +1,132 @@
+{
+  "version": "v3_real_trades_count_with_exception_accounting",
+  "attempts_after_warmup": 39670,
+  "exceptions_after_warmup": 2242,
+  "exception_types": {
+    "AttributeError: 'LiquiditySweepAlpha' object has no attribute 'ofi_sum'": 2242
+  },
+  "exception_state_attribution": {
+    "ACTIVE_SWEEP": 2242
+  },
+  "exception_first_traceback": {
+    "AttributeError: 'LiquiditySweepAlpha' object has no attribute 'ofi_sum'": "Traceback (most recent call last):\n  File \"/home/runner/workspace/audit_lsa_dec2023_v3.py\", line 169, in <module>\n    out = lsa.get_signal(md, regime_context={\"regime\": \"RANGING\"})\n          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/runner/workspace/alpha_liquidity_sweep_predictor.py\", line 923, in get_signal\n    liquidity_bias = self._liquidity_forecast()\n                     ^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/runner/workspace/alpha_liquidity_sweep_predictor.py\", line 564, in _liquidity_forecast\n    ofi_mean = self.ofi_sum / n\n               ^^^^^^^^^^^^\nAttributeError: 'LiquiditySweepAlpha' object has no attribute 'ofi_sum'\n"
+  },
+  "total_records_after_warmup": 39670,
+  "action_distribution": {
+    "HOLD": 38286,
+    "BUY": 811,
+    "SELL": 573
+  },
+  "state_distribution_observed": {
+    "NORMAL": 35857,
+    "ACTIVE_SWEEP": 2242,
+    "PRE_SWEEP_BUILDUP": 1571
+  },
+  "regime_distribution": {
+    "RANGING": 35969,
+    "UPTREND": 1937,
+    "DOWNTREND": 1764
+  },
+  "hawkes_max": 66.90000000000032,
+  "hawkes_mean": 1.12949584068567,
+  "total_trades": 1384,
+  "horizon_bars": 12,
+  "round_trip_cost_bps": 22,
+  "OVERLAP_CAVEAT": "Per-trade returns are not a portfolio backtest. With horizon=12 and 1,384 entries over 39,670 bars, ~43% of adjacent trades overlap. The headline Sharpe and max-drawdown therefore describe the SIGNAL's synthetic equity, not a single-position portfolio. They remain comparable across runs (e.g. before/after a fix), but the absolute magnitude is not portfolio-realistic.",
+  "win_rate": 0.109827,
+  "buy_count": 811,
+  "sell_count": 573,
+  "buy_hit_rate": 0.10111,
+  "sell_hit_rate": 0.122164,
+  "expectancy_per_trade_pct": -0.220971,
+  "profit_factor": 0.091998,
+  "best_trade_pct": 2.800371,
+  "worst_trade_pct": -1.916926,
+  "avg_holding_bars": 12.0,
+  "sharpe_daily_annualized_signal_synthetic": -50.783566,
+  "trading_days": 31,
+  "final_equity_signal_synthetic": 0.046634,
+  "max_drawdown_signal_synthetic": 0.953378,
+  "non_overlap_trades": 848,
+  "non_overlap_win_rate": 0.103774,
+  "non_overlap_profit_factor": 0.080526,
+  "non_overlap_final_equity": 0.143817,
+  "non_overlap_max_drawdown": 0.856217,
+  "non_overlap_expectancy_per_trade_pct": -0.228174,
+  "state_breakdown": {
+    "PRE_SWEEP_BUILDUP": {
+      "signals": 1384,
+      "win_rate": 0.1098,
+      "avg_return_pct": -0.220971,
+      "avg_confidence": 0.7264,
+      "avg_ofi_z": -0.0009,
+      "avg_hawkes": 2.9533
+    }
+  },
+  "confidence_calibration": {
+    "0.0-0.3": {
+      "count": 0,
+      "win_rate": 0.0,
+      "avg_return_pct": 0.0
+    },
+    "0.3-0.5": {
+      "count": 0,
+      "win_rate": 0.0,
+      "avg_return_pct": 0.0
+    },
+    "0.5-0.7": {
+      "count": 463,
+      "win_rate": 0.108,
+      "avg_return_pct": -0.211128
+    },
+    "0.7-1.01": {
+      "count": 921,
+      "win_rate": 0.1107,
+      "avg_return_pct": -0.225919
+    }
+  },
+  "ofi_predictive": {
+    "0-1": {
+      "count": 1178,
+      "win_rate": 0.1087,
+      "avg_return_pct": -0.223303
+    },
+    "1-2": {
+      "count": 83,
+      "win_rate": 0.1205,
+      "avg_return_pct": -0.221464
+    },
+    "2-4": {
+      "count": 123,
+      "win_rate": 0.1138,
+      "avg_return_pct": -0.198303
+    },
+    "4-999": {
+      "count": 0,
+      "win_rate": 0.0,
+      "avg_return_pct": 0.0
+    }
+  },
+  "hawkes_predictive": {
+    "0-0.1": {
+      "count": 0,
+      "win_rate": 0.0,
+      "avg_return_pct": 0.0
+    },
+    "0.1-1.0": {
+      "count": 34,
+      "win_rate": 0.0588,
+      "avg_return_pct": -0.240717
+    },
+    "1.0-5.0": {
+      "count": 1195,
+      "win_rate": 0.1046,
+      "avg_return_pct": -0.218851
+    },
+    "5.0-999": {
+      "count": 155,
+      "win_rate": 0.1613,
+      "avg_return_pct": -0.232984
+    }
+  }
+}
