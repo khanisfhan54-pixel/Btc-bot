@@ -1,0 +1,137 @@
+{
+  "bars_recorded": {
+    "baseline": 1500,
+    "fixed": 1500
+  },
+  "errors": {
+    "baseline": 0,
+    "fixed": 0
+  },
+  "elapsed_sec": {
+    "baseline": 14.46,
+    "fixed": 14.47
+  },
+  "allow_trade_rate": {
+    "baseline": 0.0,
+    "fixed": 0.0
+  },
+  "direction_distribution": {
+    "baseline": {
+      "SHORT": 213,
+      "LONG": 297,
+      "HOLD": 990
+    },
+    "fixed": {
+      "SHORT": 213,
+      "LONG": 297,
+      "HOLD": 990
+    }
+  },
+  "market_state_distribution": {
+    "baseline": {
+      "CHOPPY": 641,
+      "RANGING": 302,
+      "COMPRESSION": 557
+    },
+    "fixed": {
+      "CHOPPY": 641,
+      "RANGING": 302,
+      "COMPRESSION": 557
+    }
+  },
+  "confidence_stats": {
+    "baseline": {
+      "n": 1500,
+      "min": 0.0,
+      "max": 0.53,
+      "mean": 0.12203333333333334,
+      "p50": 0.11,
+      "p90": 0.19,
+      "p99": 0.44,
+      "zero_frac": 0.058
+    },
+    "fixed": {
+      "n": 1500,
+      "min": 0.0,
+      "max": 0.53,
+      "mean": 0.12203333333333334,
+      "p50": 0.11,
+      "p90": 0.19,
+      "p99": 0.44,
+      "zero_frac": 0.058
+    }
+  },
+  "alpha_confidence_stats": {
+    "baseline": {
+      "n": 1500,
+      "min": 0.26006796627927875,
+      "max": 0.5,
+      "mean": 0.30183139226396927,
+      "p50": 0.2964297662591231,
+      "p90": 0.3180304818392625,
+      "p99": 0.5,
+      "zero_frac": 0.0
+    },
+    "fixed": {
+      "n": 1500,
+      "min": 0.26006796627927875,
+      "max": 0.5,
+      "mean": 0.30183139226396927,
+      "p50": 0.2964297662591231,
+      "p90": 0.3180304818392625,
+      "p99": 0.5,
+      "zero_frac": 0.0
+    }
+  },
+  "invariant_violation_counts": {
+    "baseline": {
+      "INV-1": 0,
+      "INV-2": 0,
+      "INV-3": 0,
+      "INV-4": 0,
+      "INV-5": 0,
+      "INV-6": 0,
+      "INV-7": 0,
+      "INV-8": 0,
+      "INV-9": 0,
+      "INV-10": 0,
+      "INV-11": 0,
+      "INV-12": 0,
+      "INV-13": 0,
+      "INV-14": 0,
+      "INV-15": 0,
+      "INV-16": 0,
+      "INV-17": 0,
+      "INV-18": 0,
+      "INV-19": 0,
+      "INV-20": 0
+    },
+    "fixed": {
+      "INV-1": 0,
+      "INV-2": 0,
+      "INV-3": 0,
+      "INV-4": 0,
+      "INV-5": 0,
+      "INV-6": 0,
+      "INV-7": 0,
+      "INV-8": 0,
+      "INV-9": 0,
+      "INV-10": 0,
+      "INV-11": 0,
+      "INV-12": 0,
+      "INV-13": 0,
+      "INV-14": 0,
+      "INV-15": 0,
+      "INV-16": 0,
+      "INV-17": 0,
+      "INV-18": 0,
+      "INV-19": 0,
+      "INV-20": 0
+    }
+  },
+  "adversarial": {
+    "passed": 25,
+    "failed": 0,
+    "total": 25
+  }
+}
