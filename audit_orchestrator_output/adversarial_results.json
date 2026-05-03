@@ -1,0 +1,258 @@
+{
+  "TEST-1": {
+    "PASS": {
+      "action": "HOLD",
+      "rationale": "no_valid_signals",
+      "missing_keys": [
+        "final_conviction",
+        "risk_metrics",
+        "quality_metrics"
+      ],
+      "result": false
+    }
+  },
+  "TEST-2": {
+    "PASS": {
+      "action": "HOLD",
+      "rationale": "weak_score",
+      "result": true
+    }
+  },
+  "TEST-3": {
+    "PASS": {
+      "action": "HOLD",
+      "rejection_details": [
+        {
+          "reason": "invalid_input_type",
+          "type": "str"
+        }
+      ],
+      "result": true
+    }
+  },
+  "TEST-4": {
+    "PASS": {
+      "action": "HOLD",
+      "rejection_details": [
+        {
+          "source_id": "unknown_alpha",
+          "reason": "unknown_source"
+        }
+      ],
+      "result": true
+    }
+  },
+  "TEST-5": {
+    "PASS": {
+      "action": "HOLD",
+      "result": true
+    }
+  },
+  "TEST-6": {
+    "PASS": {
+      "action": "BUY",
+      "result": true
+    }
+  },
+  "TEST-7": {
+    "PASS": {
+      "action": "HOLD",
+      "rationale": "invalid_current_time",
+      "missing_keys": [
+        "final_conviction",
+        "risk_metrics",
+        "quality_metrics"
+      ],
+      "result": true
+    }
+  },
+  "TEST-8": {
+    "PASS": {
+      "action": "HOLD",
+      "rationale": "invalid_current_time",
+      "result": true
+    }
+  },
+  "TEST-9": {
+    "PASS": {
+      "action": "HOLD",
+      "rationale": "dd_breach",
+      "urgency": 0.0,
+      "result": true
+    }
+  },
+  "TEST-10": {
+    "PASS": {
+      "zero_edge_ok": true,
+      "neg_rejected": true,
+      "result": true
+    }
+  },
+  "TEST-11": {
+    "PASS": {
+      "rejection_details": [
+        {
+          "source_id": "signal_engine",
+          "reason": "future_timestamp",
+          "skew_ms": -10000.0
+        }
+      ],
+      "result": true
+    }
+  },
+  "TEST-12": {
+    "PASS": {
+      "rejection_details": [
+        {
+          "source_id": "signal_engine",
+          "reason": "stale",
+          "age": 500.0,
+          "ttl": 60.25
+        }
+      ],
+      "result": true
+    }
+  },
+  "TEST-13": {
+    "PASS": {
+      "action": "HOLD",
+      "rationale": "zero_exp",
+      "urgency": 0.0,
+      "result": true
+    }
+  },
+  "TEST-14": {
+    "PASS": {
+      "duplicates_removed": 1,
+      "result": true
+    }
+  },
+  "TEST-15": {
+    "PASS": {
+      "errors": [],
+      "n_errors": 0,
+      "result": true
+    }
+  },
+  "TEST-16": {
+    "PASS": {
+      "no_exception": true,
+      "telemetry_delta": 0,
+      "result": true
+    }
+  },
+  "TEST-17": {
+    "PASS": {
+      "result": "SKIP (requires 20+ losses to produce drift)"
+    }
+  },
+  "TEST-18": {
+    "PASS": {
+      "action": "HOLD",
+      "rationale": "weak_score",
+      "result": true
+    }
+  },
+  "TEST-19": {
+    "PASS": {
+      "action": "SELL",
+      "dominant_tf": "5m",
+      "tf_breakdown": {
+        "1m": {
+          "net_score": 1.0,
+          "blended_edge": 25.0
+        },
+        "5m": {
+          "net_score": -1.0,
+          "blended_edge": -25.0
+        }
+      },
+      "result": true
+    }
+  },
+  "TEST-20": {
+    "PASS": {
+      "per_case": {
+        "empty": {
+          "action": "HOLD",
+          "rationale": "no_valid_signals",
+          "missing_keys": [
+            "final_conviction",
+            "risk_metrics",
+            "quality_metrics"
+          ]
+        },
+        "invalid_time": {
+          "action": "HOLD",
+          "rationale": "invalid_current_time",
+          "missing_keys": [
+            "final_conviction",
+            "risk_metrics",
+            "quality_metrics"
+          ]
+        },
+        "nan_time": {
+          "action": "HOLD",
+          "rationale": "invalid_current_time",
+          "missing_keys": [
+            "final_conviction",
+            "risk_metrics",
+            "quality_metrics"
+          ]
+        },
+        "unknown": {
+          "action": "HOLD",
+          "rationale": "no_valid_signals",
+          "missing_keys": [
+            "final_conviction",
+            "risk_metrics",
+            "quality_metrics"
+          ]
+        },
+        "str_input": {
+          "action": "HOLD",
+          "rationale": "invalid_input_type",
+          "missing_keys": [
+            "final_conviction",
+            "risk_metrics",
+            "quality_metrics"
+          ]
+        },
+        "dd_breach": {
+          "action": "HOLD",
+          "rationale": "dd_breach",
+          "missing_keys": []
+        },
+        "zero_exp": {
+          "action": "HOLD",
+          "rationale": "zero_exp",
+          "missing_keys": []
+        },
+        "low_liq": {
+          "action": "HOLD",
+          "rationale": "insufficient_liquidity",
+          "missing_keys": [
+            "final_conviction",
+            "risk_metrics",
+            "quality_metrics"
+          ]
+        },
+        "poor_fq": {
+          "action": "HOLD",
+          "rationale": "poor_feature_quality",
+          "missing_keys": [
+            "final_conviction",
+            "risk_metrics",
+            "quality_metrics"
+          ]
+        },
+        "weak": {
+          "action": "HOLD",
+          "rationale": "weak_score",
+          "missing_keys": []
+        }
+      },
+      "result": false
+    }
+  }
+}
