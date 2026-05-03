@@ -2,10 +2,34 @@
 
 import json
 import asyncio
-import websockets
+try:
+    import websockets
+except Exception:  # pragma: no cover - helper import path for tooling/tests
+    websockets = None
 import time
 import os
 from typing import Any, Dict, List
+
+
+def align_book_to_bars(bars, book) -> List[Dict[str, Any]]:
+    bar_rows = [b for b in (bars or []) if isinstance(b, (list, tuple)) and len(b) >= 1]
+    book_rows = [s for s in (book or []) if isinstance(s, dict) and "timestamp" in s]
+    if not bar_rows:
+        return []
+    if not book_rows:
+        raise ValueError("book is empty; cannot align to bars")
+    aligned: List[Dict[str, Any]] = []
+    j = 0
+    last = None
+    for bar in bar_rows:
+        bar_ts = int(bar[0])
+        while j < len(book_rows) and int(book_rows[j].get("timestamp", -1)) <= bar_ts:
+            last = book_rows[j]
+            j += 1
+        if last is None:
+            raise ValueError(f"no book snapshot available at or before bar timestamp {bar_ts}")
+        aligned.append(last)
+    return aligned
 
 DATA_FILE = "l2_replay_data.json"
 

@@ -5,7 +5,7 @@ import logging
 import math
 import time as _time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -90,6 +90,13 @@ except Exception as _ba_err:
     )
 
 logger = logging.getLogger(__name__)
+
+try:
+    from l2_pipeline import align_book_to_bars
+except Exception:
+    align_book_to_bars = None  # type: ignore[assignment]
+
+BookSnapshot = Dict[str, Any]
 
 
 # ----------------------------------------------------------------------------
@@ -436,13 +443,24 @@ class BacktestEngine:
     # ------------------------------------------------------------------
     # Main entry points
     # ------------------------------------------------------------------
-    def run_backtest(self, ohlcv_data: List[list], initial_balance: float | None = None) -> Dict[str, Any]:
-        return self._run_single_pass(ohlcv_data, initial_balance=initial_balance, label="run_backtest")
+    def run_backtest(
+        self,
+        ohlcv_data: List[list],
+        initial_balance: float | None = None,
+        book_features: Optional[Sequence[BookSnapshot]] = None,
+    ) -> Dict[str, Any]:
+        return self._run_single_pass(
+            ohlcv_data,
+            initial_balance=initial_balance,
+            label="run_backtest",
+            book_features=book_features,
+        )
 
     def run_backtest_multi_resolution(
         self,
         ohlcv_1m_data: List[list],
         initial_balance: float | None = None,
+        book_features: Optional[Sequence[BookSnapshot]] = None,
     ) -> Dict[str, Any]:
         """REQUIRED-1 (B005): run the same engine at 1m, 5m, 15m and label
         each with its production semantics. Returns a dict keyed by
@@ -465,9 +483,32 @@ class BacktestEngine:
             logger.warning("15m resample failed: %s", exc)
             bars_15m = []
 
-        result_1m = self._run_single_pass(bars_1m, initial_balance=initial_balance, label="1m")
-        result_5m = self._run_single_pass(bars_5m, initial_balance=initial_balance, label="5m")
-        result_15m = self._run_single_pass(bars_15m, initial_balance=initial_balance, label="15m")
+        result_1m = self._run_single_pass(
+            bars_1m,
+            initial_balance=initial_balance,
+            label="1m",
+            book_features=book_features,
+        )
+        book_5m = None
+        book_15m = None
+        if book_features is not None:
+            if align_book_to_bars is None:
+                raise ValueError("align_book_to_bars unavailable for multi-resolution book alignment")
+            book_5m = align_book_to_bars(bars_5m, book_features)
+            book_15m = align_book_to_bars(bars_15m, book_features)
+
+        result_5m = self._run_single_pass(
+            bars_5m,
+            initial_balance=initial_balance,
+            label="5m",
+            book_features=book_5m,
+        )
+        result_15m = self._run_single_pass(
+            bars_15m,
+            initial_balance=initial_balance,
+            label="15m",
+            book_features=book_15m,
+        )
 
         result_1m["label"] = "diagnostic"
         result_1m["label_reason"] = "1m noise-dominated: SNR < cost threshold (round-trip ~11 bps)"
@@ -495,6 +536,7 @@ class BacktestEngine:
         ohlcv_data: List[list],
         initial_balance: float | None = None,
         label: str = "single",
+        book_features: Optional[Sequence[BookSnapshot]] = None,
     ) -> Dict[str, Any]:
         cache_hits = 0
         cache_misses = 0
@@ -514,6 +556,23 @@ class BacktestEngine:
             logger.info("[BACKTEST %s] insufficient bars (%d<50). cache hits=%d misses=%d",
                         label, len(data), cache_hits, cache_misses)
             return dict(empty_result)
+
+        if book_features is not None:
+            if len(book_features) != len(data):
+                raise ValueError(
+                    f"book_features length mismatch: bars={len(data)} book_features={len(book_features)}"
+                )
+            for idx, snap in enumerate(book_features):
+                if not isinstance(snap, dict):
+                    raise ValueError(f"book_features[{idx}] must be dict snapshot")
+                if "bids" not in snap or "asks" not in snap:
+                    raise ValueError(f"book_features[{idx}] missing bids/asks")
+                bar_ts = _safe_float(data[idx][0], 0.0)
+                snap_ts = _safe_float(snap.get("timestamp"), bar_ts)
+                if snap_ts != bar_ts:
+                    raise ValueError(
+                        f"book_features misaligned at index {idx}: bar_ts={bar_ts} snapshot_ts={snap_ts}"
+                    )
 
         # FIX CRITICAL-4 (e): fail-closed if production prerequisites are missing
         # in production-valid mode. The legacy_mode escape hatch is for the
@@ -556,7 +615,9 @@ class BacktestEngine:
         ema_slow = ema_fast
 
         # Running snapshot of the previous order book (LSA OFI z-score input)
-        prev_snapshot: Dict[str, Any] = _simulate_snapshot_from_candle(data[0])
+        prev_snapshot: Dict[str, Any] = (
+            dict(book_features[0]) if book_features is not None else _simulate_snapshot_from_candle(data[0])
+        )
 
         position: Optional[Dict[str, Any]] = None
 
@@ -571,7 +632,7 @@ class BacktestEngine:
             ema_fast = (1 - ema_fast_alpha) * ema_fast + ema_fast_alpha * current_price
             ema_slow = (1 - ema_slow_alpha) * ema_slow + ema_slow_alpha * current_price
 
-            cache_key = (int(candle[0]), float(current_price))
+            cache_key = (int(candle[0]), float(current_price), 1 if book_features is not None else 0)
             cached = self._analysis_cache.get(cache_key)
             if cached is not None:
                 cache_hits += 1
@@ -580,7 +641,7 @@ class BacktestEngine:
                 features_outer = dict(cached["features"])
             else:
                 cache_misses += 1
-                snapshot = _simulate_snapshot_from_candle(candle, prev_close)
+                snapshot = dict(book_features[i]) if book_features is not None else _simulate_snapshot_from_candle(candle, prev_close)
                 trades = _simulate_trades_from_candle(candle)
                 features_outer = self.feature_engine.update(snapshot, trades)
                 self._analysis_cache[cache_key] = {
