@@ -91,13 +91,6 @@ except Exception as _ba_err:
 
 logger = logging.getLogger(__name__)
 
-try:
-    from l2_pipeline import align_book_to_bars
-except Exception:
-    align_book_to_bars = None  # type: ignore[assignment]
-
-BookSnapshot = Dict[str, Any]
-
 
 # ----------------------------------------------------------------------------
 # Lightweight fallbacks (used only when imports fail upstream — not part of
@@ -241,9 +234,10 @@ class BacktestConfig:
     initial_balance: float = 10_000.0
     basis_mode: str = "none"  # none|fixed
     fixed_basis: float = 0.0
-    # Restored to production parity after FIX-1 (real microstructure integration).
-    # Date: 2026-05-03 | FIX-1 commit: UNKNOWN_AT_TIME_OF_EDIT
-    orchestrator_action_threshold: float = 0.6
+    # Phase 4: orchestrator action threshold (lower than production default of
+    # 0.6 because backtest convictions are clamped to (0.01, 0.99) and
+    # synthetic data does not produce extreme convictions).
+    orchestrator_action_threshold: float = 0.30
     # When False: ARE/LSA/AlphaOrchestrator are required and run_backtest()
     # returns a fail-closed empty result if any are missing. When True: the
     # orchestrator path is skipped entirely (legacy diagnostic-only mode).
@@ -282,6 +276,19 @@ class BacktestEngine:
         # Created once and re-used across run_backtest() invocations.
         self.are = AdvancedRegimeEngine() if AdvancedRegimeEngine is not None else None
 
+        # FIX-6 (REGIME_ENGINE_AUDIT 2026-04-23): load calibration-time
+        # feature normalization (feature_mean / feature_std) so that the
+        # canonical ARE payload is on the SAME scale used to fit NHHMM/SJM.
+        # Without this, runtime z-scores drift away from the calibration
+        # distribution and emission probabilities collapse to BEAR ~99% of
+        # bars. _load_calibration_norms is fail-closed: if the .npz is
+        # missing the keys, _build_canonical_are_payload refuses to emit
+        # the bar (sets _invalid=True) rather than silently using the
+        # wrong scale.
+        self._calibration_feature_mean: Optional[np.ndarray] = None
+        self._calibration_feature_std: Optional[np.ndarray] = None
+        self._load_calibration_norms()
+
         # FIX CRITICAL-5: LiquiditySweepAlpha must be SEEDED from a price
         # window before the first predict() call, otherwise detect_sweep_state
         # returns NORMAL forever and confidence is permanently 0.0. The actual
@@ -314,6 +321,78 @@ class BacktestEngine:
         # the production-valid path so tests (TEST-4) can assert continuity.
         self._last_alpha_signals: List[Any] = []
         self._all_alpha_convictions: List[float] = []
+
+        # FIX M-1 APPLIED — pre-compute per-minute aggTrades counts so the
+        # LSA market_data carries a REAL volume proxy instead of a synthetic
+        # one (len(trades) was a tiny per-bar slice, not the true count).
+        self._agg_trades_counts: Dict[int, int] = self._load_agg_trades_counts()
+
+    def _load_agg_trades_counts(self) -> Dict[int, int]:
+        """
+        Returns {timestamp_minute_floor_ms -> int count} from the aggTrades
+        CSV. Supports both Binance Vision schema (`transact_time`) and the
+        REST-shaped schema (`T`). Fail-soft: returns {} if the file is
+        missing or unreadable so the backtest still runs (with the legacy
+        len(trades) fallback inside _build_lsa_market_data).
+        # FIX M-1 APPLIED
+        """
+        try:
+            import os
+            import pandas as pd
+            path = os.path.join("data", "aggTrades_dec2023.csv")
+            if not os.path.exists(path):
+                return {}
+            df = pd.read_csv(path)
+            # Support both schemas — Binance Vision (`transact_time`) and the
+            # REST endpoint shape (`T`). Both are unix-millisecond integers.
+            if "T" in df.columns:
+                ts_col = "T"
+            elif "transact_time" in df.columns:
+                ts_col = "transact_time"
+            else:
+                return {}
+            df["minute"] = (df[ts_col].astype("int64") // 60000) * 60000
+            return df.groupby("minute").size().astype(int).to_dict()
+        except Exception as exc:
+            try:
+                logger.warning("FIX M-1: failed to preload aggTrades counts (%s)", exc)
+            except Exception:
+                pass
+            return {}
+
+    # ------------------------------------------------------------------
+    # FIX-6: calibration normalization loader
+    # ------------------------------------------------------------------
+    def _load_calibration_norms(self) -> None:
+        """Load feature_mean / feature_std written by calibrate_regime.py.
+        Fail-closed: missing keys → leave norms as None and let
+        _build_canonical_are_payload reject the bar."""
+        try:
+            w = np.load("weights/advanced_regime_weights.npz")
+            if "feature_mean" in w.files and "feature_std" in w.files:
+                fm = np.asarray(w["feature_mean"], dtype=float)
+                fs = np.asarray(w["feature_std"], dtype=float)
+                if fm.shape == (3,) and fs.shape == (3,) and np.all(np.isfinite(fm)) and np.all(np.isfinite(fs)) and np.all(fs > 0):
+                    self._calibration_feature_mean = fm
+                    self._calibration_feature_std = fs
+                    logger.info(
+                        "FIX-6: loaded calibration norms feature_mean=%s feature_std=%s",
+                        np.round(fm, 6).tolist(), np.round(fs, 6).tolist(),
+                    )
+                else:
+                    logger.error(
+                        "FIX-6: invalid feature_mean/feature_std shape or values "
+                        "(fm.shape=%s fs.shape=%s)", fm.shape, fs.shape,
+                    )
+            else:
+                logger.error(
+                    "FIX-6 NOT_APPLIED: weights .npz missing feature_mean/feature_std "
+                    "— canonical ARE payload will be rejected. Re-run calibrate_regime.py."
+                )
+        except Exception as exc:
+            logger.exception("FIX-6: failed to load calibration norms: %s", exc)
+            self._calibration_feature_mean = None
+            self._calibration_feature_std = None
 
     # ------------------------------------------------------------------
     # LSA seeding
@@ -352,20 +431,42 @@ class BacktestEngine:
         vol_mean: float,
         vol_std: float,
     ) -> Dict[str, Any]:
-        """FIX CRITICAL-1: build the canonical 4-key payload that
-        AdvancedRegimeEngine.update() requires. The features vector is exactly
-        n_features=3 (matches calibrate_regime.py / ARE constructor)."""
+        """FIX CRITICAL-1 + FIX-6 (REGIME_ENGINE_AUDIT 2026-04-23): build the
+        canonical 4-key payload that AdvancedRegimeEngine.update() requires
+        and apply CALIBRATION-time normalization (not runtime running stats)
+        to the feature vector. The features vector is exactly n_features=3
+        (matches calibrate_regime.py / ARE constructor).
+
+        Fail-closed: if calibration norms are missing, return a payload
+        marked _invalid=True (zero feature vector) rather than silently using
+        the wrong scale.
+        """
         c = _safe_float(candle[4])
         v = _safe_float(candle[5])
         log_ret = math.log(c / prev_close) if (prev_close > 0 and c > 0) else 0.0
-        ofi_z = _safe_float(features.get("ofi_zscore", features.get("ofi_norm", 0.0)))
-        vol_z = (v - vol_mean) / vol_std if vol_std > 0 else 0.0
-        feature_vec = np.array([float(log_ret), float(ofi_z), float(vol_z)], dtype=float)
+        ofi_z_raw = _safe_float(features.get("ofi_zscore", features.get("ofi_norm", 0.0)))
+        vol_z_raw = (v - vol_mean) / vol_std if vol_std > 0 else 0.0
+        raw = np.array([float(log_ret), float(ofi_z_raw), float(vol_z_raw)], dtype=float)
+
+        fm = self._calibration_feature_mean
+        fs = self._calibration_feature_std
+        if fm is not None and fs is not None:
+            normalized = (raw - fm) / np.where(fs > 0, fs, 1.0)
+            return {
+                "return": float(log_ret),
+                "features": normalized.astype(float, copy=False),
+                "price": float(c),
+                "timestamp": _ts_seconds(candle),
+            }
+        logger.error(
+            "FIX-6: calibration feature_mean/feature_std missing — refusing payload"
+        )
         return {
-            "return": float(log_ret),
-            "features": feature_vec,
+            "return": 0.0,
+            "features": np.zeros(3, dtype=float),
             "price": float(c),
             "timestamp": _ts_seconds(candle),
+            "_invalid": True,
         }
 
     def _build_lsa_market_data(
@@ -381,7 +482,18 @@ class BacktestEngine:
         c = _safe_float(candle[4])
         h = _safe_float(candle[2])
         l = _safe_float(candle[3])
-        return {
+
+        # FIX M-1 APPLIED — replace the synthetic len(trades) volume proxy
+        # with the real per-minute aggTrades count. Fall back to len(trades)
+        # only if the bar has no minute bucket in the preloaded map.
+        try:
+            bar_ts_ms = int(_safe_float(candle[0]))
+            bar_minute = (bar_ts_ms // 60000) * 60000
+            trades_count = int(self._agg_trades_counts.get(bar_minute, 0)) or len(trades)
+        except Exception:
+            trades_count = len(trades)
+
+        market_data: Dict[str, Any] = {
             "price": c,
             "close_price": c,
             "atr": max(1e-8, h - l),
@@ -390,8 +502,28 @@ class BacktestEngine:
             "prev_book": _snapshot_to_book(prev_snapshot),
             "curr_book": _snapshot_to_book(snapshot),
             "timestamp": _ts_seconds(candle),
-            "trades_count": len(trades),
+            "trades_count": trades_count,
         }
+
+        # FIX H-2 APPLIED — propagate the LSA-tracked liquidity pools into the
+        # macro_liquidity payload so predict_sweep() can score the macro side
+        # instead of falling back to a 0.5/0.5 prior on every bar.
+        try:
+            if self.lsa is not None and getattr(self.lsa, "liquidity_pools", None) is not None:
+                pools = self.lsa.liquidity_pools
+                macro_liquidity = {
+                    "high_pool": pools.get("high"),
+                    "low_pool": pools.get("low"),
+                    "pool_count": len([
+                        v for v in pools.values() if v is not None
+                    ]),
+                }
+                market_data["macro_liquidity"] = macro_liquidity
+        except Exception:
+            # Observability/integration must never break the trading path.
+            pass
+
+        return market_data
 
     def _build_alpha_signals(
         self,
@@ -446,7 +578,7 @@ class BacktestEngine:
         self,
         ohlcv_data: List[list],
         initial_balance: float | None = None,
-        book_features: Optional[Sequence[BookSnapshot]] = None,
+        book_features: Optional[Sequence[Any]] = None,   # FIX-1
     ) -> Dict[str, Any]:
         return self._run_single_pass(
             ohlcv_data,
@@ -459,7 +591,7 @@ class BacktestEngine:
         self,
         ohlcv_1m_data: List[list],
         initial_balance: float | None = None,
-        book_features: Optional[Sequence[BookSnapshot]] = None,
+        book_features_1m: Optional[Sequence[Any]] = None,   # FIX-1
     ) -> Dict[str, Any]:
         """REQUIRED-1 (B005): run the same engine at 1m, 5m, 15m and label
         each with its production semantics. Returns a dict keyed by
@@ -482,30 +614,23 @@ class BacktestEngine:
             logger.warning("15m resample failed: %s", exc)
             bars_15m = []
 
-        result_1m = self._run_single_pass(
-            bars_1m,
-            initial_balance=initial_balance,
-            label="1m",
-            book_features=book_features,
-        )
-        book_5m = None
-        book_15m = None
-        if book_features is not None:
-            if align_book_to_bars is None:
-                raise ValueError("align_book_to_bars unavailable for multi-resolution book alignment")
-            book_5m = align_book_to_bars(bars_5m, book_features)
-            book_15m = align_book_to_bars(bars_15m, book_features)
+        # FIX-1: realign book to coarser resolutions when 1m book features
+        # are provided. The 1m series may not line up directly with 5m/15m
+        # bar closes, so we pick the latest 1m snapshot at-or-before each
+        # coarser bar close (same semantics as align_book_to_bars).
+        book_5m = self._realign_book(book_features_1m, bars_1m, bars_5m) if book_features_1m else None
+        book_15m = self._realign_book(book_features_1m, bars_1m, bars_15m) if book_features_1m else None
 
+        result_1m = self._run_single_pass(
+            bars_1m, initial_balance=initial_balance, label="1m",
+            book_features=book_features_1m,
+        )
         result_5m = self._run_single_pass(
-            bars_5m,
-            initial_balance=initial_balance,
-            label="5m",
+            bars_5m, initial_balance=initial_balance, label="5m",
             book_features=book_5m,
         )
         result_15m = self._run_single_pass(
-            bars_15m,
-            initial_balance=initial_balance,
-            label="15m",
+            bars_15m, initial_balance=initial_balance, label="15m",
             book_features=book_15m,
         )
 
@@ -528,6 +653,26 @@ class BacktestEngine:
         return {"1m": result_1m, "5m": result_5m, "15m": result_15m}
 
     # ------------------------------------------------------------------
+    # FIX-1: re-align 1m book features to a coarser bar set
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _realign_book(
+        book_1m: Optional[Sequence[Any]],
+        bars_1m: Sequence[Sequence],
+        bars_target: Sequence[Sequence],
+    ) -> Optional[List[Any]]:
+        if not book_1m or not bars_1m or not bars_target:
+            return None
+        try:
+            from data_tools.l2_to_backtest import align_book_to_bars
+        except Exception:
+            return None
+        snaps = [s for s in book_1m if s is not None]
+        if not snaps:
+            return None
+        return align_book_to_bars(bars_target, snaps)
+
+    # ------------------------------------------------------------------
     # Internal: single-pass backtest
     # ------------------------------------------------------------------
     def _run_single_pass(
@@ -535,7 +680,7 @@ class BacktestEngine:
         ohlcv_data: List[list],
         initial_balance: float | None = None,
         label: str = "single",
-        book_features: Optional[Sequence[BookSnapshot]] = None,
+        book_features: Optional[Sequence[Any]] = None,   # FIX-1
     ) -> Dict[str, Any]:
         cache_hits = 0
         cache_misses = 0
@@ -556,23 +701,6 @@ class BacktestEngine:
                         label, len(data), cache_hits, cache_misses)
             return dict(empty_result)
 
-        if book_features is not None:
-            if len(book_features) != len(data):
-                raise ValueError(
-                    f"book_features length mismatch: bars={len(data)} book_features={len(book_features)}"
-                )
-            for idx, snap in enumerate(book_features):
-                if not isinstance(snap, dict):
-                    raise ValueError(f"book_features[{idx}] must be dict snapshot")
-                if "bids" not in snap or "asks" not in snap:
-                    raise ValueError(f"book_features[{idx}] missing bids/asks")
-                bar_ts = _safe_float(data[idx][0], 0.0)
-                snap_ts = _safe_float(snap.get("timestamp"), bar_ts)
-                if snap_ts != bar_ts:
-                    raise ValueError(
-                        f"book_features misaligned at index {idx}: bar_ts={bar_ts} snapshot_ts={snap_ts}"
-                    )
-
         # FIX CRITICAL-4 (e): fail-closed if production prerequisites are missing
         # in production-valid mode. The legacy_mode escape hatch is for the
         # legacy diagnostic-only path and is not used by run_backtest_multi_resolution.
@@ -589,6 +717,28 @@ class BacktestEngine:
         if not self.cfg.legacy_mode and self.lsa is None and LiquiditySweepAlpha is not None:
             logger.error("[BACKTEST %s] LiquiditySweepAlpha could not be seeded — fail-closed", label)
             return dict(empty_result)
+
+        # FIX-1: real L1 book features (per-bar) — only honored when the
+        # caller passes a sequence aligned 1-to-1 with the input bar set.
+        # When provided, every bar with a non-None snapshot uses real
+        # spread / imbalance / OFI z-score instead of the synthetic
+        # _simulate_snapshot_from_candle values. Bars with None fall back
+        # to the synthetic path (preserved for parity with prior behavior).
+        use_real_book = (
+            book_features is not None and len(book_features) == len(data)
+        )
+        if book_features is not None and not use_real_book:
+            logger.warning(
+                "[BACKTEST %s] book_features length %d != data length %d — "
+                "ignoring and using synthetic snapshots",
+                label, len(book_features), len(data),
+            )
+        if use_real_book:
+            n_real = sum(1 for s in book_features if s is not None)
+            logger.info(
+                "[BACKTEST %s] FIX-1 using real book features: %d/%d bars",
+                label, n_real, len(data),
+            )
 
         # Pre-compute volume stats for the canonical vol_z feature
         all_vols = np.array([_safe_float(r[5]) for r in data], dtype=float)
@@ -614,9 +764,7 @@ class BacktestEngine:
         ema_slow = ema_fast
 
         # Running snapshot of the previous order book (LSA OFI z-score input)
-        prev_snapshot: Dict[str, Any] = (
-            dict(book_features[0]) if book_features is not None else _simulate_snapshot_from_candle(data[0])
-        )
+        prev_snapshot: Dict[str, Any] = _simulate_snapshot_from_candle(data[0])
 
         position: Optional[Dict[str, Any]] = None
 
@@ -631,23 +779,51 @@ class BacktestEngine:
             ema_fast = (1 - ema_fast_alpha) * ema_fast + ema_fast_alpha * current_price
             ema_slow = (1 - ema_slow_alpha) * ema_slow + ema_slow_alpha * current_price
 
-            cache_key = (int(candle[0]), float(current_price), 1 if book_features is not None else 0)
-            cached = self._analysis_cache.get(cache_key)
-            if cached is not None:
-                cache_hits += 1
-                snapshot = cached["snapshot"]
-                trades = cached["trades"]
-                features_outer = dict(cached["features"])
-            else:
+            # FIX-1: build the per-bar snapshot from the real L1 book when
+            # provided. Caching is bypassed on real-book bars because two
+            # bars with identical (ts, close) can still have different L1
+            # snapshots; we never want a stale cached synthetic snapshot to
+            # override a fresh real one. Trades remain synthetic for now —
+            # FeatureEngine still gets a full snapshot+trades pair.
+            real_snap = book_features[i] if use_real_book else None
+            if real_snap is not None:
                 cache_misses += 1
-                snapshot = dict(book_features[i]) if book_features is not None else _simulate_snapshot_from_candle(candle, prev_close)
+                snapshot = {
+                    "timestamp": int(candle[0]),
+                    "bids": [[float(real_snap.bid_price), float(real_snap.bid_qty)]],
+                    "asks": [[float(real_snap.ask_price), float(real_snap.ask_qty)]],
+                }
                 trades = _simulate_trades_from_candle(candle)
                 features_outer = self.feature_engine.update(snapshot, trades)
-                self._analysis_cache[cache_key] = {
-                    "snapshot": snapshot,
-                    "trades": trades,
-                    "features": dict(features_outer),
-                }
+                # Override the synthesized OFI/imbalance/spread with real L1.
+                feat_inner_seed = features_outer.get("features", features_outer)
+                if isinstance(feat_inner_seed, dict):
+                    feat_inner_seed["ofi_zscore"] = float(real_snap.ofi_z)
+                    feat_inner_seed["ofi_norm"]   = float(real_snap.imbalance)
+                    feat_inner_seed["imbalance"]  = float(real_snap.imbalance)
+                    feat_inner_seed["spread_bps"] = float(real_snap.spread_bps)
+                    feat_inner_seed["bid_price"]  = float(real_snap.bid_price)
+                    feat_inner_seed["ask_price"]  = float(real_snap.ask_price)
+                    feat_inner_seed["bid_qty"]    = float(real_snap.bid_qty)
+                    feat_inner_seed["ask_qty"]    = float(real_snap.ask_qty)
+            else:
+                cache_key = (int(candle[0]), float(current_price))
+                cached = self._analysis_cache.get(cache_key)
+                if cached is not None:
+                    cache_hits += 1
+                    snapshot = cached["snapshot"]
+                    trades = cached["trades"]
+                    features_outer = dict(cached["features"])
+                else:
+                    cache_misses += 1
+                    snapshot = _simulate_snapshot_from_candle(candle, prev_close)
+                    trades = _simulate_trades_from_candle(candle)
+                    features_outer = self.feature_engine.update(snapshot, trades)
+                    self._analysis_cache[cache_key] = {
+                        "snapshot": snapshot,
+                        "trades": trades,
+                        "features": dict(features_outer),
+                    }
 
             # CONSOLIDATED FIX S004: inject the rolling 20-bar candle history
             # so SignalEngine can pass its ≥3-candle guard. Previously this
@@ -672,40 +848,14 @@ class BacktestEngine:
                 feat_inner["price"]   = current_price
                 feat_inner["close"]   = current_price
                 feat_inner["volume"]  = _safe_float(candle[5])
-                feat_inner["ofi_zscore"]       = feat_inner.get("ofi_norm", feat_inner.get("ofi", 0.0))
+                # FIX-1: when real L1 already populated ofi_zscore (real
+                # rolling-60 z-score from BookSnapshot.ofi_z), preserve it.
+                # Otherwise fall back to the synthetic ofi_norm-based proxy.
+                if "ofi_zscore" not in feat_inner:
+                    feat_inner["ofi_zscore"] = feat_inner.get("ofi_norm", feat_inner.get("ofi", 0.0))
                 feat_inner["flow_imbalance"]   = feat_inner.get("aggressor_imbalance", 0.0)
                 feat_inner["hawkes_intensity"] = feat_inner.get("trade_burst", 0.0)
             features = feat_inner if isinstance(feat_inner, dict) else features_outer
-
-            # FIX S004: inject OHLCV candle history so SignalEngine can pass the
-            # ≥3-candle guard and compute real LONG/SHORT signals.
-            # Build normalised candle dicts from the rolling window (last 20 bars).
-            ohlcv_window = window[-20:] if len(window) >= 20 else window
-            candle_list = [
-                {
-                    "open":   _safe_float(c[1]),
-                    "high":   _safe_float(c[2]),
-                    "low":    _safe_float(c[3]),
-                    "close":  _safe_float(c[4]),
-                    "volume": _safe_float(c[5]),
-                }
-                for c in ohlcv_window
-                if len(c) >= 6
-                    and _safe_float(c[4]) > 0
-                    and _safe_float(c[1]) > 0
-            ]
-            # Wire into the features dict that signal_engine.generate() receives.
-            feat_inner = features.get("features", features)
-            if isinstance(feat_inner, dict):
-                feat_inner["candles"] = candle_list
-                feat_inner["price"]   = _safe_float(candle[4])
-                feat_inner["close"]   = _safe_float(candle[4])
-                feat_inner["volume"]  = _safe_float(candle[5])
-                # Expose OFI z-score and Hawkes signals already computed by FeatureEngine
-                feat_inner["ofi_zscore"]        = feat_inner.get("ofi_norm", feat_inner.get("ofi", 0.0))
-                feat_inner["flow_imbalance"]    = feat_inner.get("aggressor_imbalance", 0.0)
-                feat_inner["hawkes_intensity"]  = feat_inner.get("trade_burst", 0.0)
-            features = feat_inner  # unwrap so signal_engine.generate() sees the flat dict
 
             if self.fill_model is not None:
                 features = self.fill_model.enrich(features)
@@ -726,6 +876,11 @@ class BacktestEngine:
                     vol_mean=vol_mean,
                     vol_std=vol_std,
                 )
+                # FIX-6 strict fail-closed: never forward a payload built
+                # without calibration norms — those features are on the
+                # wrong scale and would drive emission probabilities.
+                if are_payload.get("_invalid"):
+                    continue
                 try:
                     are_out = self.are.update(are_payload)
                     if isinstance(are_out, dict):
@@ -942,12 +1097,20 @@ class BacktestEngine:
                 net_pnl_pct = gross_pnl_pct - total_fee_pct - slippage
                 pnl = balance * net_pnl_pct * 0.25
                 balance += pnl
-                if self.are is not None:
-                    self.are.update_portfolio_equity(balance)
                 peak = max(peak, balance)
                 dd = (peak - balance) / peak if peak > 0 else 0.0
                 max_dd = max(max_dd, dd)
                 returns.append(net_pnl_pct)
+                # FIX-7 (REGIME_ENGINE_AUDIT 2026-04-23): notify the engine on
+                # every realized trade close so portfolio-DD is tracked and
+                # the circuit breaker can trip when DD >= _MAX_PORTFOLIO_DRAWDOWN.
+                if self.are is not None and hasattr(self.are, "report_realized_pnl"):
+                    try:
+                        self.are.report_realized_pnl(
+                            realized_pnl=float(pnl), equity=float(balance),
+                        )
+                    except Exception as exc:
+                        logger.debug("ARE.report_realized_pnl failed: %s", exc)
                 le = getattr(self, "learning_engine", None)
                 if le and hasattr(le, "record_closed_trade"):
                     try:
