@@ -1,0 +1,83 @@
+name: engine-audit
+
+on:
+  pull_request:
+    paths:
+      - "engine.py"
+      - "audit_engine_dec2023.py"
+      - "audit_engine_adversarial.py"
+      - ".github/workflows/engine_audit.yml"
+
+jobs:
+  audit:
+    name: engine.run_all_engines audit (Dec 2023)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      AUDIT_LOG_LEVEL: WARNING
+      AUDIT_BARS: "1500"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install minimal deps
+        run: |
+          python -m pip install --upgrade pip
+          # engine.py + harnesses are stdlib + numpy/pandas only
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install numpy pandas
+          fi
+
+      - name: Run adversarial harness (25 tests)
+        run: |
+          python audit_engine_adversarial.py
+
+      - name: Run Dec-2023 audit harness (1500 bars)
+        timeout-minutes: 2
+        run: |
+          python audit_engine_dec2023.py --bars ${AUDIT_BARS} --prefix ci
+
+      - name: Enforce fallback_rate < 0.05 and elapsed budget
+        run: |
+          python - <<'PY'
+          import json, sys
+          s = json.load(open("audit_engine_output/ci_summary.json"))
+          fr = float(s.get("fallback_rate", 1.0))
+          el = float(s.get("elapsed_sec", 999.0))
+          err = int(s.get("errors", 0))
+          fcnt = int(s.get("fallback_count", 0))
+          ec = int(s.get("engine_error_count", 0))
+          print("fallback_rate=", fr, "elapsed_sec=", el,
+                "errors=", err, "fallback_count=", fcnt,
+                "engine_error_count=", ec)
+          # AUDIT-FIX L-3: never tolerate errors==0 while fallback_count>0
+          if err == 0 and fcnt > 0:
+              print("ERROR: dishonest reporting (errors==0 with fallback_count=", fcnt, ")")
+              sys.exit(1)
+          if fr >= 0.05:
+              print("ERROR: fallback_rate", fr, "exceeds 0.05 budget")
+              sys.exit(1)
+          if el >= 15.0:
+              print("ERROR: elapsed_sec", el, "exceeds 15s budget")
+              sys.exit(1)
+          # Phase 1 #5: 0 invariant violations.
+          viol = sum((s.get("invariant_violation_counts") or {}).values())
+          if viol > 0:
+              print("ERROR: invariant violations:", viol,
+                    s.get("invariant_violation_counts"))
+              sys.exit(1)
+          print("OK")
+          PY
+
+      - name: Upload audit artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-audit-output
+          path: audit_engine_output/
