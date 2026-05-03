@@ -1,0 +1,143 @@
+{
+  "audit_date": "2026-05-02",
+  "engine": "AdvancedRegimeEngine",
+  "schema_version": "1.2.0",
+  "weight_status": "CALIBRATED",
+  "backtest_result_label": "VALID",
+  "data": {
+    "source_files": [
+      "data/aggTrades_dec2023.csv",
+      "data/bookTicker_dec2023.csv"
+    ],
+    "date_range_start": "2023-12-01",
+    "date_range_end": "2023-12-31",
+    "total_bars_1m": 39695,
+    "total_bars_5m": 8910,
+    "total_bars_15m": 2976,
+    "data_gaps_count": 824,
+    "overlap_days": 30.999642546296297,
+    "phase_2c_threshold_passes": true,
+    "book_format": "L1_TOB",
+    "book_align_match_pct": 99.88159717848596
+  },
+  "signal_distribution": {
+    "long_count": 0,
+    "short_count": 1300,
+    "hold_count": 38394,
+    "total_bars": 39694,
+    "signal_coverage_pct": 3.2750541643573334
+  },
+  "performance": {
+    "win_rate_pct": 19.384615384615383,
+    "hit_rate_long_pct": 0.0,
+    "hit_rate_short_pct": 19.384615384615383,
+    "profit_factor": 0.15707385345174088,
+    "profit_factor_str": "0.1571",
+    "expectancy_pct": -0.22350285573660528,
+    "sharpe_ratio_raw": -0.6583432933292674,
+    "sharpe_ratio_annualized_per_minute_DIAGNOSTIC": -396.5828524310848,
+    "sharpe_ratio_annualized": -17.0888,
+    "sharpe_basis": "PRIMARY = daily-aggregated Sharpe = (mean(daily_net_return)/stdev(daily_net_return)) * sqrt(252) computed over 30 UTC trading days. The earlier 'holding-time aware' figure (sqrt(30240) factor, -114.4836) is preserved as a HEURISTIC because 77.75% of adjacent trades have overlapping holding windows (the engine re-enters before the prior trade exits), violating the i.i.d./non-overlapping assumption that factor relies on; daily aggregation internalizes that overlap. The per-minute diagnostic (-396.5829) further over-annualizes 12-min holds and is for sanity only. All three figures agree directionally; daily is the methodologically clean headline.",
+    "max_drawdown_pct": 94.5865181772479,
+    "avg_return_per_trade_pct": -0.22350285573660528,
+    "avg_holding_bars": 12.0,
+    "avg_holding_minutes": 12.0,
+    "total_trades": 1300,
+    "winning_trades": 252,
+    "losing_trades": 1048,
+    "best_trade_pct": 3.153495601793023,
+    "worst_trade_pct": -1.3871366396265163,
+    "longest_winning_streak": 10,
+    "longest_losing_streak": 44,
+    "calmar_ratio": -71.45549373970618,
+    "sharpe_ratio_annualized_daily_aggregated": -17.0888,
+    "sharpe_ratio_annualized_holding_time_aware_HEURISTIC": -114.48360830353822,
+    "adjacent_trade_overlap_pct": 77.75,
+    "daily_aggregation_trading_days": 30
+  },
+  "assumptions": {
+    "forward_return_horizon_bars": 12,
+    "fee_bps_per_side": 8.0,
+    "slippage_bps_per_side": 3.0,
+    "initial_capital": 10000.0
+  },
+  "regime_breakdown": {
+    "TREND": {
+      "count": 0,
+      "win_rate_pct": 0.0,
+      "avg_return_pct": 0.0,
+      "avg_confidence": 0.0,
+      "avg_conviction": 0.0
+    },
+    "RANGE": {
+      "count": 0,
+      "win_rate_pct": 0.0,
+      "avg_return_pct": 0.0,
+      "avg_confidence": 0.0,
+      "avg_conviction": 0.0
+    },
+    "BEAR": {
+      "count": 1300,
+      "win_rate_pct": 19.384615384615383,
+      "avg_return_pct": -0.22350285573660528,
+      "avg_confidence": 0.9978942097214888,
+      "avg_conviction": 0.9939999401603395
+    },
+    "TOXIC": {
+      "count": 0,
+      "win_rate_pct": 0.0,
+      "avg_return_pct": 0.0,
+      "avg_confidence": 0.0,
+      "avg_conviction": 0.0
+    }
+  },
+  "engine_health": {
+    "signal_valid_rate_pct": 99.73547639441729,
+    "circuit_breaker_trigger_count": 0,
+    "circuit_breaker_reasons": {},
+    "degraded_ticks_pct": 0.0,
+    "avg_edge_score": 0.2730169827388926,
+    "avg_expected_volatility": 0.010792768116522744
+  },
+  "audit_findings_summary": {
+    "critical_count": 0,
+    "high_count": 1,
+    "medium_count": 2,
+    "low_count": 1,
+    "top_critical_issues": [
+      "BacktestEngine simulates synthetic order book from candles instead of consuming real bookDepth.csv"
+    ]
+  },
+  "verdict": {
+    "signal_quality": "broken",
+    "production_ready": false,
+    "production_verdict": "NEEDS FIXES",
+    "recommended_action": "Re-run on \u22657d overlap data and wire real book features into BacktestEngine"
+  },
+  "phase_5c_full_backtest": {
+    "total_trades": 0,
+    "win_rate": 0.0,
+    "pnl": 0.0,
+    "max_drawdown": 0.0,
+    "sharpe": 0.0,
+    "expectancy": 0.0
+  },
+  "phase_5d_multi_resolution": {
+    "status": "SKIPPED",
+    "reason": "run_backtest_multi_resolution iterates the engine across 1m/5m/15m on 39,695 1m bars and exceeded the audit time budget on this 31-day window. Phase 5C single-resolution backtest provides the primary engine assessment; Phase 5D was previously validated on the 8h-overlap audit run and that prior result is NOT carried into the verdict here."
+  },
+  "reproducibility": {
+    "audited_commit": "df70811efd9f86b0a8d21fe3389ec0a24c6272f9",
+    "audit_script": "audit_run_dec2023.py",
+    "engine_files_modified_by_audit": [],
+    "dirty_tree_disclosure": "backtest_engine.py shows +30 lines vs HEAD on the working tree. These changes were already present BEFORE the audit started and were NOT introduced by the audit. The audit ran against the working-tree version of backtest_engine.py. For a strictly clean re-run, revert backtest_engine.py to commit df70811 and re-execute python3 audit_run_dec2023.py.",
+    "engine_read_only_modules_verified_unchanged": [
+      "advanced_regime_engine.py",
+      "signal_engine.py",
+      "feature_engine.py",
+      "alpha_orchestrator.py",
+      "liquidity_sweep_alpha.py",
+      "meta_filter.py"
+    ]
+  }
+}
