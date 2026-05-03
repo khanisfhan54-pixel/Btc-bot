@@ -346,6 +346,62 @@ def test_build_output_fallback_handles_runtime_float_exceptions(monkeypatch):
     assert np.isclose(sum(out["macro_probs"]), 1.0)
 
 
+
+
+def test_schema_failure_metrics():
+    if not module._PROM_AVAILABLE:
+        pytest.skip("prometheus_client not available")
+
+    schema_counter = module.REGIME_SCHEMA_VIOLATIONS.labels(
+        engine_id="default",
+        reason="schema_validation_failed",
+    )
+    failsafe_counter = module.REGIME_FAILSAFE_EMITTED.labels(
+        engine_id="default",
+        reason="failsafe_triggered",
+    )
+    base_schema = schema_counter._value.get()
+    base_failsafe = failsafe_counter._value.get()
+
+    out_valid_1 = module._build_output(
+        regime_idx=0, regime_label="TREND", trend_strength=0.5, risk_level=0.2,
+        confidence=0.9, edge_score=0.2, probabilities={"bull": 0.8, "bear": 0.1, "crisis": 0.1},
+        macro_probs=[0.7, 0.2, 0.1], position_size=0.2, expected_vol=0.01, raw_size=0.3,
+        is_toxic=False, garch_regime_probs=[0.6, 0.4], feed_status="OK", execution_mode="trend_follow", execution_side="long",
+    )
+    out_valid_2 = module._build_output(
+        regime_idx=0, regime_label="TREND", trend_strength=0.5, risk_level=0.2,
+        confidence=0.9, edge_score=0.2, probabilities={"bull": 0.8, "bear": 0.1, "crisis": 0.1},
+        macro_probs=[0.7, 0.2, 0.1], position_size=0.2, expected_vol=0.01, raw_size=0.3,
+        is_toxic=False, garch_regime_probs=[0.6, 0.4], feed_status="OK", execution_mode="trend_follow", execution_side="long",
+    )
+    assert out_valid_1 == out_valid_2
+    assert schema_counter._value.get() == base_schema
+    assert failsafe_counter._value.get() == base_failsafe
+
+    out_fail_1 = module._build_output(
+        regime_idx=0, regime_label="TREND", trend_strength=0.5, risk_level=0.2,
+        confidence=0.9, edge_score=0.2, probabilities={"bull": 0.8, "bear": 0.1, "crisis": 0.1},
+        macro_probs=[0.7, 0.2, 0.1], position_size=0.2, expected_vol=0.01, raw_size=0.3,
+        is_toxic=False, garch_regime_probs=[0.6, 0.4], feed_status="OK", execution_mode="", execution_side="",
+    )
+    out_fail_2 = module._build_output(
+        regime_idx=0, regime_label="TREND", trend_strength=0.5, risk_level=0.2,
+        confidence=0.9, edge_score=0.2, probabilities={"bull": 0.8, "bear": 0.1, "crisis": 0.1},
+        macro_probs=[0.7, 0.2, 0.1], position_size=0.2, expected_vol=0.01, raw_size=0.3,
+        is_toxic=False, garch_regime_probs=[0.6, 0.4], feed_status="OK", execution_mode="", execution_side="",
+    )
+    assert out_fail_1 == out_fail_2
+
+    assert schema_counter._value.get() == base_schema + 2
+    assert failsafe_counter._value.get() == base_failsafe + 2
+
+    from prometheus_client import generate_latest
+    metrics_text = generate_latest().decode("utf-8")
+    assert "regime_schema_violations_total" in metrics_text
+    assert "regime_failsafe_emitted_total" in metrics_text
+
+
 def test_validate_output_schema_rejects_non_finite_position_size():
     bad = {
         "schema_version": "1.2.0",
