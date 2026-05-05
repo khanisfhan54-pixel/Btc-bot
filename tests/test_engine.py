@@ -67,6 +67,51 @@ def test_run_all_engines_deterministic_and_thread_safe_cache_reads():
     assert all(o == result1 for o in outputs), "concurrent identical requests should remain deterministic"
 
 
+def test_run_all_engines_uses_single_canonical_oi_prior(monkeypatch):
+    orderbook, trades, candles = _base_inputs()
+    captured = {"spike": None, "cascade": None}
+
+    def _fake_oi_spike_detection(current_oi, oi_history, price):
+        captured["spike"] = list(oi_history)
+        return {"oi_spike": False, "oi_change_pct": 0.0, "zscore": 0.0, "signal_strength": "normal"}
+
+    def _fake_get_cascade_probability(**kwargs):
+        captured["cascade"] = list(kwargs.get("oi_history") or [])
+        return 0.0
+
+    monkeypatch.setattr(engine, "oi_spike_detection", _fake_oi_spike_detection)
+    monkeypatch.setattr(engine, "get_cascade_probability", _fake_get_cascade_probability)
+
+    out = engine.run_all_engines(
+        orderbook=orderbook,
+        trades=trades,
+        price=100000.0,
+        recent_candles=candles,
+        open_interest=100.0,
+        current_oi=100.0,
+        oi_history=None,
+    )
+    assert isinstance(out, dict)
+    assert captured["spike"] == [100.0 * engine._OI_PRIOR_MULTIPLIER, 100.0]
+    assert captured["cascade"] == [100.0 * engine._OI_PRIOR_MULTIPLIER, 100.0]
+
+
+def test_run_all_engines_oi_path_is_deterministic_across_repeated_runs():
+    orderbook, trades, candles = _base_inputs()
+    kwargs = dict(
+        orderbook=orderbook,
+        trades=trades,
+        price=100000.0,
+        recent_candles=candles,
+        open_interest=100.0,
+        current_oi=100.0,
+        oi_history=None,
+    )
+    out1 = engine.run_all_engines(**kwargs)
+    out2 = engine.run_all_engines(**kwargs)
+    assert out1 == out2
+
+
 def test_shared_alpha_predictor_is_singleton_thread_safe():
     instances = []
     lock = threading.Lock()

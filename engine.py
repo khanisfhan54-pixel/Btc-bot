@@ -40,6 +40,9 @@ from thread_safe_wrappers import ordered_lock
 logger = logging.getLogger(__name__)
 
 
+_OI_PRIOR_MULTIPLIER = 0.98
+
+
 # =============================================================================
 # AUDIT-FIX Phase 3 #13 — centralised OUTPUT_SCHEMA for run_all_engines().
 # Opt-in validation (env AUDIT_VALIDATE=1) keeps zero behaviour change in
@@ -3921,7 +3924,7 @@ def run_all_engines(
             current_oi = _safe_float(open_interest, 0.0)
         oi = oi_spike_detection(
             current_oi=current_oi,
-            oi_history=oi_hist or [current_oi * 0.98, current_oi],
+            oi_history=oi_hist or [current_oi * _OI_PRIOR_MULTIPLIER, current_oi],
             price=price,
         ) or {}
         cprob = _safe_float(cascade_prob, 0.0)
@@ -3933,7 +3936,7 @@ def run_all_engines(
                 # default used a few lines above). Both call sites now use
                 # the same expansion factor so cascade probability and the
                 # spike detector see a consistent synthetic history.
-                oi_history=oi_hist or [oi_value * 0.98, oi_value],
+                oi_history=oi_hist or [oi_value * _OI_PRIOR_MULTIPLIER, oi_value],
                 liquidation_cluster=liquid_cluster_usd,
                 bid=best_bid or price,
                 ask=best_ask or price,
