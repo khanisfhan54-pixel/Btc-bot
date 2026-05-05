@@ -15,24 +15,6 @@
 # Legacy signal/execution helpers are kept for backward-compatibility but are
 # marked  # DEPRECATED (moved to signal_engine / execution_logic)
 #
-# =============================================================================
-# AUDIT-FIX M-1 — TOP-LEVEL OUTPUT FIELD SCALE REGISTRY
-# =============================================================================
-# run_all_engines() returns a dict whose keys live on DIFFERENT scales.
-# Downstream consumers MUST honour the scale of each field — DO NOT clamp
-# the [0,10] fields to 1.0.
-#
-#   confidence            -> [0.0, 1.0]
-#   alpha.confidence      -> [0.0, 1.0]
-#   cascade_probability   -> [0.0, 1.0]
-#   regime.confidence     -> [0.0, 1.0]
-#   order_imbalance       -> [-1.0, 1.0]
-#   confluence_score      -> [0.0, 10.0]   <-- DIFFERENT SCALE
-#   smc_signal.confidence -> [0.0, 10.0]   <-- DIFFERENT SCALE
-#
-# These constraints are enforced by INV-3, INV-5, INV-12, INV-13, INV-15,
-# INV-17, INV-19 in audit_engine_dec2023.py and by OUTPUT_SCHEMA below.
-# =============================================================================
 from __future__ import annotations
 
 import json
@@ -58,26 +40,7 @@ from thread_safe_wrappers import ordered_lock
 logger = logging.getLogger(__name__)
 
 
-# =============================================================================
-# AUDIT-FIX Phase 2 #6 — fallback offender identification helper.
-# Walks the traceback and returns the deepest engine.py frame's enclosing
-# function name so the outer except in run_all_engines can bin failures by
-# the inner engine that actually raised. Pure stdlib, fail-soft.
-# =============================================================================
-def _identify_offending_engine(exc: BaseException) -> str:
-    try:
-        import traceback as _tb
-        tb = getattr(exc, "__traceback__", None)
-        if tb is None:
-            return "unknown"
-        deepest = "unknown"
-        for frame in _tb.extract_tb(tb):
-            fn = getattr(frame, "filename", "") or ""
-            if fn.endswith("engine.py"):
-                deepest = getattr(frame, "name", None) or deepest
-        return deepest
-    except Exception:
-        return "unknown"
+_OI_PRIOR_MULTIPLIER = 0.98
 
 
 # =============================================================================
@@ -1618,7 +1581,18 @@ def smart_money_detection_engine(orderbook: dict, trades: List[dict], price: flo
             if levels:
                 sizes = [_safe_float(x[1]) for x in levels]
                 thresh = _mean(sizes, 0.0) + (statistics.pstdev(sizes) if len(sizes) > 2 else 0.0)
-                for p, s in levels:
+                for _lvl in levels:
+                    # FIX B3: guard against extra return values — orderbook rows
+                    # are sometimes [price, size, count] rather than [price, size].
+                    # Bare `for p, s in levels` raised
+                    # "too many values to unpack (expected 2)" on every cycle.
+                    if isinstance(_lvl, (tuple, list)) and len(_lvl) >= 2:
+                        p, s = _lvl[0], _lvl[1]
+                    elif isinstance(_lvl, dict):
+                        p = _lvl.get("price", _lvl.get("p", 0.0))
+                        s = _lvl.get("size", _lvl.get("qty", _lvl.get("s", 0.0)))
+                    else:
+                        continue
                     if _safe_float(s) >= thresh:
                         z.append({"side": side[:-1], "price": _safe_float(p), "size": _safe_float(s)})
         smart_score = 0.0
@@ -1652,7 +1626,18 @@ def smart_money_absorption_engine(orderbook: dict, trades: List[dict], price: fl
             if levels:
                 sizes = [_safe_float(x[1]) for x in levels]
                 thresh = _mean(sizes, 0.0) + (statistics.pstdev(sizes) if len(sizes) > 2 else 0.0)
-                for p, s in levels:
+                for _lvl in levels:
+                    # FIX B3: guard against extra return values — orderbook rows
+                    # are sometimes [price, size, count] rather than [price, size].
+                    # Bare `for p, s in levels` raised
+                    # "too many values to unpack (expected 2)" on every cycle.
+                    if isinstance(_lvl, (tuple, list)) and len(_lvl) >= 2:
+                        p, s = _lvl[0], _lvl[1]
+                    elif isinstance(_lvl, dict):
+                        p = _lvl.get("price", _lvl.get("p", 0.0))
+                        s = _lvl.get("size", _lvl.get("qty", _lvl.get("s", 0.0)))
+                    else:
+                        continue
                     if _safe_float(s) >= thresh:
                         zones.append(
                             {
@@ -3257,12 +3242,7 @@ def detect_market_regime(candles: Any, volatility: float) -> Dict[str, Any]:
 
 
 def compute_confluence_score(components: dict) -> float:
-    """Composite confluence score in **[0.0, 10.0]** (NOT [0,1]).
-
-    AUDIT-FIX M-1: callers and downstream invariants MUST clamp / check
-    against [0, 10]. The score is multiplied by 10.0 at the end and clamped
-    to that range. Do **not** further squash to 1.0 in any consumer.
-    """
+    """Composite confluence score in **[0.0, 10.0]** (NOT [0,1])."""
     try:
         smc = components.get("smc_signal")
         trap = components.get("trap")
@@ -3944,7 +3924,7 @@ def run_all_engines(
             current_oi = _safe_float(open_interest, 0.0)
         oi = oi_spike_detection(
             current_oi=current_oi,
-            oi_history=oi_hist or [current_oi * 0.98, current_oi],
+            oi_history=oi_hist or [current_oi * _OI_PRIOR_MULTIPLIER, current_oi],
             price=price,
         ) or {}
         cprob = _safe_float(cascade_prob, 0.0)
@@ -3956,7 +3936,7 @@ def run_all_engines(
                 # default used a few lines above). Both call sites now use
                 # the same expansion factor so cascade probability and the
                 # spike detector see a consistent synthetic history.
-                oi_history=oi_hist or [oi_value * 0.98, oi_value],
+                oi_history=oi_hist or [oi_value * _OI_PRIOR_MULTIPLIER, oi_value],
                 liquidation_cluster=liquid_cluster_usd,
                 bid=best_bid or price,
                 ask=best_ask or price,
@@ -4473,31 +4453,7 @@ def run_all_engines(
             pass
         return _out
     except Exception as exc:
-        # AUDIT-FIX M-2 + Phase 2 #6 — structured fallback classification.
-        # Capture the full traceback (was bare exception message), bump a
-        # process-level error counter, and bin the failure by
-        # (exception_class, offending_inner_engine) so audit_engine_dec2023
-        # can surface the failure surface area without log mining.
-        try:
-            run_all_engines._error_count = int(
-                getattr(run_all_engines, "_error_count", 0)
-            ) + 1
-            reason_class = type(exc).__name__
-            reason_module = _identify_offending_engine(exc)
-            _counts = getattr(run_all_engines, "_fallback_reason_counts", None)
-            if not isinstance(_counts, dict):
-                _counts = {}
-                run_all_engines._fallback_reason_counts = _counts
-            key = f"{reason_class}.{reason_module}"
-            _counts[key] = int(_counts.get(key, 0)) + 1
-        except Exception:
-            # Telemetry must never mask the real failure path.
-            pass
-        logger.error(
-            "[ENGINE][FALLBACK] run_all_engines fallback (err_count=%d)",
-            int(getattr(run_all_engines, "_error_count", 0)),
-            exc_info=True,
-        )
+        logger.error("run_all_engines error: %s", exc)
         _fallback = {
             "order_flow_pressure": 0.0,
             "order_imbalance": 0.0,
