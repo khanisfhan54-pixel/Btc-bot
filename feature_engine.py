@@ -503,6 +503,21 @@ class FeatureEngine:
                 features["trend_strength"] = trend
 
         features = self._sanitize_features(features)
+        # FIX B2: alias missing imbalance key
+        # Legacy consumers and the failsafe gate in main.py read
+        # features["imbalance"]. We already compute the signal under
+        # three keys; alias to the strongest available so the gate
+        # stays armed instead of bypassing on a missing key.
+        features.setdefault(
+            "imbalance",
+            features.get(
+                "order_imbalance",
+                features.get(
+                    "aggressor_imbalance",
+                    features.get("trade_imbalance", 0.0)
+                )
+            )
+        )
         confidence = _clamp(confidence, 0.0, 1.0)
         return {"features": features, "confidence": confidence}
 
@@ -887,7 +902,7 @@ class FeatureEngine:
             "latency_ms": latency, "timestamp_ms": ts,
             # Backward-compat aliases
             "ofi_norm": 0.0, "mlofi_signed": 0.0, "vamp_bias_bps": 0.0,
-            "order_imbalance": 0.0, "trade_imbalance": 0.0,
+            "order_imbalance": 0.0, "trade_imbalance": 0.0, "imbalance": 0.0,
             "bid_depth_n": 0.0, "ask_depth_n": 0.0, "total_depth_n": 0.0,
             "spoofing_intensity": 0.0,
         }
