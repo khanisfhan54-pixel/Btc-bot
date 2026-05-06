@@ -383,12 +383,17 @@ def calibrate(input_csv: str | None, output_path: str) -> None:
     beta              = _build_beta(k=N_STATES, n_features=n_features)
     sjm_weights       = _build_sjm_weights(n_features=n_features)
 
+    feature_mean = X.mean(axis=0)
+    feature_std = X.std(axis=0)
+
     weights = {
         "nhhmm_beta":          beta,
         "nhhmm_mu":            mus,
         "nhhmm_sigma":         sigmas,
         "sjm_centroids":       centroids,
         "sjm_feature_weights": sjm_weights,
+        "feature_mean":        feature_mean,
+        "feature_std":         feature_std,
     }
     _validate(weights, n_features)
     _save(weights, output_path)
