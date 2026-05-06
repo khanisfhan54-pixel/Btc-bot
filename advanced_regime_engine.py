@@ -45,6 +45,7 @@ LOGGER = logging.getLogger(__name__)
 # emitted at most once per process (was a WARNING fired on every ARE
 # construction). See AdvancedRegimeEngine.__init__ for the gated emission.
 _ERROR_MAP_WARN_EMITTED: bool = False
+_NHHMM_NORM_WARN_EMITTED: bool = False
 _OUTPUT_SCHEMA_VERSION = "1.2.0"
 _POSITION_SIZE_CAP = 0.35
 _VALID_ENGINE_STATUS = frozenset({
@@ -868,12 +869,16 @@ class NHHMM_Engine:
                 and getattr(self, "_feature_std", None) is not None):
             x_t_norm = (x_t - self._feature_mean) / (self._feature_std + 1e-8)
         else:
-            # Fallback: identity pass. Emit warning at most once per 30s.
-            LOGGER.warning(
-                "_compute_transition_matrix: no calibrated moments available — "
-                "NHHMM using raw unnormalized features. "
-                "Call set_normalization_moments() after loading weights."
-            )
+            # Fallback: identity pass. Warning fires once per process lifetime
+            # to avoid ~1440 log lines/day on 1-minute BTC data.
+            global _NHHMM_NORM_WARN_EMITTED
+            if not _NHHMM_NORM_WARN_EMITTED:
+                LOGGER.warning(
+                    "_compute_transition_matrix: no calibrated moments available — "
+                    "NHHMM using raw unnormalized features. "
+                    "Call set_normalization_moments() after loading weights."
+                )
+                _NHHMM_NORM_WARN_EMITTED = True
             x_t_norm = x_t.copy()
 
         x_t_safe = np.clip(x_t_norm, -3.0, 3.0)
@@ -1169,7 +1174,12 @@ class MSGARCH_RiskEngine:
 
         for k in range(len(alpha_arr)):
             persistence = alpha_arr[k] + beta_arr[k]
-            if persistence >= 1.0 and not getattr(self, '_allow_igarch', False):
+            engine_ref = getattr(self, '_regime_engine_ref', None)
+            allow_igarch = (
+                getattr(engine_ref, '_allow_igarch', False)
+                if engine_ref is not None else False
+            )
+            if persistence >= 1.0 and not allow_igarch:
                 raise ValueError(
                     f"Regime {k}: alpha+beta={persistence:.4f} >= 1.0. "
                     "Non-stationary GARCH. Refit with stricter bounds or "
@@ -2355,6 +2365,20 @@ class AdvancedRegimeEngine:
 
             self._weights_loaded = True
             self._calibration_status = "calibrated"
+            # Warn operator when GARCH parameters appear to be equity defaults.
+            # This does not block loading — it makes the gap visible at startup.
+            _eq_alpha = np.array([0.05, 0.20])
+            _eq_beta  = np.array([0.90, 0.70])
+            if (np.allclose(self.garch.alpha,      _eq_alpha, atol=1e-6)
+                    and np.allclose(self.garch.beta_garch, _eq_beta, atol=1e-6)):
+                LOGGER.warning(
+                    "[REGIME] GARCH parameters are equity defaults "
+                    "(alpha=%s beta=%s). "
+                    "Run calibrate_garch.py on BTCUSDT data and call "
+                    "engine.garch.load_fitted_params() before live trading.",
+                    self.garch.alpha.tolist(),
+                    self.garch.beta_garch.tolist(),
+                )
         except Exception:
             LOGGER.critical("[REGIME] Failed to load trained weights", exc_info=True)
             self._weights_loaded = False
