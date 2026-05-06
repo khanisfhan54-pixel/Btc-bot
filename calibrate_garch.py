@@ -37,13 +37,13 @@ def fit_msgarch_mle(returns: np.ndarray, n_regimes: int = 2) -> dict:
     def neg_log_likelihood(params: np.ndarray) -> float:
         omega = np.abs(params[:2])
         alpha = np.clip(params[2:4], 1e-6, 0.5)
-        beta  = np.clip(params[4:6], 0.1, 0.98)
+        beta_garch = np.clip(params[4:6], 0.1, 0.98)
         p11   = float(np.clip(params[6], 0.80, 0.999))
         p22   = float(np.clip(params[7], 0.80, 0.999))
 
         # Stationarity check: reject non-stationary candidates early
         for k in range(n_regimes):
-            if alpha[k] + beta[k] >= 0.999:
+            if alpha[k] + beta_garch[k] >= 0.999:
                 return 1e10
 
         P_mat = np.array([[p11, 1.0 - p11], [1.0 - p22, p22]])
@@ -66,7 +66,7 @@ def fit_msgarch_mle(returns: np.ndarray, n_regimes: int = 2) -> dict:
             prob  = np.clip(prob, 1e-6, None)
             prob /= prob.sum()
 
-            var = np.clip(omega + alpha * r2 + beta * var, 1e-8, None)
+            var = np.clip(omega + alpha * r2 + beta_garch * var, 1e-8, None)
 
         return -log_lik
 
@@ -86,7 +86,7 @@ def fit_msgarch_mle(returns: np.ndarray, n_regimes: int = 2) -> dict:
     return {
         "omega":     np.abs(p[:2]),
         "alpha":     np.clip(p[2:4], 1e-6, 0.5),
-        "beta":      np.clip(p[4:6], 0.1,  0.98),
+        "beta_garch": np.clip(p[4:6], 0.1,  0.98),
         "P":         np.array([[p[6], 1.0 - p[6]], [1.0 - p[7], p[7]]]),
         "converged": bool(result.success),
         "log_lik":   float(-result.fun),

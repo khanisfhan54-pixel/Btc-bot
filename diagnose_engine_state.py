@@ -56,20 +56,43 @@ def diagnose_engine_state(engine: "AdvancedRegimeEngine") -> Dict[str, Any]:
     weights_loaded      = bool(engine._weights_loaded)
     feature_norm_source = str(getattr(engine, "_feature_norm_source", "rolling"))
 
+    # BTC-specific persistence range: alpha+beta must be in [0.88, 0.97].
+    # Equity defaults produce [0.95, 0.90] which passes garch_stationary
+    # but is WRONG for 1-minute BTCUSDT. This check catches the gap.
+    _EQUITY_DEFAULT_ALPHA    = np.array([0.05, 0.20])
+    _EQUITY_DEFAULT_BETA     = np.array([0.90, 0.70])
+    _BTC_PERSISTENCE_LO      = 0.88
+    _BTC_PERSISTENCE_HI      = 0.97
+
+    garch_persistence_vals = engine.garch.alpha + engine.garch.beta_garch
+    garch_btc_range_ok = bool(
+        np.all(garch_persistence_vals >= _BTC_PERSISTENCE_LO)
+        and np.all(garch_persistence_vals <= _BTC_PERSISTENCE_HI)
+    )
+    garch_not_equity_defaults = not (
+        np.allclose(engine.garch.alpha,      _EQUITY_DEFAULT_ALPHA, atol=1e-6)
+        and np.allclose(engine.garch.beta_garch, _EQUITY_DEFAULT_BETA,  atol=1e-6)
+    )
+    garch_calibrated = bool(garch_btc_range_ok and garch_not_equity_defaults)
+
     report: Dict[str, Any] = {
-        "weights_loaded":      weights_loaded,
-        "sjm_centroids_valid": sjm_ok,
-        "nhhmm_moments_set":   nhhmm_norm_ok,
-        "garch_stationary":    garch_stationary,
-        "feature_norm_source": feature_norm_source,
-        "garch_alpha":         engine.garch.alpha.tolist(),
-        "garch_beta":          engine.garch.beta_garch.tolist(),
-        "garch_persistence":   (engine.garch.alpha + engine.garch.beta_garch).tolist(),
+        "weights_loaded":          weights_loaded,
+        "sjm_centroids_valid":     sjm_ok,
+        "nhhmm_moments_set":       nhhmm_norm_ok,
+        "garch_stationary":        garch_stationary,
+        "garch_btc_range_ok":      garch_btc_range_ok,
+        "garch_not_equity_defaults": garch_not_equity_defaults,
+        "garch_calibrated":        garch_calibrated,
+        "feature_norm_source":     feature_norm_source,
+        "garch_alpha":             engine.garch.alpha.tolist(),
+        "garch_beta":              engine.garch.beta_garch.tolist(),
+        "garch_persistence":       garch_persistence_vals.tolist(),
         "all_ok": all([
             weights_loaded,
             sjm_ok,
             nhhmm_norm_ok,
             garch_stationary,
+            garch_calibrated,       # NEW: equity defaults now cause all_ok=False
         ]),
     }
 
