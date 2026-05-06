@@ -833,6 +833,25 @@ class NHHMM_Engine:
             )
         self.sigma = np.clip(np.abs(sigma_arr), 1e-4, None)
 
+    def set_normalization_moments(
+        self, feature_mean: np.ndarray, feature_std: np.ndarray
+    ) -> None:
+        """
+        Inject calibration-time per-feature moments for longitudinal z-scoring.
+        Called by AdvancedRegimeEngine._load_model_weights() after weight loading.
+        """
+        fm = np.asarray(feature_mean, dtype=np.float64)
+        fs = np.asarray(feature_std,  dtype=np.float64)
+        if fm.shape != (self.n_features,) or fs.shape != (self.n_features,):
+            raise ValueError(
+                f"Moments must have shape ({self.n_features},), "
+                f"got mean={fm.shape}, std={fs.shape}"
+            )
+        # Guard against zero-std features (flat/constant feature column)
+        fs = np.where(fs > 1e-12, fs, 1.0)
+        self._feature_mean = fm
+        self._feature_std  = fs
+
     def _compute_transition_matrix(self, x_t: np.ndarray) -> np.ndarray:
         try:
             x_t = _coerce_1d_vector(x_t, self.n_features, name="NHHMM transition x_t")
@@ -841,7 +860,22 @@ class NHHMM_Engine:
                 f"NHHMM input validation failed: {e}. "
                 "Upstream feature pipeline produced invalid data."
             ) from e
-        x_t_norm = x_t / (np.std(x_t) + 1e-8)
+
+        # FIX-1.1: Use calibrated longitudinal z-score (per-feature, across time).
+        # self._feature_mean and self._feature_std are injected by
+        # AdvancedRegimeEngine._load_model_weights() via set_normalization_moments().
+        if (getattr(self, "_feature_mean", None) is not None
+                and getattr(self, "_feature_std", None) is not None):
+            x_t_norm = (x_t - self._feature_mean) / (self._feature_std + 1e-8)
+        else:
+            # Fallback: identity pass. Emit warning at most once per 30s.
+            LOGGER.warning(
+                "_compute_transition_matrix: no calibrated moments available — "
+                "NHHMM using raw unnormalized features. "
+                "Call set_normalization_moments() after loading weights."
+            )
+            x_t_norm = x_t.copy()
+
         x_t_safe = np.clip(x_t_norm, -3.0, 3.0)
         beta_safe = np.clip(self.beta, -5.0, 5.0)
         logits = np.einsum('ijk,k->ij', beta_safe, x_t_safe)
@@ -850,7 +884,8 @@ class NHHMM_Engine:
         p_t = softmax(logits, axis=1)
         if np.any(p_t > 0.9999):
             LOGGER.warning(
-                "[NHHMM] Softmax saturation detected — transition matrix degenerate. Check x_t range [%.4f, %.4f]",
+                "[NHHMM] Softmax saturation detected — transition matrix degenerate. "
+                "Check x_t range [%.4f, %.4f]",
                 float(np.min(x_t)),
                 float(np.max(x_t)),
             )
@@ -858,7 +893,10 @@ class NHHMM_Engine:
         row_sums = p_t.sum(axis=1, keepdims=True)
         p_t = p_t / np.clip(row_sums, 1e-12, None)
         if not np.all(np.isfinite(p_t)):
-            LOGGER.error("_compute_transition_matrix: non-finite output after clipping. Falling back to uniform transition matrix.")
+            LOGGER.error(
+                "_compute_transition_matrix: non-finite output after clipping. "
+                "Falling back to uniform transition matrix."
+            )
             p_t = np.full((self.K, self.K), 1.0 / self.K)
         return p_t
 
@@ -1112,6 +1150,41 @@ class MSGARCH_RiskEngine:
         updated = np.clip(updated, self._REGIME_PROB_FLOOR, None)
         updated /= updated.sum()
         return updated
+
+    def load_fitted_params(
+        self,
+        omega: np.ndarray,
+        alpha: np.ndarray,
+        beta_garch: np.ndarray,
+        P: np.ndarray,
+    ) -> None:
+        """
+        Load MLE-fitted GARCH parameters. Call after running calibrate_garch.py.
+        Validates stationarity before accepting parameters.
+        """
+        omega_arr      = np.asarray(omega,      dtype=float)
+        alpha_arr      = np.asarray(alpha,      dtype=float)
+        beta_arr       = np.asarray(beta_garch, dtype=float)
+        P_arr          = np.asarray(P,          dtype=float)
+
+        for k in range(len(alpha_arr)):
+            persistence = alpha_arr[k] + beta_arr[k]
+            if persistence >= 1.0 and not getattr(self, '_allow_igarch', False):
+                raise ValueError(
+                    f"Regime {k}: alpha+beta={persistence:.4f} >= 1.0. "
+                    "Non-stationary GARCH. Refit with stricter bounds or "
+                    "pass allow_igarch=True to the engine constructor."
+                )
+        self.omega      = omega_arr
+        self.alpha      = alpha_arr
+        self.beta_garch = beta_arr
+        self.P          = P_arr
+        LOGGER.info(
+            "GARCH params loaded: alpha=%s beta=%s persistence=%s",
+            self.alpha.tolist(),
+            self.beta_garch.tolist(),
+            (self.alpha + self.beta_garch).tolist(),
+        )
 
 
 class AdvancedRegimeEngine:
@@ -2274,6 +2347,7 @@ class AdvancedRegimeEngine:
                 self._feature_mean = fm
                 self._feature_std  = fs
                 self._feature_norm_source = "calibrated"
+                self.nhhmm.set_normalization_moments(fm, fs)   # FIX-1.1: wire moments to NHHMM
             else:
                 self._feature_mean = None
                 self._feature_std  = None
