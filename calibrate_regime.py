@@ -198,6 +198,84 @@ def triple_barrier_labels(
     return labels
 
 
+
+def add_toxic_label(
+    labels: np.ndarray,
+    realized_vol: np.ndarray,
+    vol_threshold_quantile: float = 0.90,
+) -> np.ndarray:
+    """
+    Overlay TOXIC / CRISIS label (2) on triple-barrier labels
+    using a realized-volatility percentile threshold.
+
+    Logic:
+        Any bar where rolling realized vol exceeds the
+        vol_threshold_quantile of the vol distribution is
+        relabeled as TOXIC (2), regardless of triple-barrier
+        direction. This captures high-vol sideways and shock events
+        that the barrier method does not explicitly label as crisis.
+
+    Args:
+        labels:                 Triple-barrier labels {-1, 0, 1}.
+        realized_vol:           Per-bar rolling realized vol, same
+                                length as labels. Must be non-negative.
+        vol_threshold_quantile: Percentile threshold for TOXIC.
+                                Default 0.90 (top 10% of vol bars).
+
+    Returns:
+        Modified labels array {-1, 0, 1, 2}. Original array
+        is NOT modified (copy returned).
+
+    Note:
+        Only used in 4-state calibration (N_STATES == 4).
+        The 3-state calibration path never calls this function.
+    """
+    if len(labels) != len(realized_vol):
+        raise ValueError(
+            f"labels length ({len(labels)}) must equal "
+            f"realized_vol length ({len(realized_vol)})"
+        )
+    rv = np.asarray(realized_vol, dtype=float)
+    if not np.all(np.isfinite(rv)):
+        raise ValueError(
+            "realized_vol contains non-finite values. "
+            "Compute rolling vol only over valid return windows."
+        )
+    threshold = float(np.quantile(rv, float(vol_threshold_quantile)))
+    result = labels.copy()
+    result[rv > threshold] = 2
+    return result
+
+def estimate_emission_moments(
+    returns: np.ndarray,
+    labels: np.ndarray,  # {-1=BEAR, 0=RANGE, 1=TREND, 2=TOXIC}
+) -> tuple:
+    """
+    Compute per-regime mean and std of returns from labeled training data.
+    Used to calibrate NHHMM emission distributions for 4-state mode.
+    State mapping: BULL=0, BEAR=1, RANGE=2, CRISIS=3
+    """
+    label_to_state = {1: 0, -1: 1, 0: 2, 2: 3}
+    K = 4
+    mu = np.zeros(K, dtype=float)
+    sigma = np.ones(K, dtype=float) * 0.004
+
+    for label, state_idx in label_to_state.items():
+        mask = labels == label
+        n = int(mask.sum())
+        if n < 10:
+            continue
+        mu[state_idx] = float(returns[mask].mean())
+        raw_std = float(returns[mask].std())
+        sigma[state_idx] = max(raw_std, 1e-4)
+
+    sigma[2] = min(sigma[2], sigma[0], sigma[1])
+    sigma[3] = max(sigma[3], sigma[0], sigma[1])
+    sigma = np.clip(sigma, 1e-4, None)
+
+    return mu, sigma
+
+
 y_labels = triple_barrier_labels(
     valid_returns,
     window=BARRIER_WINDOW,
@@ -246,18 +324,49 @@ print(f"    Feature weights: {sjm_feature_weights.round(4)}")
 
 print("\n[6/7] Fitting NHHMM parameters...")
 
-nhhmm_mu    = np.zeros(N_STATES, dtype=float)
-nhhmm_sigma = np.ones(N_STATES,  dtype=float) * 0.005
+if N_STATES == 4:
+    # FIX-CRISIS-CALIB: compute rolling 5-bar realized volatility
+    # to identify TOXIC bars. rv_5bar[i] = std of returns[i-5:i].
+    # Bars with insufficient history receive 0.0 (will not exceed threshold).
+    _rv_window = 5
+    rv_5bar = np.zeros(len(valid_returns), dtype=float)
+    for _i in range(_rv_window, len(valid_returns)):
+        rv_5bar[_i] = float(np.std(valid_returns[_i - _rv_window:_i]))
 
-for k in range(N_STATES):
-    mask          = y_3state == k
-    state_returns = valid_returns[mask]
-    if len(state_returns) > 5:
-        nhhmm_mu[k]    = float(np.mean(state_returns))
-        nhhmm_sigma[k] = float(max(np.std(state_returns), 1e-4))
-    else:
-        nhhmm_mu[k]    = 0.0
-        nhhmm_sigma[k] = 0.005
+    # Overlay TOXIC label (2) on top 10% of vol bars.
+    y_labels_4state = add_toxic_label(
+        y_labels,
+        rv_5bar,
+        vol_threshold_quantile=0.90,
+    )
+
+    # Report label distribution to catch degenerate calibration.
+    _label_counts = {
+        int(k): int(v)
+        for k, v in zip(*np.unique(y_labels_4state, return_counts=True))
+    }
+    print(f"    4-state label distribution: {_label_counts}")
+    assert 2 in _label_counts and _label_counts[2] >= 10, (
+        "Too few TOXIC bars (label=2) after overlay. "
+        "Lower vol_threshold_quantile or increase N_BARS."
+    )
+
+    nhhmm_mu, nhhmm_sigma = estimate_emission_moments(
+        valid_returns, y_labels_4state
+    )
+else:
+    nhhmm_mu = np.zeros(N_STATES, dtype=float)
+    nhhmm_sigma = np.ones(N_STATES, dtype=float) * 0.005
+
+    for k in range(N_STATES):
+        mask = y_3state == k
+        state_returns = valid_returns[mask]
+        if len(state_returns) > 5:
+            nhhmm_mu[k] = float(np.mean(state_returns))
+            nhhmm_sigma[k] = float(max(np.std(state_returns), 1e-4))
+        else:
+            nhhmm_mu[k] = 0.0
+            nhhmm_sigma[k] = 0.005
 
 rng        = np.random.default_rng(RANDOM_SEED)
 nhhmm_beta = rng.normal(

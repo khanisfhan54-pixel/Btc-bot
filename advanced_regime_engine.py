@@ -271,6 +271,15 @@ def _validate_output_schema(output: Dict[str, Any], engine_id: str = "unknown") 
                 raise ValueError(f"non-finite risk_metrics.{rk}")
         if output["risk_metrics"]["expected_volatility"] < 0.0:
             raise ValueError("risk_metrics.expected_volatility must be >= 0")
+
+        # FIX-RANGE-PROB: range_prob is optional (absent in 3-state mode).
+        # When present it must be finite and in [0, 1].
+        if "range_prob" in output["risk_metrics"]:
+            rp_val = safe_float(output["risk_metrics"]["range_prob"], default=np.nan)
+            if not np.isfinite(rp_val) or rp_val < 0.0 or rp_val > 1.0:
+                raise ValueError(
+                    f"risk_metrics.range_prob must be finite and in [0,1], got {rp_val}"
+                )
         if output["risk_metrics"]["last_valid_vol"] <= 0.0:
             raise ValueError("risk_metrics.last_valid_vol must be > 0")
         if output["risk_metrics"]["switch_stability_ema"] <= 0.0:
@@ -399,6 +408,7 @@ def _build_output(
     signal_valid: bool = True,
     include_signal_valid: bool = True,
     engine_id: str = "unknown",
+    range_prob: float = 0.0,
 ) -> Dict[str, Any]:
     """
     Single authoritative output constructor for AdvancedRegimeEngine.update().
@@ -487,6 +497,15 @@ def _build_output(
             'feed_status': {"primary": primary_status, "flags": status_flags},
             'engine_status': str(engine_status or "UNKNOWN"),
             'range_ticks': int(safe_float(range_ticks, default=0.0, min=0.0, max=1e9)),
+            # FIX-RANGE-PROB: 4-state mode only. In 3-state mode this is 0.0.
+            # The probabilities{bull/bear/crisis} dict does NOT include range mass
+            # because the schema validator requires exactly those three keys.
+            # Consumers using 4-state mode MUST read range_prob from here,
+            # not infer it from the probabilities dict.
+            'range_prob': float(np.clip(
+                safe_float(range_prob, default=0.0, min=0.0, max=1.0),
+                0.0, 1.0,
+            )),
         },
         # ==========================================
         # EDGE OUTPUT (NEW - FIXES SCHEMA GAP)
@@ -545,6 +564,7 @@ def _build_output(
                 "feed_status": {"primary": "SCHEMA_FAILURE", "flags": []},
                 "range_ticks": 0,
                 "engine_status": "SCHEMA_FAILURE",
+                "range_prob": 0.0,
             },
             "signal_valid": False,
             "alpha": {
@@ -797,14 +817,113 @@ def compute_hmm_regime(
 # ==========================================
 # 1. NHHMM (Predictive Macro Engine)
 # ==========================================
+
+
+def compute_hmm_regime_4state(
+    alpha: np.ndarray,
+    *,
+    prev_directional_label: str | None = None,
+    direction_switch_gap: float = 0.02,
+    last_signed_return: float = 0.0,
+) -> Dict[str, Any]:
+    """
+    4-state posterior → regime scores.
+    alpha = [bull, bear, range, crisis] — RANGE is directly modeled, not inferred.
+
+    This function MUST be used when n_states=4.
+    compute_hmm_regime() remains unchanged for n_states=3.
+    """
+    alpha_safe = np.asarray(alpha, dtype=float)
+    if alpha_safe.shape != (4,):
+        raise ValueError(
+            f"compute_hmm_regime_4state expects shape (4,), got {alpha_safe.shape}. "
+            "Use compute_hmm_regime() for 3-state posteriors."
+        )
+    if not np.all(np.isfinite(alpha_safe)):
+        raise ValueError(f"Non-finite values in 4-state posterior: {alpha_safe}")
+    if np.any(alpha_safe < 0):
+        raise ValueError(f"Negative probability in 4-state posterior: {alpha_safe}")
+
+    alpha_safe = np.clip(alpha_safe, 1e-12, None)
+    total = float(alpha_safe.sum())
+    if total <= 0:
+        raise ValueError("4-state posterior sums to zero or below.")
+    alpha_safe = alpha_safe / total
+
+    bull = float(alpha_safe[0])
+    bear = float(alpha_safe[1])
+    range_p = float(alpha_safe[2])
+    crisis = float(alpha_safe[3])
+
+    state_probs = {"TREND": bull, "BEAR": bear, "RANGE": range_p, "TOXIC": crisis}
+    regime = max(state_probs, key=state_probs.get)
+
+    directional_strength = float(abs(bull - bear))
+    edge_score = float(np.clip(
+        max(bull, bear) - crisis + 0.25 * directional_strength,
+        0.0, 1.0
+    ))
+
+    entropy = float(-np.sum(alpha_safe * np.log(np.clip(alpha_safe, 1e-12, None))))
+    max_entropy = float(np.log(4))
+    conviction = float(np.clip(1.0 - entropy / max(max_entropy, 1e-12), 0.0, 1.0))
+
+    direction_gap = float(bull - bear)
+    switch_gap = float(np.clip(direction_switch_gap, 0.0, 0.25))
+    directional_label = "TREND" if direction_gap >= 0.0 else "BEAR"
+    if prev_directional_label in ("TREND", "BEAR"):
+        if prev_directional_label == "TREND" and direction_gap > -switch_gap:
+            directional_label = "TREND"
+        elif prev_directional_label == "BEAR" and direction_gap < switch_gap:
+            directional_label = "BEAR"
+
+    trend_score = bull
+    bear_score = bear
+
+    return {
+        "regime": regime,
+        "bull": bull,
+        "bear": bear,
+        "crisis": crisis,
+        "range": range_p,
+        "trend_strength": bull - bear,
+        "risk_level": crisis,
+        "confidence": max(bull, bear, range_p, crisis),
+        "conviction": conviction,
+        "uncertainty": float(np.clip(entropy / max(max_entropy, 1e-12), 0.0, 1.0)),
+        "directional_margin": abs(direction_gap),
+        "directional_label": directional_label,
+        "edge_score": edge_score,
+        "trend_score": trend_score,
+        "bear_score": bear_score,
+        "range_score": range_p,
+        "toxic_score": crisis,
+        "score_map": dict(state_probs),
+        "metadata": {
+            "directional_label_winner": directional_label,
+            "score_sum": 1.0,
+            "mode": "4state_direct",
+        },
+    }
+
 class NHHMM_Engine:
     def __init__(self, n_states=3, n_features=3):
         self.K = n_states
         self.n_features = n_features
         init_rng = np.random.default_rng(7)
         self.beta = init_rng.normal(0.0, 0.01, size=(self.K, self.K, n_features))
-        self.mu = np.array([0.001, -0.001, 0.0], dtype=float)
-        self.sigma = np.array([0.004, 0.004, 0.010], dtype=float)
+
+        if n_states == 4:
+            # State 0: BULL  — mu > 0,  sigma small
+            # State 1: BEAR  — mu < 0,  sigma small
+            # State 2: RANGE — mu ≈ 0,  sigma very small (low drift, compressed var)
+            # State 3: CRISIS— mu ≈ 0,  sigma large
+            self.mu = np.array([0.001, -0.001, 0.000, 0.000], dtype=float)
+            self.sigma = np.array([0.004, 0.004, 0.0015, 0.015], dtype=float)
+        else:
+            # Legacy 3-state defaults (BULL/BEAR/CRISIS)
+            self.mu = np.array([0.001, -0.001, 0.000], dtype=float)
+            self.sigma = np.array([0.004, 0.004, 0.010], dtype=float)
         
     def load_weights(self, beta: np.ndarray, mu: np.ndarray, sigma: np.ndarray):
         """Inject pre-trained parameters for live inference."""
@@ -835,20 +954,32 @@ class NHHMM_Engine:
         self.sigma = np.clip(np.abs(sigma_arr), 1e-4, None)
 
     def set_normalization_moments(
-        self, feature_mean: np.ndarray, feature_std: np.ndarray
+        self,
+        feature_mean: np.ndarray,
+        feature_std: np.ndarray,
     ) -> None:
         """
-        Inject calibration-time per-feature moments for longitudinal z-scoring.
-        Called by AdvancedRegimeEngine._load_model_weights() after weight loading.
+        Inject calibration-time per-feature longitudinal moments.
+        Called by AdvancedRegimeEngine._load_model_weights() after
+        loading the .npz weight file.
+
+        These replace the incorrect cross-sectional normalization
+        x_t / std(x_t) that was previously applied inside
+        _compute_transition_matrix().
         """
         fm = np.asarray(feature_mean, dtype=np.float64)
         fs = np.asarray(feature_std,  dtype=np.float64)
-        if fm.shape != (self.n_features,) or fs.shape != (self.n_features,):
+        if fm.shape != (self.n_features,):
             raise ValueError(
-                f"Moments must have shape ({self.n_features},), "
-                f"got mean={fm.shape}, std={fs.shape}"
+                f"feature_mean must have shape ({self.n_features},), "
+                f"got {fm.shape}"
             )
-        # Guard against zero-std features (flat/constant feature column)
+        if fs.shape != (self.n_features,):
+            raise ValueError(
+                f"feature_std must have shape ({self.n_features},), "
+                f"got {fs.shape}"
+            )
+        # Guard against zero-std features (flat feature during calibration)
         fs = np.where(fs > 1e-12, fs, 1.0)
         self._feature_mean = fm
         self._feature_std  = fs
@@ -862,25 +993,26 @@ class NHHMM_Engine:
                 "Upstream feature pipeline produced invalid data."
             ) from e
 
-        # FIX-1.1: Use calibrated longitudinal z-score (per-feature, across time).
-        # self._feature_mean and self._feature_std are injected by
-        # AdvancedRegimeEngine._load_model_weights() via set_normalization_moments().
-        if (getattr(self, "_feature_mean", None) is not None
-                and getattr(self, "_feature_std", None) is not None):
+        # FIX-NORM: use calibrated longitudinal z-score when moments
+        # are available (set via set_normalization_moments() after
+        # weight loading). Falls back to identity pass if moments are
+        # absent, with a rate-limited warning so the gap is visible
+        # in logs without flooding them.
+        if (
+            getattr(self, "_feature_mean", None) is not None
+            and getattr(self, "_feature_std",  None) is not None
+        ):
             x_t_norm = (x_t - self._feature_mean) / (self._feature_std + 1e-8)
         else:
-            # Fallback: identity pass. Warning fires once per process lifetime
-            # to avoid ~1440 log lines/day on 1-minute BTC data.
-            global _NHHMM_NORM_WARN_EMITTED
-            if not _NHHMM_NORM_WARN_EMITTED:
-                LOGGER.warning(
-                    "_compute_transition_matrix: no calibrated moments available — "
-                    "NHHMM using raw unnormalized features. "
-                    "Call set_normalization_moments() after loading weights."
-                )
-                _NHHMM_NORM_WARN_EMITTED = True
             x_t_norm = x_t.copy()
-
+            # Emit warning at most once per engine instance lifetime.
+            if not getattr(self, "_norm_fallback_warned", False):
+                LOGGER.warning(
+                    "_compute_transition_matrix: calibrated normalization "
+                    "moments not set. Call set_normalization_moments() after "
+                    "load_weights(). Using raw features as fallback."
+                )
+                self._norm_fallback_warned = True
         x_t_safe = np.clip(x_t_norm, -3.0, 3.0)
         beta_safe = np.clip(self.beta, -5.0, 5.0)
         logits = np.einsum('ijk,k->ij', beta_safe, x_t_safe)
@@ -1415,10 +1547,11 @@ class AdvancedRegimeEngine:
         enable_background_workers: bool = True,
         load_model_weights_on_init: bool = True,
     ):
-        if n_states != 3:
+        if n_states not in (3, 4):
             raise ValueError(
-                f"AdvancedRegimeEngine requires exactly 3 states (Bull/Bear/Crisis), "
-                f"got n_states={n_states}. compute_hmm_regime is hard-coded for 3 regimes."
+                f"AdvancedRegimeEngine supports n_states=3 (Bull/Bear/Crisis) or "
+                f"n_states=4 (Bull/Bear/Range/Crisis). Got n_states={n_states}. "
+                "Valid values are 3 (legacy) or 4 (Phase 3 architecture)."
             )
         if n_features < 1:
             raise ValueError(f"n_features must be >= 1, got {n_features}.")
@@ -4931,19 +5064,35 @@ class AdvancedRegimeEngine:
             if self.K >= 3:
                 sjm_probs = np.asarray(sjm_probs, dtype=float).copy()
                 non_crisis_scale = max(1.0 - 0.45 * shock_intensity, 0.4)
-                sjm_probs[0] *= non_crisis_scale
-                sjm_probs[1] *= non_crisis_scale
-                sjm_probs[2] *= (1.0 + 0.9 * shock_intensity)
+                if self.K == 4:
+                    # 4-state: BULL=0, BEAR=1, RANGE=2, CRISIS=3
+                    sjm_probs[0] *= non_crisis_scale
+                    sjm_probs[1] *= non_crisis_scale
+                    sjm_probs[2] *= non_crisis_scale
+                    sjm_probs[3] *= (1.0 + 0.9 * shock_intensity)
+                else:
+                    # 3-state: BULL=0, BEAR=1, CRISIS=2
+                    sjm_probs[0] *= non_crisis_scale
+                    sjm_probs[1] *= non_crisis_scale
+                    sjm_probs[2] *= (1.0 + 0.9 * shock_intensity)
                 sjm_probs = _normalize_prob_vector(sjm_probs)
                 sjm_state = int(np.argmax(sjm_probs))
-            
+
         self.current_regime_idx = sjm_state
-        regime_scores = compute_hmm_regime(
-            sjm_probs,
-            prev_directional_label=getattr(self, "_prev_directional_label", None),
-            direction_switch_gap=self._DIRECTION_SWITCH_GAP,
-            last_signed_return=float(getattr(self, "_last_signed_return", 0.0)),
-        )
+        if self.K == 4:
+            regime_scores = compute_hmm_regime_4state(
+                sjm_probs,
+                prev_directional_label=getattr(self, "_prev_directional_label", None),
+                direction_switch_gap=self._DIRECTION_SWITCH_GAP,
+                last_signed_return=float(getattr(self, "_last_signed_return", 0.0)),
+            )
+        else:
+            regime_scores = compute_hmm_regime(
+                sjm_probs,
+                prev_directional_label=getattr(self, "_prev_directional_label", None),
+                direction_switch_gap=self._DIRECTION_SWITCH_GAP,
+                last_signed_return=float(getattr(self, "_last_signed_return", 0.0)),
+            )
         self._prev_directional_label = self._validate_directional_label(
             regime_scores.get("directional_label"),
             "prev_directional_label_runtime",
@@ -5524,6 +5673,7 @@ class AdvancedRegimeEngine:
             include_signal_valid=True,
             signal_valid=bool(self._weights_loaded),
             engine_id=self._metrics_engine_id,
+            range_prob=float(regime_scores.get("range", 0.0)),
         )
         if not self._weights_loaded:
             output["regime_label"] = "UNCALIBRATED"
