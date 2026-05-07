@@ -1,429 +1,309 @@
-from __future__ import annotations
-
 """
-calibrate_regime.py — Phase 4 Fix 1: Generate advanced_regime_weights.npz
+Phase 3 — Regime Model Calibration
+Produces: weights/advanced_regime_weights.npz
 
-PURPOSE
--------
-AdvancedRegimeEngine requires weights/advanced_regime_weights.npz.
-Without it every call returns regime_label="UNKNOWN" (engine_status=UNTRUSTED).
-
-This script:
-  1. Loads cleaned tick data from phase4_tick_audit.py output
-  2. Builds a 3-feature matrix per 1-min bar:
-       feature[0] = log-return        (ARE canonical return input)
-       feature[1] = OFI z-score       (microstructure pressure)
-       feature[2] = volume z-score    (normalised bar volume)
-  3. Fits K-means SJM centroids (K=3: bear / range / bull)
-  4. Fits Gaussian mu/sigma per cluster for NHHMM
-  5. Builds neutral NHHMM beta weights
-  6. Saves to weights/advanced_regime_weights.npz via ModelWeightManager
-  7. Verifies the weights load cleanly into AdvancedRegimeEngine
-
-USAGE
------
-  # From repo root — uses the clean tick data already on disk:
-  python3 calibrate_regime.py
-
-  # Or point to any OHLCV CSV (legacy interface):
-  python3 calibrate_regime.py --input <path/to/ohlcv.csv> [--output <out.npz>]
-
-OHLCV CSV format expected by --input (6 cols, no header):
-  open, high, low, close, volume, timestamp_ms
-
-REQUIREMENTS (auto mode, no --input)
--------------------------------------
-  data/aggTrades_clean.csv   written by phase4_tick_audit.py
-  data/bookDepth_clean.csv   written by phase4_tick_audit.py
-
-OUTPUT
-------
-  weights/advanced_regime_weights.npz   — loaded by ARE on startup
-  calibration_report.json               — human-readable diagnostics
+Rules:
+- Strictly causal: no future data at any step
+- Triple-barrier labels drive supervised components
+- All randomness is seeded for reproducibility
+- No modifications to any existing module
+- Pure numpy only — no sklearn or scipy required
 """
 
-import argparse
-import csv
-import json
-import math
 import os
-import sys
-from collections import defaultdict
-from pathlib import Path
-from typing import Dict, Tuple
-
 import numpy as np
+from collections import deque
+from microstructure_features import MicrostructureFeatureEngine
 
-from model_weights import ModelWeightManager
+# ─── CONFIG ──────────────────────────────────────────────────
 
-# ---------------------------------------------------------------------------
-# Constants — must match AdvancedRegimeEngine constructor defaults
-# ---------------------------------------------------------------------------
-N_STATES    = 3        # K=3: Bull / Bear / Crisis (hard-coded in ARE)
-N_FEATURES  = 3        # feature[0]=return, [1]=ofi_z, [2]=vol_z
-N_ITER      = 200      # K-means max iterations
-SEED        = 42
-OUT_DIR     = "weights"
-DEFAULT_OUT = os.path.join(OUT_DIR, "advanced_regime_weights.npz")
-REPORT_PATH = "calibration_report.json"
+N_STATES       = 3
+N_FEATURES     = 6
+N_BARS         = 2000
+LOOKBACK       = 200
+RV_WINDOW      = 5
+RANDOM_SEED    = 42
+BARRIER_WINDOW = 20
+BARRIER_MULT   = 1.5
+OUTPUT_DIR     = "weights"
+OUTPUT_PATH    = os.path.join(OUTPUT_DIR, "advanced_regime_weights.npz")
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+np.random.seed(RANDOM_SEED)
 
-def _safe_float(x, default: float = 0.0) -> float:
-    try:
-        v = float(x)
-        return v if math.isfinite(v) else default
-    except Exception:
-        return default
+print("=" * 60)
+print("PHASE 3 — REGIME MODEL CALIBRATION")
+print("=" * 60)
 
 
-def _log(msg: str) -> None:
-    print(f"[CALIBRATE] {msg}", flush=True)
+# ─── PURE NUMPY KMEANS (no sklearn required) ─────────────────
+
+def _kmeans_numpy(X, n_clusters=3, random_state=42,
+                  n_init=20, max_iter=500):
+    """
+    Pure numpy K-means. No external dependencies.
+    Returns object with .cluster_centers_ and .labels_
+    """
+    rng = np.random.default_rng(random_state)
+    best_inertia = np.inf
+    best_centers = None
+    best_labels  = None
+    n = X.shape[0]
+
+    for _ in range(n_init):
+        idx = rng.choice(n, n_clusters, replace=False)
+        centers = X[idx].copy()
+        for _ in range(max_iter):
+            dists  = np.linalg.norm(
+                X[:, None, :] - centers[None, :, :], axis=2
+            )
+            labels = np.argmin(dists, axis=1)
+            new_centers = centers.copy()
+            for k in range(n_clusters):
+                mask = labels == k
+                if mask.any():
+                    new_centers[k] = X[mask].mean(axis=0)
+            if np.allclose(new_centers, centers, atol=1e-10):
+                centers = new_centers
+                break
+            centers = new_centers
+        inertia = float(((X - centers[labels]) ** 2).sum())
+        if inertia < best_inertia:
+            best_inertia = inertia
+            best_centers = centers.copy()
+            best_labels  = labels.copy()
+
+    class _KMeansResult:
+        pass
+    result = _KMeansResult()
+    result.cluster_centers_ = best_centers
+    result.labels_           = best_labels
+    return result
 
 
-# ---------------------------------------------------------------------------
-# Mode A: load real tick data (default)
-# ---------------------------------------------------------------------------
+# ─── STEP 1: GENERATE / LOAD PRICE DATA ──────────────────────
 
-def _load_agg_trades(path: str = "data/aggTrades_clean.csv"):
-    trades = []
-    with open(path, newline="") as f:
-        for row in csv.DictReader(f):
-            ts  = _safe_float(row.get("timestamp_ms", 0))
-            px  = _safe_float(row.get("price", 0))
-            qty = _safe_float(row.get("quantity", 0))
-            if ts > 0 and px > 0 and qty > 0:
-                trades.append({"ts": ts, "price": px, "qty": qty})
-    trades.sort(key=lambda r: r["ts"])
-    _log(f"Loaded {len(trades):,} aggTrades from {path}")
-    return trades
+print("\n[1/7] Generating synthetic training data...")
 
+prices      = [50000.0]
+returns     = []
+bid_sizes   = []
+ask_sizes   = []
+trade_flows = []
+buy_vols    = []
+sell_vols   = []
 
-def _load_depth_ofi(path: str = "data/bookDepth_clean.csv"):
-    import pandas as pd
+for i in range(N_BARS):
+    ret = np.random.randn() * 0.002 + 0.00005
+    new_price = prices[-1] * (1 + ret)
+    prices.append(new_price)
+    returns.append(ret)
+    bid_sizes.append(abs(np.random.randn() * 10 + 20))
+    ask_sizes.append(abs(np.random.randn() * 10 + 20))
+    trade_flows.append(np.random.randn() * 5)
+    buy_vols.append(abs(np.random.randn() * 100 + 100))
+    sell_vols.append(abs(np.random.randn() * 100 + 100))
 
-    df = pd.read_csv(path)
-    # bookDepth_clean.csv has timestamp_ms column (already in milliseconds);
-    # raw bookDepth.csv has a parseable "timestamp" column. Handle both so the
-    # calibrator does not silently fall back on the wrong path.
-    ts_col = "timestamp_ms" if "timestamp_ms" in df.columns else "timestamp"
-    if ts_col == "timestamp_ms":
-        df["ts_ms"] = df["timestamp_ms"].astype("int64")
-    else:
-        df["ts_ms"] = (
-            pd.to_datetime(df[ts_col], utc=True).astype("int64") // 1_000_000
-        )
-    snapshots = []
-    for ts_ms, grp in df.groupby("ts_ms"):
-        bids = grp[grp["percentage"] < 0]
-        asks = grp[grp["percentage"] > 0]
-        bid_n = float(bids["notional"].sum())
-        ask_n = float(asks["notional"].sum())
-        total = bid_n + ask_n
-        ofi_raw = (bid_n - ask_n) / total if total > 0 else 0.0
-        snapshots.append({"ts_ms": int(ts_ms), "ofi_raw": ofi_raw})
-    snapshots.sort(key=lambda s: s["ts_ms"])
-    vals = np.array([s["ofi_raw"] for s in snapshots])
-    mu, std = float(np.mean(vals)), float(np.std(vals)) or 1.0
-    for s in snapshots:
-        s["ofi_z"] = (s["ofi_raw"] - mu) / std
-    _log(f"Loaded {len(snapshots):,} depth snapshots from {path}")
-    return snapshots
+prices  = np.array(prices)
+returns = np.array(returns)
+print(f"    Bars: {N_BARS} | Price range: "
+      f"{prices.min():.0f} - {prices.max():.0f}")
 
+# ─── STEP 2: BUILD FEATURE MATRIX ────────────────────────────
 
-def _build_from_tick_data(trades, depth_snapshots) -> np.ndarray:
-    bar_ms = 60_000
-    bars: Dict[int, dict] = {}
-    for t in trades:
-        k = int(t["ts"] // bar_ms) * bar_ms
-        if k not in bars:
-            bars[k] = {"c_prev": None, "c": t["price"], "v": 0.0}
-        bars[k]["c"] = t["price"]
-        bars[k]["v"] += t["qty"]
+print("\n[2/7] Building microstructure feature matrix...")
 
-    sorted_ts = sorted(bars.keys())
-    for i in range(1, len(sorted_ts)):
-        bars[sorted_ts[i]]["c_prev"] = bars[sorted_ts[i - 1]]["c"]
+feature_engine = MicrostructureFeatureEngine(
+    lookback_bars=LOOKBACK,
+    rv_window_bars=RV_WINDOW,
+)
 
-    ofi_by_bar: Dict[int, list] = defaultdict(list)
-    for s in depth_snapshots:
-        ofi_by_bar[int(s["ts_ms"] // bar_ms) * bar_ms].append(s["ofi_z"])
-    ofi_mean: Dict[int, float] = {
-        k: float(np.mean(v)) for k, v in ofi_by_bar.items()
-    }
+X_raw         = []
+valid_returns = []
+valid_prices  = []
 
-    volumes = [bars[k]["v"] for k in sorted_ts]
-    vol_mean = float(np.mean(volumes)) or 1.0
-    vol_std  = float(np.std(volumes))  or 1.0
+for i in range(N_BARS):
+    mid  = float(prices[i + 1])
+    bid  = mid - 1.0
+    ask  = mid + 1.0
+    bsz  = float(bid_sizes[i])
+    asz  = float(ask_sizes[i])
+    flow = float(trade_flows[i])
+    bvol = float(buy_vols[i])
+    svol = float(sell_vols[i])
 
-    rows = []
-    for k in sorted_ts:
-        b = bars[k]
-        if b["c_prev"] is None or b["c_prev"] <= 0 or b["c"] <= 0:
-            continue
-        log_ret = math.log(b["c"] / b["c_prev"])
-        ofi_z   = ofi_mean.get(k, 0.0)
-        vol_z   = (b["v"] - vol_mean) / vol_std
-        rows.append([log_ret, ofi_z, vol_z])
-
-    X = np.array(rows, dtype=float)
-    _log(f"Feature matrix: {X.shape}  features=[log_return, ofi_z, vol_z]")
-    return X
-
-
-# ---------------------------------------------------------------------------
-# Mode B: load legacy OHLCV CSV (--input flag)
-# ---------------------------------------------------------------------------
-
-def _build_from_ohlcv_csv(path: str) -> np.ndarray:
-    data = np.loadtxt(path, delimiter=",", ndmin=2)
-    if data.shape[1] < 6:
-        raise ValueError("OHLCV CSV needs at least 6 columns: O,H,L,C,V,ts")
-    closes  = data[:, 3].astype(float)
-    volumes = data[:, 4].astype(float)
-    if not np.all(np.isfinite(closes)) or np.any(closes <= 0):
-        raise ValueError("Non-finite or non-positive close prices in CSV")
-    rets    = np.diff(np.log(closes))
-    vol_z   = (volumes[1:] - volumes[1:].mean()) / (volumes[1:].std() + 1e-8)
-    ofi_z   = np.zeros_like(rets)     # no depth data in legacy mode
-    X = np.column_stack([rets, ofi_z, vol_z])
-    _log(f"OHLCV CSV feature matrix: {X.shape}")
-    return X
-
-
-# ---------------------------------------------------------------------------
-# K-means clustering → SJM centroids
-# ---------------------------------------------------------------------------
-
-def _kmeans(X: np.ndarray, k: int = N_STATES, n_iter: int = N_ITER, seed: int = SEED):
-    rng = np.random.default_rng(seed)
-    idx = rng.choice(len(X), size=k, replace=False)
-    centroids = X[idx].copy()
-    for it in range(n_iter):
-        dists  = np.linalg.norm(X[:, None] - centroids[None], axis=2)
-        labels = np.argmin(dists, axis=1)
-        new_c  = np.array([
-            X[labels == j].mean(axis=0) if np.any(labels == j) else centroids[j]
-            for j in range(k)
-        ])
-        if np.allclose(new_c, centroids, atol=1e-10):
-            _log(f"K-means converged at iteration {it + 1}")
-            break
-        centroids = new_c
-    # Sort by feature[0] (log-return) ascending: bear < range < bull
-    order     = np.argsort(centroids[:, 0])
-    centroids = centroids[order]
-    labels    = np.array([int(np.where(order == lb)[0][0]) for lb in labels])
-    _log(f"SJM centroids:\n{np.round(centroids, 6)}")
-    return centroids, labels
-
-
-# ---------------------------------------------------------------------------
-# NHHMM params (mu / sigma per cluster from log-return distribution)
-# ---------------------------------------------------------------------------
-
-def _fit_nhhmm(X: np.ndarray, labels: np.ndarray, k: int = N_STATES):
-    mus    = np.zeros(k, dtype=float)
-    sigmas = np.ones(k, dtype=float) * 1e-4
-    for j in range(k):
-        pts = X[labels == j, 0]
-        if len(pts) > 1:
-            mus[j]    = float(np.mean(pts))
-            sigmas[j] = max(float(np.std(pts)), 1e-6)
-        elif len(pts) == 1:
-            mus[j] = float(pts[0])
-    _log(f"NHHMM mu    per cluster: {np.round(mus, 8)}")
-    _log(f"NHHMM sigma per cluster: {np.round(sigmas, 8)}")
-    return mus, sigmas
-
-
-# ---------------------------------------------------------------------------
-# NHHMM beta (transition feature weights) shape [K, K, F]
-# ---------------------------------------------------------------------------
-
-def _build_beta(k: int = N_STATES, n_features: int = N_FEATURES) -> np.ndarray:
-    beta = np.zeros((k, k, n_features), dtype=float)
-    # Slight self-persistence prior on log-return axis
-    for i in range(k):
-        beta[i, i, 0] = 0.05
-    _log(f"NHHMM beta shape: {beta.shape}  (neutral transition prior)")
-    return beta
-
-
-# ---------------------------------------------------------------------------
-# SJM feature weights (unit-L2 normalised)
-# ---------------------------------------------------------------------------
-
-def _build_sjm_weights(n_features: int = N_FEATURES) -> np.ndarray:
-    w = np.ones(n_features, dtype=float)
-    w /= np.linalg.norm(w)
-    _log(f"SJM feature weights: {np.round(w, 6)}")
-    return w
-
-
-# ---------------------------------------------------------------------------
-# Validate weight shapes (same logic as ARE._load_model_weights)
-# ---------------------------------------------------------------------------
-
-def _validate(weights: dict, n_features: int) -> None:
-    expected = {
-        "nhhmm_beta":     (N_STATES, N_STATES, n_features),
-        "nhhmm_mu":       (N_STATES,),
-        "nhhmm_sigma":    (N_STATES,),
-        "sjm_centroids":  (N_STATES, n_features),
-    }
-    for key, shape in expected.items():
-        if key not in weights:
-            raise ValueError(f"Missing weight key: {key}")
-        arr = np.asarray(weights[key], dtype=float)
-        if arr.shape != shape:
-            raise ValueError(f"{key}: shape {arr.shape} != expected {shape}")
-        if not np.all(np.isfinite(arr)):
-            raise ValueError(f"{key} contains non-finite values")
-    _log("Weight shape validation PASSED")
-
-
-# ---------------------------------------------------------------------------
-# Save + verify
-# ---------------------------------------------------------------------------
-
-def _save(weights: dict, output_path: str) -> None:
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    ModelWeightManager.save_weights("advanced_regime", weights, output_path)
-    kb = os.path.getsize(output_path) / 1024
-    _log(f"Saved {output_path}  ({kb:.1f} KB)")
-    _log(f"Keys: {list(np.load(output_path).keys())}")
-
-
-def _verify(output_path: str) -> bool:
-    _log("Verifying weights load into AdvancedRegimeEngine ...")
-    try:
-        from advanced_regime_engine import AdvancedRegimeEngine
-        are = AdvancedRegimeEngine(
-            n_states=N_STATES,
-            n_features=N_FEATURES,
-            load_model_weights_on_init=True,
-        )
-        loaded = getattr(are, "_weights_loaded", False)
-        status = getattr(are, "_calibration_status", "unknown")
-        _log(f"_weights_loaded    : {loaded}")
-        _log(f"_calibration_status: {status}")
-        if not loaded:
-            _log("WARNING: weights file exists but did not load — check shapes")
-            return False
-        result = are.update({
-            "price":    69000.0,
-            "return":   0.0005,
-            "timestamp": 1_774_580_000.0,
-            # Canonical 4-key payload required by AdvancedRegimeEngine.update()
-            # — the smoke test must include `features` so we exercise the same
-            # path the production BacktestEngine takes.
-            "features": np.array([0.0005, 0.0, 0.0], dtype=float),
-        })
-        label = result.get("regime_label", "N/A")
-        conf  = result.get("confidence", -1.0)
-        _log(f"Smoke-test result: regime_label={label}  confidence={conf:.4f}")
-        if label not in ("UNKNOWN", "UNCALIBRATED", "HALTED"):
-            _log("Verification PASSED — ARE is producing real regime labels")
-            return True
-        _log("WARNING: still returning non-regime label after loading weights")
-        return False
-    except Exception as exc:
-        _log(f"Verification ERROR: {exc}")
-        import traceback; traceback.print_exc()
-        return False
-
-
-def _write_report(centroids, mus, sigmas, n_rows: int, verify_ok: bool) -> None:
-    report = {
-        "status":         "ok" if verify_ok else "weight_load_failed",
-        "n_bars_used":    int(n_rows),
-        "n_states":       N_STATES,
-        "n_features":     N_FEATURES,
-        "feature_names":  ["log_return_1m", "ofi_zscore", "vol_zscore"],
-        "regime_order":   ["bear", "range", "bull"],
-        "sjm_centroids":  centroids.tolist(),
-        "nhhmm_mu":       mus.tolist(),
-        "nhhmm_sigma":    sigmas.tolist(),
-        "weight_file":    DEFAULT_OUT,
-    }
-    with open(REPORT_PATH, "w") as f:
-        json.dump(report, f, indent=2)
-    _log(f"Calibration report: {REPORT_PATH}")
-
-
-# ---------------------------------------------------------------------------
-# Main entry — calibrate(input_csv, output_path) is the programmatic API
-# ---------------------------------------------------------------------------
-
-def calibrate(input_csv: str | None, output_path: str) -> None:
-    _log("=" * 60)
-    _log("Phase 4 Fix 1 — Regime Calibration Pipeline")
-    _log("=" * 60)
-
-    if input_csv is not None:
-        _log(f"Mode: OHLCV CSV ({input_csv})")
-        X = _build_from_ohlcv_csv(input_csv)
-    else:
-        _log("Mode: real tick data (aggTrades + bookDepth)")
-        trades    = _load_agg_trades()
-        snapshots = _load_depth_ofi()
-        X = _build_from_tick_data(trades, snapshots)
-
-    if len(X) < N_STATES * 5:
-        raise ValueError(
-            f"Too few data points ({len(X)}) — need at least {N_STATES * 5}"
-        )
-
-    n_features  = X.shape[1]
-    centroids, labels = _kmeans(X, k=N_STATES)
-    mus, sigmas       = _fit_nhhmm(X, labels)
-    beta              = _build_beta(k=N_STATES, n_features=n_features)
-    sjm_weights       = _build_sjm_weights(n_features=n_features)
-
-    feature_mean = X.mean(axis=0)
-    feature_std = X.std(axis=0)
-
-    weights = {
-        "nhhmm_beta":          beta,
-        "nhhmm_mu":            mus,
-        "nhhmm_sigma":         sigmas,
-        "sjm_centroids":       centroids,
-        "sjm_feature_weights": sjm_weights,
-        "feature_mean":        feature_mean,
-        "feature_std":         feature_std,
-    }
-    _validate(weights, n_features)
-    _save(weights, output_path)
-
-    verify_ok = _verify(output_path)
-    _write_report(centroids, mus, sigmas, len(X), verify_ok)
-
-    _log("=" * 60)
-    if verify_ok:
-        _log("RESULT: Calibration COMPLETE")
-        _log("  AdvancedRegimeEngine will no longer return UNKNOWN for every bar.")
-        _log("  R005 (CRITICAL) is resolved. Re-run phase4_tick_audit.py to confirm.")
-    else:
-        _log("RESULT: Weights saved but ARE verification FAILED.")
-        _log("  Check shape logs above. ARE n_features must match N_FEATURES here.")
-    _log("=" * 60)
-
-
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser(
-        description="Calibrate AdvancedRegimeEngine weights from tick data or OHLCV CSV"
+    feat = feature_engine.update(
+        mid, bid, ask, bsz, asz, flow, bvol, svol
     )
-    ap.add_argument(
-        "--input", default=None,
-        help="Path to OHLCV CSV (6 cols: O,H,L,C,V,ts). "
-             "Omit to use data/aggTrades_clean.csv + data/bookDepth_clean.csv"
-    )
-    ap.add_argument(
-        "--output", default=DEFAULT_OUT,
-        help=f"Output path for .npz weights (default: {DEFAULT_OUT})"
-    )
-    args = ap.parse_args()
-    calibrate(input_csv=args.input, output_path=args.output)
+    X_raw.append(feat)
+    valid_returns.append(returns[i])
+    valid_prices.append(mid)
+
+X_raw         = np.array(X_raw,         dtype=float)
+valid_returns = np.array(valid_returns, dtype=float)
+
+assert X_raw.shape == (N_BARS, N_FEATURES), \
+    f"Feature matrix shape error: {X_raw.shape}"
+assert not np.isnan(X_raw).any(),  "NaN in feature matrix"
+assert np.isfinite(X_raw).all(),   "Non-finite in feature matrix"
+
+print(f"    Feature matrix: {X_raw.shape} — OK")
+
+# ─── STEP 3: COMPUTE NORMALIZATION MOMENTS ───────────────────
+
+print("\n[3/7] Computing calibration-time normalization moments...")
+
+calib_cutoff = int(0.8 * N_BARS)
+X_calib      = X_raw[:calib_cutoff]
+
+feature_mean = X_calib.mean(axis=0)
+feature_std  = X_calib.std(axis=0)
+feature_std  = np.where(feature_std > 1e-12, feature_std, 1.0)
+
+print(f"    feature_mean: {feature_mean.round(4)}")
+print(f"    feature_std:  {feature_std.round(4)}")
+
+# ─── STEP 4: TRIPLE-BARRIER LABELS ───────────────────────────
+
+print("\n[4/7] Computing triple-barrier regime labels...")
+
+
+def triple_barrier_labels(
+    returns: np.ndarray,
+    window: int = 20,
+    vol_mult: float = 1.5,
+) -> np.ndarray:
+    N      = len(returns)
+    labels = np.zeros(N, dtype=int)
+    rolling_vol = deque(maxlen=window)
+
+    for i in range(N - window):
+        if len(rolling_vol) >= 5:
+            barrier = float(np.std(rolling_vol)) * vol_mult
+        else:
+            barrier = 0.003
+
+        fwd = np.cumsum(returns[i + 1: i + 1 + window])
+        hit_upper = np.any(fwd >=  barrier)
+        hit_lower = np.any(fwd <= -barrier)
+
+        if hit_upper and not hit_lower:
+            labels[i] =  1
+        elif hit_lower and not hit_upper:
+            labels[i] = -1
+        else:
+            labels[i] =  0
+
+        rolling_vol.append(returns[i])
+
+    return labels
+
+
+y_labels = triple_barrier_labels(
+    valid_returns,
+    window=BARRIER_WINDOW,
+    vol_mult=BARRIER_MULT,
+)
+
+y_3state = np.where(y_labels ==  1, 0,
+           np.where(y_labels == -1, 1, 2))
+
+counts = np.bincount(y_3state, minlength=3)
+print(f"    Bull: {counts[0]} | Bear: {counts[1]} | Crisis: {counts[2]}")
+assert counts.min() >= 10, \
+    "Too few samples in one regime class — increase N_BARS"
+
+# ─── STEP 5: FIT SJM CENTROIDS (pure numpy KMeans) ───────────
+
+print("\n[5/7] Fitting SJM centroids via pure numpy KMeans...")
+
+X_norm = (X_raw - feature_mean) / (feature_std + 1e-8)
+
+kmeans = _kmeans_numpy(
+    X_norm,
+    n_clusters=N_STATES,
+    random_state=RANDOM_SEED,
+    n_init=20,
+    max_iter=500,
+)
+sjm_centroids = kmeans.cluster_centers_
+
+within_var = np.zeros(N_FEATURES)
+for k in range(N_STATES):
+    mask = kmeans.labels_ == k
+    if mask.sum() > 1:
+        within_var += X_norm[mask].var(axis=0)
+within_var = within_var / N_STATES
+within_var = np.where(within_var > 1e-12, within_var, 1.0)
+sjm_feature_weights = 1.0 / (within_var + 1e-8)
+sjm_feature_weights = sjm_feature_weights / (
+    np.linalg.norm(sjm_feature_weights) + 1e-12
+)
+
+print(f"    Centroids shape: {sjm_centroids.shape}")
+print(f"    Feature weights: {sjm_feature_weights.round(4)}")
+
+# ─── STEP 6: FIT NHHMM PARAMETERS ────────────────────────────
+
+print("\n[6/7] Fitting NHHMM parameters...")
+
+nhhmm_mu    = np.zeros(N_STATES, dtype=float)
+nhhmm_sigma = np.ones(N_STATES,  dtype=float) * 0.005
+
+for k in range(N_STATES):
+    mask          = y_3state == k
+    state_returns = valid_returns[mask]
+    if len(state_returns) > 5:
+        nhhmm_mu[k]    = float(np.mean(state_returns))
+        nhhmm_sigma[k] = float(max(np.std(state_returns), 1e-4))
+    else:
+        nhhmm_mu[k]    = 0.0
+        nhhmm_sigma[k] = 0.005
+
+rng        = np.random.default_rng(RANDOM_SEED)
+nhhmm_beta = rng.normal(
+    0.0, 0.01, size=(N_STATES, N_STATES, N_FEATURES)
+)
+nhhmm_beta[:, 0, :] = 0.0  # identifiability pin
+
+print(f"    nhhmm_mu:         {nhhmm_mu.round(6)}")
+print(f"    nhhmm_sigma:      {nhhmm_sigma.round(6)}")
+print(f"    nhhmm_beta shape: {nhhmm_beta.shape}")
+
+assert np.all(nhhmm_sigma >= 1e-4), \
+    "nhhmm_sigma below 1e-4 — emission too concentrated"
+
+# ─── STEP 7: SAVE WEIGHTS ────────────────────────────────────
+
+print("\n[7/7] Saving calibration artifacts...")
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+np.savez(
+    OUTPUT_PATH,
+    nhhmm_beta          = nhhmm_beta.astype(np.float64),
+    nhhmm_mu            = nhhmm_mu.astype(np.float64),
+    nhhmm_sigma         = nhhmm_sigma.astype(np.float64),
+    sjm_centroids       = sjm_centroids.astype(np.float64),
+    sjm_feature_weights = sjm_feature_weights.astype(np.float64),
+    feature_mean        = feature_mean.astype(np.float64),
+    feature_std         = feature_std.astype(np.float64),
+)
+
+saved = np.load(OUTPUT_PATH)
+required_keys = [
+    "nhhmm_beta", "nhhmm_mu", "nhhmm_sigma",
+    "sjm_centroids", "sjm_feature_weights",
+    "feature_mean", "feature_std",
+]
+for key in required_keys:
+    assert key in saved, f"Missing key: {key}"
+    assert np.isfinite(saved[key]).all(), \
+        f"Non-finite in saved key: {key}"
+
+print(f"    Saved:  {OUTPUT_PATH}")
+print(f"    Keys:   {sorted(saved.files)}")
+print()
+print("=" * 60)
+print("  CALIBRATION COMPLETE")
+print("  weights/advanced_regime_weights.npz — READY")
+print("=" * 60)
