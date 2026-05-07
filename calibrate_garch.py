@@ -26,7 +26,7 @@ def fit_msgarch_mle(returns: np.ndarray, n_regimes: int = 2) -> dict:
         n_regimes: Number of volatility regimes (default: 2)
 
     Returns:
-        dict with keys: omega, alpha, beta, P, converged, log_lik
+        dict with keys: omega, alpha, beta_garch, P, converged, log_lik
     """
     returns = np.asarray(returns, dtype=float)
     if returns.ndim != 1:
@@ -101,6 +101,6 @@ if __name__ == "__main__":
     print("Fitted GARCH params:")
     for k, v in params.items():
         print(f"  {k}: {v}")
-    print(f"\nPersistence (alpha+beta): {params['alpha'] + params['beta']}")
+    print(f"\nPersistence (alpha+beta): {params['alpha'] + params['beta_garch']}")
     assert params["converged"], "MLE did not converge on synthetic data"
     print("\nSmoke test passed.")
