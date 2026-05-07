@@ -1172,13 +1172,13 @@ class MSGARCH_RiskEngine:
         beta_arr       = np.asarray(beta_garch, dtype=float)
         P_arr          = np.asarray(P,          dtype=float)
 
+        engine_ref = getattr(self, '_regime_engine_ref', None)
+        allow_igarch = (
+            getattr(engine_ref, '_allow_igarch', False)
+            if engine_ref is not None else False
+        )
         for k in range(len(alpha_arr)):
             persistence = alpha_arr[k] + beta_arr[k]
-            engine_ref = getattr(self, '_regime_engine_ref', None)
-            allow_igarch = (
-                getattr(engine_ref, '_allow_igarch', False)
-                if engine_ref is not None else False
-            )
             if persistence >= 1.0 and not allow_igarch:
                 raise ValueError(
                     f"Regime {k}: alpha+beta={persistence:.4f} >= 1.0. "
