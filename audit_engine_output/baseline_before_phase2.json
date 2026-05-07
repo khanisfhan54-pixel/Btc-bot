@@ -1,0 +1,22 @@
+{
+  "schema_version": "1.2.0",
+  "engine_status": "OK",
+  "regime_label": "UNCALIBRATED",
+  "signal_valid": false,
+  "probabilities_sum": 1.0,
+  "macro_probs_sum": 0.9999999999999998,
+  "risk_metrics_keys": [
+    "engine_status",
+    "expected_volatility",
+    "feed_status",
+    "garch_regime_probs",
+    "last_valid_vol",
+    "range_ticks",
+    "raw_leverage",
+    "switch_stability_ema",
+    "toxic_penalty_applied"
+  ],
+  "alpha_keys": [
+    "edge_score"
+  ]
+}
