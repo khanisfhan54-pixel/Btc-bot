@@ -683,7 +683,8 @@ def compute_hmm_regime(
     if alpha_safe.shape != (3,):
         raise ValueError(
             f"compute_hmm_regime expects a 3-state vector, got shape {alpha_safe.shape}. "
-            "Engine is hard-coded for Bull/Bear/Crisis states."
+            "This function handles the 3-state (Bull/Bear/Crisis) path. "
+            "For 4-state posteriors (Bull/Bear/Range/Crisis) use compute_hmm_regime_4state()."
         )
     if np.any(alpha_safe < 0):
         raise ValueError(f"Negative probability in SJM output: {alpha_safe}")
@@ -5642,6 +5643,24 @@ class AdvancedRegimeEngine:
         if confirmed_regime in ("TREND", "BEAR"):
             final_regime_idx = int(self.current_regime_idx) if self.current_regime_idx is not None else -1
 
+        # FIX-B1: In 4-state mode, nhhmm_prior = [bull, bear, range, crisis].
+        # _build_output takes macro_probs[:3] and normalizes. Without correction
+        # macro_probs[2] would become RANGE (index 2), not CRISIS (index 3),
+        # silently breaking downstream consumers of the crisis macro probability.
+        # We explicitly project to [bull, bear, crisis] so index 2 remains CRISIS
+        # in both 3-state and 4-state mode. The RANGE macro probability is already
+        # exposed to consumers via risk_metrics.range_prob.
+        if self.K == 4:
+            _prior = np.asarray(self.nhhmm_prior, dtype=float)
+            _bul   = float(_prior[0]) if _prior.size > 0 else 1.0 / 3.0
+            _bea   = float(_prior[1]) if _prior.size > 1 else 1.0 / 3.0
+            _cri   = float(_prior[3]) if _prior.size > 3 else 1.0 / 3.0
+            _macro_probs_3 = _normalize_prob_vector(
+                np.asarray([_bul, _bea, _cri], dtype=float)
+            ).tolist()
+        else:
+            _macro_probs_3 = self.nhhmm_prior.tolist()
+
         output = _build_output(
             regime_idx=final_regime_idx,
             regime_label=confirmed_regime,
@@ -5656,7 +5675,7 @@ class AdvancedRegimeEngine:
                 'bear': float(regime_scores["bear"]),
                 'crisis': float(regime_scores["crisis"]),
             },
-            macro_probs=self.nhhmm_prior.tolist(),
+            macro_probs=_macro_probs_3,
             position_size=position_size,
             signed_position_size=signed_position_size,
             expected_vol=expected_vol,

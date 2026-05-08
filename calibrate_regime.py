@@ -17,6 +17,14 @@ from microstructure_features import MicrostructureFeatureEngine
 
 # ─── CONFIG ──────────────────────────────────────────────────
 
+# N_STATES controls the regime model architecture:
+#   3 = Legacy 3-state (Bull/Bear/Crisis) — default, backward-compatible
+#   4 = Phase 3 4-state (Bull/Bear/Range/Crisis) — requires ARE(n_states=4)
+#       and a 4-state weights file to be loaded into the engine.
+#
+# OPERATOR: to run Phase 3 calibration, set N_STATES = 4 here AND ensure
+# AdvancedRegimeEngine is constructed with n_states=4.
+# The .npz produced with N_STATES=4 is INCOMPATIBLE with n_states=3 engines.
 N_STATES       = 3
 N_FEATURES     = 6
 N_BARS         = 2000
@@ -27,6 +35,13 @@ BARRIER_WINDOW = 20
 BARRIER_MULT   = 1.5
 OUTPUT_DIR     = "weights"
 OUTPUT_PATH    = os.path.join(OUTPUT_DIR, "advanced_regime_weights.npz")
+
+# Guard: N_STATES must be 3 or 4. Any other value indicates a misconfiguration.
+if N_STATES not in (3, 4):
+    raise ValueError(
+        f"calibrate_regime.py: N_STATES must be 3 (legacy) or 4 (Phase 3). "
+        f"Got N_STATES={N_STATES}."
+    )
 
 np.random.seed(RANDOM_SEED)
 
