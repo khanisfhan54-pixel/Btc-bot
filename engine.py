@@ -551,14 +551,24 @@ def _trade_usd(t: dict, fallback_price: float = 0.0) -> float:
 
 def _best_bid_ask(orderbook: dict) -> Tuple[float, float]:
     # FIX-7 (AUDIT): sort orderbook levels to avoid incorrect best bid/ask on unsorted feeds
-    bids = orderbook.get("bids") or []
-    asks = orderbook.get("asks") or []
+    bids = orderbook.get("bids") if isinstance(orderbook, dict) else []
+    asks = orderbook.get("asks") if isinstance(orderbook, dict) else []
+    bids = bids if isinstance(bids, list) else []
+    asks = asks if isinstance(asks, list) else []
     try:
-        sorted_bids = sorted(bids, key=lambda x: _safe_float(x[0]), reverse=True)
-        sorted_asks = sorted(asks, key=lambda x: _safe_float(x[0]), reverse=False)
+        sorted_bids = sorted(
+            [b for b in bids if isinstance(b, (list, tuple)) and len(b) >= 1],
+            key=lambda x: _safe_float(x[0]),
+            reverse=True,
+        )
+        sorted_asks = sorted(
+            [a for a in asks if isinstance(a, (list, tuple)) and len(a) >= 1],
+            key=lambda x: _safe_float(x[0]),
+            reverse=False,
+        )
     except Exception:
-        sorted_bids = bids
-        sorted_asks = asks
+        sorted_bids = []
+        sorted_asks = []
     bid = _safe_float(sorted_bids[0][0]) if sorted_bids else 0.0
     ask = _safe_float(sorted_asks[0][0]) if sorted_asks else 0.0
     return bid, ask

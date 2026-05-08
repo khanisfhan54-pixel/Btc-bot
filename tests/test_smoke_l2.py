@@ -24,7 +24,10 @@ def test_real_l2_smoke_200_bars():
 
     # Import inside the test to avoid paying the ARE/engine import cost
     # for unrelated test sessions.
-    from audit_engine_dec2023 import run  # type: ignore
+    from audit_engine_dec2023 import DATA_1M, run  # type: ignore
+
+    if not os.path.exists(os.path.join(repo_root, DATA_1M)):
+        pytest.skip(f"l2 smoke data missing: {DATA_1M}")
 
     result = run(num_bars=200, start_offset=60, out_prefix="smoke_l2")
     assert result, "audit_engine_dec2023.run returned a falsy result"
