@@ -660,6 +660,91 @@ class RegimeMarkovSmoother:
         self.prev_probs = smoothed
         return winner, smoothed
 
+
+
+class SJMCentroidMonitor:
+    """Phase 4.1: detect when SJM centroids have drifted beyond calibration geometry."""
+    def __init__(self, baseline_means: np.ndarray, alert_threshold_sigma: float = 2.0):
+        self.baseline = np.asarray(baseline_means, dtype=float)
+        self.threshold = float(alert_threshold_sigma)
+        self._drift_history: list = []
+
+    def check(self, current_means: np.ndarray) -> dict:
+        current = np.asarray(current_means, dtype=float)
+        drift = float(np.linalg.norm(current - self.baseline, axis=1).mean())
+        self._drift_history.append(drift)
+        if len(self._drift_history) > 500:
+            self._drift_history = self._drift_history[-500:]
+        mu  = float(np.mean(self._drift_history))
+        std = float(np.std(self._drift_history))
+        z   = float((drift - mu) / max(std, 1e-10))
+        alert = bool(z > self.threshold)
+        if alert:
+            LOGGER.error(
+                "SJM CENTROID DRIFT ALERT: z=%.2f > %.1f sigma. "
+                "Model retraining required.", z, self.threshold
+            )
+        return {"drift": drift, "z_score": z, "alert": alert}
+
+
+def compute_regime_entropy_alert(
+    nhhmm_posterior: np.ndarray,
+    alert_threshold_nats: float = 0.5,
+    consecutive_required: int = 3,
+    _streak: list = [0],
+) -> dict:
+    """Phase 4.2: detect confidence collapse (entropy below threshold for N bars)."""
+    entropy = float(-np.sum(
+        nhhmm_posterior * np.log(np.clip(nhhmm_posterior, 1e-12, None))
+    ))
+    if entropy < alert_threshold_nats:
+        _streak[0] += 1
+    else:
+        _streak[0] = 0
+    alert = bool(_streak[0] >= consecutive_required)
+    if alert:
+        LOGGER.warning(
+            "REGIME ENTROPY COLLAPSE: entropy=%.3f nats for %d consecutive bars. "
+            "Check for data feed issues or model collapse.", entropy, _streak[0]
+        )
+    return {"entropy": entropy, "streak": _streak[0], "alert": alert}
+
+
+def diagnose_engine_state(engine) -> dict:
+    """
+    Rapid health check after construction and after load_state().
+    Any False value means Phase 1 is not complete.
+    """
+    sjm_ok = (
+        engine.sjm.means is not None
+        and not getattr(engine.sjm, "_default_params_initialized", True)
+        and engine.sjm.means.shape[0] == engine.K
+    )
+    nhhmm_norm_ok = (
+        getattr(engine.nhhmm, "_feature_mean", None) is not None
+        and getattr(engine.nhhmm, "_feature_std",  None) is not None
+    )
+    garch_stationary = bool(
+        np.all(engine.garch.alpha + engine.garch.beta_garch < 0.999)
+    )
+    weights_loaded = bool(engine._weights_loaded)
+    feature_norm_source = str(getattr(engine, "_feature_norm_source", "rolling"))
+
+    report = {
+        "weights_loaded":      weights_loaded,
+        "sjm_centroids_valid": sjm_ok,
+        "nhhmm_moments_set":   nhhmm_norm_ok,
+        "garch_stationary":    garch_stationary,
+        "feature_norm_source": feature_norm_source,
+        "garch_alpha":         engine.garch.alpha.tolist(),
+        "garch_beta":          engine.garch.beta_garch.tolist(),
+        "garch_persistence":   (engine.garch.alpha + engine.garch.beta_garch).tolist(),
+        "all_ok": all([weights_loaded, sjm_ok, nhhmm_norm_ok, garch_stationary]),
+    }
+    if not report["all_ok"]:
+        LOGGER.critical("ENGINE DIAGNOSTIC FAILED: %s", report)
+    return report
+
 # ==========================================
 # NEW: Real-Time Continuous Scoring Layer
 # ==========================================
@@ -1210,8 +1295,8 @@ class MSGARCH_RiskEngine:
     def __init__(self, target_volatility=0.02, regime_prob_floor: float = None):
         self.target_vol = target_volatility
         self.omega = np.array([1e-5, 5e-4])
-        self.alpha = np.array([0.05, 0.20])
-        self.beta_garch = np.array([0.90, 0.70])  
+        self.alpha = np.array([0.12, 0.22])
+        self.beta_garch = np.array([0.85, 0.68])  
         self.P = np.array([[0.98, 0.02],   
                            [0.05, 0.95]])
         if regime_prob_floor is not None:

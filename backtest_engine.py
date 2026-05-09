@@ -257,9 +257,10 @@ class BacktestEngine:
             → position management
     """
 
-    def __init__(self, config: BacktestConfig | None = None, learning_engine: Any = None) -> None:
+    def __init__(self, config: BacktestConfig | None = None, learning_engine: Any = None, signal_only: bool = False) -> None:
         self.cfg = config or BacktestConfig()
         self.learning_engine = learning_engine if learning_engine is not None else LEARNING_ENGINE
+        self._signal_only = bool(signal_only)
 
         self.feature_engine = FeatureEngine() if FeatureEngine is not None else _FallbackFeatureEngine()
         self.signal_engine = SignalEngine() if SignalEngine is not None else _FallbackSignalEngine()
@@ -579,6 +580,7 @@ class BacktestEngine:
         ohlcv_data: List[list],
         initial_balance: float | None = None,
         book_features: Optional[Sequence[Any]] = None,   # FIX-1
+        **kwargs: Any,
     ) -> Dict[str, Any]:
         return self._run_single_pass(
             ohlcv_data,
@@ -681,6 +683,7 @@ class BacktestEngine:
         initial_balance: float | None = None,
         label: str = "single",
         book_features: Optional[Sequence[Any]] = None,   # FIX-1
+        **kwargs: Any,
     ) -> Dict[str, Any]:
         cache_hits = 0
         cache_misses = 0

@@ -13,7 +13,6 @@ Rules:
 import os
 import numpy as np
 from collections import deque
-from microstructure_features import MicrostructureFeatureEngine
 
 # ─── CONFIG ──────────────────────────────────────────────────
 
@@ -26,7 +25,7 @@ from microstructure_features import MicrostructureFeatureEngine
 # AdvancedRegimeEngine is constructed with n_states=4.
 # The .npz produced with N_STATES=4 is INCOMPATIBLE with n_states=3 engines.
 N_STATES       = 3
-N_FEATURES     = 6
+N_FEATURES     = 3
 N_BARS         = 2000
 LOOKBACK       = 200
 RV_WINDOW      = 5
@@ -125,33 +124,25 @@ print(f"    Bars: {N_BARS} | Price range: "
 
 # ─── STEP 2: BUILD FEATURE MATRIX ────────────────────────────
 
-print("\n[2/7] Building microstructure feature matrix...")
+print("\n[2/7] Building feature matrix...")
 
-feature_engine = MicrostructureFeatureEngine(
-    lookback_bars=LOOKBACK,
-    rv_window_bars=RV_WINDOW,
-)
+_raw_vols = np.abs(np.random.randn(N_BARS) * 100 + 100)
+_vol_mean = float(_raw_vols.mean())
+_vol_std  = float(_raw_vols.std()) if float(_raw_vols.std()) > 1e-8 else 1.0
+candle_volume_z = (_raw_vols - _vol_mean) / _vol_std  # z-scored, mean≈0, std≈1
 
 X_raw         = []
 valid_returns = []
 valid_prices  = []
 
 for i in range(N_BARS):
-    mid  = float(prices[i + 1])
-    bid  = mid - 1.0
-    ask  = mid + 1.0
-    bsz  = float(bid_sizes[i])
-    asz  = float(ask_sizes[i])
-    flow = float(trade_flows[i])
-    bvol = float(buy_vols[i])
-    svol = float(sell_vols[i])
+    log_ret = float(returns[i])
+    ofi_z = float((bid_sizes[i] - ask_sizes[i]) / max(bid_sizes[i] + ask_sizes[i], 1e-8))
+    vol_idx = float(candle_volume_z[i])
 
-    feat = feature_engine.update(
-        mid, bid, ask, bsz, asz, flow, bvol, svol
-    )
-    X_raw.append(feat)
+    X_raw.append([log_ret, ofi_z, vol_idx])
     valid_returns.append(returns[i])
-    valid_prices.append(mid)
+    valid_prices.append(float(prices[i + 1]))
 
 X_raw         = np.array(X_raw,         dtype=float)
 valid_returns = np.array(valid_returns, dtype=float)
