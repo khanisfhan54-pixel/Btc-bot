@@ -81,6 +81,13 @@ def add_toxic_label(
     """
     Overlay TOXIC label (2) on top of Triple-Barrier labels.
 
+    INTERFACE NOTE: This version accepts pd.Series inputs and is
+    the public API in triple_barrier_labeler.py. A semantically
+    identical but np.ndarray-based version exists in
+    calibrate_regime.py. Do NOT merge or alias these without
+    verifying interface compatibility — their callers use different
+    data types throughout.
+
     Any bar where realized vol exceeds the 90th percentile becomes TOXIC.
     This yields the 4-class target: -1 (BEAR), 0 (RANGE), 1 (TREND), 2 (TOXIC).
 
