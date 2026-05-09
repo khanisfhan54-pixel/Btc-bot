@@ -1885,6 +1885,30 @@ class AdvancedRegimeEngine:
         target_var = float(self.garch.target_vol ** 2)
         return np.full(2, target_var, dtype=float)
 
+    def _macro_probs_3state(self) -> list:
+        """
+        Return a 3-element [bull, bear, crisis] macro-probability list
+        for both 3-state and 4-state mode.
+
+        In 3-state mode: nhhmm_prior = [bull, bear, crisis] — return as-is.
+        In 4-state mode: nhhmm_prior = [bull, bear, range, crisis].
+            Index 2 is RANGE (not CRISIS). We project to [bull, bear, crisis]
+            by reading index 3 for crisis, then renormalize.
+            The same logic as FIX-B1 in the main update() path.
+
+        Used by all early-exit _build_output() calls so that
+        macro_probs[2] always means CRISIS regardless of engine mode.
+        """
+        prior = np.asarray(self.nhhmm_prior, dtype=float)
+        if self.K == 4 and prior.size >= 4:
+            bul = float(prior[0])
+            bea = float(prior[1])
+            cri = float(prior[3])
+            return _normalize_prob_vector(
+                np.asarray([bul, bea, cri], dtype=float)
+            ).tolist()
+        return self.nhhmm_prior.tolist()
+
     def _obs_should_sample(self) -> bool:
         """
         Randomized sampling removes deterministic blind spots (aliasing).
@@ -3157,6 +3181,18 @@ class AdvancedRegimeEngine:
             raw["nhhmm_beta"] = self.nhhmm.beta.tolist()
             raw["nhhmm_mu"] = self.nhhmm.mu.tolist()
             raw["nhhmm_sigma"] = self.nhhmm.sigma.tolist()
+            # Capture calibration-time normalization moments so that
+            # state snapshots are portable across engine restarts.
+            raw["nhhmm_feature_mean"] = (
+                self.nhhmm._feature_mean.tolist()
+                if getattr(self.nhhmm, "_feature_mean", None) is not None
+                else None
+            )
+            raw["nhhmm_feature_std"] = (
+                self.nhhmm._feature_std.tolist()
+                if getattr(self.nhhmm, "_feature_std", None) is not None
+                else None
+            )
             for key in ("nhhmm_beta", "nhhmm_mu", "nhhmm_sigma"):
                 arr = np.asarray(raw[key], dtype=float)
                 if not np.all(np.isfinite(arr)):
@@ -3751,6 +3787,46 @@ class AdvancedRegimeEngine:
                 self.nhhmm.sigma.shape,
             )
 
+        # ADV-NORM: restore NHHMM normalization moments from snapshot
+        # when available. This prevents staging engines from emitting
+        # fallback warnings during state validation passes. The moments
+        # are optional — older snapshots without this key fall back
+        # gracefully (moments will be None until _load_model_weights()
+        # is called separately, which is safe for production usage
+        # where __init__ always calls _load_model_weights()).
+        _nhhmm_fm_raw = state.get("nhhmm_feature_mean", None)
+        _nhhmm_fs_raw = state.get("nhhmm_feature_std",  None)
+        if _nhhmm_fm_raw is not None and _nhhmm_fs_raw is not None:
+            try:
+                _nhhmm_fm = np.asarray(_nhhmm_fm_raw, dtype=np.float64)
+                _nhhmm_fs = np.asarray(_nhhmm_fs_raw, dtype=np.float64)
+                if (
+                    _nhhmm_fm.shape == (self.nhhmm.n_features,)
+                    and _nhhmm_fs.shape == (self.nhhmm.n_features,)
+                    and np.all(np.isfinite(_nhhmm_fm))
+                    and np.all(np.isfinite(_nhhmm_fs))
+                    and np.all(_nhhmm_fs > 0)
+                ):
+                    self.nhhmm.set_normalization_moments(_nhhmm_fm, _nhhmm_fs)
+                    LOGGER.debug(
+                        "load_state: NHHMM normalization moments restored "
+                        "(mean=%s std=%s).",
+                        _nhhmm_fm.round(4).tolist(),
+                        _nhhmm_fs.round(4).tolist(),
+                    )
+                else:
+                    LOGGER.warning(
+                        "load_state: nhhmm_feature_mean/std shapes or values "
+                        "invalid in snapshot — moments not restored. "
+                        "Engine will use fallback normalization until "
+                        "_load_model_weights() is called."
+                    )
+            except Exception as _nhhmm_norm_exc:
+                LOGGER.warning(
+                    "load_state: failed to restore NHHMM normalization "
+                    "moments (%s). Engine will use fallback.", _nhhmm_norm_exc
+                )
+
         sjm_means_raw = state.get("sjm_means")
         sjm_weights_raw = state.get("sjm_weights")
         if sjm_means_raw is not None and sjm_weights_raw is not None:
@@ -4200,7 +4276,7 @@ class AdvancedRegimeEngine:
                 conviction=0.0,
                 edge_score=0.0,
                 probabilities={'bull': 0.0, 'bear': 0.0, 'crisis': 1.0},
-                macro_probs=self.nhhmm_prior.tolist(),
+                macro_probs=self._macro_probs_3state(),
                 position_size=0.0,
                 signed_position_size=0.0,
                 expected_vol=float(getattr(self, "_last_valid_vol", self.garch.target_vol)),
@@ -4350,7 +4426,7 @@ class AdvancedRegimeEngine:
                                                 conviction=0.0,
                                                 edge_score=0.0,
                                                 probabilities={'bull': 0.0, 'bear': 0.0, 'crisis': 1.0},
-                                                macro_probs=self.nhhmm_prior.tolist(),
+                                                macro_probs=self._macro_probs_3state(),
                                                 position_size=0.0,
                                                 signed_position_size=0.0,
                                                 expected_vol=float(getattr(self, "_last_valid_vol", self.garch.target_vol)),
@@ -4493,7 +4569,7 @@ class AdvancedRegimeEngine:
                     conviction=0.0,
                     edge_score=0.0,
                     probabilities={'bull': 0.0, 'bear': 0.0, 'crisis': 1.0},
-                    macro_probs=self.nhhmm_prior.tolist(),
+                    macro_probs=self._macro_probs_3state(),
                     position_size=0.0,
                     signed_position_size=0.0,
                     expected_vol=float(getattr(self, "_last_valid_vol", self.garch.target_vol)),
@@ -4687,7 +4763,7 @@ class AdvancedRegimeEngine:
                     conviction=0.0,
                     edge_score=0.0,
                     probabilities={'bull': 0.0, 'bear': 0.0, 'crisis': 1.0},
-                    macro_probs=self.nhhmm_prior.tolist(),
+                    macro_probs=self._macro_probs_3state(),
                     position_size=0.0,
                     signed_position_size=0.0,
                     expected_vol=float(getattr(self, "_last_valid_vol", self.garch.target_vol)),
@@ -4760,7 +4836,7 @@ class AdvancedRegimeEngine:
                 conviction=0.0,
                 edge_score=0.0,
                 probabilities={'bull': 0.0, 'bear': 0.0, 'crisis': 1.0},
-                macro_probs=self.nhhmm_prior.tolist(),
+                macro_probs=self._macro_probs_3state(),
                 position_size=0.0,
                 signed_position_size=0.0,
                 expected_vol=float(getattr(self, "_last_valid_vol", self.garch.target_vol)),
@@ -4903,7 +4979,7 @@ class AdvancedRegimeEngine:
                 conviction=0.0,
                 edge_score=0.0,
                 probabilities={'bull': 0.0, 'bear': 0.0, 'crisis': 1.0},
-                macro_probs=self.nhhmm_prior.tolist(),
+                macro_probs=self._macro_probs_3state(),
                 position_size=0.0,
                 expected_vol=expected_vol_frozen,
                 raw_size=0.0,

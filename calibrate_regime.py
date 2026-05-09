@@ -223,6 +223,13 @@ def add_toxic_label(
     Overlay TOXIC / CRISIS label (2) on triple-barrier labels
     using a realized-volatility percentile threshold.
 
+    INTERFACE NOTE: This version accepts np.ndarray inputs and is
+    used exclusively by calibrate_regime.py. A semantically
+    identical but pd.Series-based version exists in
+    triple_barrier_labeler.py. Do NOT merge or alias these without
+    verifying interface compatibility — their callers use different
+    data types throughout.
+
     Logic:
         Any bar where rolling realized vol exceeds the
         vol_threshold_quantile of the vol distribution is
