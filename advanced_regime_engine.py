@@ -859,8 +859,12 @@ def compute_hmm_regime(
     if not np.isfinite(score_sum) or score_sum <= 0.0:
         LOGGER.error("compute_hmm_regime: invalid score sum=%.6f using uniform fallback", score_sum)
         score_map = {"TREND": 0.25, "BEAR": 0.25, "RANGE": 0.25, "TOXIC": 0.25}
-    elif abs(score_sum - 1.0) > 0.10:
-        LOGGER.warning("compute_hmm_regime: score sum out-of-band sum=%.6f", score_sum)
+        score_sum = 1.0
+    elif score_sum > 0.0:
+        # Normalize so scores sum to exactly 1.0 — prevents posterior inflation
+        # from independently computed directional/range/toxic components.
+        score_map = {k: v / score_sum for k, v in score_map.items()}
+        score_sum = 1.0
     max_score = max(score_map.values())
     tied_labels = [label for label, score in score_map.items() if abs(score - max_score) <= 1e-12]
     tie_priority = {"TOXIC": 0, "TREND": 1, "BEAR": 2, "RANGE": 3}
