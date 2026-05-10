@@ -242,6 +242,7 @@ class BacktestConfig:
     # returns a fail-closed empty result if any are missing. When True: the
     # orchestrator path is skipped entirely (legacy diagnostic-only mode).
     legacy_mode: bool = False
+    weight_path: str = "weights/advanced_regime_weights.npz"
 
 
 class BacktestEngine:
@@ -257,8 +258,17 @@ class BacktestEngine:
             → position management
     """
 
-    def __init__(self, config: BacktestConfig | None = None, learning_engine: Any = None, signal_only: bool = False) -> None:
+    def __init__(
+        self,
+        config: BacktestConfig | None = None,
+        learning_engine: Any = None,
+        signal_only: bool = False,
+        weight_path: str | None = None,
+        orchestrator_overrides: Dict[str, Any] | None = None,
+    ) -> None:
         self.cfg = config or BacktestConfig()
+        if weight_path is not None:
+            self.cfg.weight_path = str(weight_path)
         self.learning_engine = learning_engine if learning_engine is not None else LEARNING_ENGINE
         self._signal_only = bool(signal_only)
 
@@ -275,7 +285,10 @@ class BacktestEngine:
         # FIX CRITICAL-1: AdvancedRegimeEngine is the regime classifier. It
         # MUST be called with a canonical dict payload (price/return/features).
         # Created once and re-used across run_backtest() invocations.
-        self.are = AdvancedRegimeEngine() if AdvancedRegimeEngine is not None else None
+        self.are = AdvancedRegimeEngine(load_model_weights_on_init=False) if AdvancedRegimeEngine is not None else None
+        if self.are is not None:
+            self.are._weight_path = str(getattr(self.cfg, "weight_path", "weights/advanced_regime_weights.npz"))
+            self.are._load_model_weights()
 
         # FIX-6 (REGIME_ENGINE_AUDIT 2026-04-23): load calibration-time
         # feature normalization (feature_mean / feature_std) so that the
@@ -302,12 +315,15 @@ class BacktestEngine:
         # liquidity_sweep_alpha as the two sources (CRITICAL-6 compliant).
         if AlphaOrchestrator is not None and OrchestratorConfig is not None:
             try:
-                cfg = OrchestratorConfig(
+                orch_kwargs = dict(
                     signal_weights={"signal_engine": 0.5, "liquidity_sweep_alpha": 0.5},
                     action_threshold=float(self.cfg.orchestrator_action_threshold),
                     allow_unknown_sources=False,
                     feedback_enabled=False,
                 )
+                if orchestrator_overrides:
+                    orch_kwargs.update(orchestrator_overrides)
+                cfg = OrchestratorConfig(**orch_kwargs)
                 self.orchestrator: Optional[Any] = AlphaOrchestrator(cfg)
             except Exception as _o_init_err:
                 logger.warning("AlphaOrchestrator construction failed (%s)", _o_init_err)
@@ -369,7 +385,7 @@ class BacktestEngine:
         Fail-closed: missing keys → leave norms as None and let
         _build_canonical_are_payload reject the bar."""
         try:
-            w = np.load("weights/advanced_regime_weights.npz")
+            w = np.load(str(getattr(self.cfg, "weight_path", "weights/advanced_regime_weights.npz")))
             if "feature_mean" in w.files and "feature_std" in w.files:
                 fm = np.asarray(w["feature_mean"], dtype=float)
                 fs = np.asarray(w["feature_std"], dtype=float)
