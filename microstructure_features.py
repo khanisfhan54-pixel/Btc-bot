@@ -1,83 +1,72 @@
-import numpy as np
 from collections import deque
+import numpy as np
 
 
 class MicrostructureFeatureEngine:
     """
-    Produces a normalized feature vector for each tick.
-    Output: np.ndarray of shape (6,) — feed directly as x_t into AdvancedRegimeEngine.
-
-    Features (indices 0–5):
-        0: OFI      — Order Flow Imbalance (z-scored)
-        1: VWOI     — Volume-Weighted Order Imbalance (clipped [-1, 1])
-        2: RV_5m    — 5-minute realized volatility (z-scored)
-        3: Kyle_lam — Price impact per unit flow, log-transformed (z-scored)
-        4: Spread   — Bid-ask spread ratio (z-scored)
-        5: TradeImb — Buy/sell trade imbalance (clipped [-1, 1])
+    Features (in order, indices 0–5):
+        0: OFI      — Order Flow Imbalance (signed, delta bid_size - delta ask_size)
+        1: VWOI     — Volume-Weighted Order Imbalance (bounded [-1,1])
+        2: RV_5m    — 5-minute realized volatility (sqrt of sum of squared log-returns)
+        3: Kyle_lam — Price impact per unit flow (log-transformed OLS slope)
+        4: Spread   — Bid-ask spread ratio (ask-bid)/mid
+        5: TradeImb — Buy/sell trade imbalance (signed, bounded [-1,1])
     """
 
-    N_FEATURES: int = 6
-
     def __init__(self, lookback_bars: int = 200, rv_window_bars: int = 5):
-        self.lookback = lookback_bars
-        self.rv_window = rv_window_bars
-        self._returns     = deque(maxlen=lookback_bars)
-        self._ofi_hist    = deque(maxlen=lookback_bars)
-        self._vwoi_hist   = deque(maxlen=lookback_bars)
-        self._rv_hist     = deque(maxlen=lookback_bars)
-        self._lam_hist    = deque(maxlen=lookback_bars)
+        self._ofi_hist = deque(maxlen=lookback_bars)
+        self._rv_hist = deque(maxlen=lookback_bars)
+        self._kyle_hist = deque(maxlen=lookback_bars)
         self._spread_hist = deque(maxlen=lookback_bars)
-        self._timb_hist   = deque(maxlen=lookback_bars)
+        self._price_buf = deque(maxlen=rv_window_bars + 1)
+        self._flow_buf = deque(maxlen=20)
+        self._dp_buf = deque(maxlen=20)
         self._prev_bid_size = None
         self._prev_ask_size = None
-        self._price_buf   = deque(maxlen=rv_window_bars + 1)
-        self._flow_buf    = deque(maxlen=20)
-        self._dprice_buf  = deque(maxlen=20)
+        self._prev_mid_price = None
 
     def _compute_ofi(self, bid_size: float, ask_size: float) -> float:
-        if self._prev_bid_size is None:
-            self._prev_bid_size = bid_size
-            self._prev_ask_size = ask_size
+        if self._prev_bid_size is None or self._prev_ask_size is None:
+            self._prev_bid_size = float(bid_size)
+            self._prev_ask_size = float(ask_size)
             return 0.0
-        delta_bid = bid_size - self._prev_bid_size
-        delta_ask = ask_size - self._prev_ask_size
-        self._prev_bid_size = bid_size
-        self._prev_ask_size = ask_size
-        return float(delta_bid - delta_ask)
+        d_bid = float(bid_size) - float(self._prev_bid_size)
+        d_ask = float(ask_size) - float(self._prev_ask_size)
+        self._prev_bid_size = float(bid_size)
+        self._prev_ask_size = float(ask_size)
+        return float(d_bid - d_ask)
 
     def _compute_rv(self) -> float:
-        buf = list(self._price_buf)
-        if len(buf) < 2:
+        if len(self._price_buf) < 2:
             return 0.0
-        rets = np.diff(np.log(np.clip(buf, 1e-8, None)))
-        return float(np.sqrt(np.sum(rets ** 2)))
+        prices = np.asarray(self._price_buf, dtype=float)
+        returns = np.diff(np.log(np.clip(prices, 1e-10, None)))
+        return float(np.sqrt(np.sum(returns * returns)))
 
     def _compute_kyle_lambda(self, dp: float, flow: float) -> float:
-        self._dprice_buf.append(dp)
-        self._flow_buf.append(flow)
-        if len(self._dprice_buf) < 10:
+        self._dp_buf.append(float(dp))
+        self._flow_buf.append(float(flow))
+        if len(self._flow_buf) < 5:
             return 0.0
-        dp_arr   = np.asarray(self._dprice_buf, dtype=float)
+        dp_arr = np.asarray(self._dp_buf, dtype=float)
         flow_arr = np.asarray(self._flow_buf, dtype=float)
-        flow_std = float(np.std(flow_arr))
-        if flow_std < 1e-10:
-            return 0.0
-        cov = float(np.mean(dp_arr * flow_arr))
-        var = float(np.mean(flow_arr ** 2))
-        if var < 1e-12:
-            return 0.0
-        lam = cov / var
-        return float(np.log1p(abs(lam)) * np.sign(lam))
+        cov = float(np.mean((dp_arr - dp_arr.mean()) * (flow_arr - flow_arr.mean())))
+        var_flow = float(np.mean((flow_arr - flow_arr.mean()) ** 2))
+        if var_flow < 1e-10:
+            raw = 0.0
+        else:
+            raw = cov / max(var_flow, 1e-10)
+        return float(np.sign(raw) * np.log1p(abs(raw)))
 
     def _z_score(self, history: deque, value: float) -> float:
-        arr = np.asarray(history, dtype=float)
-        if len(arr) < 5:
+        if len(history) < 5:
             return 0.0
-        mu  = float(arr.mean())
+        arr = np.asarray(history, dtype=float)
         std = float(arr.std())
         if std < 1e-10:
             return 0.0
-        return float(np.clip((value - mu) / std, -3.0, 3.0))
+        z = (float(value) - float(arr.mean())) / max(std, 1e-10)
+        return float(np.clip(z, -3.0, 3.0))
 
     def update(
         self,
@@ -90,46 +79,49 @@ class MicrostructureFeatureEngine:
         buy_volume: float,
         sell_volume: float,
     ) -> np.ndarray:
-        """
-        Call once per bar with current L2 snapshot.
-        Returns normalized feature vector of shape (6,).
-        No future data is used. All normalization is strictly backward-looking.
-        """
-        ofi_raw  = self._compute_ofi(bid_size, ask_size)
-
-        total_vol = buy_volume + sell_volume + 1e-10
-        vwoi_raw  = float((buy_volume - sell_volume) / total_vol)
-
-        self._price_buf.append(mid_price)
-        rv_raw = self._compute_rv()
-
-        price_buf_list = list(self._price_buf)
-        dp = float(mid_price - price_buf_list[-2]) if len(price_buf_list) >= 2 else 0.0
-        lam_raw = self._compute_kyle_lambda(dp, trade_flow)
-
-        spread_raw = float((ask_price - bid_price) / max(mid_price, 1e-8))
-
-        timb_raw = float(np.sign(trade_flow) * min(abs(trade_flow) / (total_vol + 1e-10), 1.0))
-
+        ofi_raw = self._compute_ofi(bid_size=bid_size, ask_size=ask_size)
         self._ofi_hist.append(ofi_raw)
-        self._vwoi_hist.append(vwoi_raw)
+        ofi = self._z_score(self._ofi_hist, ofi_raw)
+
+        total_vol = float(buy_volume) + float(sell_volume)
+        vwoi = (float(buy_volume) - float(sell_volume)) / max(total_vol, 1e-10)
+        vwoi = float(np.clip(vwoi, -1.0, 1.0))
+
+        self._price_buf.append(float(mid_price))
+        rv_raw = self._compute_rv()
         self._rv_hist.append(rv_raw)
-        self._lam_hist.append(lam_raw)
+        rv = self._z_score(self._rv_hist, rv_raw)
+
+        dp = 0.0 if self._prev_mid_price is None else float(mid_price) - float(self._prev_mid_price)
+        self._prev_mid_price = float(mid_price)
+        kyle_raw = self._compute_kyle_lambda(dp=dp, flow=float(trade_flow))
+        self._kyle_hist.append(kyle_raw)
+        kyle = self._z_score(self._kyle_hist, kyle_raw)
+
+        spread_raw = (float(ask_price) - float(bid_price)) / max(float(mid_price), 1e-10)
         self._spread_hist.append(spread_raw)
-        self._timb_hist.append(timb_raw)
+        spread = self._z_score(self._spread_hist, spread_raw)
 
-        features = np.array([
-            self._z_score(self._ofi_hist,    ofi_raw),
-            float(np.clip(vwoi_raw, -1.0, 1.0)),
-            self._z_score(self._rv_hist,     rv_raw),
-            self._z_score(self._lam_hist,    lam_raw),
-            self._z_score(self._spread_hist, spread_raw),
-            float(np.clip(timb_raw, -1.0, 1.0)),
-        ], dtype=float)
+        trade_imb = np.sign(float(trade_flow)) * min(abs(float(trade_flow)) / max(total_vol, 1e-10), 1.0)
+        trade_imb = float(np.clip(trade_imb, -1.0, 1.0))
 
-        # --- Production safety assertions ---
-        assert not np.isnan(features).any(), "NaN in microstructure features"
-        assert np.isfinite(features).all(), "Non-finite in microstructure features"
-        assert features.shape == (self.N_FEATURES,), f"Shape mismatch: {features.shape}"
+        return np.asarray([ofi, vwoi, rv, kyle, spread, trade_imb], dtype=float)
 
-        return features
+
+if __name__ == "__main__":
+    import numpy as np
+    eng = MicrostructureFeatureEngine(lookback_bars=50)
+    for i in range(30):
+        feats = eng.update(
+            mid_price=50000.0 + i,
+            bid_price=49999.0 + i,
+            ask_price=50001.0 + i,
+            bid_size=10.0 + i * 0.1,
+            ask_size=9.5 + i * 0.1,
+            trade_flow=float(1 if i % 2 == 0 else -1) * (i + 1),
+            buy_volume=500.0 + i * 5,
+            sell_volume=450.0 + i * 3,
+        )
+    assert feats.shape == (6,), f"Expected shape (6,), got {feats.shape}"
+    assert np.all(np.isfinite(feats)), f"Non-finite features: {feats}"
+    print("MicrostructureFeatureEngine smoke test PASSED:", feats)
