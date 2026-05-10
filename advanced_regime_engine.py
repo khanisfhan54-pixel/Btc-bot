@@ -1965,6 +1965,27 @@ class AdvancedRegimeEngine:
         self._smoothed_garch_prob = self.garch_prob.copy()
         if bool(load_model_weights_on_init):
             self._load_model_weights()
+            # Phase 1 Gate: run health check after weight loading.
+            # Log CRITICAL on any False field so operator is immediately aware.
+            # Does NOT raise — engine remains usable but logged as degraded.
+            if self._weights_loaded:
+                _diag = diagnose_engine_state(self)
+                if not _diag["all_ok"]:
+                    LOGGER.critical(
+                        "AdvancedRegimeEngine post-init health gate FAILED: %s. "
+                        "Engine will run DEGRADED. Fix calibration artifacts before live trading.",
+                        _diag,
+                    )
+                    self._engine_status = "DEGRADED"
+                else:
+                    LOGGER.info(
+                        "AdvancedRegimeEngine post-init health gate PASSED: "
+                        "weights_loaded=%s sjm_valid=%s nhhmm_moments=%s garch_stationary=%s",
+                        _diag["weights_loaded"],
+                        _diag["sjm_centroids_valid"],
+                        _diag["nhhmm_moments_set"],
+                        _diag["garch_stationary"],
+                    )
 
     def _stationary_garch_var(self) -> np.ndarray:
         target_var = float(self.garch.target_vol ** 2)

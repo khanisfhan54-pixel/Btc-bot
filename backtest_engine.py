@@ -579,15 +579,55 @@ class BacktestEngine:
         self,
         ohlcv_data: List[list],
         initial_balance: float | None = None,
-        book_features: Optional[Sequence[Any]] = None,   # FIX-1
+        book_features: Optional[Sequence[Any]] = None,
+        signal_quality_required: bool = False,
+        allow_ohlcv_synthetic: bool = True,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        return self._run_single_pass(
+        if not allow_ohlcv_synthetic:
+            if self.are is None or not getattr(self.are, '_weights_loaded', False):
+                logger.error(
+                    "[BACKTEST] allow_ohlcv_synthetic=False but ARE weights not loaded. "
+                    "Refusing to run — results would be non-production-valid."
+                )
+                return {
+                    "total_trades": 0,
+                    "win_rate": 0.0,
+                    "pnl": 0.0,
+                    "max_drawdown": 0.0,
+                    "sharpe": 0.0,
+                    "expectancy": 0.0,
+                    "trade_log": [],
+                    "signal_quality_valid": False,
+                    "signal_quality_reason": "uncalibrated_are_weights_ohlcv_synthetic_disallowed",
+                }
+
+        result = self._run_single_pass(
             ohlcv_data,
             initial_balance=initial_balance,
             label="run_backtest",
             book_features=book_features,
         )
+
+        if signal_quality_required:
+            total_trades = int(result.get("total_trades", 0))
+            n_bars = len([r for r in (ohlcv_data or []) if isinstance(r, (list, tuple)) and len(r) >= 6])
+            min_signal_rate = 0.005
+            actual_rate = total_trades / max(n_bars, 1)
+            if actual_rate < min_signal_rate and n_bars >= 100:
+                result["signal_quality_valid"] = False
+                result["signal_quality_reason"] = (
+                    f"signal_rate={actual_rate:.4f} below min={min_signal_rate:.4f}; "
+                    "engine may be uncalibrated or all features produce HOLD"
+                )
+            else:
+                result["signal_quality_valid"] = True
+                result["signal_quality_reason"] = f"signal_rate={actual_rate:.4f}"
+        else:
+            result.setdefault("signal_quality_valid", True)
+            result.setdefault("signal_quality_reason", "not_checked")
+
+        return result
 
     def run_backtest_multi_resolution(
         self,
