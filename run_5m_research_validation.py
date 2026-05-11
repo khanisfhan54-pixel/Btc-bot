@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 import json, os
+import math
 import numpy as np
 import pandas as pd
 from bar_aggregator import resample_bars
@@ -74,56 +75,159 @@ def _rewrite_replit(report:str)->None:
     with open("replit.md","w",encoding="utf-8") as f:f.write(prev+report)
 
 
-def main()->None:
-    bars_1m=_load("data/ohlcv_1m.csv"); bars_5m=resample_bars(bars_1m,minutes=5)
-    embargo,train,val,test,step=12,300,120,120,120
-    folds=[]; blockers=[]
-    for fs in range(0,len(bars_5m)-(train+val+test+2*embargo)+1,step):
-        tr0,tr1=fs,fs+train; va0,va1=tr1+embargo,tr1+embargo+val; te0,te1=va1+embargo,va1+embargo+test
-        try:
-            cal=calibrate_5m_artifacts(bars_1m=bars_1m,out_path=f"weights/advanced_regime_weights_5m_fold_{fs}.npz",meta_path=f"weights/advanced_regime_weights_5m_fold_{fs}.meta.json",cal_slice=CalibrationSlice(start_idx=tr0,end_idx=va1))
-        except Exception as e:
-            blockers.append({"fold":fs,"reason":str(e)}); continue
-        base_cfg=BacktestConfig(max_hold_bars=36)
-        sel=_select_threshold(bars_5m[va0:va1],cal["output_path"],base_cfg)
-        cfg5=BacktestConfig(max_hold_bars=36,orchestrator_action_threshold=float(sel["threshold"]))
-        cost5=_cost_basis(cfg5)
-        r5=BacktestEngine(config=cfg5,weight_path=cal["output_path"])._run_single_pass(bars_5m[te0:te1],label=f"5m_test_{fs}")
-        t0,t1=int(bars_5m[te0][0]),int(bars_5m[te1-1][0])
-        slice1=[r for r in bars_1m if t0<=int(r[0])<=t1]
-        cfg1=BacktestConfig(); cost1=_cost_basis(cfg1)
-        r1=BacktestEngine(config=cfg1)._run_single_pass(slice1,label=f"1m_test_{fs}")
-        m5,b5=_compute_metrics(r5,len(bars_5m[te0:te1]),cost5); m1,b1=_compute_metrics(r1,len(slice1),cost1)
-        blockers.extend({"fold":fs,"reason":b} for b in (b5+b1))
-        folds.append({"fold":len(folds),"ranges":{"train":[int(bars_5m[tr0][0]),int(bars_5m[tr1-1][0])],"val":[int(bars_5m[va0][0]),int(bars_5m[va1-1][0])],"test":[t0,t1]},"walk_forward_integrity":True,"calibration_separation":True,"threshold_selection":sel,"baseline_1m":m1,"candidate_5m":m5})
-    if not folds: raise RuntimeError(f"No valid folds produced. blockers={blockers}")
-    def _avg_field(path: tuple[str, str, str]) -> float | None:
-        vals = []
-        for fold in folds:
-            v = fold.get(path[0], {}).get(path[1], {}).get(path[2])
-            if v is not None:
-                vals.append(float(v))
-        return float(np.mean(vals)) if vals else None
+def main() -> None:
+    bars_1m = _load("data/ohlcv_1m.csv")
+    bars_5m_raw = _load("data/ohlcv_5m.csv")
+    bars_5m_resampled = resample_bars(bars_1m, minutes=5)
+    bars_5m = bars_5m_raw if len(bars_5m_raw) >= len(bars_5m_resampled) else bars_5m_resampled
+    print(f"[5m audit] 1m bars: {len(bars_1m)}  5m bars: {len(bars_5m)}")
 
-    def _avg_side(side: str) -> dict:
-        fields = {
-            "trading": ["total_trades", "win_rate", "profit_factor", "expectancy", "sharpe", "max_drawdown", "average_return_per_trade", "average_holding_time", "turnover"],
-            "signals": ["LONG_count", "SHORT_count", "HOLD_count", "signal_coverage", "directional_precision", "macro_f1"],
-            "regimes": ["regime_entropy", "regime_persistence", "transition_frequency", "trend_vs_range_ratio"],
-            "costs": ["gross_expectancy", "net_expectancy", "fee_burden", "slippage_burden", "edge_after_costs"],
-        }
-        return {section: {k: _avg_field((side, section, k)) for k in keys} for section, keys in fields.items()}
+    cal_result = None
+    cal_blocker = None
+    try:
+        cal_result = calibrate_5m_artifacts(
+            bars_1m=bars_1m,
+            out_path="weights/advanced_regime_weights_5m.npz",
+            meta_path="weights/advanced_regime_weights_5m.meta.json",
+        )
+        print(f"[5m audit] calibration OK: n_bars_used={cal_result['n_bars_used']}")
+    except Exception as e:
+        cal_blocker = str(e)
+        print(f"[5m audit] BLOCKER — calibration failed: {cal_blocker}")
+        print("  Continuing with default weights for comparison only.")
 
-    avg1 = _avg_side("baseline_1m")
-    def _delta(a: float | None, b: float | None) -> float | None:
-        return (a - b) if (a is not None and b is not None) else None
-    avg5 = _avg_side("candidate_5m")
-    deltas={"delta_profit_factor":_delta(avg5["trading"]["profit_factor"],avg1["trading"]["profit_factor"]),"delta_expectancy":_delta(avg5["trading"]["expectancy"],avg1["trading"]["expectancy"]),"delta_sharpe":_delta(avg5["trading"]["sharpe"],avg1["trading"]["sharpe"]),"delta_max_drawdown":_delta(avg5["trading"]["max_drawdown"],avg1["trading"]["max_drawdown"]),"delta_signal_coverage":_delta(avg5["signals"]["signal_coverage"],avg1["signals"]["signal_coverage"]),"delta_regime_entropy":_delta(avg5["regimes"]["regime_entropy"],avg1["regimes"]["regime_entropy"]),"delta_macro_f1":None,"delta_net_edge_after_costs":_delta(avg5["costs"]["edge_after_costs"],avg1["costs"]["edge_after_costs"])}
-    verdict="STILL UNTRADABLE" if avg5["costs"]["net_expectancy"]<=0 else "PROMISING BUT WEAK"
-    out={"run_id":{"start_ts":int(bars_5m[0][0]),"end_ts":int(bars_5m[-1][0]),"fold_count":len(folds)},"summary":"Research-only 5m walk-forward audit vs 1m baseline on matched windows.","metrics_table":{"baseline_1m":avg1,"candidate_5m":avg5,"comparison":deltas},"regime_analysis":{"baseline_1m":avg1["regimes"],"candidate_5m":avg5["regimes"]},"cost_analysis":{"baseline_1m":avg1["costs"],"candidate_5m":avg5["costs"]},"walk_forward_validation_quality":{"chronological":True,"embargo_bars":embargo,"calibration_separation":True,"production_parity":False},"files":{"inputs":["data/ohlcv_1m.csv","data/bookDepth.csv"],"outputs":["audit_output/5m_walk_forward_results.json","backtest_summary.json","replit.md"]},"blockers":blockers,"fold_results":folds,"final_verdict":verdict}
-    os.makedirs("audit_output",exist_ok=True)
-    json.dump(out,open("audit_output/5m_walk_forward_results.json","w",encoding="utf-8"),indent=2,sort_keys=True)
-    json.dump(out,open("backtest_summary.json","w",encoding="utf-8"),indent=2,sort_keys=True)
-    _rewrite_replit(f"## 5m walk-forward validation\n\n- mode: research_only\n- folds: {len(folds)}\n- final verdict: {verdict}\n")
+    weight_path = cal_result["output_path"] if cal_result else "weights/advanced_regime_weights.npz"
+
+    base_cfg = BacktestConfig(fee_bps=8.0, slippage_bps=3.0, max_hold_bars=12, orchestrator_action_threshold=0.60)
+    cost = _cost_basis(base_cfg)
+
+    engine_A = BacktestEngine(config=base_cfg, weight_path=weight_path)
+    result_A = engine_A._run_single_pass(bars_5m, label="5m_fixed_horizon")
+    metrics_A, blockers_A = _compute_metrics(result_A, len(bars_5m), cost)
+
+    regime_cfg = BacktestConfig(
+        fee_bps=8.0, slippage_bps=3.0, max_hold_bars=12, orchestrator_action_threshold=0.60,
+        regime_hold_horizon_bars={"CHOPPY": 4, "COMPRESSION": 4, "RANGING": 6, "RANGE": 6, "TREND": 20, "BULL": 20, "BEAR": 8, "TOXIC": 2},
+    )
+    engine_B = BacktestEngine(config=regime_cfg, weight_path=weight_path)
+    result_B = engine_B._run_single_pass(bars_5m, label="5m_regime_horizon")
+    cost_B = _cost_basis(regime_cfg)
+    metrics_B, blockers_B = _compute_metrics(result_B, len(bars_5m), cost_B)
+
+    cfg_1m = BacktestConfig(fee_bps=8.0, slippage_bps=3.0, max_hold_bars=12, orchestrator_action_threshold=0.60)
+    cost_1m = _cost_basis(cfg_1m)
+    engine_C = BacktestEngine(config=cfg_1m)
+    result_C = engine_C._run_single_pass(bars_1m, label="1m_baseline")
+    metrics_C, blockers_C = _compute_metrics(result_C, len(bars_1m), cost_1m)
+
+    engine_D = BacktestEngine(config=base_cfg, weight_path=weight_path)
+    result_D_multi = engine_D.run_backtest_multi_resolution(bars_1m[:3000])
+    result_D = result_D_multi.get("5m", {})
+    metrics_D, blockers_D = _compute_metrics(result_D, result_D.get("bars", 0), cost)
+
+    all_blockers = []
+    if cal_blocker:
+        all_blockers.append({"pass": "calibration", "reason": cal_blocker})
+    for b in (blockers_A + blockers_B + blockers_C + blockers_D):
+        all_blockers.append(b)
+
+    def _verdict(m: dict) -> str:
+        net = m.get("costs", {}).get("net_expectancy", None)
+        if net is None:
+            return "INCONCLUSIVE"
+        return "UNTRADABLE" if net <= 0 else "PROMISING"
+
+    output = {
+        "run_timestamp": _utc_now(),
+        "cost_basis": cost,
+        "calibration": {"status": "ok" if cal_result else "failed", "n_bars_used": cal_result["n_bars_used"] if cal_result else None, "output_path": weight_path, "blocker": cal_blocker},
+        "passes": {
+            "A_5m_fixed_horizon": {"metrics": metrics_A, "verdict": _verdict(metrics_A)},
+            "B_5m_regime_conditioned": {"metrics": metrics_B, "verdict": _verdict(metrics_B)},
+            "C_1m_baseline": {"metrics": metrics_C, "verdict": _verdict(metrics_C)},
+            "D_5m_multi_resolution": {"metrics": metrics_D, "raw": result_D_multi},
+        },
+        "comparison": {
+            "fixed_vs_regime_conditioned": {
+                "delta_profit_factor": _safe_delta(metrics_B, metrics_A, "trading", "profit_factor"),
+                "delta_net_expectancy": _safe_delta(metrics_B, metrics_A, "costs", "net_expectancy"),
+                "delta_max_drawdown": _safe_delta(metrics_B, metrics_A, "trading", "max_drawdown"),
+                "delta_win_rate": _safe_delta(metrics_B, metrics_A, "trading", "win_rate"),
+            },
+            "5m_fixed_vs_1m_baseline": {
+                "delta_profit_factor": _safe_delta(metrics_A, metrics_C, "trading", "profit_factor"),
+                "delta_net_expectancy": _safe_delta(metrics_A, metrics_C, "costs", "net_expectancy"),
+            },
+        },
+        "required_output_fields": {
+            "LONG_count": metrics_A.get("signals", {}).get("LONG_count"),
+            "SHORT_count": metrics_A.get("signals", {}).get("SHORT_count"),
+            "HOLD_count": metrics_A.get("signals", {}).get("HOLD_count"),
+            "signal_coverage": metrics_A.get("signals", {}).get("signal_coverage"),
+            "win_rate": metrics_A.get("trading", {}).get("win_rate"),
+            "profit_factor": metrics_A.get("trading", {}).get("profit_factor"),
+            "expectancy": metrics_A.get("trading", {}).get("expectancy"),
+            "sharpe": metrics_A.get("trading", {}).get("sharpe"),
+            "max_drawdown": metrics_A.get("trading", {}).get("max_drawdown"),
+            "average_return": metrics_A.get("trading", {}).get("average_return_per_trade"),
+            "average_holding_time": metrics_A.get("trading", {}).get("average_holding_time"),
+            "regime_distribution": metrics_A.get("regimes"),
+            "regime_entropy": metrics_A.get("regimes", {}).get("regime_entropy"),
+            "regime_persistence": metrics_A.get("regimes", {}).get("regime_persistence"),
+            "cost_assumptions": cost,
+            "forward_horizon_used": base_cfg.max_hold_bars,
+        },
+        "blockers": all_blockers,
+    }
+    os.makedirs("audit_output", exist_ok=True)
+    json.dump(output, open("audit_output/5m_walk_forward_results.json", "w"), indent=2)
+    json.dump(output, open("backtest_summary.json", "w"), indent=2)
+    _rewrite_replit(_build_markdown_report(output))
+    print("[5m audit] Done. See backtest_summary.json and replit.md")
+
+
+def _utc_now() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _safe_delta(m_new: dict, m_base: dict, section: str, field: str) -> Optional[float]:
+    try:
+        a = float(m_new[section][field])
+        b = float(m_base[section][field])
+        if math.isfinite(a) and math.isfinite(b):
+            return round(a - b, 6)
+    except (KeyError, TypeError, ValueError):
+        pass
+    return None
+
+
+def _build_markdown_report(output: dict) -> str:
+    lines = ["## 5m architecture audit — four-pass comparison", ""]
+    lines.append(f"Run: {output.get('run_timestamp', 'unknown')}")
+    lines.append("")
+    cal = output.get("calibration", {})
+    lines.append(f"**Calibration:** {cal.get('status')}  n_bars_used={cal.get('n_bars_used')}  weight_path={cal.get('output_path')}")
+    if cal.get("blocker"):
+        lines.append(f"> BLOCKER: {cal['blocker']}")
+    lines.append("")
+    for pass_id, data in output.get("passes", {}).items():
+        v = data.get("verdict", "?")
+        m = data.get("metrics", {})
+        tr = m.get("trading", {})
+        lines.append(f"### {pass_id} — {v}")
+        lines.append(f"- trades: {tr.get('total_trades')}  win_rate: {tr.get('win_rate')}  PF: {tr.get('profit_factor')}  maxDD: {tr.get('max_drawdown')}")
+        lines.append("")
+    comp = output.get("comparison", {}).get("fixed_vs_regime_conditioned", {})
+    lines.append("### regime-conditioned vs fixed delta")
+    for k, v in comp.items():
+        lines.append(f"- {k}: {v}")
+    lines.append("")
+    blockers = output.get("blockers", [])
+    if blockers:
+        lines.append(f"**Blockers ({len(blockers)}):**")
+        for b in blockers:
+            lines.append(f"- {b}")
+    return "\n".join(lines) + "\n"
 
 if __name__=="__main__":main()

@@ -855,18 +855,22 @@ def compute_hmm_regime(
         if score_val < 0.0:
             LOGGER.warning("compute_hmm_regime: negative score detected key=%s value=%.6f action=clamp_to_zero", score_key, score_val)
             score_map[score_key] = 0.0
-    score_sum = float(sum(score_map.values()))
-    if np.isfinite(score_sum) and abs(score_sum - 1.0) > 0.10:
-        LOGGER.warning("compute_hmm_regime: score sum out-of-band sum=%.6f", score_sum)
-    if np.isfinite(score_sum) and score_sum > 0.0:
-        score_map = {k: v / score_sum for k, v in score_map.items()}
-    score_sum = float(sum(score_map.values()))
-    if not np.isfinite(score_sum) or score_sum <= 0.0:
-        LOGGER.error("compute_hmm_regime: invalid score sum=%.6f using uniform fallback", score_sum)
-        score_map = {"TREND": 0.25, "BEAR": 0.25, "RANGE": 0.25, "TOXIC": 0.25}
-        score_sum = 1.0
+    # --- Safe normalization (replaces the previous two-step if/if pattern) ---
+    _raw_sum = float(sum(score_map.values()))
+    if np.isfinite(_raw_sum) and _raw_sum > 1e-12:
+        score_map = {k: v / _raw_sum for k, v in score_map.items()}
+        if abs(_raw_sum - 1.0) > 0.10:
+            LOGGER.warning(
+                "compute_hmm_regime: score sum was out-of-band (%.6f) — "
+                "normalized to 1.0.", _raw_sum
+            )
     else:
-        score_sum = 1.0
+        LOGGER.error(
+            "compute_hmm_regime: invalid score sum=%.6f — "
+            "falling back to uniform distribution.", _raw_sum
+        )
+        score_map = {"TREND": 0.25, "BEAR": 0.25, "RANGE": 0.25, "TOXIC": 0.25}
+
     max_score = max(score_map.values())
     tied_labels = [label for label, score in score_map.items() if abs(score - max_score) <= 1e-12]
     tie_priority = {"TOXIC": 0, "TREND": 1, "BEAR": 2, "RANGE": 3}
@@ -5264,6 +5268,14 @@ class AdvancedRegimeEngine:
                     sjm_probs[0] *= non_crisis_scale
                     sjm_probs[1] *= non_crisis_scale
                     sjm_probs[2] *= (1.0 + 0.9 * shock_intensity)
+                # Explicit guard: ensure the sum is positive before delegating to _normalize_prob_vector
+                _shock_sum = float(sjm_probs.sum())
+                if not (np.isfinite(_shock_sum) and _shock_sum > 1e-12):
+                    LOGGER.warning(
+                        "update: IGARCH shock blending produced near-zero or non-finite "
+                        "probability sum=%.6f — resetting to uniform.", _shock_sum
+                    )
+                    sjm_probs = np.ones(self.K, dtype=float) / self.K
                 sjm_probs = _normalize_prob_vector(sjm_probs)
                 sjm_state = int(np.argmax(sjm_probs))
 

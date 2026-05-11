@@ -243,6 +243,12 @@ class BacktestConfig:
     # orchestrator path is skipped entirely (legacy diagnostic-only mode).
     legacy_mode: bool = False
     weight_path: str = "weights/advanced_regime_weights.npz"
+    # Optional per-regime hold-horizon override (research validation only).
+    # Dict maps regime label strings to bar counts. When absent or when the
+    # current regime label is not found, max_hold_bars is used unchanged.
+    # Example: {"CHOPPY": 4, "COMPRESSION": 4, "RANGING": 6, "TREND": 20}
+    # Do NOT set this field in any live or paper trading configuration.
+    regime_hold_horizon_bars: Optional[Dict[str, int]] = None
 
 
 class BacktestEngine:
@@ -591,6 +597,24 @@ class BacktestEngine:
     # ------------------------------------------------------------------
     # Main entry points
     # ------------------------------------------------------------------
+    def _resolve_hold_horizon(self, regime_label: str) -> int:
+        """
+        Return the active hold-horizon bar count for the given regime label.
+
+        Uses regime_hold_horizon_bars when configured; falls back to
+        max_hold_bars when the mapping is absent or the label is not found.
+
+        This method is for research validation only. Live paths do not call it.
+        """
+        mapping = getattr(self.cfg, "regime_hold_horizon_bars", None)
+        if mapping and isinstance(mapping, dict):
+            label = str(regime_label).upper().strip()
+            if label in mapping:
+                horizon = int(mapping[label])
+                if horizon > 0:
+                    return horizon
+        return int(self.cfg.max_hold_bars)
+
     def run_backtest(
         self,
         ohlcv_data: List[list],
@@ -1146,7 +1170,8 @@ class BacktestEngine:
                 (side == "LONG"  and orch_action_str == "SHORT")
                 or (side == "SHORT" and orch_action_str == "LONG")
             )
-            timeout = hold >= self.cfg.max_hold_bars
+            active_horizon = self._resolve_hold_horizon(str(signal.get("regime", "UNKNOWN")))
+            timeout = hold >= active_horizon
 
             if hit_sl or hit_tp or flip or timeout:
                 gross_pnl_pct = ((current_price - entry) / entry) if side == "LONG" else ((entry - current_price) / entry)

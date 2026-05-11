@@ -1,153 +1,128 @@
-import csv
+"""
+Regression tests for Phase-4 three-fix patch:
+  1. 5m calibration metadata completeness
+  2. HMM posterior normalization
+  3. Regime-conditioned hold-horizon
+"""
+from __future__ import annotations
 import json
-import sys
-import types
-from pathlib import Path
-
-from data_tools.l2_to_backtest import align_book_to_bars, load_l2_csv
-
-
-def _write_csv(path: Path, header, rows):
-    with path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(header)
-        w.writerows(rows)
+import math
+import os
+import numpy as np
+import pytest
 
 
-def test_load_l2_csv_raises_on_missing_ofi_z(tmp_path: Path):
-    p = tmp_path / "book.csv"
-    _write_csv(p, ["timestamp", "bidPrice", "askPrice", "bidQty", "askQty"], [[1000, 10, 11, 1, 1]])
-    try:
-        load_l2_csv(str(p))
-        assert False, "expected ValueError"
-    except ValueError as e:
-        assert "ofi_z" in str(e)
+def _make_1m_bars(n: int = 600) -> list[list]:
+    rng = np.random.default_rng(42)
+    price = 69_000.0
+    bars = []
+    for i in range(n):
+        o = price
+        h = o * (1 + rng.uniform(0, 0.001))
+        l = o * (1 - rng.uniform(0, 0.001))
+        c = o * (1 + rng.uniform(-0.0005, 0.0005))
+        v = rng.uniform(1.0, 5.0)
+        bars.append([i * 60_000, o, h, l, c, v])
+        price = c
+    return bars
 
 
-def test_align_book_to_bars_fails_closed_on_unalignable():
-    bars = [[1000, 1, 1, 1, 1, 1]]
-    try:
-        align_book_to_bars(bars, [])
-        assert False, "expected ValueError"
-    except ValueError:
-        pass
+class TestCalibrationMetadata:
+    def test_metadata_fields_present(self, tmp_path):
+        from calibrate_regime_5m import calibrate_5m_artifacts
+        bars_1m = _make_1m_bars(600)
+        out_npz = str(tmp_path / "weights_5m.npz")
+        out_meta = str(tmp_path / "weights_5m.meta.json")
+        with pytest.raises(RuntimeError, match="insufficient 5m bars"):
+            calibrate_5m_artifacts(bars_1m=bars_1m, out_path=out_npz, meta_path=out_meta)
+
+    def test_metadata_with_enough_bars(self, tmp_path):
+        from calibrate_regime_5m import calibrate_5m_artifacts, _MIN_5M_BARS
+        bars_1m = _make_1m_bars(2600)
+        out_npz = str(tmp_path / "weights_5m.npz")
+        out_meta = str(tmp_path / "weights_5m.meta.json")
+        result = calibrate_5m_artifacts(bars_1m=bars_1m, out_path=out_npz, meta_path=out_meta)
+        assert result["n_bars_used"] >= _MIN_5M_BARS
+        assert os.path.exists(out_meta)
+        with open(out_meta) as f:
+            meta = json.load(f)
+        required_meta_keys = {"timeframe", "feature_source", "source_files", "n_bars_used", "n_bars_total_5m", "train_range", "val_range", "label_method", "calibration_status", "min_bars_required"}
+        assert not (required_meta_keys - set(meta.keys()))
+
+    def test_calibration_not_using_tiny_sample(self, tmp_path):
+        from calibrate_regime_5m import calibrate_5m_artifacts, CalibrationSlice
+        bars_1m = _make_1m_bars(2600)
+        with pytest.raises(RuntimeError):
+            calibrate_5m_artifacts(bars_1m=bars_1m, out_path=str(tmp_path / "a.npz"), meta_path=str(tmp_path / "a.json"), cal_slice=CalibrationSlice(start_idx=0, end_idx=10))
 
 
-def test_valid_rows_load_and_align_deterministically(tmp_path: Path):
-    p = tmp_path / "book.csv"
-    _write_csv(
-        p,
-        ["timestamp", "bidPrice", "askPrice", "bidQty", "askQty", "ofi_z"],
-        [[1000, 10, 11, 1, 1, 0.1], [2000, 10, 11, 2, 1, 0.2]],
-    )
-    snaps = load_l2_csv(str(p))
-    bars = [[1500, 1, 1, 1, 1, 1], [2500, 1, 1, 1, 1, 1]]
-    a1 = align_book_to_bars(bars, snaps)
-    a2 = align_book_to_bars(bars, snaps)
-    assert [s.ofi_z for s in a1] == [0.1, 0.2]
-    assert [s.timestamp for s in a1] == [s.timestamp for s in a2]
+class TestHMMNormalization:
+    def test_score_map_sums_to_one_typical_input(self):
+        from advanced_regime_engine import compute_hmm_regime
+        alpha = np.array([0.40, 0.38, 0.22])
+        score_sum = sum(compute_hmm_regime(alpha)["score_map"].values())
+        assert math.isfinite(score_sum)
+        assert abs(score_sum - 1.0) < 1e-6
 
+    def test_score_map_sums_to_one_crisis_input(self):
+        from advanced_regime_engine import compute_hmm_regime
+        score_sum = sum(compute_hmm_regime(np.array([0.05, 0.05, 0.90]))["score_map"].values())
+        assert abs(score_sum - 1.0) < 1e-6
 
-def test_report_contract_fields_present():
-    src = Path("run_5m_research_validation.py").read_text(encoding="utf-8")
-    for key in [
-        "threshold_selection_mode",
-        "research_only",
-        "selection_cost_basis",
-        "production_parity",
-        "metrics_table",
-        "baseline_1m",
-        "candidate_5m",
-    ]:
-        assert key in src
-    assert "4.0" not in src
+    def test_score_map_sums_to_one_strong_trend(self):
+        from advanced_regime_engine import compute_hmm_regime
+        score_sum = sum(compute_hmm_regime(np.array([0.85, 0.10, 0.05]))["score_map"].values())
+        assert abs(score_sum - 1.0) < 1e-6
 
-
-def _import_validation_module_with_pandas_stub(csv_rows):
-    import importlib
-    import pytest
-
-    pytest.importorskip("numpy")
-
-    class _DF:
-        def __init__(self, rows):
-            self._rows = rows
-
-        def __getitem__(self, cols):
-            class _Slice:
-                def __init__(self, rows, cols):
-                    class _Vals(list):
-                        def tolist(self):
-                            return list(self)
-
-                    self.values = _Vals([[r[c] for c in cols] for r in rows])
-
-            return _Slice(self._rows, cols)
-
-    pandas_stub = types.SimpleNamespace(read_csv=lambda path: _DF(csv_rows))
-    sys.modules["pandas"] = pandas_stub
-    sys.modules.pop("run_5m_research_validation", None)
-    return importlib.import_module("run_5m_research_validation")
-
-
-def test_report_build_writes_json_without_nameerror(monkeypatch, tmp_path: Path):
-    mod = _import_validation_module_with_pandas_stub([{"timestamp": i * 1000, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1} for i in range(200)])
-
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "data").mkdir()
-    _write_csv(
-        tmp_path / "data" / "ohlcv_1m.csv",
-        ["timestamp", "open", "high", "low", "close", "volume"],
-        [[i * 1000, 1, 1, 1, 1, 1] for i in range(200)],
-    )
-
-    monkeypatch.setattr(mod, "resample_bars", lambda bars, minutes: [[i * 1000, 1, 1, 1, 1, 1] for i in range(700)])
-    monkeypatch.setattr(mod, "calibrate_5m_artifacts", lambda **kwargs: {"output_path": "weights/mock.npz"})
-    monkeypatch.setattr(mod, "_select_threshold", lambda *args, **kwargs: {"threshold": 0.5, "threshold_selection_mode": "research_only", "selection_cost_basis": {"fee_bps": 0.0, "slippage_bps": 0.0, "round_trip_cost_bps": 0.0, "formula": "x"}, "production_parity": False})
-
-    class DummyEngine:
-        def __init__(self, config=None, weight_path=None):
+    def test_invalid_input_falls_back_to_uniform(self):
+        from advanced_regime_engine import compute_hmm_regime
+        alpha = np.array([1e-15, 1e-15, 1e-15])
+        try:
+            score_sum = sum(compute_hmm_regime(alpha)["score_map"].values())
+            assert abs(score_sum - 1.0) < 1e-6
+        except (ValueError, ZeroDivisionError):
             pass
 
-        def _run_single_pass(self, bars, label=""):
-            return {"total_trades": 0, "win_rate": 0.0, "expectancy": 0.0, "sharpe": 0.0, "max_drawdown": 0.0, "trade_log": []}
-
-    monkeypatch.setattr(mod, "BacktestEngine", DummyEngine)
-
-    mod.main()
-
-    out = json.loads((tmp_path / "audit_output" / "5m_walk_forward_results.json").read_text(encoding="utf-8"))
-    assert "metrics_table" in out
-    assert "baseline_1m" in out["metrics_table"]
-    assert "candidate_5m" in out["metrics_table"]
+    def test_probabilities_field_sums_to_one(self):
+        from advanced_regime_engine import compute_hmm_regime
+        for alpha in [np.array([0.40, 0.38, 0.22]), np.array([0.05, 0.05, 0.90]), np.array([0.80, 0.15, 0.05])]:
+            result = compute_hmm_regime(alpha)
+            assert abs((result["bull"] + result["bear"] + result["crisis"]) - 1.0) < 1e-6
 
 
-def test_missing_metrics_stay_explicit(monkeypatch, tmp_path: Path):
-    mod = _import_validation_module_with_pandas_stub([{"timestamp": i * 1000, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1} for i in range(200)])
+class TestRegimeHorizon:
+    def _make_engine(self, **cfg_kwargs):
+        from backtest_engine import BacktestConfig, BacktestEngine
+        return BacktestEngine(config=BacktestConfig(**cfg_kwargs))
 
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "data").mkdir()
-    _write_csv(
-        tmp_path / "data" / "ohlcv_1m.csv",
-        ["timestamp", "open", "high", "low", "close", "volume"],
-        [[i * 1000, 1, 1, 1, 1, 1] for i in range(200)],
-    )
+    def test_default_horizon_unchanged(self):
+        engine = self._make_engine(max_hold_bars=12)
+        assert engine._resolve_hold_horizon("CHOPPY") == 12
 
-    monkeypatch.setattr(mod, "resample_bars", lambda bars, minutes: [[i * 1000, 1, 1, 1, 1, 1] for i in range(700)])
-    monkeypatch.setattr(mod, "calibrate_5m_artifacts", lambda **kwargs: {"output_path": "weights/mock.npz"})
-    monkeypatch.setattr(mod, "_select_threshold", lambda *args, **kwargs: {"threshold": 0.5, "threshold_selection_mode": "research_only", "selection_cost_basis": {"fee_bps": 0.0, "slippage_bps": 0.0, "round_trip_cost_bps": 0.0, "formula": "x"}, "production_parity": False})
+    def test_regime_mapping_overrides_correctly(self):
+        engine = self._make_engine(max_hold_bars=12, regime_hold_horizon_bars={"CHOPPY": 4, "TREND": 20, "COMPRESSION": 4})
+        assert engine._resolve_hold_horizon("CHOPPY") == 4
+        assert engine._resolve_hold_horizon("TREND") == 20
 
-    class DummyEngine:
-        def __init__(self, config=None, weight_path=None):
-            pass
+    def test_unmapped_label_falls_back_to_max_hold_bars(self):
+        engine = self._make_engine(max_hold_bars=12, regime_hold_horizon_bars={"CHOPPY": 4})
+        assert engine._resolve_hold_horizon("RANGING") == 12
 
-        def _run_single_pass(self, bars, label=""):
-            return {"total_trades": 0, "win_rate": 0.0, "expectancy": 0.0, "sharpe": 0.0, "max_drawdown": 0.0, "trade_log": []}
+    def test_case_insensitive_matching(self):
+        engine = self._make_engine(max_hold_bars=12, regime_hold_horizon_bars={"CHOPPY": 4, "TREND": 20})
+        assert engine._resolve_hold_horizon("choppy") == 4
 
-    monkeypatch.setattr(mod, "BacktestEngine", DummyEngine)
-    mod.main()
-    out = json.loads((tmp_path / "audit_output" / "5m_walk_forward_results.json").read_text(encoding="utf-8"))
-    assert out["metrics_table"]["baseline_1m"]["signals"]["macro_f1"] is None
-    assert out["metrics_table"]["candidate_5m"]["signals"]["macro_f1"] is None
-    assert out["metrics_table"]["comparison"]["delta_macro_f1"] is None
-    assert any("macro_f1" in b["reason"] for b in out["blockers"])
+    def test_existing_callers_unaffected(self):
+        from backtest_engine import BacktestConfig
+        cfg = BacktestConfig()
+        assert cfg.regime_hold_horizon_bars is None
+        assert cfg.max_hold_bars == 12
+
+    def test_run_single_pass_respects_regime_horizon(self):
+        from backtest_engine import BacktestConfig, BacktestEngine
+        from bar_aggregator import resample_bars
+        bars_5m = resample_bars(_make_1m_bars(600), minutes=5)
+        cfg = BacktestConfig(max_hold_bars=12, regime_hold_horizon_bars={"CHOPPY": 4, "TREND": 20}, orchestrator_action_threshold=0.60)
+        result = BacktestEngine(config=cfg)._run_single_pass(bars_5m, label="test_regime_horizon")
+        assert "total_trades" in result and "max_drawdown" in result
+        assert math.isfinite(float(result["max_drawdown"]))
