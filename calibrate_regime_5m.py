@@ -71,57 +71,122 @@ def _snapshot_ts(s: Any) -> int:
     return int(getattr(s, "timestamp", 0))
 
 
-def _build_5m_features(bars_5m: Sequence[Sequence[Any]], bars_1m: Sequence[Sequence[Any]]) -> tuple[np.ndarray, str, bool]:
+def _build_5m_features(
+    bars_5m: Sequence[Sequence[Any]],
+    bars_1m: Sequence[Sequence[Any]],
+) -> tuple[np.ndarray, str, bool]:
+    """
+    Build 5m feature matrix using ONLY real L1 book data.
+    Fails closed with a BLOCKER: RuntimeError if the real book source
+    is missing, malformed, unaligned, or produces non-finite OFI values.
+    The synthetic OHLCV fallback has been intentionally removed.
+    """
     closes = np.asarray([float(r[4]) for r in bars_5m], dtype=float)
-    opens = np.asarray([float(r[1]) for r in bars_5m], dtype=float)
     vols = np.asarray([float(r[5]) for r in bars_5m], dtype=float)
-    log_ret = np.diff(np.log(np.clip(closes, 1e-12, None)), prepend=np.log(max(closes[0], 1e-12)))
+    log_ret = np.diff(
+        np.log(np.clip(closes, 1e-12, None)),
+        prepend=np.log(max(closes[0], 1e-12)),
+    )
     vol_z = (vols - vols.mean()) / (vols.std() + 1e-12)
 
-    used_real_l1 = False
-    feature_source = "ohlcv_synthetic"
-    ofi_z = None
+    if not os.path.exists(_L1_BOOK_PATH):
+        raise RuntimeError(
+            f"BLOCKER: real L1 book file missing at '{_L1_BOOK_PATH}'. "
+            "Fetch data/bookTicker_dec2023_30s.csv before running calibration."
+        )
 
-    if os.path.exists(_L1_BOOK_PATH):
-        try:
-            l1 = pd.read_csv(_L1_BOOK_PATH)
-            required = {"timestamp", "bidPrice", "askPrice", "bidQty", "askQty"}
-            if required.issubset(set(l1.columns)):
-                bid_qty = l1["bidQty"].astype(float).to_numpy()
-                ask_qty = l1["askQty"].astype(float).to_numpy()
-                imbalance = (bid_qty - ask_qty) / (bid_qty + ask_qty + 1e-12)
-                imb_s = pd.Series(imbalance)
-                roll_mean = imb_s.rolling(60, min_periods=5).mean()
-                roll_std = imb_s.rolling(60, min_periods=5).std()
-                ofi_vals = ((imb_s - roll_mean) / (roll_std + 1e-12)).fillna(0.0).to_numpy(dtype=float)
-                bid_price = l1["bidPrice"].astype(float).to_numpy()
-                ask_price = l1["askPrice"].astype(float).to_numpy()
-                ts = l1["timestamp"].astype(np.int64).to_numpy()
-                snaps = []
-                for i in range(len(l1)):
-                    mid = max((bid_price[i] + ask_price[i]) * 0.5, 1e-12)
-                    spread_bps = ((ask_price[i] - bid_price[i]) / mid) * 1e4
-                    snaps.append(_L1Snap(int(ts[i]), float(bid_price[i]), float(ask_price[i]), float(bid_qty[i]), float(ask_qty[i]), float(spread_bps), float(imbalance[i]), float(ofi_vals[i])))
-                snaps_5m = align_book_to_bars(bars_5m, snaps)
-                if len(snaps_5m) >= _MIN_5M_BARS and len(snaps_5m) == len(bars_5m) and not any(s is None for s in snaps_5m):
-                    ofi_z = np.asarray([_snapshot_ofi(s) for s in snaps_5m], dtype=float)
-                    used_real_l1 = True
-                    feature_source = "real_l1_aligned"
-        except Exception:
-            used_real_l1 = False
+    try:
+        l1 = pd.read_csv(_L1_BOOK_PATH)
+    except Exception as exc:
+        raise RuntimeError(
+            f"BLOCKER: real L1 book file unreadable — {exc}. "
+            f"File path: '{_L1_BOOK_PATH}'."
+        ) from exc
 
-    if ofi_z is None:
-        print("calibrate_regime_5m: real L1 unavailable — using OHLCV synthetic features.")
-        signed_ret = np.sign(closes - opens) * np.abs(log_ret)
-        s = pd.Series(signed_ret)
-        roll_mean = s.rolling(20, min_periods=5).mean()
-        roll_std = s.rolling(20, min_periods=5).std()
-        ofi_z = ((s - roll_mean) / (roll_std + 1e-12)).fillna(0.0).to_numpy(dtype=float)
+    required_cols = {"timestamp", "bidPrice", "askPrice", "bidQty", "askQty"}
+    missing_cols = required_cols - set(l1.columns)
+    if missing_cols:
+        raise RuntimeError(
+            f"BLOCKER: real L1 book file malformed — missing columns: {missing_cols}. "
+            f"Found columns: {list(l1.columns)}. File: '{_L1_BOOK_PATH}'."
+        )
+
+    if len(l1) == 0:
+        raise RuntimeError(
+            f"BLOCKER: real L1 book file is empty — 0 rows. File: '{_L1_BOOK_PATH}'."
+        )
+
+    bid_qty = l1["bidQty"].astype(float).to_numpy()
+    ask_qty = l1["askQty"].astype(float).to_numpy()
+    bid_price = l1["bidPrice"].astype(float).to_numpy()
+    ask_price = l1["askPrice"].astype(float).to_numpy()
+    ts_raw = l1["timestamp"].astype(np.int64).to_numpy()
+
+    imbalance = (bid_qty - ask_qty) / (bid_qty + ask_qty + 1e-12)
+    imb_s = pd.Series(imbalance)
+    roll_mean = imb_s.rolling(60, min_periods=5).mean()
+    roll_std = imb_s.rolling(60, min_periods=5).std()
+    ofi_vals = ((imb_s - roll_mean) / (roll_std + 1e-12)).fillna(0.0).to_numpy(dtype=float)
+
+    snaps = []
+    for i in range(len(l1)):
+        mid = max((bid_price[i] + ask_price[i]) * 0.5, 1e-12)
+        spread_bps = ((ask_price[i] - bid_price[i]) / mid) * 1e4
+        snaps.append(
+            _L1Snap(
+                int(ts_raw[i]),
+                float(bid_price[i]),
+                float(ask_price[i]),
+                float(bid_qty[i]),
+                float(ask_qty[i]),
+                float(spread_bps),
+                float(imbalance[i]),
+                float(ofi_vals[i]),
+            )
+        )
+
+    try:
+        snaps_5m = align_book_to_bars(bars_5m, snaps)
+    except Exception as exc:
+        raise RuntimeError(
+            f"BLOCKER: L1 book alignment failed — {exc}. "
+            "Check that bookTicker timestamps overlap with the 5m bar range."
+        ) from exc
+
+    if len(snaps_5m) < _MIN_5M_BARS:
+        raise RuntimeError(
+            f"BLOCKER: insufficient aligned L1 book snaps — got {len(snaps_5m)}, "
+            f"need >= {_MIN_5M_BARS}. Verify the book file covers Dec 2023."
+        )
+
+    if len(snaps_5m) != len(bars_5m):
+        raise RuntimeError(
+            f"BLOCKER: aligned snapshot count {len(snaps_5m)} != bar count {len(bars_5m)}. "
+            "Alignment produced a ragged output; check bar timestamps."
+        )
+
+    if any(s is None for s in snaps_5m):
+        raise RuntimeError(
+            "BLOCKER: alignment produced None entries — some bars have no book snapshot. "
+            "Verify the L1 file covers the full Dec 2023 period."
+        )
+
+    ofi_z = np.asarray([_snapshot_ofi(s) for s in snaps_5m], dtype=float)
+
+    if not np.all(np.isfinite(ofi_z)):
+        n_bad = int(np.sum(~np.isfinite(ofi_z)))
+        raise RuntimeError(
+            f"BLOCKER: OFI values contain {n_bad} non-finite entries after alignment. "
+            "Check the L1 book CSV for corrupt rows."
+        )
 
     X = np.column_stack([log_ret, ofi_z, vol_z])
     if X.shape[1] != 3 or not np.all(np.isfinite(X)):
-        raise RuntimeError("calibrate_regime_5m: non-finite feature matrix — calibration aborted.")
-    return X, feature_source, used_real_l1
+        raise RuntimeError(
+            "BLOCKER: non-finite feature matrix after construction — calibration aborted."
+        )
+
+    return X, "real_l1_aligned", True
 
 
 def calibrate_5m_artifacts(*, bars_1m: list[list], out_path: str = OUTPUT_PATH, meta_path: str = META_PATH, cal_slice: CalibrationSlice | None = None) -> dict:
@@ -129,17 +194,17 @@ def calibrate_5m_artifacts(*, bars_1m: list[list], out_path: str = OUTPUT_PATH, 
     bars_5m = resample_bars(bars_1m, minutes=5)
     if len(bars_5m) < _MIN_5M_BARS:
         raise RuntimeError(
-            f"calibrate_regime_5m: insufficient 5m bars: {len(bars_5m)} < {_MIN_5M_BARS}. "
+            f"BLOCKER: insufficient 5m bars: {len(bars_5m)} < {_MIN_5M_BARS}. "
             "Pass more 1m data covering at least Dec 2023 (8,910 bars)."
         )
 
     sl = cal_slice or CalibrationSlice(start_idx=0, end_idx=len(bars_5m))
     if sl.start_idx < 0 or sl.end_idx > len(bars_5m) or sl.start_idx >= sl.end_idx:
-        raise RuntimeError("invalid calibration slice")
+        raise RuntimeError("BLOCKER: invalid calibration slice")
     bars_5m_slice = bars_5m[sl.start_idx:sl.end_idx]
     if len(bars_5m_slice) < _MIN_TRAIN_BARS:
         raise RuntimeError(
-            f"calibrate_regime_5m: calibration slice too small: "
+            f"BLOCKER: calibration slice too small: "
             f"{len(bars_5m_slice)} < {_MIN_TRAIN_BARS} bars. "
             "Widen CalibrationSlice or provide more data."
         )
@@ -190,7 +255,7 @@ def calibrate_5m_artifacts(*, bars_1m: list[list], out_path: str = OUTPUT_PATH, 
         _arr = np.asarray(_v, dtype=float) if _k != "confirmation_ticks" else np.asarray(_v)
         if not np.all(np.isfinite(_arr.astype(float))):
             raise RuntimeError(
-                f"calibrate_regime_5m: non-finite values in '{_k}' — "
+                f"BLOCKER: non-finite values in '{_k}' — "
                 "calibration aborted. Check input data quality."
             )
 
@@ -199,12 +264,13 @@ def calibrate_5m_artifacts(*, bars_1m: list[list], out_path: str = OUTPUT_PATH, 
     saved = np.load(out_path)
     missing = sorted(REQUIRED_KEYS - set(saved.files))
     if missing:
-        raise RuntimeError(f"missing keys in {out_path}: {missing}")
+        raise RuntimeError(f"BLOCKER: missing keys in {out_path}: {missing}")
 
     meta = {
         "timeframe": "5m",
         "feature_source": feature_source,
-        "source_files": {"ohlcv_1m": "data/ohlcv_1m.csv", "l1_book": _L1_BOOK_PATH if used_real_l1 else None},
+        "real_book_only": True,
+        "source_files": {"ohlcv_1m": "data/ohlcv_1m.csv", "l1_book": _L1_BOOK_PATH},
         "n_bars_total_5m": len(bars_5m),
         "n_bars_used": len(bars_5m_slice),
         "train_range": {"start_ts": int(bars_5m_slice[0][0]), "end_ts": int(bars_5m_slice[cutoff - 1][0]), "n_bars": cutoff},

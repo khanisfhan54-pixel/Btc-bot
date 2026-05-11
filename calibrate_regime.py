@@ -26,7 +26,7 @@ from collections import deque
 # The .npz produced with N_STATES=4 is INCOMPATIBLE with n_states=3 engines.
 N_STATES       = 3
 N_FEATURES     = 3
-N_BARS         = 2000
+N_BARS         = 8910
 LOOKBACK       = 200
 RV_WINDOW      = 5
 RANDOM_SEED    = 42
