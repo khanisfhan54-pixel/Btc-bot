@@ -97,10 +97,25 @@ def main()->None:
         blockers.extend({"fold":fs,"reason":b} for b in (b5+b1))
         folds.append({"fold":len(folds),"ranges":{"train":[int(bars_5m[tr0][0]),int(bars_5m[tr1-1][0])],"val":[int(bars_5m[va0][0]),int(bars_5m[va1-1][0])],"test":[t0,t1]},"walk_forward_integrity":True,"calibration_separation":True,"threshold_selection":sel,"baseline_1m":m1,"candidate_5m":m5})
     if not folds: raise RuntimeError(f"No valid folds produced. blockers={blockers}")
-    agg=lambda side,key: float(np.mean([f[side][key] for f in folds]))
-    comp={"delta_profit_factor":agg("candidate_5m","trading") if False else None}
-    avg1={"trading":{k:float(np.mean([f["baseline_1m"]["trading"][k] for f in folds])) for k in ["total_trades","win_rate","profit_factor","expectancy","sharpe","max_drawdown","average_return_per_trade","average_holding_time","turnover"]},"signals":{k:float(np.mean([f["baseline_1m"]["signals"][k] for f in folds])) if f["baseline_1m"]["signals"][k] is not None else None for k in ["LONG_count","SHORT_count","HOLD_count","signal_coverage","directional_precision","macro_f1"]},"regimes":{k:float(np.mean([f["baseline_1m"]["regimes"][k] for f in folds])) for k in ["regime_entropy","regime_persistence","transition_frequency","trend_vs_range_ratio"]},"costs":{k:float(np.mean([f["baseline_1m"]["costs"][k] for f in folds])) for k in ["gross_expectancy","net_expectancy","fee_burden","slippage_burden","edge_after_costs"]}}
-    avg5={"trading":{k:float(np.mean([f["candidate_5m"]["trading"][k] for f in folds])) for k in ["total_trades","win_rate","profit_factor","expectancy","sharpe","max_drawdown","average_return_per_trade","average_holding_time","turnover"]},"signals":{k:float(np.mean([f["candidate_5m"]["signals"][k] for f in folds])) if f["candidate_5m"]["signals"][k] is not None else None for k in ["LONG_count","SHORT_count","HOLD_count","signal_coverage","directional_precision","macro_f1"]},"regimes":{k:float(np.mean([f["candidate_5m"]["regimes"][k] for f in folds])) for k in ["regime_entropy","regime_persistence","transition_frequency","trend_vs_range_ratio"]},"costs":{k:float(np.mean([f["candidate_5m"]["costs"][k] for f in folds])) for k in ["gross_expectancy","net_expectancy","fee_burden","slippage_burden","edge_after_costs"]}}
+    def _avg_field(path: tuple[str, str, str]) -> float | None:
+        vals = []
+        for fold in folds:
+            v = fold.get(path[0], {}).get(path[1], {}).get(path[2])
+            if v is not None:
+                vals.append(float(v))
+        return float(np.mean(vals)) if vals else None
+
+    def _avg_side(side: str) -> dict:
+        fields = {
+            "trading": ["total_trades", "win_rate", "profit_factor", "expectancy", "sharpe", "max_drawdown", "average_return_per_trade", "average_holding_time", "turnover"],
+            "signals": ["LONG_count", "SHORT_count", "HOLD_count", "signal_coverage", "directional_precision", "macro_f1"],
+            "regimes": ["regime_entropy", "regime_persistence", "transition_frequency", "trend_vs_range_ratio"],
+            "costs": ["gross_expectancy", "net_expectancy", "fee_burden", "slippage_burden", "edge_after_costs"],
+        }
+        return {section: {k: _avg_field((side, section, k)) for k in keys} for section, keys in fields.items()}
+
+    avg1 = _avg_side("baseline_1m")
+    avg5 = _avg_side("candidate_5m")
     deltas={"delta_profit_factor":avg5["trading"]["profit_factor"]-avg1["trading"]["profit_factor"],"delta_expectancy":avg5["trading"]["expectancy"]-avg1["trading"]["expectancy"],"delta_sharpe":avg5["trading"]["sharpe"]-avg1["trading"]["sharpe"],"delta_max_drawdown":avg5["trading"]["max_drawdown"]-avg1["trading"]["max_drawdown"],"delta_signal_coverage":avg5["signals"]["signal_coverage"]-avg1["signals"]["signal_coverage"],"delta_regime_entropy":avg5["regimes"]["regime_entropy"]-avg1["regimes"]["regime_entropy"],"delta_macro_f1":None,"delta_net_edge_after_costs":avg5["costs"]["edge_after_costs"]-avg1["costs"]["edge_after_costs"]}
     verdict="STILL UNTRADABLE" if avg5["costs"]["net_expectancy"]<=0 else "PROMISING BUT WEAK"
     out={"run_id":{"start_ts":int(bars_5m[0][0]),"end_ts":int(bars_5m[-1][0]),"fold_count":len(folds)},"summary":"Research-only 5m walk-forward audit vs 1m baseline on matched windows.","metrics_table":{"baseline_1m":avg1,"candidate_5m":avg5,"comparison":deltas},"regime_analysis":{"baseline_1m":avg1["regimes"],"candidate_5m":avg5["regimes"]},"cost_analysis":{"baseline_1m":avg1["costs"],"candidate_5m":avg5["costs"]},"walk_forward_validation_quality":{"chronological":True,"embargo_bars":embargo,"calibration_separation":True,"production_parity":False},"files":{"inputs":["data/ohlcv_1m.csv","data/bookDepth.csv"],"outputs":["audit_output/5m_walk_forward_results.json","backtest_summary.json","replit.md"]},"blockers":blockers,"fold_results":folds,"final_verdict":verdict}
