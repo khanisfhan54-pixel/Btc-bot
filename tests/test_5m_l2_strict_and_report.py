@@ -65,6 +65,9 @@ def test_report_contract_fields_present():
 
 def _import_validation_module_with_pandas_stub(csv_rows):
     import importlib
+    import pytest
+
+    pytest.importorskip("numpy")
 
     class _DF:
         def __init__(self, rows):
