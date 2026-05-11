@@ -903,7 +903,7 @@ def compute_hmm_regime(
             "trend_score_trend": trend_score_trend,
             "trend_score_bear": trend_score_bear,
             "directional_label_winner": directional_label_winner,
-            "score_sum": score_sum,
+            "score_sum": _raw_sum,
         },
     }
     if return_score_map:
