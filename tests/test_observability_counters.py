@@ -1,6 +1,13 @@
-"""Tests for the 4 observability counters added in Task #9.
+"""Tests for FIX-3 and FIX-4 observability counters in advanced_regime_engine.
 
-Covers FIX-3 (IGARCH runtime guardrail) and FIX-4 (schema/failsafe counters).
+FIX-3: runtime IGARCH persistence-high guardrail counter
+    Counter: REGIME_GARCH_PERSISTENCE_HIGH (igarch_runtime_warnings_total)
+    Location: advanced_regime_engine._garch_update (~line 1062)
+
+FIX-4: schema-violation and fail-safe-emitted counters
+    Counters: REGIME_SCHEMA_VIOLATIONS (regime_schema_violations_total)
+              REGIME_FAILSAFE_EMITTED  (fail_safe_activations_total)
+    Location: advanced_regime_engine._validate_output_schema / _build_output (~line 81)
 """
 from __future__ import annotations
 
@@ -67,7 +74,7 @@ def test_fix4_schema_violation_counter():
 
 
 def test_fix4_failsafe_counter():
-    """When _build_output's hard guard rejects a payload, failsafe counter increments."""
+    """When _build_output hard guard rejects a payload, failsafe counter increments."""
     eid = "test_engine_failsafe"
     before = _counter_value(
         are_mod.REGIME_FAILSAFE_EMITTED, (eid, "schema_validation_failed")
