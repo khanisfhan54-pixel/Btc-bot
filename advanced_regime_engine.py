@@ -871,6 +871,20 @@ def compute_hmm_regime(
         )
         score_map = {"TREND": 0.25, "BEAR": 0.25, "RANGE": 0.25, "TOXIC": 0.25}
 
+    # Post-normalization guard — ensures floating-point residual is zero.
+    _norm_vec = np.array(
+        [score_map["TREND"], score_map["BEAR"], score_map["RANGE"], score_map["TOXIC"]],
+        dtype=float,
+    )
+    if not np.all(np.isfinite(_norm_vec)) or _norm_vec.sum() < 1e-12:
+        # Degenerate path: reset to uniform and record in metadata.
+        score_map = {"TREND": 0.25, "BEAR": 0.25, "RANGE": 0.25, "TOXIC": 0.25}
+    else:
+        _norm_vec /= _norm_vec.sum()
+        score_map = dict(zip(
+            ["TREND", "BEAR", "RANGE", "TOXIC"], _norm_vec.tolist()
+        ))
+
     max_score = max(score_map.values())
     tied_labels = [label for label, score in score_map.items() if abs(score - max_score) <= 1e-12]
     tie_priority = {"TOXIC": 0, "TREND": 1, "BEAR": 2, "RANGE": 3}

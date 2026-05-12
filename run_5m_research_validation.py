@@ -179,6 +179,7 @@ def main() -> None:
         },
         "blockers": all_blockers,
     }
+    output["run_status"] = "BLOCKED" if cal_blocker else "OK"
     os.makedirs("audit_output", exist_ok=True)
     json.dump(output, open("audit_output/5m_walk_forward_results.json", "w"), indent=2)
     json.dump(output, open("backtest_summary.json", "w"), indent=2)

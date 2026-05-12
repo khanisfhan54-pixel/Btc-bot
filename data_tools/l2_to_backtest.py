@@ -87,7 +87,7 @@ def align_book_to_bars(bars: Sequence[Sequence[Any]], snaps: Iterable[Any]) -> l
             imbalance=float(cur["imbalance"]), ofi_z=float(cur["ofi_z"]),
         )
         if snap.timestamp > ts:
-            raise ValueError(f"align_book_to_bars: forward-looking alignment at bar_index={idx} bar_ts={ts} snap_ts={snap.timestamp}")
+            raise ValueError(f"BLOCKER: forward-looking alignment at bar_index={idx} bar_ts={ts} snap_ts={snap.timestamp}")
         if not _finite(float(snap.ofi_z)):
             raise ValueError(f"align_book_to_bars: non-finite ofi_z at bar_index={idx}")
         out.append(snap)
