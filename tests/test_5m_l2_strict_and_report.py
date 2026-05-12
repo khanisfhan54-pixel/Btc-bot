@@ -5,6 +5,12 @@ import numpy as np
 import pytest
 
 from advanced_regime_engine import compute_hmm_regime
+REQUIRED_META_KEYS = {
+    "timeframe", "real_book_only", "feature_source", "ofi_source",
+    "blocker_on_missing_data", "source_files", "n_bars_total_5m",
+    "n_bars_used", "n_bars_ofi_nonzero", "train_range", "val_range",
+    "label_method", "calibration_status", "min_bars_required",
+}
 
 
 class TestComputeHmmRegimeNormalization:
@@ -94,35 +100,52 @@ def _make_synthetic_bars(n=600):
 
 
 class TestCalibrateRegime5mBlockers:
+    def test_5m_meta_has_required_keys(self, tmp_path):
+        if not os.path.exists("data/ohlcv_1m.csv") or not os.path.exists("data/bookDepth.csv"):
+            pytest.skip("requires local fixture files")
+        from calibrate_regime_5m import calibrate_5m_artifacts, _load_1m_csv
+        out_meta = str(tmp_path / "meta.json")
+        calibrate_5m_artifacts(bars_1m=_load_1m_csv("data/ohlcv_1m.csv"), out_path=str(tmp_path / "w.npz"), meta_path=out_meta)
+        meta = json.load(open(out_meta))
+        assert REQUIRED_META_KEYS.issubset(meta.keys()), f"missing: {REQUIRED_META_KEYS - meta.keys()}"
 
-    def test_missing_l1_book_file_raises_blocker(self, tmp_path):
-        pytest.importorskip("pandas")
-        from unittest.mock import patch
-        bars = _make_synthetic_bars(600)
-        with patch("calibrate_regime_5m._L1_BOOK_PATH", str(tmp_path / "nonexistent.csv")):
-            with pytest.raises(RuntimeError, match="BLOCKER:"):
-                import calibrate_regime_5m as m
-                m._build_5m_features(bars, bars)
+    def test_n_bars_ofi_nonzero_when_book_present(self):
+        if not os.path.exists("weights/advanced_regime_weights_5m.meta.json"):
+            pytest.skip("meta not present")
+        meta = json.load(open("weights/advanced_regime_weights_5m.meta.json"))
+        assert meta["n_bars_ofi_nonzero"] > 0
 
-    def test_empty_l1_book_file_raises_blocker(self, tmp_path):
+    def test_calibration_blocks_on_missing_book(self, tmp_path, monkeypatch):
         pytest.importorskip("pandas")
-        from unittest.mock import patch
-        empty = tmp_path / "empty.csv"
-        empty.write_text("timestamp,bidPrice,askPrice,bidQty,askQty\n")
-        with patch("calibrate_regime_5m._L1_BOOK_PATH", str(empty)):
-            with pytest.raises(RuntimeError, match="BLOCKER:"):
-                import calibrate_regime_5m as m
-                m._build_5m_features(_make_synthetic_bars(600), _make_synthetic_bars(600))
+        import calibrate_regime_5m as m
+        monkeypatch.setattr(m, "_L2_BOOK_PATH", str(tmp_path / "nonexistent_l2.csv"))
+        with pytest.raises(RuntimeError, match="BLOCKER"):
+            m.calibrate_5m_artifacts(bars_1m=_make_synthetic_bars(3000), out_path=str(tmp_path/"w.npz"), meta_path=str(tmp_path/"m.json"))
 
-    def test_malformed_l1_book_file_raises_blocker(self, tmp_path):
+    def test_missing_l2_book_raises_blocker(self, tmp_path, monkeypatch):
         pytest.importorskip("pandas")
-        from unittest.mock import patch
-        bad = tmp_path / "bad.csv"
+        import calibrate_regime_5m as m
+        monkeypatch.setattr(m, "_L2_BOOK_PATH", str(tmp_path / "no_l2.csv"))
+        with pytest.raises(RuntimeError, match="BLOCKER"):
+            m._build_5m_features(_make_synthetic_bars(600), _make_synthetic_bars(600))
+
+    def test_empty_l2_book_raises_blocker(self, tmp_path, monkeypatch):
+        pytest.importorskip("pandas")
+        import calibrate_regime_5m as m
+        empty = tmp_path / "empty_l2.csv"
+        empty.write_text("timestamp,bidPrice0,bidPrice1,askPrice0,askPrice1\n")
+        monkeypatch.setattr(m, "_L2_BOOK_PATH", str(empty))
+        with pytest.raises(RuntimeError, match="BLOCKER"):
+            m._build_5m_features(_make_synthetic_bars(600), _make_synthetic_bars(600))
+
+    def test_malformed_l2_book_raises_blocker(self, tmp_path, monkeypatch):
+        pytest.importorskip("pandas")
+        import calibrate_regime_5m as m
+        bad = tmp_path / "bad_l2.csv"
         bad.write_text("ts,bid,ask\n1,100,101\n")
-        with patch("calibrate_regime_5m._L1_BOOK_PATH", str(bad)):
-            with pytest.raises(RuntimeError, match="BLOCKER:"):
-                import calibrate_regime_5m as m
-                m._build_5m_features(_make_synthetic_bars(600), _make_synthetic_bars(600))
+        monkeypatch.setattr(m, "_L2_BOOK_PATH", str(bad))
+        with pytest.raises(RuntimeError, match="BLOCKER"):
+            m._build_5m_features(_make_synthetic_bars(600), _make_synthetic_bars(600))
 
     def test_no_synthetic_ofi_string_in_source(self):
         pytest.importorskip("pandas")
@@ -140,8 +163,8 @@ class TestCalibrateRegime5mBlockers:
             "label_method", "calibration_status", "min_bars_required",
             "source_files",
         }
-        if not os.path.exists("data/bookTicker_dec2023_30s.csv"):
-            pytest.skip("Real L1 book file absent — integration test skipped")
+        if not os.path.exists("data/bookDepth.csv"):
+            pytest.skip("Real L2 book file absent — integration test skipped")
         if not os.path.exists("data/ohlcv_1m.csv"):
             pytest.skip("Real 1m OHLCV absent — integration test skipped")
 
@@ -156,13 +179,22 @@ class TestCalibrateRegime5mBlockers:
         assert not missing
         assert meta["real_book_only"] is True
         assert meta["blocker_on_missing_data"] is True
-        assert meta["ofi_source"] == "real_l1_aligned"
+        assert meta["ofi_source"] == "real_l2_depth"
         assert meta["calibration_status"] == "calibrated"
         assert isinstance(meta["n_bars_ofi_nonzero"], int)
         assert meta["n_bars_ofi_nonzero"] > 0
 
 
 class TestRunValidationReportHonesty:
+    def test_report_comparison_fields_present(self):
+        if not os.path.exists("backtest_summary.json"):
+            pytest.skip("backtest_summary.json absent")
+        report = json.load(open("backtest_summary.json"))
+        assert "prior_run_comparison" in report
+        comp = report["prior_run_comparison"]
+        for field in ["total_trades", "win_rate", "profit_factor",
+                      "max_drawdown", "sharpe", "net_expectancy"]:
+            assert field in comp, f"missing comparison field: {field}"
 
     def test_report_contains_run_status_field(self):
         if not os.path.exists("backtest_summary.json"):
@@ -189,6 +221,15 @@ class TestRunValidationReportHonesty:
             report = json.load(f)
         assert "blockers" in report
         assert isinstance(report["blockers"], list)
+
+    def test_unavailable_metrics_field_present(self):
+        if not os.path.exists("backtest_summary.json"):
+            pytest.skip("backtest_summary.json absent")
+        report = json.load(open("backtest_summary.json"))
+        assert "unavailable_metrics" in report
+        assert isinstance(report["unavailable_metrics"], list)
+        names = [u.get("metric") for u in report["unavailable_metrics"]]
+        assert "macro_f1" in names
 
     def test_report_does_not_hide_blocker_when_cal_failed(self):
         if not os.path.exists("backtest_summary.json"):

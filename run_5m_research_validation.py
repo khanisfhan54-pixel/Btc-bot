@@ -2,8 +2,10 @@
 from __future__ import annotations
 import json, os
 import math
+import glob
 import numpy as np
 import pandas as pd
+from typing import Optional
 from bar_aggregator import resample_bars
 from backtest_engine import BacktestConfig, BacktestEngine
 from calibrate_regime_5m import CalibrationSlice, calibrate_5m_artifacts
@@ -96,7 +98,13 @@ def main() -> None:
         print(f"[5m audit] BLOCKER — calibration failed: {cal_blocker}")
         print("  Continuing with default weights for comparison only.")
 
-    weight_path = cal_result["output_path"] if cal_result else "weights/advanced_regime_weights.npz"
+    pref_5m = "weights/advanced_regime_weights_5m.npz"
+    if cal_result and os.path.exists(pref_5m):
+        weight_path = pref_5m
+    else:
+        weight_path = "weights/advanced_regime_weights.npz"
+        if not cal_result:
+            print("[5m audit] calibration failed; explicit fallback to 1m default weights.")
 
     base_cfg = BacktestConfig(fee_bps=8.0, slippage_bps=3.0, max_hold_bars=12, orchestrator_action_threshold=0.60)
     cost = _cost_basis(base_cfg)
@@ -137,6 +145,31 @@ def main() -> None:
             return "INCONCLUSIVE"
         return "UNTRADABLE" if net <= 0 else "PROMISING"
 
+    def _prior_field(doc: dict, field: str):
+        try:
+            return doc["passes"]["A_5m_fixed_horizon"]["metrics"]["trading"][field]
+        except Exception:
+            try:
+                return doc["required_output_fields"][field]
+            except Exception:
+                return None
+    def _prior_delta(current_val, field: str):
+        try:
+            prior_val = _prior_field(prior, field)
+            if prior_val is None:
+                return None
+            a, b = float(current_val), float(prior_val)
+            return round(a - b, 6) if (math.isfinite(a) and math.isfinite(b)) else None
+        except Exception:
+            return None
+    prior_docs = []
+    for p in ["audit_output/post_run_comparison.json", "backtest_summary.json"] + glob.glob("calibration_report*.json") + glob.glob("audit_output/calibration_report*.json"):
+        if os.path.exists(p):
+            try:
+                prior_docs.append(json.load(open(p)))
+            except Exception:
+                pass
+    prior = prior_docs[-1] if prior_docs else {}
     output = {
         "run_timestamp": _utc_now(),
         "cost_basis": cost,
@@ -179,7 +212,35 @@ def main() -> None:
         },
         "blockers": all_blockers,
     }
-    output["run_status"] = "BLOCKED" if cal_blocker else "OK"
+    output["unavailable_metrics"] = [
+        {
+            "metric": "macro_f1",
+            "reason": "backtest engine does not expose per-bar predicted vs actual regime labels",
+            "impact": "classification accuracy cannot be quantified from this run",
+        },
+        {
+            "metric": "confusion_matrix",
+            "reason": "same as macro_f1",
+            "impact": "none on trading metrics",
+        },
+    ]
+    output["prior_run_comparison"] = {
+        "total_trades": _prior_delta(metrics_A["trading"]["total_trades"], "total_trades"),
+        "win_rate": _prior_delta(metrics_A["trading"]["win_rate"], "win_rate"),
+        "profit_factor": _prior_delta(metrics_A["trading"]["profit_factor"], "profit_factor"),
+        "max_drawdown": _prior_delta(metrics_A["trading"]["max_drawdown"], "max_drawdown"),
+        "sharpe": _prior_delta(metrics_A["trading"]["sharpe"], "sharpe"),
+        "net_expectancy": _prior_delta(metrics_A["costs"]["net_expectancy"], "net_expectancy"),
+    }
+    partial = ("FIX-6 NOT_APPLIED" in json.dumps(result_A)) or (result_A.get("total_trades", 0) == 0 or result_B.get("total_trades", 0) == 0 or result_D.get("total_trades", 0) == 0)
+    if cal_blocker:
+        output["run_status"] = "BLOCKED"
+    elif partial:
+        output["run_status"] = "PARTIAL"
+    elif result_A.get("total_trades",0) > 0:
+        output["run_status"] = "OK"
+    else:
+        output["run_status"] = "PARTIAL"
     os.makedirs("audit_output", exist_ok=True)
     json.dump(output, open("audit_output/5m_walk_forward_results.json", "w"), indent=2)
     json.dump(output, open("backtest_summary.json", "w"), indent=2)
@@ -229,6 +290,11 @@ def _build_markdown_report(output: dict) -> str:
         lines.append(f"**Blockers ({len(blockers)}):**")
         for b in blockers:
             lines.append(f"- {b}")
+    unacc = output.get("unavailable_metrics", [])
+    if unacc:
+        lines.append(f"**Unavailable metrics ({len(unacc)}):**")
+        for u in unacc:
+            lines.append(f"- `{u['metric']}`: {u['reason']}")
     return "\n".join(lines) + "\n"
 
 if __name__=="__main__":main()
