@@ -70,7 +70,7 @@ def align_book_to_bars(bars: Sequence[Sequence[Any]], snaps: Iterable[Any]) -> l
     """Strict deterministic aligner: each bar must map to a valid snapshot <= bar ts."""
     rows = sorted(list(snaps), key=lambda x: int(x.timestamp if hasattr(x, "timestamp") else x["timestamp"]))
     if not rows:
-        raise ValueError("align_book_to_bars: no snapshots provided")
+        raise RuntimeError("BLOCKER: no snapshots provided")
     out: list[BookSnapshot] = []
     j = 0
     cur: Any = None
@@ -80,15 +80,15 @@ def align_book_to_bars(bars: Sequence[Sequence[Any]], snaps: Iterable[Any]) -> l
             cur = rows[j]
             j += 1
         if cur is None:
-            raise ValueError(f"align_book_to_bars: no snapshot aligned for bar_index={idx} ts={ts}")
+            raise RuntimeError(f"BLOCKER: no snapshot aligned to bar {idx} ts={ts}")
         snap = cur if isinstance(cur, BookSnapshot) else BookSnapshot(
             timestamp=int(cur["timestamp"]), bid_price=float(cur["bid_price"]), ask_price=float(cur["ask_price"]),
             bid_qty=float(cur["bid_qty"]), ask_qty=float(cur["ask_qty"]), spread_bps=float(cur["spread_bps"]),
             imbalance=float(cur["imbalance"]), ofi_z=float(cur["ofi_z"]),
         )
         if snap.timestamp > ts:
-            raise ValueError(f"BLOCKER: forward-looking alignment at bar_index={idx} bar_ts={ts} snap_ts={snap.timestamp}")
+            raise RuntimeError(f"BLOCKER: forward-looking alignment at bar_index={idx} bar_ts={ts} snap_ts={snap.timestamp}")
         if not _finite(float(snap.ofi_z)):
-            raise ValueError(f"align_book_to_bars: non-finite ofi_z at bar_index={idx}")
+            raise RuntimeError(f"BLOCKER: ofi_z non-finite at bar {idx}")
         out.append(snap)
     return out
