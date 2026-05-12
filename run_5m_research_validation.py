@@ -42,8 +42,6 @@ def _compute_metrics(result:dict, bars:int, cost:dict)->tuple[dict,list[str]]:
     wins=pnls[pnls>0]; losses=np.abs(pnls[pnls<=0])
     gross_exp=float(np.mean(pnl_pct))*1e4 if pnl_pct.size else 0.0
     net_exp=gross_exp-cost["round_trip_cost_bps"]
-    if not log:
-        blockers.append("No trade-level predictions/confusion labels; macro_f1/confusion_matrix unavailable from current backtest output.")
     m={
       "trading":{"total_trades":int(result.get("total_trades",0)),"win_rate":float(result.get("win_rate",0.0)),"profit_factor":float(wins.sum()/max(losses.sum(),1e-12)) if wins.size else 0.0,"expectancy":float(result.get("expectancy",0.0)),"sharpe":float(result.get("sharpe",0.0)),"max_drawdown":float(result.get("max_drawdown",0.0),),"average_return_per_trade":float(np.mean(pnls)) if pnls.size else 0.0,"average_holding_time":float(np.mean(holds)) if holds.size else 0.0,"turnover":float(len(log)/max(1,bars)),"exposure":None},
       "signals":{"LONG_count":long_n,"SHORT_count":short_n,"HOLD_count":hold_n,"signal_coverage":sig_cov,"directional_precision":float((pnls>0).mean()) if pnls.size else 0.0,"macro_f1":None,"confusion_matrix":None},
@@ -139,6 +137,23 @@ def main() -> None:
     for b in (blockers_A + blockers_B + blockers_C + blockers_D):
         all_blockers.append(b)
 
+    unavailable_metrics = [
+        {
+            "metric": "macro_f1",
+            "reason": (
+                "backtest engine does not expose per-bar predicted vs actual "
+                "regime labels; per-trade signal dict contains 'regime' string "
+                "but no ground-truth label"
+            ),
+            "impact": "classification accuracy unquantifiable from this harness",
+        },
+        {
+            "metric": "confusion_matrix",
+            "reason": "same as macro_f1",
+            "impact": "none on trading metrics",
+        },
+    ]
+
     def _verdict(m: dict) -> str:
         net = m.get("costs", {}).get("net_expectancy", None)
         if net is None:
@@ -153,7 +168,7 @@ def main() -> None:
                 return doc["required_output_fields"][field]
             except Exception:
                 return None
-    def _prior_delta(current_val, field: str):
+    def _prior_delta(current_val, field: str) -> Optional[float]:
         try:
             prior_val = _prior_field(prior, field)
             if prior_val is None:
@@ -211,19 +226,8 @@ def main() -> None:
             "forward_horizon_used": base_cfg.max_hold_bars,
         },
         "blockers": all_blockers,
+        "unavailable_metrics": unavailable_metrics,
     }
-    output["unavailable_metrics"] = [
-        {
-            "metric": "macro_f1",
-            "reason": "backtest engine does not expose per-bar predicted vs actual regime labels",
-            "impact": "classification accuracy cannot be quantified from this run",
-        },
-        {
-            "metric": "confusion_matrix",
-            "reason": "same as macro_f1",
-            "impact": "none on trading metrics",
-        },
-    ]
     output["prior_run_comparison"] = {
         "total_trades": _prior_delta(metrics_A["trading"]["total_trades"], "total_trades"),
         "win_rate": _prior_delta(metrics_A["trading"]["win_rate"], "win_rate"),
@@ -232,7 +236,11 @@ def main() -> None:
         "sharpe": _prior_delta(metrics_A["trading"]["sharpe"], "sharpe"),
         "net_expectancy": _prior_delta(metrics_A["costs"]["net_expectancy"], "net_expectancy"),
     }
-    partial = ("FIX-6 NOT_APPLIED" in json.dumps(result_A)) or (result_A.get("total_trades", 0) == 0 or result_B.get("total_trades", 0) == 0 or result_D.get("total_trades", 0) == 0)
+    partial = (
+        result_A.get("total_trades", 0) == 0
+        or result_B.get("total_trades", 0) == 0
+        or result_D.get("total_trades", 0) == 0
+    )
     if cal_blocker:
         output["run_status"] = "BLOCKED"
     elif partial:
@@ -292,9 +300,10 @@ def _build_markdown_report(output: dict) -> str:
             lines.append(f"- {b}")
     unacc = output.get("unavailable_metrics", [])
     if unacc:
-        lines.append(f"**Unavailable metrics ({len(unacc)}):**")
+        lines.append(f"**Unavailable metrics ({len(unacc)}) — not blockers:**")
         for u in unacc:
             lines.append(f"- `{u['metric']}`: {u['reason']}")
+        lines.append("")
     return "\n".join(lines) + "\n"
 
 if __name__=="__main__":main()

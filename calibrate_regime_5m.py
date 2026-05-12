@@ -74,15 +74,20 @@ def _build_5m_features(
     bars_5m: Sequence[Sequence[Any]],
     bars_1m: Sequence[Sequence[Any]],
 ) -> tuple[np.ndarray, str, bool]:
-    """Build 5m feature matrix using real L2 depth only (no fallback)."""
+    """
+    Build 5m feature matrix from real L2 depth data only.
+    Fail closed on any missing, malformed, empty, misaligned,
+    or non-finite condition. No fallback to L1 or synthetic data.
+    """
     closes = np.asarray([float(r[4]) for r in bars_5m], dtype=float)
-    vols = np.asarray([float(r[5]) for r in bars_5m], dtype=float)
+    vols   = np.asarray([float(r[5]) for r in bars_5m], dtype=float)
     log_ret = np.diff(
         np.log(np.clip(closes, 1e-12, None)),
         prepend=np.log(max(closes[0], 1e-12)),
     )
     vol_z = (vols - vols.mean()) / (vols.std() + 1e-12)
 
+    # ── L2 depth is the ONLY permitted source. No fallback. ──────────────
     if not os.path.exists(_L2_BOOK_PATH):
         raise RuntimeError(
             f"BLOCKER: real L2 depth file missing at '{_L2_BOOK_PATH}'. "
@@ -91,60 +96,104 @@ def _build_5m_features(
     try:
         l2 = pd.read_csv(_L2_BOOK_PATH)
     except Exception as exc:
-        raise RuntimeError(f"BLOCKER: L2 depth file unreadable — {exc}.") from exc
+        raise RuntimeError(
+            f"BLOCKER: L2 depth file unreadable — {exc}."
+        ) from exc
 
+    if len(l2) == 0:
+        raise RuntimeError(
+            f"BLOCKER: L2 depth file is empty. File: '{_L2_BOOK_PATH}'."
+        )
     if "timestamp" not in l2.columns:
-        raise RuntimeError("BLOCKER: L2 depth file missing 'timestamp' column.")
+        raise RuntimeError(
+            f"BLOCKER: L2 depth file missing 'timestamp' column. "
+            f"Found: {list(l2.columns)}."
+        )
 
-    bid_price_cols = sorted([c for c in l2.columns if c.lower().startswith("bidprice")])
-    ask_price_cols = sorted([c for c in l2.columns if c.lower().startswith("askprice")])
-    bid_qty_cols = sorted([c for c in l2.columns if c.lower().startswith("bidqty")])
-    ask_qty_cols = sorted([c for c in l2.columns if c.lower().startswith("askqty")])
-    if len(bid_price_cols) < 2 or len(ask_price_cols) < 2:
+    # Detect level columns by prefix (case-insensitive)
+    bp_cols = sorted(c for c in l2.columns if c.lower().startswith("bidprice"))
+    ap_cols = sorted(c for c in l2.columns if c.lower().startswith("askprice"))
+    bq_cols = sorted(c for c in l2.columns if c.lower().startswith("bidqty"))
+    aq_cols = sorted(c for c in l2.columns if c.lower().startswith("askqty"))
+
+    if len(bp_cols) < 2 or len(ap_cols) < 2:
         raise RuntimeError(
             f"BLOCKER: L2 depth file has fewer than 2 price levels per side. "
-            f"bid_price cols={bid_price_cols}, ask_price cols={ask_price_cols}."
+            f"bid_price cols={bp_cols}, ask_price cols={ap_cols}. "
+            f"File: '{_L2_BOOK_PATH}'."
         )
-    if len(l2) == 0:
-        raise RuntimeError("BLOCKER: L2 depth file is empty.")
+    if len(bq_cols) < 2 or len(aq_cols) < 2:
+        raise RuntimeError(
+            f"BLOCKER: L2 depth file has fewer than 2 quantity levels per side. "
+            f"bid_qty cols={bq_cols}, ask_qty cols={aq_cols}. "
+            f"File: '{_L2_BOOK_PATH}'."
+        )
 
-    bp = l2[bid_price_cols[:2]].astype(float).to_numpy()
-    ap = l2[ask_price_cols[:2]].astype(float).to_numpy()
-    bq = l2[bid_qty_cols[:2]].astype(float).to_numpy() if bid_qty_cols else np.ones((len(l2), 2))
-    aq = l2[ask_qty_cols[:2]].astype(float).to_numpy() if ask_qty_cols else np.ones((len(l2), 2))
-    ts_raw = l2["timestamp"].astype(np.int64).to_numpy()
+    try:
+        bp = l2[bp_cols[:2]].astype(float).to_numpy()
+        ap = l2[ap_cols[:2]].astype(float).to_numpy()
+        bq = l2[bq_cols[:2]].astype(float).to_numpy()
+        aq = l2[aq_cols[:2]].astype(float).to_numpy()
+        ts_raw = l2["timestamp"].astype(np.int64).to_numpy()
+    except Exception as exc:
+        raise RuntimeError(
+            f"BLOCKER: L2 depth column parsing failed — {exc}."
+        ) from exc
+
     total_bid = bq[:, 0] + bq[:, 1]
     total_ask = aq[:, 0] + aq[:, 1]
+
+    if not np.all(np.isfinite(total_bid)) or not np.all(np.isfinite(total_ask)):
+        raise RuntimeError(
+            "BLOCKER: L2 depth qty columns contain non-finite values."
+        )
+
     raw_ofi = total_bid - total_ask
     rs = pd.Series(raw_ofi)
-    ofi_vals = ((rs - rs.rolling(60, min_periods=5).mean()) / (rs.rolling(60, min_periods=5).std() + 1e-12)).fillna(0.0).to_numpy(dtype=float)
-    mid_arr = (bp[:, 0] + ap[:, 0]) * 0.5
+    roll_mean = rs.rolling(60, min_periods=5).mean()
+    roll_std  = rs.rolling(60, min_periods=5).std()
+    ofi_vals  = ((rs - roll_mean) / (roll_std + 1e-12)).fillna(0.0).to_numpy(dtype=float)
+
+    mid_arr    = (bp[:, 0] + ap[:, 0]) * 0.5
     spread_arr = ((ap[:, 0] - bp[:, 0]) / np.maximum(mid_arr, 1e-12)) * 1e4
-    imb_arr = raw_ofi / np.maximum(total_bid + total_ask, 1e-12)
+    imb_arr    = raw_ofi / np.maximum(total_bid + total_ask, 1e-12)
 
     snaps = [
-        _L1Snap(int(ts_raw[i]), float(bp[i, 0]), float(ap[i, 0]), float(total_bid[i]), float(total_ask[i]),
-                float(spread_arr[i]), float(imb_arr[i]), float(ofi_vals[i]))
+        _L1Snap(
+            int(ts_raw[i]),
+            float(bp[i, 0]),
+            float(ap[i, 0]),
+            float(total_bid[i]),
+            float(total_ask[i]),
+            float(spread_arr[i]),
+            float(imb_arr[i]),
+            float(ofi_vals[i]),
+        )
         for i in range(len(l2))
     ]
+
+    # Align OUTSIDE the loop
     try:
         snaps_5m = align_book_to_bars(bars_5m, snaps)
     except Exception as exc:
-        raise RuntimeError(f"BLOCKER: L2 book alignment failed — {exc}.") from exc
+        raise RuntimeError(
+            f"BLOCKER: L2 book alignment failed — {exc}."
+        ) from exc
 
     if len(snaps_5m) < _MIN_5M_BARS:
         raise RuntimeError(
-            f"BLOCKER: only {len(snaps_5m)} L2 snaps aligned, need >= {_MIN_5M_BARS}."
+            f"BLOCKER: only {len(snaps_5m)} L2 snaps aligned to 5m bars; "
+            f"need >= {_MIN_5M_BARS}. Verify bookDepth.csv covers Dec 2023."
         )
-
     if len(snaps_5m) != len(bars_5m):
         raise RuntimeError(
-            f"BLOCKER: aligned snap count {len(snaps_5m)} != bar count {len(bars_5m)}."
+            f"BLOCKER: aligned snap count {len(snaps_5m)} != bar count "
+            f"{len(bars_5m)}."
         )
-
     if any(s is None for s in snaps_5m):
         raise RuntimeError(
-            "BLOCKER: alignment produced None entries."
+            "BLOCKER: alignment produced None entries — some bars have "
+            "no L2 snapshot. Verify bookDepth.csv covers the full range."
         )
 
     ofi_z = np.asarray([_snapshot_ofi(s) for s in snaps_5m], dtype=float)
@@ -158,7 +207,7 @@ def _build_5m_features(
     X = np.column_stack([log_ret, ofi_z, vol_z])
     if X.shape[1] != 3 or not np.all(np.isfinite(X)):
         raise RuntimeError(
-            "BLOCKER: non-finite feature matrix after construction."
+            "BLOCKER: non-finite feature matrix after L2 construction."
         )
 
     return X, "real_l2_depth", True
@@ -184,7 +233,7 @@ def calibrate_5m_artifacts(*, bars_1m: list[list], out_path: str = OUTPUT_PATH, 
             "Widen CalibrationSlice or provide more data."
         )
 
-    X, feature_source, used_real_l1 = _build_5m_features(bars_5m_slice, bars_1m)
+    X, feature_source, used_real_book = _build_5m_features(bars_5m_slice, bars_1m)
     closes = np.asarray([float(r[4]) for r in bars_5m_slice], dtype=float)
     cutoff = int(0.8 * len(X))
     X_train = X[:cutoff]
@@ -234,6 +283,13 @@ def calibrate_5m_artifacts(*, bars_1m: list[list], out_path: str = OUTPUT_PATH, 
                 "calibration aborted. Check input data quality."
             )
 
+    n_bars_ofi_nonzero = int(np.sum(np.abs(X[:, 1]) > 1e-9))
+    if n_bars_ofi_nonzero == 0:
+        raise RuntimeError(
+            "BLOCKER: all OFI values are zero after L2 calibration. "
+            "The L2 book data may be degenerate or constant."
+        )
+
     np.savez(out_path, nhhmm_beta=nhhmm_beta.astype(np.float64), feature_mean=fmean.astype(np.float64), feature_std=fstd.astype(np.float64), sjm_centroids=sjm_centroids.astype(np.float64), sjm_feature_weights=sjm_feature_weights.astype(np.float64), nhhmm_mu=nhhmm_mu.astype(np.float64), nhhmm_sigma=nhhmm_sigma.astype(np.float64), garch_omega=np.asarray(g["omega"], dtype=np.float64), garch_alpha=np.asarray(g["alpha"], dtype=np.float64), garch_beta=np.asarray(g["beta_garch"], dtype=np.float64), garch_P=np.asarray(g["P"], dtype=np.float64), confirmation_ticks=np.asarray([conf_ticks], dtype=np.int64))
 
     saved = np.load(out_path)
@@ -251,14 +307,23 @@ def calibrate_5m_artifacts(*, bars_1m: list[list], out_path: str = OUTPUT_PATH, 
         "real_book_only": True,
         "ofi_source": feature_source,
         "blocker_on_missing_data": True,
-        "source_files": {"ohlcv_1m": "data/ohlcv_1m.csv", "l2_book": _L2_BOOK_PATH},
+        "source_files": {
+            "ohlcv_1m": "data/ohlcv_1m.csv",
+            "l2_book": _L2_BOOK_PATH,
+        },
         "n_bars_total_5m": len(bars_5m),
         "n_bars_used": len(bars_5m_slice),
-        "n_bars_ofi_nonzero": int(
-            np.sum(np.abs(X[:, 1]) > 1e-9)
-        ),
-        "train_range": {"start_ts": int(bars_5m_slice[0][0]), "end_ts": int(bars_5m_slice[cutoff - 1][0]), "n_bars": cutoff},
-        "val_range": {"start_ts": int(bars_5m_slice[min(cutoff, len(bars_5m_slice)-1)][0]), "end_ts": int(bars_5m_slice[-1][0]), "n_bars": len(bars_5m_slice) - cutoff},
+        "n_bars_ofi_nonzero": n_bars_ofi_nonzero,
+        "train_range": {
+            "start_ts": int(bars_5m_slice[0][0]),
+            "end_ts":   int(bars_5m_slice[cutoff - 1][0]),
+            "n_bars":   cutoff,
+        },
+        "val_range": {
+            "start_ts": int(bars_5m_slice[min(cutoff, len(bars_5m_slice) - 1)][0]),
+            "end_ts":   int(bars_5m_slice[-1][0]),
+            "n_bars":   len(bars_5m_slice) - cutoff,
+        },
         "label_method": "triple_barrier_labels",
         "calibration_status": "calibrated",
         "min_bars_required": _MIN_5M_BARS,
@@ -269,16 +334,16 @@ def calibrate_5m_artifacts(*, bars_1m: list[list], out_path: str = OUTPUT_PATH, 
 
 
 def main() -> None:
-    p = _L2_BOOK_PATH
-    if os.path.exists(p):
-        try:
-            df_probe = pd.read_csv(p)
-            cols = list(df_probe.columns)
-            print(f"[book-source] {p}: exists=True rows={len(df_probe)} columns={cols}")
-        except Exception as exc:
-            print(f"[book-source] {p}: exists=True unreadable={exc}")
-    else:
-        print(f"[book-source] {p}: exists=False")
+    for p, label in [(_L2_BOOK_PATH, "L2-depth")]:
+        if os.path.exists(p):
+            try:
+                cols = list(pd.read_csv(p, nrows=0).columns)
+                nrows = sum(1 for _ in open(p)) - 1
+            except Exception as exc:
+                cols, nrows = [f"unreadable: {exc}"], -1
+            print(f"[book-source] {label}: exists=True rows≈{nrows} columns={cols}")
+        else:
+            print(f"[book-source] {label}: exists=False — calibration will BLOCK")
     print("calibrate_regime_5m: loading full Dec 2023 1m OHLCV …")
     bars_1m = _load_1m_csv("data/ohlcv_1m.csv")
     print(f"  loaded {len(bars_1m)} 1m bars")
