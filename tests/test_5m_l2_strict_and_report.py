@@ -118,9 +118,13 @@ class TestCalibrateRegime5mBlockers:
     def test_calibration_blocks_on_missing_book(self, tmp_path, monkeypatch):
         pytest.importorskip("pandas")
         import calibrate_regime_5m as m
-        monkeypatch.setattr(m, "_L2_BOOK_PATH", str(tmp_path / "nonexistent_l2.csv"))
+        monkeypatch.setattr(m, "_L2_BOOK_PATH", str(tmp_path / "no_l2.csv"))
         with pytest.raises(RuntimeError, match="BLOCKER"):
-            m.calibrate_5m_artifacts(bars_1m=_make_synthetic_bars(3000), out_path=str(tmp_path/"w.npz"), meta_path=str(tmp_path/"m.json"))
+            m.calibrate_5m_artifacts(
+                bars_1m=_make_synthetic_bars(3000),
+                out_path=str(tmp_path / "w.npz"),
+                meta_path=str(tmp_path / "m.json"),
+            )
 
     def test_missing_l2_book_raises_blocker(self, tmp_path, monkeypatch):
         pytest.importorskip("pandas")
@@ -142,7 +146,11 @@ class TestCalibrateRegime5mBlockers:
         pytest.importorskip("pandas")
         import calibrate_regime_5m as m
         bad = tmp_path / "bad_l2.csv"
-        bad.write_text("ts,bid,ask\n1,100,101\n")
+        bad.write_text(
+            "timestamp,bidPrice0,bidPrice1,askPrice0,askPrice1,"
+            "bidQty0,bidQty1,askQty0,askQty1\n"
+            "1,100,99,101,102,bad,1,1,1\n"
+        )
         monkeypatch.setattr(m, "_L2_BOOK_PATH", str(bad))
         with pytest.raises(RuntimeError, match="BLOCKER"):
             m._build_5m_features(_make_synthetic_bars(600), _make_synthetic_bars(600))
@@ -180,6 +188,7 @@ class TestCalibrateRegime5mBlockers:
         assert meta["real_book_only"] is True
         assert meta["blocker_on_missing_data"] is True
         assert meta["ofi_source"] == "real_l2_depth"
+        assert meta["feature_source"] == "real_l2_depth"
         assert meta["calibration_status"] == "calibrated"
         assert isinstance(meta["n_bars_ofi_nonzero"], int)
         assert meta["n_bars_ofi_nonzero"] > 0
@@ -239,3 +248,20 @@ class TestRunValidationReportHonesty:
         cal_status = report.get("calibration", {}).get("status", "ok")
         if cal_status == "failed":
             assert report.get("run_status") != "OK"
+    def test_unavailable_metrics_not_blocker(self):
+        if not os.path.exists("backtest_summary.json"):
+            pytest.skip("backtest_summary.json absent")
+        report = json.load(open("backtest_summary.json"))
+        # unavailable_metrics must be a separate list, not inside blockers
+        assert "unavailable_metrics" in report
+        assert isinstance(report["unavailable_metrics"], list)
+        metric_names = [u.get("metric") for u in report["unavailable_metrics"]]
+        assert "macro_f1" in metric_names
+        # blockers must not contain macro_f1
+        blocker_reasons = " ".join(
+            str(b.get("reason", "")) for b in report.get("blockers", [])
+        )
+        assert "macro_f1" not in blocker_reasons, (
+            "macro_f1 must appear in unavailable_metrics, not in blockers"
+        )
+
