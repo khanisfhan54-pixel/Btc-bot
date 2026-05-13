@@ -309,6 +309,7 @@ class LiquiditySweepAlpha:
         self.liquidity_pools = {"high": None, "low": None}
         self._pool_set_bar = {"high": None, "low": None}
         self._bar_count = 0
+        self._volatile_gate_count: int = 0
         self.ofi_history = deque(maxlen=history_window)
         self.hawkes_history = deque(maxlen=history_window)
         self.short_ofi = deque(maxlen=5)
@@ -425,6 +426,7 @@ class LiquiditySweepAlpha:
                 "state_invalid_count": self._state_invalid_count,
                 "active_sweep_fired_count": self._active_sweep_fired_count,
                 "pre_sweep_fired_count": getattr(self, "_pre_sweep_fired_count", 0),
+                "volatile_gate_count": self._volatile_gate_count,
                 "last_ofi_levels_used": self._last_ofi_levels_used,
                 "active_sweep_lookback_bars": self.active_sweep_lookback_bars,
                 "direction_mode": self.direction_mode,
@@ -618,12 +620,21 @@ class LiquiditySweepAlpha:
         z = (ofi_total - self._ofi_mean) / ofi_std
         return 4.0 * math.tanh(z / 3.0)
 
-    def _detect_regime(self, ema_fast: float, ema_slow: float, buffer: float = 0.001) -> str:
+    def _detect_regime(
+        self,
+        ema_fast: float,
+        ema_slow: float,
+        buffer: float = 0.001,
+        vol_ratio: float = 0.0,
+    ) -> str:
+        # VOLATILE threshold: empirical tuning deferred to Phase E
+        if vol_ratio > 0.015:
+            return "VOLATILE"
         # fully dynamic buffer using normalized thresholds
         if ema_fast > ema_slow * (1 + buffer):
-            return "UPTREND"
+            return "TRENDING_UP"
         elif ema_fast < ema_slow * (1 - buffer):
-            return "DOWNTREND"
+            return "TRENDING_DOWN"
         return "RANGING"
 
     def detect_sweep_state(self, price: float, atr: float, hawkes_intensity: float) -> str:
@@ -942,7 +953,8 @@ class LiquiditySweepAlpha:
             regime = self._detect_regime(
                 md.get('ema_fast', price),
                 md.get('ema_slow', price),
-                buffer=thresholds["trend_buffer"]
+                buffer=thresholds["trend_buffer"],
+                vol_ratio=vol_ratio,
             )
     
             state = self.detect_sweep_state(price, atr, hawkes)
@@ -1036,6 +1048,30 @@ class LiquiditySweepAlpha:
             if not isinstance(macro_reliability, (int, float)):
                 macro_reliability = 0.5
             macro_reliability = _clamp(macro_reliability, 0.0, 1.0)
+
+            # C3: Internal adverse selection gate.
+            # When the internal regime detector identifies VOLATILE conditions
+            # (vol_ratio > 0.015), market makers are withdrawing quotes and
+            # adverse selection probability is elevated. All directional signals
+            # are suppressed. This gate fires on INTERNAL regime only so it works
+            # even when regime_context is absent.
+            # Threshold 0.015 is conservative; empirical calibration deferred to Phase E.
+            if regime == "VOLATILE":
+                self._volatile_gate_count += 1
+                return self._safe_output({
+                    "action": "HOLD",
+                    "confidence": 0.0,
+                    "state": state,
+                    "regime": regime,
+                    "ofi_zscore": round(ofi_z, 4),
+                    "hawkes_intensity": round(hawkes, 4),
+                    "logic": f"VOLATILE regime gate: adverse selection suppression. "
+                             f"vol_ratio={vol_ratio:.4f}",
+                    "micro_prob": 0.5,
+                    "macro_prob": 0.5,
+                    "prob_above": 0.5,
+                    "prob_below": 0.5,
+                })
 
             if state == "PRE_SWEEP_BUILDUP":
                 # --- Early Anticipation Logic ---
@@ -1160,7 +1196,7 @@ class LiquiditySweepAlpha:
                 reaction_score = _standard_sigmoid(centered_logit)
     
                 trend_penalty = 0.0
-                if (sweep_side == "high" and regime == "UPTREND") or (sweep_side == "low" and regime == "DOWNTREND"):
+                if (sweep_side == "high" and regime == "TRENDING_UP") or (sweep_side == "low" and regime == "TRENDING_DOWN"):
                     trend_penalty = 0.2 
     
                 reaction_score = _clamp(reaction_score - trend_penalty)
@@ -1240,13 +1276,42 @@ class LiquiditySweepAlpha:
                 ensemble_score = _clamp(ensemble_score, 0.0, 1.0)
     
                 active_sweep_threshold = _clamp(0.65 + threshold_offset, 0.5, 0.9)
-                if ensemble_score >= active_sweep_threshold and is_fake:
+                # C2: Regime-direction alignment gate.
+                # In a trending regime, a sweep in the trend direction is structurally
+                # more likely to be continuation than reversal. Block fade entries
+                # when regime and sweep are aligned. This is NOT a threshold change —
+                # it is a structural prior based on microstructure theory.
+                # Empirical validation of the alignment criterion is deferred to Phase E.
+                trend_aligned = (
+                    (sweep_side == "high" and regime == "TRENDING_UP") or
+                    (sweep_side == "low" and regime == "TRENDING_DOWN")
+                )
+
+                if trend_aligned:
+                    action = "HOLD"
+                    confidence = 0.0
+                    logic_path = (
+                        f"ACTIVE_SWEEP on {sweep_side} suppressed: "
+                        f"regime {regime} aligned with sweep direction. "
+                        f"Reversal prior invalid. trend_aligned={trend_aligned} "
+                        f"ensemble={ensemble_score:.3f}"
+                    )
+                elif ensemble_score >= active_sweep_threshold and is_fake:
                     action = "SELL" if sweep_side == "high" else "BUY"
                     confidence = max(0.0, ensemble_score - 0.15 * (1.0 - warmup_factor))
-                    logic_path = f"Fake {sweep_side} sweep confirmed via logit ensemble."
+                    logic_path = f"Fake {sweep_side} sweep confirmed via logit ensemble. trend_aligned={trend_aligned}"
                 else:
-                    logic_path = f"True breakout / lack of reversion edge on {sweep_side} sweep."
+                    logic_path = f"True breakout / lack of reversion edge on {sweep_side} sweep. trend_aligned={trend_aligned}"
     
+            # NOTE: Two regime strings are in scope here:
+            # `regime`       — INTERNAL: computed by _detect_regime from market data.
+            #                  Values: TRENDING_UP, TRENDING_DOWN, RANGING, VOLATILE.
+            #                  Used for: C2 trend_aligned gate, C3 VOLATILE gate,
+            #                  ACTIVE_SWEEP trend_penalty, final output field.
+            # `regime_label` — EXTERNAL: from regime_context dict passed by caller.
+            #                  Values: arbitrary strings from AdvancedRegimeEngine.
+            #                  Used for: confidence scaling multipliers only.
+            # These are intentionally separate. Do not merge them.
             regime_label = str((regime_context or {}).get("regime", regime)).upper()
 
             if "RANGE" in regime_label:
