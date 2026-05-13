@@ -1,3 +1,4 @@
+import logging
 import math
 import threading
 from typing import Dict, Any, Optional, List, Tuple
@@ -17,6 +18,7 @@ _VALID_REGIMES = frozenset({
 __all__ = ["predict_sweep", "LiquiditySweepAlpha"]
 LOGIT_TEMP = 1.2
 EPS = 1e-12
+logger = logging.getLogger(__name__)
 
 # STRICT SAFE FLOAT (guaranteed float output)
 def _safe_num(x: Any, default: float = 0.0) -> float:
@@ -57,7 +59,9 @@ def _is_finite(x: float) -> bool:
 def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, x))
 
-def _calibrate_prob(p: float) -> float:
+# Confidence shrinkage toward 0.5. This is NOT probability calibration.
+# Isotonic/Platt calibration is deferred to Phase B.
+def _shrink_prob(p: float) -> float:
     return _clamp(0.5 + (p - 0.5) * 0.8, 0.0, 1.0)
 
 def _safe_logit(p: float, volatility: float = 0.0) -> float:
@@ -294,6 +298,8 @@ class LiquiditySweepAlpha:
         active_sweep_lookback_bars: int = 30,         # FIX C-2 APPLIED
         pool_reset_atr_mult: float = 5.0,             # FIX H-3 APPLIED
         enable_sweep_directional_fallback: bool = False,  # FIX-28 (M-2)
+        hawkes_decay: float = 0.5,
+        hawkes_alpha: float = 0.1,
     ):
         self.levels = depth_levels
         self.resiliency_threshold = resiliency_threshold
@@ -317,8 +323,12 @@ class LiquiditySweepAlpha:
         # Hawkes Process State
         self.hawkes_lambda = 0.0
         self.last_trade_time = 0.0
-        self.hawkes_decay = 0.5
-        self.hawkes_alpha = 0.1
+        self.hawkes_decay = float(hawkes_decay)
+        self.hawkes_alpha = float(hawkes_alpha)
+        if not (0.0 < self.hawkes_decay <= 20.0):
+            raise ValueError(f"hawkes_decay must be in (0, 20], got {hawkes_decay}")
+        if not (0.0 < self.hawkes_alpha <= 5.0):
+            raise ValueError(f"hawkes_alpha must be in (0, 5], got {hawkes_alpha}")
         self._lock = threading.RLock()
         # FIX M-3 APPLIED — _time_lock created up front so get_signal()
         # never has to lazy-init it under contention.
@@ -411,6 +421,9 @@ class LiquiditySweepAlpha:
                 "active_sweep_lookback_bars": self.active_sweep_lookback_bars,
                 "direction_mode": self.direction_mode,
                 "pool_reset_atr_mult": self.pool_reset_atr_mult,
+                "branching_ratio": round(
+                    self.hawkes_alpha / max(self.hawkes_decay, 1e-9), 6
+                ),
             }
         except Exception:
             # Telemetry must never raise into the trading path.
@@ -471,6 +484,12 @@ class LiquiditySweepAlpha:
             dt = 0.0
         decay_term = math.exp(-self.hawkes_decay * min(dt, 60.0))
         self.hawkes_lambda = (self.hawkes_lambda * decay_term) + (self.hawkes_alpha * tc)
+        branching_ratio = self.hawkes_alpha / max(self.hawkes_decay, 1e-9)
+        if branching_ratio >= 0.9:
+            logger.warning(
+                "Hawkes branching_ratio %.6f is >= 0.9; process may be near-critical",
+                branching_ratio,
+            )
         if self.hawkes_lambda < 0.0 or not _is_finite(self.hawkes_lambda):
             self.hawkes_lambda = 0.0
         self.hawkes_lambda = min(self.hawkes_lambda, 100.0)
@@ -669,6 +688,10 @@ class LiquiditySweepAlpha:
                 rejection_score += 0.5
             if ofi_z < -1.0: 
                 rejection_score += 0.5
+            # WARNING: A rejection_score of 0.5 is reached by price-position alone
+            # (one component scores 0.5). OFI confirmation is optional under this
+            # threshold. Empirical threshold review is deferred to Phase B after
+            # calibration data collection. Do not change this value in Phase A.
             is_fake = rejection_score >= 0.5
 
         elif sweep_side == "low":
@@ -678,6 +701,10 @@ class LiquiditySweepAlpha:
                 rejection_score += 0.5
             if ofi_z > 1.0:
                 rejection_score += 0.5
+            # WARNING: A rejection_score of 0.5 is reached by price-position alone
+            # (one component scores 0.5). OFI confirmation is optional under this
+            # threshold. Empirical threshold review is deferred to Phase B after
+            # calibration data collection. Do not change this value in Phase A.
             is_fake = rejection_score >= 0.5
 
         return is_fake, rejection_score
@@ -984,8 +1011,8 @@ class LiquiditySweepAlpha:
                     pred_micro = 0.5
                 if not math.isfinite(pred_macro):
                     pred_macro = 0.5
-                pred_micro = _calibrate_prob(pred_micro)
-                pred_macro = _calibrate_prob(pred_macro)
+                pred_micro = _shrink_prob(pred_micro)
+                pred_macro = _shrink_prob(pred_macro)
                 # HARD safety after calibration (critical)
                 if not math.isfinite(pred_micro):
                     pred_micro = 0.5
@@ -1101,13 +1128,6 @@ class LiquiditySweepAlpha:
     
                 reaction_score = _clamp(reaction_score - trend_penalty)
     
-                ml_prob = self._ml_sweep_probability({
-                    "ofi": ofi_z,
-                    "hawkes": hawkes,
-                    "volatility": vol_ratio,
-                    "depth": md.get("curr_depth", 1.0)
-                })
-    
                 liquidity_bias = self._liquidity_forecast()
                 liq_prob = (liquidity_bias + 1.0) / 2.0
     
@@ -1115,10 +1135,7 @@ class LiquiditySweepAlpha:
                 # Ensure required variables exist (explicit fallback)
                 if not isinstance(reaction_score, (int, float)):
                     reaction_score = 0.5
-                if not isinstance(ml_prob, (int, float)):
-                    ml_prob = 0.5
                 reaction_score = _clamp(reaction_score, 1e-6, 1.0 - 1e-6)
-                ml_prob = _clamp(ml_prob, 1e-6, 1.0 - 1e-6)
                 # In an active sweep, we are looking for the fake-out / reversion.
                 # If sweeping 'high', we want high prob_down. If 'low', we want prob_up.
                 pred_micro = micro_prediction["prob_down"] if sweep_side == "high" else micro_prediction["prob_up"]
@@ -1128,8 +1145,8 @@ class LiquiditySweepAlpha:
                     pred_micro = 0.5
                 if not math.isfinite(pred_macro):
                     pred_macro = 0.5
-                pred_micro = _calibrate_prob(pred_micro)
-                pred_macro = _calibrate_prob(pred_macro)
+                pred_micro = _shrink_prob(pred_micro)
+                pred_macro = _shrink_prob(pred_macro)
                 # POST-CALIBRATION SAFETY
                 if not math.isfinite(pred_micro):
                     pred_micro = 0.5
@@ -1169,15 +1186,13 @@ class LiquiditySweepAlpha:
                 # Logit Ensemble: Full statistical mapping across all primary system variables.
                 # Single clamp (avoid distortion)
                 reaction_score = _clamp(reaction_score, 1e-6, 1.0 - 1e-6)
-                ml_prob        = _clamp(ml_prob,        1e-6, 1.0 - 1e-6)
                 liq_prob       = _clamp(liq_prob,       1e-6, 1.0 - 1e-6)
 
                 ensemble_logit = (
                     # CONSISTENT LOGIT SCALING (bounded vol_ratio)
-                    0.40 * _safe_logit_guard(reaction_score, min(vol_ratio, 5.0)) +
-                    0.25 * _safe_logit_guard(ml_prob,        min(vol_ratio, 5.0)) +
-                    0.15 * _safe_logit_guard(liq_prob,       min(vol_ratio, 5.0)) +
-                    0.20 * pred_logit
+                    0.52 * _safe_logit_guard(reaction_score, min(vol_ratio, 5.0)) +
+                    0.20 * _safe_logit_guard(liq_prob,       min(vol_ratio, 5.0)) +
+                    0.28 * pred_logit
                 )
                 # HARD SAFETY BEFORE SIGMOID
                 if not math.isfinite(ensemble_logit):
