@@ -300,12 +300,15 @@ class LiquiditySweepAlpha:
         enable_sweep_directional_fallback: bool = False,  # FIX-28 (M-2)
         hawkes_decay: float = 0.5,
         hawkes_alpha: float = 0.1,
+        pool_max_age_bars: int = 200,
     ):
         self.levels = depth_levels
         self.resiliency_threshold = resiliency_threshold
         self.history_window = history_window
 
         self.liquidity_pools = {"high": None, "low": None}
+        self._pool_set_bar = {"high": None, "low": None}
+        self._bar_count = 0
         self.ofi_history = deque(maxlen=history_window)
         self.hawkes_history = deque(maxlen=history_window)
         self.short_ofi = deque(maxlen=5)
@@ -329,6 +332,9 @@ class LiquiditySweepAlpha:
             raise ValueError(f"hawkes_decay must be in (0, 20], got {hawkes_decay}")
         if not (0.0 < self.hawkes_alpha <= 5.0):
             raise ValueError(f"hawkes_alpha must be in (0, 5], got {hawkes_alpha}")
+        self.pool_max_age_bars = int(pool_max_age_bars)
+        if self.pool_max_age_bars < 10:
+            raise ValueError(f"pool_max_age_bars must be >= 10, got {pool_max_age_bars}")
         self._lock = threading.RLock()
         # FIX M-3 APPLIED — _time_lock created up front so get_signal()
         # never has to lazy-init it under contention.
@@ -373,8 +379,10 @@ class LiquiditySweepAlpha:
         # FIX L002: seed pools from constructor if provided
         if initial_high is not None and _is_finite(float(initial_high)) and float(initial_high) > 0:
             self.liquidity_pools["high"] = float(initial_high)
+            self._pool_set_bar["high"] = self._bar_count
         if initial_low is not None and _is_finite(float(initial_low)) and float(initial_low) > 0:
             self.liquidity_pools["low"] = float(initial_low)
+            self._pool_set_bar["low"] = self._bar_count
 
     # FIX C-3 APPLIED — instance wrapper around the module-level
     # _safe_output() that adds state/regime vocabulary validation. Internal
@@ -421,6 +429,16 @@ class LiquiditySweepAlpha:
                 "active_sweep_lookback_bars": self.active_sweep_lookback_bars,
                 "direction_mode": self.direction_mode,
                 "pool_reset_atr_mult": self.pool_reset_atr_mult,
+                "ofi_level_weighting": "cont_2014_decay",
+                "pool_max_age_bars": self.pool_max_age_bars,
+                "pool_age_high_bars": (
+                    self._bar_count - self._pool_set_bar["high"]
+                    if self._pool_set_bar["high"] is not None else None
+                ),
+                "pool_age_low_bars": (
+                    self._bar_count - self._pool_set_bar["low"]
+                    if self._pool_set_bar["low"] is not None else None
+                ),
                 "branching_ratio": round(
                     self.hawkes_alpha / max(self.hawkes_decay, 1e-9), 6
                 ),
@@ -463,10 +481,12 @@ class LiquiditySweepAlpha:
                 valid_highs = [v for v in recent_highs[-20:] if isinstance(v, (int, float)) and _is_finite(v)]
                 if valid_highs:
                     self.liquidity_pools['high'] = max(valid_highs)
+                    self._pool_set_bar['high'] = self._bar_count
             if recent_lows is not None and len(recent_lows) > 0:
                 valid_lows = [v for v in recent_lows[-20:] if isinstance(v, (int, float)) and _is_finite(v)]
                 if valid_lows:
                     self.liquidity_pools['low'] = min(valid_lows)
+                    self._pool_set_bar['low'] = self._bar_count
 
     def _update_hawkes(self, timestamp: float, trade_count: int) -> float:
         ts = self._normalize_timestamp(timestamp, self.last_trade_time)
@@ -535,7 +555,8 @@ class LiquiditySweepAlpha:
                 elif curr_ask_p == prev_ask_p: delta_ask = curr_ask_s - prev_ask_s
                 else: delta_ask = -prev_ask_s
 
-                ofi_total += (delta_bid - delta_ask)
+                level_weight = 1.0 / (i + 1.0)  # Cont et al. (2014) level-decay weight: level 0 = 1.0, level 1 = 0.5, ...
+                ofi_total += level_weight * (delta_bid - delta_ask)
         except (KeyError, IndexError, TypeError):
             # treat malformed/partial book as "no signal" to prevent poisoning rolling stats
             return 0.0
@@ -608,6 +629,19 @@ class LiquiditySweepAlpha:
     def detect_sweep_state(self, price: float, atr: float, hawkes_intensity: float) -> str:
         if self.liquidity_pools['high'] is None or self.liquidity_pools['low'] is None:
             return "NORMAL"
+
+        # Pool staleness gate: expire pools older than pool_max_age_bars
+        if self._pool_set_bar["high"] is not None:
+            if (self._bar_count - self._pool_set_bar["high"]) > self.pool_max_age_bars:
+                self.liquidity_pools["high"] = None
+                self._pool_set_bar["high"] = None
+        if self._pool_set_bar["low"] is not None:
+            if (self._bar_count - self._pool_set_bar["low"]) > self.pool_max_age_bars:
+                self.liquidity_pools["low"] = None
+                self._pool_set_bar["low"] = None
+        if self.liquidity_pools["high"] is None or self.liquidity_pools["low"] is None:
+            return "NORMAL"
+
         # FIX H-3 APPLIED — independent per-side pool reset. The previous
         # joint-AND condition required BOTH pools to be far from price before
         # either was cleared, leaving stale pools in place during one-sided
@@ -619,8 +653,10 @@ class LiquiditySweepAlpha:
             reset_dist = atr * self.pool_reset_atr_mult
             if (price - high_pool) > reset_dist:
                 self.liquidity_pools['high'] = None
+                self._pool_set_bar['high'] = None
             if (low_pool - price) > reset_dist:
                 self.liquidity_pools['low'] = None
+                self._pool_set_bar['low'] = None
             if self.liquidity_pools['high'] is None or self.liquidity_pools['low'] is None:
                 return "NORMAL"
 
@@ -856,6 +892,7 @@ class LiquiditySweepAlpha:
                  macro_liquidity (optional), macro_market_state (optional), macro_volume_intel (optional)
         """
         with self._lock:
+            self._bar_count += 1
             md = market_data if isinstance(market_data, dict) else {}  # local alias (latency)
 
             # FIX M-3 APPLIED — _time_lock is now created in __init__, so the
