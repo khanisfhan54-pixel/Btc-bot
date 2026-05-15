@@ -182,6 +182,40 @@ def test_regime_output_field_is_valid_vocab():
     assert out["regime"] == "TRENDING_UP"
 
 
+def test_confidence_scaled_in_trending_up_no_external_context(monkeypatch):
+    model = alpha.LiquiditySweepAlpha(direction_mode="fade")
+    _warm_model(model)
+    _seed_pools(model, high=100.0, low=90.0)
+    monkeypatch.setattr(model, "detect_sweep_state", lambda price, atr, hawkes: "PRE_SWEEP_BUILDUP")
+    monkeypatch.setattr(model, "_predict_next_sweep", lambda *args, **kwargs: {"prob_up": 0.99, "prob_down": 0.01})
+    monkeypatch.setattr(alpha, "predict_sweep", lambda *args, **kwargs: {"prob_above": 0.99, "prob_below": 0.01})
+
+    out = model.get_signal(_market_data(price=99.5, ema_fast=103.0, ema_slow=100.0), regime_context=None)
+    combined_prob = float(out["logic"].split("Prob: ", 1)[1])
+
+    assert out["state"] == "PRE_SWEEP_BUILDUP"
+    assert out["regime"] == "TRENDING_UP"
+    assert out["action"] == "SELL"
+    assert out["confidence"] < combined_prob
+
+
+def test_confidence_scaled_in_trending_down_no_external_context(monkeypatch):
+    model = alpha.LiquiditySweepAlpha(direction_mode="fade")
+    _warm_model(model)
+    _seed_pools(model, high=110.0, low=100.0)
+    monkeypatch.setattr(model, "detect_sweep_state", lambda price, atr, hawkes: "PRE_SWEEP_BUILDUP")
+    monkeypatch.setattr(model, "_predict_next_sweep", lambda *args, **kwargs: {"prob_up": 0.01, "prob_down": 0.99})
+    monkeypatch.setattr(alpha, "predict_sweep", lambda *args, **kwargs: {"prob_above": 0.01, "prob_below": 0.99})
+
+    out = model.get_signal(_market_data(price=100.5, ema_fast=97.0, ema_slow=100.0), regime_context=None)
+    combined_prob = float(out["logic"].split("Prob: ", 1)[1])
+
+    assert out["state"] == "PRE_SWEEP_BUILDUP"
+    assert out["regime"] == "TRENDING_DOWN"
+    assert out["action"] == "BUY"
+    assert out["confidence"] < combined_prob
+
+
 def test_phase_b_items_still_present():
     metrics = alpha.LiquiditySweepAlpha().get_state_metrics()
 

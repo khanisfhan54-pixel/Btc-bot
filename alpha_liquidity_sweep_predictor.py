@@ -1318,9 +1318,9 @@ class LiquiditySweepAlpha:
                 confidence *= 0.9
             # Match both internal (UPTREND/DOWNTREND) and external (TREND/BEAR)
             # regime labels emitted by AdvancedRegimeEngine.
-            if ("UPTREND" in regime_label or regime_label == "TREND") and action == "SELL":
+            if ("UPTREND" in regime_label or "TRENDING_UP" in regime_label or regime_label == "TREND") and action == "SELL":
                 confidence *= 0.9
-            if ("DOWNTREND" in regime_label or regime_label == "BEAR") and action == "BUY":
+            if ("DOWNTREND" in regime_label or "TRENDING_DOWN" in regime_label or regime_label == "BEAR") and action == "BUY":
                 confidence *= 0.9
             # FINAL CONFIDENCE SAFETY (prevent drift)
             if not math.isfinite(confidence):
