@@ -12,7 +12,7 @@ _VALID_STATES = frozenset({
     "NORMAL", "PRE_SWEEP_BUILDUP", "ACTIVE_SWEEP", "POST_SWEEP"
 })
 _VALID_REGIMES = frozenset({
-    "TRENDING_UP", "TRENDING_DOWN", "RANGING", "VOLATILE", "UNKNOWN"
+    "TRENDING_UP", "TRENDING_DOWN", "RANGING", "VOLATILE", "LOW_LIQUIDITY", "UNKNOWN"
 })
 
 __all__ = ["predict_sweep", "LiquiditySweepAlpha"]
@@ -626,10 +626,13 @@ class LiquiditySweepAlpha:
         ema_slow: float,
         buffer: float = 0.001,
         vol_ratio: float = 0.0,
+        session_volume_percentile: float = 1.0,
     ) -> str:
         # VOLATILE threshold: empirical tuning deferred to Phase E
         if vol_ratio > 0.015:
             return "VOLATILE"
+        if session_volume_percentile < 0.40:
+            return "LOW_LIQUIDITY"
         # fully dynamic buffer using normalized thresholds
         if ema_fast > ema_slow * (1 + buffer):
             return "TRENDING_UP"
@@ -955,6 +958,10 @@ class LiquiditySweepAlpha:
                 md.get('ema_slow', price),
                 buffer=thresholds["trend_buffer"],
                 vol_ratio=vol_ratio,
+                session_volume_percentile=_clamp(
+                    _safe_float(md.get('session_volume_percentile', 1.0), 1.0),
+                    0.0, 1.0,
+                ),
             )
     
             state = self.detect_sweep_state(price, atr, hawkes)
@@ -1072,6 +1079,44 @@ class LiquiditySweepAlpha:
                     "prob_above": 0.5,
                     "prob_below": 0.5,
                 })
+
+            if regime == "LOW_LIQUIDITY":
+                if state == "PRE_SWEEP_BUILDUP":
+                    return self._safe_output({
+                        "action": "HOLD",
+                        "confidence": 0.0,
+                        "state": state,
+                        "regime": regime,
+                        "ofi_zscore": round(ofi_z, 4),
+                        "hawkes_intensity": round(hawkes, 4),
+                        "logic": "LOW_LIQUIDITY regime: anticipation entries suppressed.",
+                        "micro_prob": 0.5,
+                        "macro_prob": 0.5,
+                        "prob_above": 0.5,
+                        "prob_below": 0.5,
+                    })
+                if state == "ACTIVE_SWEEP":
+                    _hw_list = list(self.hawkes_history)
+                    _liq_baseline = (
+                        self.hawkes_sum / len(_hw_list) if _hw_list else 1.0
+                    )
+                    if hawkes < _liq_baseline * 3.0:
+                        return self._safe_output({
+                            "action": "HOLD",
+                            "confidence": 0.0,
+                            "state": state,
+                            "regime": regime,
+                            "ofi_zscore": round(ofi_z, 4),
+                            "hawkes_intensity": round(hawkes, 4),
+                            "logic": (
+                                f"LOW_LIQUIDITY regime: Hawkes {hawkes:.3f} below "
+                                f"3x baseline {_liq_baseline:.3f}. Sweep suppressed."
+                            ),
+                            "micro_prob": 0.5,
+                            "macro_prob": 0.5,
+                            "prob_above": 0.5,
+                            "prob_below": 0.5,
+                        })
 
             if state == "PRE_SWEEP_BUILDUP":
                 # --- Early Anticipation Logic ---
