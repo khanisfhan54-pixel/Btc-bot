@@ -1,0 +1,60 @@
+diff --git a/advanced_regime_engine.py b/advanced_regime_engine.py
+--- a/advanced_regime_engine.py
++++ b/advanced_regime_engine.py
++            except Exception as _swallowed_exc:
++                LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
++            except Exception as _swallowed_exc:
++                LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
++                    except Exception as _swallowed_exc:
++                        LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
++                    except Exception as _swallowed_exc:
++                        LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
++        except Exception as _swallowed_exc:
++            LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
++        except queue.Full as _swallowed_exc:
++            LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
++                except Exception as _swallowed_exc:
++                    LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
++                except Exception as _swallowed_exc:
++                    LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
++            except Exception as _swallowed_exc:
++                LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
++                    except Exception as _swallowed_exc:
++                        LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
++                except Exception as _swallowed_exc:
++                    LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
++                        except Exception as _swallowed_exc:
++                            LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
++                except Exception as _swallowed_exc:
++                    LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
++                except Exception as _swallowed_exc:
++                    LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
++                except Exception as _swallowed_exc:
++                    LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
++        except Exception as _swallowed_exc:
++            LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
++                except Exception as _swallowed_exc:
++                    LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
++                except Exception as _swallowed_exc:
++                    LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
++                except Exception as _swallowed_exc:
++                    LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+diff --git a/engine.py b/engine.py
+--- a/engine.py
++++ b/engine.py
++    except Exception as _swallowed_exc:
++        logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
++    except Exception as _swallowed_exc:
++        logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
++    except Exception as _swallowed_exc:
++        logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
++        except Exception as _swallowed_exc:
++            logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
++    except Exception as _swallowed_exc:
++        logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
++        except Exception as _swallowed_exc:
++            logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
++            except Exception as _swallowed_exc:
++                logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
++        except Exception as _swallowed_exc:
++            logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)

@@ -1,0 +1,43 @@
++        # AUDIT FIX ISSUE-C+PART6: compute BACKTEST_LABEL once per run.
++        _non_production_conditions: Dict[str, bool] = {
++            "l2_data_missing_or_mismatched": not _l2_valid,
++            "orchestration_bypassed": False,      # enforced by Issue D
++            "regime_pipeline_uncalibrated": False, # weights loaded by __init__
++        }
++        _backtest_label = (
+--
++                except Exception as _swallowed_exc:
++                    logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+ 
+             orch_action_str = "HOLD"
+             orch_conviction = 0.0
+@@ -960,6 +1078,31 @@ class BacktestEngine:
+                 except Exception as exc:
+                     logger.debug("orchestrator.orchestrate failed at i=%d: %s", i, exc)
+ 
++            # AUDIT FIX ISSUE-D: orchestration guard.
++            # In production-valid mode, orch_action_str MUST have come from
++            # AlphaOrchestrator.  If the orchestrator didn't run (too few
++            # alpha signals, dependency None), force HOLD — never let a
++            # raw SignalEngine output bypass the orchestration layer.
++            if not self.cfg.legacy_mode:
++                _valid_orch_actions = {"LONG", "SHORT", "HOLD"}
++                if orch_action_str not in _valid_orch_actions:
++                    logger.warning(
++                        "[BACKTEST %s][ISSUE-D] orch_action_str=%r invalid at i=%d — forcing HOLD",
++                        label, orch_action_str, i,
++                    )
++                    orch_action_str = "HOLD"
++                    orch_conviction = 0.0
++                if (self.orchestrator is None
++                        or len(self._last_alpha_signals) < 2):
++                    if orch_action_str in ("LONG", "SHORT"):
++                        logger.warning(
++                            "[BACKTEST %s][ISSUE-D] orchestrator unavailable/insufficient sources at i=%d "
++                            "— forcing HOLD to prevent signal_engine bypass",
++                            label, i,
++                        )
++                        orch_action_str = "HOLD"
++                        orch_conviction = 0.0
++
+             # The signal that drives execution_logic is the orchestrator's

@@ -1765,9 +1765,9 @@ class AlphaOrchestrator:
 
             try:
                 signals = sorted(signals, key=_signal_sort_key)
-            except Exception:
+            except Exception as _swallowed_exc:
                 # Fallback: keep unsorted materialized list and let validation reject bad items
-                pass
+                logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
 
         # FIX 10: Extract ALL environmental quantities from input parameters before
         # the time-resolution guard. None of these values depend on `now`, so they
@@ -1785,8 +1785,8 @@ class AlphaOrchestrator:
             try:
                 stale_ratio = _safe_float(feature_quality.staleness_ratio, 0.0, 0.0, 1.0)
                 missing_ratio = _safe_float(feature_quality.missing_data_ratio, 0.0, 0.0, 1.0)
-            except Exception:
-                pass
+            except Exception as _swallowed_exc:
+                logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
 
         reg_name: str = "unknown"
         if regime:
@@ -2091,8 +2091,8 @@ class AlphaOrchestrator:
                         "min_liquidity_threshold setting if this was unexpected.",
                         float(reg_liq), float(self.config.min_liquidity_threshold),
                     )
-            except Exception:
-                pass
+            except Exception as _swallowed_exc:
+                logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
             return self._hold("insufficient_liquidity", base_meta)
 
         if not valid:
@@ -2132,8 +2132,8 @@ class AlphaOrchestrator:
                 _grps = _csum.get("groups") or []
                 if _grps:
                     _correlation_groups_acc.extend(_grps)
-            except Exception:
-                pass
+            except Exception as _swallowed_exc:
+                logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
             if meta_fusion and "breakdown" in meta_fusion:
                 # FIX 19: Stamp timeframe on every row so MTF forensics are self-contained.
                 for entry in meta_fusion["breakdown"]:

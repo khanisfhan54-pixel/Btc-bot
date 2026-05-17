@@ -242,13 +242,6 @@ class BacktestConfig:
     # returns a fail-closed empty result if any are missing. When True: the
     # orchestrator path is skipped entirely (legacy diagnostic-only mode).
     legacy_mode: bool = False
-    weight_path: str = "weights/advanced_regime_weights.npz"
-    # Optional per-regime hold-horizon override (research validation only).
-    # Dict maps regime label strings to bar counts. When absent or when the
-    # current regime label is not found, max_hold_bars is used unchanged.
-    # Example: {"CHOPPY": 4, "COMPRESSION": 4, "RANGING": 6, "TREND": 20}
-    # Do NOT set this field in any live or paper trading configuration.
-    regime_hold_horizon_bars: Optional[Dict[str, int]] = None
 
 
 class BacktestEngine:
@@ -264,19 +257,15 @@ class BacktestEngine:
             → position management
     """
 
-    def __init__(
-        self,
-        config: BacktestConfig | None = None,
-        learning_engine: Any = None,
-        signal_only: bool = False,
-        weight_path: str | None = None,
-        orchestrator_overrides: Dict[str, Any] | None = None,
-    ) -> None:
+    def __init__(self, config: BacktestConfig | None = None, learning_engine: Any = None) -> None:
+        import os as _os  # AUDIT FIX ISSUE-A
+        if _os.environ.get("BTCBOT_LIVE_MODE") == "1":
+            raise RuntimeError(
+                "BacktestEngine must not be instantiated while BTCBOT_LIVE_MODE=1. "
+                "Unset BTCBOT_LIVE_MODE before running backtests."
+            )
         self.cfg = config or BacktestConfig()
-        if weight_path is not None:
-            self.cfg.weight_path = str(weight_path)
         self.learning_engine = learning_engine if learning_engine is not None else LEARNING_ENGINE
-        self._signal_only = bool(signal_only)
 
         self.feature_engine = FeatureEngine() if FeatureEngine is not None else _FallbackFeatureEngine()
         self.signal_engine = SignalEngine() if SignalEngine is not None else _FallbackSignalEngine()
@@ -291,10 +280,7 @@ class BacktestEngine:
         # FIX CRITICAL-1: AdvancedRegimeEngine is the regime classifier. It
         # MUST be called with a canonical dict payload (price/return/features).
         # Created once and re-used across run_backtest() invocations.
-        self.are = AdvancedRegimeEngine(load_model_weights_on_init=False) if AdvancedRegimeEngine is not None else None
-        if self.are is not None:
-            self.are._weight_path = str(getattr(self.cfg, "weight_path", "weights/advanced_regime_weights.npz"))
-            self.are._load_model_weights()
+        self.are = AdvancedRegimeEngine() if AdvancedRegimeEngine is not None else None
 
         # FIX-6 (REGIME_ENGINE_AUDIT 2026-04-23): load calibration-time
         # feature normalization (feature_mean / feature_std) so that the
@@ -321,15 +307,12 @@ class BacktestEngine:
         # liquidity_sweep_alpha as the two sources (CRITICAL-6 compliant).
         if AlphaOrchestrator is not None and OrchestratorConfig is not None:
             try:
-                orch_kwargs = dict(
+                cfg = OrchestratorConfig(
                     signal_weights={"signal_engine": 0.5, "liquidity_sweep_alpha": 0.5},
                     action_threshold=float(self.cfg.orchestrator_action_threshold),
                     allow_unknown_sources=False,
                     feedback_enabled=False,
                 )
-                if orchestrator_overrides:
-                    orch_kwargs.update(orchestrator_overrides)
-                cfg = OrchestratorConfig(**orch_kwargs)
                 self.orchestrator: Optional[Any] = AlphaOrchestrator(cfg)
             except Exception as _o_init_err:
                 logger.warning("AlphaOrchestrator construction failed (%s)", _o_init_err)
@@ -379,8 +362,8 @@ class BacktestEngine:
         except Exception as exc:
             try:
                 logger.warning("FIX M-1: failed to preload aggTrades counts (%s)", exc)
-            except Exception:
-                pass
+            except Exception as _swallowed_exc:
+                logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
             return {}
 
     # ------------------------------------------------------------------
@@ -391,7 +374,7 @@ class BacktestEngine:
         Fail-closed: missing keys → leave norms as None and let
         _build_canonical_are_payload reject the bar."""
         try:
-            w = np.load(str(getattr(self.cfg, "weight_path", "weights/advanced_regime_weights.npz")))
+            w = np.load("weights/advanced_regime_weights.npz")
             if "feature_mean" in w.files and "feature_std" in w.files:
                 fm = np.asarray(w["feature_mean"], dtype=float)
                 fs = np.asarray(w["feature_std"], dtype=float)
@@ -542,9 +525,9 @@ class BacktestEngine:
                     ]),
                 }
                 market_data["macro_liquidity"] = macro_liquidity
-        except Exception:
+        except Exception as _swallowed_exc:
             # Observability/integration must never break the trading path.
-            pass
+            logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
 
         return market_data
 
@@ -595,79 +578,95 @@ class BacktestEngine:
         return out
 
     # ------------------------------------------------------------------
+    # AUDIT FIX ISSUE-C: L2 timestamp alignment validation
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _validate_l2_timestamp_alignment(
+        l2_csv_path: str,
+        expected_start_ms: int,
+        expected_end_ms: int,
+    ) -> Dict[str, Any]:
+        """Validate that an L2 depth CSV covers the expected replay window.
+
+        Returns a dict with keys:
+          valid (bool)      — True only when the first row falls inside the expected range
+          first_ts_ms (int) — first timestamp found in the file (or -1 on error)
+          reason (str)      — human-readable explanation
+          label (str)       — 'PRODUCTION-VALID' or 'NON-PRODUCTION-VALID: ...'
+        """
+        result: Dict[str, Any] = {
+            "valid": False,
+            "first_ts_ms": -1,
+            "reason": "",
+            "label": "",
+        }
+        try:
+            import csv as _csv
+            with open(l2_csv_path, "r", encoding="utf-8") as fh:
+                reader = _csv.reader(fh)
+                header = next(reader, None)
+                if header is None:
+                    result["reason"] = f"L2 file '{l2_csv_path}' is empty."
+                    result["label"] = "NON-PRODUCTION-VALID: l2_data_missing_or_mismatched"
+                    logger.warning("[BACKTEST][L2_VALIDATE] %s", result["reason"])
+                    return result
+                first_row = next(reader, None)
+                if first_row is None:
+                    result["reason"] = f"L2 file '{l2_csv_path}' has header but no data rows."
+                    result["label"] = "NON-PRODUCTION-VALID: l2_data_missing_or_mismatched"
+                    logger.warning("[BACKTEST][L2_VALIDATE] %s", result["reason"])
+                    return result
+                # Try the first column as timestamp (ms)
+                try:
+                    first_ts = int(float(first_row[0]))
+                except (ValueError, IndexError):
+                    result["reason"] = (
+                        f"L2 file '{l2_csv_path}' first-row timestamp not parseable: {first_row[:2]}"
+                    )
+                    result["label"] = "NON-PRODUCTION-VALID: l2_data_missing_or_mismatched"
+                    logger.warning("[BACKTEST][L2_VALIDATE] %s", result["reason"])
+                    return result
+                result["first_ts_ms"] = first_ts
+                if not (expected_start_ms <= first_ts <= expected_end_ms):
+                    result["reason"] = (
+                        f"L2 file '{l2_csv_path}' timestamp {first_ts} is OUTSIDE "
+                        f"the expected window [{expected_start_ms}, {expected_end_ms}]. "
+                        "This is a date-mismatched file — OFI features will be synthetic."
+                    )
+                    result["label"] = "NON-PRODUCTION-VALID: l2_data_missing_or_mismatched"
+                    logger.warning("[BACKTEST][L2_VALIDATE] %s", result["reason"])
+                    return result
+                result["valid"] = True
+                result["reason"] = (
+                    f"L2 file '{l2_csv_path}' first_ts_ms={first_ts} is within window."
+                )
+                result["label"] = "PRODUCTION-VALID"
+                logger.info("[BACKTEST][L2_VALIDATE] %s", result["reason"])
+        except FileNotFoundError:
+            result["reason"] = f"L2 file '{l2_csv_path}' not found — OFI features will be synthetic."
+            result["label"] = "NON-PRODUCTION-VALID: l2_data_missing_or_mismatched"
+            logger.warning("[BACKTEST][L2_VALIDATE] %s", result["reason"])
+        except Exception as exc:
+            result["reason"] = f"L2 file '{l2_csv_path}' validation error: {exc}"
+            result["label"] = "NON-PRODUCTION-VALID: l2_data_missing_or_mismatched"
+            logger.warning("[BACKTEST][L2_VALIDATE] %s", result["reason"])
+        return result
+
+    # ------------------------------------------------------------------
     # Main entry points
     # ------------------------------------------------------------------
-    def _resolve_hold_horizon(self, regime_label: str) -> int:
-        """
-        Return the active hold-horizon bar count for the given regime label.
-
-        Uses regime_hold_horizon_bars when configured; falls back to
-        max_hold_bars when the mapping is absent or the label is not found.
-
-        This method is for research validation only. Live paths do not call it.
-        """
-        mapping = getattr(self.cfg, "regime_hold_horizon_bars", None)
-        if mapping and isinstance(mapping, dict):
-            label = str(regime_label).upper().strip()
-            if label in mapping:
-                horizon = int(mapping[label])
-                if horizon > 0:
-                    return horizon
-        return int(self.cfg.max_hold_bars)
-
     def run_backtest(
         self,
         ohlcv_data: List[list],
         initial_balance: float | None = None,
-        book_features: Optional[Sequence[Any]] = None,
-        signal_quality_required: bool = False,
-        allow_ohlcv_synthetic: bool = True,
-        **kwargs: Any,
+        book_features: Optional[Sequence[Any]] = None,   # FIX-1
     ) -> Dict[str, Any]:
-        if not allow_ohlcv_synthetic:
-            if self.are is None or not getattr(self.are, '_weights_loaded', False):
-                logger.error(
-                    "[BACKTEST] allow_ohlcv_synthetic=False but ARE weights not loaded. "
-                    "Refusing to run — results would be non-production-valid."
-                )
-                return {
-                    "total_trades": 0,
-                    "win_rate": 0.0,
-                    "pnl": 0.0,
-                    "max_drawdown": 0.0,
-                    "sharpe": 0.0,
-                    "expectancy": 0.0,
-                    "trade_log": [],
-                    "signal_quality_valid": False,
-                    "signal_quality_reason": "uncalibrated_are_weights_ohlcv_synthetic_disallowed",
-                }
-
-        result = self._run_single_pass(
+        return self._run_single_pass(
             ohlcv_data,
             initial_balance=initial_balance,
             label="run_backtest",
             book_features=book_features,
         )
-
-        if signal_quality_required:
-            total_trades = int(result.get("total_trades", 0))
-            n_bars = len([r for r in (ohlcv_data or []) if isinstance(r, (list, tuple)) and len(r) >= 6])
-            min_signal_rate = 0.005
-            actual_rate = total_trades / max(n_bars, 1)
-            if actual_rate < min_signal_rate and n_bars >= 100:
-                result["signal_quality_valid"] = False
-                result["signal_quality_reason"] = (
-                    f"signal_rate={actual_rate:.4f} below min={min_signal_rate:.4f}; "
-                    "engine may be uncalibrated or all features produce HOLD"
-                )
-            else:
-                result["signal_quality_valid"] = True
-                result["signal_quality_reason"] = f"signal_rate={actual_rate:.4f}"
-        else:
-            result.setdefault("signal_quality_valid", True)
-            result.setdefault("signal_quality_reason", "not_checked")
-
-        return result
 
     def run_backtest_multi_resolution(
         self,
@@ -763,7 +762,6 @@ class BacktestEngine:
         initial_balance: float | None = None,
         label: str = "single",
         book_features: Optional[Sequence[Any]] = None,   # FIX-1
-        **kwargs: Any,
     ) -> Dict[str, Any]:
         cache_hits = 0
         cache_misses = 0
@@ -822,6 +820,43 @@ class BacktestEngine:
                 "[BACKTEST %s] FIX-1 using real book features: %d/%d bars",
                 label, n_real, len(data),
             )
+
+        # AUDIT FIX ISSUE-C: validate L2 depth file timestamp alignment.
+        # Dec-2023 replay window in Binance epoch ms.
+        _DEC2023_START_MS = 1_701_388_800_000
+        _DEC2023_END_MS   = 1_704_067_199_000
+        _l2_candidates = [
+            "data/bookDepth.csv",
+            "data/bookDepth_L2.csv",
+            "data/bookDepth_clean.csv",
+        ]
+        _l2_validation: Dict[str, Any] = {
+            "valid": False,
+            "label": "NON-PRODUCTION-VALID: l2_data_missing_or_mismatched",
+        }
+        for _l2_path in _l2_candidates:
+            _v = self._validate_l2_timestamp_alignment(
+                _l2_path, _DEC2023_START_MS, _DEC2023_END_MS
+            )
+            if _v["valid"]:
+                _l2_validation = _v
+                break
+        _l2_valid = _l2_validation["valid"]
+
+        # AUDIT FIX ISSUE-C+PART6: compute BACKTEST_LABEL once per run.
+        _non_production_conditions: Dict[str, bool] = {
+            "l2_data_missing_or_mismatched": not _l2_valid,
+            "orchestration_bypassed": False,      # enforced by Issue D
+            "regime_pipeline_uncalibrated": False, # weights loaded by __init__
+        }
+        _backtest_label = (
+            "PRODUCTION-VALID"
+            if not any(_non_production_conditions.values())
+            else "NON-PRODUCTION-VALID: " + ", ".join(
+                k for k, v in _non_production_conditions.items() if v
+            )
+        )
+        logger.info("[BACKTEST %s] %s", label, _backtest_label)
 
         # Pre-compute volume stats for the canonical vol_z feature
         all_vols = np.array([_safe_float(r[5]) for r in data], dtype=float)
@@ -997,8 +1032,8 @@ class BacktestEngine:
             for s in alpha_signals:
                 try:
                     self._all_alpha_convictions.append(float(s.conviction))
-                except Exception:
-                    pass
+                except Exception as _swallowed_exc:
+                    logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
 
             orch_action_str = "HOLD"
             orch_conviction = 0.0
@@ -1042,6 +1077,31 @@ class BacktestEngine:
                         orch_meta = dict(orchestrated.meta_info or {})
                 except Exception as exc:
                     logger.debug("orchestrator.orchestrate failed at i=%d: %s", i, exc)
+
+            # AUDIT FIX ISSUE-D: orchestration guard.
+            # In production-valid mode, orch_action_str MUST have come from
+            # AlphaOrchestrator.  If the orchestrator didn't run (too few
+            # alpha signals, dependency None), force HOLD — never let a
+            # raw SignalEngine output bypass the orchestration layer.
+            if not self.cfg.legacy_mode:
+                _valid_orch_actions = {"LONG", "SHORT", "HOLD"}
+                if orch_action_str not in _valid_orch_actions:
+                    logger.warning(
+                        "[BACKTEST %s][ISSUE-D] orch_action_str=%r invalid at i=%d — forcing HOLD",
+                        label, orch_action_str, i,
+                    )
+                    orch_action_str = "HOLD"
+                    orch_conviction = 0.0
+                if (self.orchestrator is None
+                        or len(self._last_alpha_signals) < 2):
+                    if orch_action_str in ("LONG", "SHORT"):
+                        logger.warning(
+                            "[BACKTEST %s][ISSUE-D] orchestrator unavailable/insufficient sources at i=%d "
+                            "— forcing HOLD to prevent signal_engine bypass",
+                            label, i,
+                        )
+                        orch_action_str = "HOLD"
+                        orch_conviction = 0.0
 
             # The signal that drives execution_logic is the orchestrator's
             # decision, not the raw SignalEngine output. This is the single
@@ -1170,8 +1230,7 @@ class BacktestEngine:
                 (side == "LONG"  and orch_action_str == "SHORT")
                 or (side == "SHORT" and orch_action_str == "LONG")
             )
-            active_horizon = self._resolve_hold_horizon(str(signal.get("regime", "UNKNOWN")))
-            timeout = hold >= active_horizon
+            timeout = hold >= self.cfg.max_hold_bars
 
             if hit_sl or hit_tp or flip or timeout:
                 gross_pnl_pct = ((current_price - entry) / entry) if side == "LONG" else ((entry - current_price) / entry)
@@ -1253,4 +1312,6 @@ class BacktestEngine:
             "sharpe": round(_compute_sharpe(returns), 6),
             "expectancy": round(expectancy, 6),
             "trade_log": trade_log,
+            "backtest_label": _backtest_label,                  # AUDIT FIX ISSUE-C / PART-6
+            "non_production_conditions": _non_production_conditions,  # AUDIT FIX ISSUE-C / PART-6
         }

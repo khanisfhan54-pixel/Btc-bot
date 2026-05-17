@@ -1,0 +1,8 @@
+{
+  "are_regime_label": "BEAR",
+  "are_signal_valid": true,
+  "are_prob_sum": 1.0,
+  "are_engine_status": "OK",
+  "orch_instantiated": true,
+  "bt_instantiated": true
+}

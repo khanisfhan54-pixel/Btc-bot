@@ -1,0 +1,199 @@
+diff --git a/advanced_regime_engine.py b/advanced_regime_engine.py
+index 8d79e98..f3d8b31 100644
+--- a/advanced_regime_engine.py
++++ b/advanced_regime_engine.py
+@@ -366,8 +366,8 @@ def _validate_output_schema(output: Dict[str, Any], engine_id: str = "unknown")
+                 else:
+                     vt = "other"
+                 REGIME_SCHEMA_VIOLATIONS.labels(str(engine_id or "unknown"), vt).inc()
+-            except Exception:
+-                pass
++            except Exception as _swallowed_exc:
++                LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+         return False
+ 
+ def _build_output(
+@@ -506,8 +506,8 @@ def _build_output(
+                 REGIME_FAILSAFE_EMITTED.labels(
+                     str(engine_id or "unknown"), "schema_validation_failed"
+                 ).inc()
+-            except Exception:
+-                pass
++            except Exception as _swallowed_exc:
++                LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+         fail_safe_probs = [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]
+         fail_safe_macro_probs = _normalize_prob_vector(np.asarray(fail_safe_probs, dtype=float)).tolist()
+         fail_safe_garch_probs = _normalize_prob_vector(np.asarray([0.5, 0.5], dtype=float)).tolist()
+@@ -1070,18 +1070,18 @@ class MSGARCH_RiskEngine:
+                 if _PROM_AVAILABLE:
+                     try:
+                         REGIME_GARCH_PERSISTENCE_HIGH.labels(eid).inc()
+-                    except Exception:
+-                        pass
++                    except Exception as _swallowed_exc:
++                        LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+                 if engine is not None:
+                     try:
+                         engine._warn_rate_limited(
+                             "garch_persistence_high",
+                             f"GARCH persistence {persistence.tolist()} >= 0.99 (IGARCH risk).",
+                         )
+-                    except Exception:
+-                        pass
+-        except Exception:
+-            pass
++                    except Exception as _swallowed_exc:
++                        LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
++        except Exception as _swallowed_exc:
++            LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+         if not np.all(np.isfinite(new_var)):
+             return np.full(2, max(self.target_vol ** 2, 1e-8), dtype=float)
+         return np.clip(new_var, 1e-8, self._VAR_CEIL)
+@@ -1770,8 +1770,8 @@ class AdvancedRegimeEngine:
+         stop_event.set()
+         try:
+             warning_queue.put_nowait(None)
+-        except queue.Full:
+-            pass
++        except queue.Full as _swallowed_exc:
++            LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+ 
+         if worker.is_alive():
+             worker.join(timeout=1.0)
+@@ -1832,15 +1832,15 @@ class AdvancedRegimeEngine:
+             if tf == "base":
+                 try:
+                     LOGGER.warning("Ignoring mtf_weights['base']; base is anchor-only and not a fusion candidate.")
+-                except Exception:
+-                    pass
++                except Exception as _swallowed_exc:
++                    LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+                 continue
+             weight = _safe_float(raw_weight, default=np.nan)
+             if not np.isfinite(weight) or weight <= 0.0:
+                 try:
+                     LOGGER.warning("Ignoring non-positive/invalid MTF weight for '%s': %r", tf, raw_weight)
+-                except Exception:
+-                    pass
++                except Exception as _swallowed_exc:
++                    LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+                 continue
+             normalized[tf] = float(weight)
+         return normalized
+@@ -2000,8 +2000,8 @@ class AdvancedRegimeEngine:
+         if warmup < 1.0:
+             try:
+                 self._record_regime_downgrade("nhhmm_warmup")
+-            except Exception:
+-                pass
++            except Exception as _swallowed_exc:
++                LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+         floor_mult = (
+             self._shock_startup_vol_floor_mult
+             + (1.5 - self._shock_startup_vol_floor_mult) * warmup
+@@ -2205,14 +2205,14 @@ class AdvancedRegimeEngine:
+                             RuntimeWarning,
+                             stacklevel=1,
+                         )
+-                    except Exception:
+-                        pass
++                    except Exception as _swallowed_exc:
++                        LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+             except Exception:
+                 engine._increment_warning_backend_failure_count()
+                 try:
+                     warnings.warn(msg, RuntimeWarning, stacklevel=1)
+-                except Exception:
+-                    pass
++                except Exception as _swallowed_exc:
++                    LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+ 
+     def _load_model_weights(self) -> None:
+         weights = ModelWeightManager.load_weights("advanced_regime", self._weight_path)
+@@ -2349,8 +2349,8 @@ class AdvancedRegimeEngine:
+                                 "Snapshot dropped: _lock held by update() thread.",
+                                 cooldown_s=30.0,
+                             )
+-                        except Exception:
+-                            pass
++                        except Exception as _swallowed_exc:
++                            LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+                     continue
+                 try:
+                     materialized_payload = engine._materialize_snapshot_payload(snapshot_payload)
+@@ -2514,8 +2514,8 @@ class AdvancedRegimeEngine:
+                         RuntimeWarning,
+                         stacklevel=2,
+                     )
+-                except Exception:
+-                    pass
++                except Exception as _swallowed_exc:
++                    LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+             return False
+         return True
+ 
+@@ -2972,8 +2972,8 @@ class AdvancedRegimeEngine:
+                         ),
+                         cooldown_s=300.0,
+                     )
+-                except Exception:
+-                    pass
++                except Exception as _swallowed_exc:
++                    LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+                 reason = "unspecified"
+             self._regime_downgrade_count[reason] = (
+                 self._regime_downgrade_count.get(reason, 0) + 1
+@@ -2987,10 +2987,10 @@ class AdvancedRegimeEngine:
+                         getattr(self, "_metrics_engine_id", "unknown"),
+                         reason,
+                     ).set(self._regime_downgrade_count[reason])
+-                except Exception:
+-                    pass
+-        except Exception:
+-            pass
++                except Exception as _swallowed_exc:
++                    LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
++        except Exception as _swallowed_exc:
++            LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+ 
+     @_synchronized
+     def reconcile_drawdown(
+@@ -3112,12 +3112,12 @@ class AdvancedRegimeEngine:
+                     self._cb_trigger_history.append(
+                         (float(time.time()), "portfolio_drawdown_breach", float(dd))
+                     )
+-                except Exception:
+-                    pass
++                except Exception as _swallowed_exc:
++                    LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+                 try:
+                     self._record_regime_downgrade("circuit_breaker")
+-                except Exception:
+-                    pass
++                except Exception as _swallowed_exc:
++                    LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+                 # UPGRADE-5.8: persist cb_trigger_history to disk so the
+                 # operator can recover trip context after a crash. Replay-
+                 # skipped (preserves determinism) and fail-soft on I/O.
+@@ -3134,8 +3134,8 @@ class AdvancedRegimeEngine:
+                         "CIRCUIT_BREAKER: portfolio DD %.4f >= %.4f (realized_pnl=%.6f equity=%.6f)",
+                         dd, self._MAX_PORTFOLIO_DRAWDOWN, float(realized_pnl), eq,
+                     )
+-                except Exception:
+-                    pass
++                except Exception as _swallowed_exc:
++                    LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+ 
+     @_synchronized
+     def serialize_state(self) -> Dict[str, Any]:
+@@ -4839,6 +4839,10 @@ class AdvancedRegimeEngine:
+                 sjm_probs = _normalize_prob_vector(sjm_probs)
+                 sjm_state = int(np.argmax(sjm_probs))
+             
++        # Defense-in-depth: final normalization before argmax (AUDIT FIX ISSUE-B)
++        if np.all(np.isfinite(sjm_probs)):
++            sjm_probs = _normalize_prob_vector(sjm_probs)
++            sjm_state = int(np.argmax(sjm_probs))
+         self.current_regime_idx = sjm_state
+         regime_scores = compute_hmm_regime(
+             sjm_probs,
