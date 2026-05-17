@@ -9,6 +9,67 @@ from typing import Optional
 from bar_aggregator import resample_bars
 from backtest_engine import BacktestConfig, BacktestEngine
 from calibrate_regime_5m import CalibrationSlice, calibrate_5m_artifacts
+from data_tools.l2_to_backtest import load_l2_csv
+
+
+BASELINE_INVARIANTS = {
+    "output_keys": ["action","confidence","state","regime","ofi_zscore",
+                    "hawkes_intensity","logic","micro_prob","macro_prob",
+                    "prob_above","prob_below"],
+    "hold_on_missing_ofi": True,
+    "hold_on_l1_only_book": True,
+    "hold_on_no_pools": True,
+    "hold_on_invalid_price": True,
+    "hold_on_volatile_regime": True,
+    "deterministic_across_runs": True,
+    "no_nan_propagation": True,
+    "no_inf_propagation": True,
+    "prob_above_plus_prob_below_eq_1": True,
+    "confidence_in_0_1": True,
+    "ofi_count_sync": True,
+    "orchestrator_compatible": True,
+    "state_invalid_count_not_regression": True,
+    "l2_partial_alpha_conf_mean": 0.29535,
+    "l2_partial_alpha_dir_neutral_pct": 1.0,
+    "ohlcv_synthetic_alpha_conf_mean": 0.32582,
+    "ohlcv_synthetic_alpha_dir_neutral_pct": 1.0,
+    "enable_sweep_directional_fallback_default": False,
+    "fail_closed_on_uncertainty": True,
+}
+
+
+def _classify_ofi_capability(book_snapshots, required_levels=10):
+    if not book_snapshots:
+        return {"ofi_capable": False, "max_levels_available": 0, "classification": "NO_BOOK_DATA", "production_valid": False}
+    # BookSnapshot path is L1-only by schema.
+    effective_levels = 1
+    if effective_levels < required_levels:
+        return {
+            "ofi_capable": False,
+            "max_levels_available": effective_levels,
+            "classification": "L1_ONLY_REPLAY" if effective_levels <= 1 else f"PARTIAL_L2_REPLAY_{effective_levels}_LEVELS",
+            "production_valid": False,
+            "warning": (
+                f"NON-PRODUCTION MICROSTRUCTURE VALIDATION: Only {effective_levels} book level(s) available. "
+                f"OFI requires {required_levels} levels. ofi_zscore will be ≈ 0.0. "
+                "LSA directional output unreliable."
+            ),
+        }
+    return {"ofi_capable": True, "max_levels_available": effective_levels, "classification": "REAL_L2_REPLAY", "production_valid": True}
+
+
+def _diagnose_neutral_reason(lsa):
+    if lsa is None or not hasattr(lsa, "get_state_metrics"):
+        return "LSA not initialized"
+    metrics = lsa.get_state_metrics() or {}
+    reasons = []
+    if metrics.get("last_ofi_levels_used", 10) < 5:
+        reasons.append(f"ofi_levels_used={metrics.get('last_ofi_levels_used', 0)} (insufficient depth for meaningful OFI signal)")
+    if metrics.get("neutral_predict_count", 0) > 0:
+        reasons.append(f"neutral_predict_count={metrics['neutral_predict_count']} (cold-start or pool geometry insufficient)")
+    if metrics.get("volatile_gate_count", 0) > 0:
+        reasons.append(f"volatile_gate_count={metrics['volatile_gate_count']} (VOLATILE regime gate fired)")
+    return " | ".join(reasons) if reasons else "unknown — check hawkes and pool state"
 
 
 def _load(path:str)->list[list]:
@@ -76,6 +137,7 @@ def _rewrite_replit(report:str)->None:
 
 
 def main() -> None:
+    json.dump(BASELINE_INVARIANTS, open("baseline_snapshot.json", "w"), indent=2)
     bars_1m = _load("data/ohlcv_1m.csv")
     bars_5m_raw = _load("data/ohlcv_5m.csv")
     bars_5m_resampled = resample_bars(bars_1m, minutes=5)
@@ -106,6 +168,11 @@ def main() -> None:
 
     base_cfg = BacktestConfig(fee_bps=8.0, slippage_bps=3.0, max_hold_bars=12, orchestrator_action_threshold=0.60)
     cost = _cost_basis(base_cfg)
+    try:
+        l2_snaps = load_l2_csv("data/bookTicker_dec2023_30s.csv")
+    except Exception:
+        l2_snaps = []
+    ofi_capability = _classify_ofi_capability(l2_snaps, required_levels=10)
 
     engine_A = BacktestEngine(config=base_cfg, weight_path=weight_path)
     result_A = engine_A._run_single_pass(bars_5m, label="5m_fixed_horizon")
@@ -227,6 +294,25 @@ def main() -> None:
         },
         "blockers": all_blockers,
         "unavailable_metrics": unavailable_metrics,
+        "ofi_capability": ofi_capability,
+        "lsa_validity": "NOT_VALID_OFI_INSUFFICIENT" if not ofi_capability.get("ofi_capable", False) else "VALID",
+        "lsa_final_diagnostics": engine_A.lsa.get_state_metrics() if getattr(engine_A, "lsa", None) and hasattr(engine_A.lsa, "get_state_metrics") else {},
+        "lsa_neutral_reason": _diagnose_neutral_reason(getattr(engine_A, "lsa", None)),
+        "validation_integrity": {
+            "walk_forward_implemented": False,
+            "embargo_implemented": False,
+            "train_test_split": "NONE",
+            "calibration_window": "Dec-2023",
+            "test_window": "Dec-2023",
+            "in_sample_contamination_risk": "HIGH",
+            "production_validity": "NOT_VALID — in-sample result only",
+            "required_before_paper_trading": [
+                "Fetch Dec-2023 20-level L2 depth",
+                "Calibrate Hawkes parameters on Nov-2023",
+                "Implement walk-forward: calibrate Nov-2023, test Dec-2023",
+                "Add embargo to pool seeding",
+            ],
+        },
     }
     output["prior_run_comparison"] = {
         "total_trades": _prior_delta(metrics_A["trading"]["total_trades"], "total_trades"),

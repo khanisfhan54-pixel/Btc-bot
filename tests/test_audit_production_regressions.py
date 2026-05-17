@@ -83,3 +83,23 @@ def test_set_price_anchor_recovers_mode_when_timestamp_resumes():
     ok2, reason = eng._set_price_anchor(101.0, 1_700_000_000.0, 2)
     assert ok2, reason
     assert eng._pnl_mode == "TIMESTAMP"
+
+
+def test_hold_preserved_under_l1_book():
+    lsa = lsp.LiquiditySweepAlpha(enable_sweep_directional_fallback=False)
+    l1_book = {
+        "bids": [{"price": 60000.0, "size": 1.0}],
+        "asks": [{"price": 60010.0, "size": 1.0}],
+    }
+    out = lsa.get_signal({
+        "price": 60005.0,
+        "prev_book": l1_book,
+        "curr_book": l1_book,
+        "timestamp": 1700000000.0,
+        "trades_count": 50,
+        "atr": 150.0,
+        "ema_fast": 60010.0,
+        "ema_slow": 60005.0,
+    })
+    assert out["action"] == "HOLD"
+    assert out["ofi_zscore"] == 0.0 or abs(out["ofi_zscore"]) < 0.01
