@@ -1,0 +1,216 @@
+diff --git a/backtest_engine.py b/backtest_engine.py
+index dfe687e..32bd73e 100644
+--- a/backtest_engine.py
++++ b/backtest_engine.py
+@@ -258,6 +258,12 @@ class BacktestEngine:
+     """
+ 
+     def __init__(self, config: BacktestConfig | None = None, learning_engine: Any = None) -> None:
++        import os as _os  # AUDIT FIX ISSUE-A
++        if _os.environ.get("BTCBOT_LIVE_MODE") == "1":
++            raise RuntimeError(
++                "BacktestEngine must not be instantiated while BTCBOT_LIVE_MODE=1. "
++                "Unset BTCBOT_LIVE_MODE before running backtests."
++            )
+         self.cfg = config or BacktestConfig()
+         self.learning_engine = learning_engine if learning_engine is not None else LEARNING_ENGINE
+ 
+@@ -356,8 +362,8 @@ class BacktestEngine:
+         except Exception as exc:
+             try:
+                 logger.warning("FIX M-1: failed to preload aggTrades counts (%s)", exc)
+-            except Exception:
+-                pass
++            except Exception as _swallowed_exc:
++                logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+             return {}
+ 
+     # ------------------------------------------------------------------
+@@ -519,9 +525,9 @@ class BacktestEngine:
+                     ]),
+                 }
+                 market_data["macro_liquidity"] = macro_liquidity
+-        except Exception:
++        except Exception as _swallowed_exc:
+             # Observability/integration must never break the trading path.
+-            pass
++            logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+ 
+         return market_data
+ 
+@@ -571,6 +577,81 @@ class BacktestEngine:
+ 
+         return out
+ 
++    # ------------------------------------------------------------------
++    # AUDIT FIX ISSUE-C: L2 timestamp alignment validation
++    # ------------------------------------------------------------------
++    @staticmethod
++    def _validate_l2_timestamp_alignment(
++        l2_csv_path: str,
++        expected_start_ms: int,
++        expected_end_ms: int,
++    ) -> Dict[str, Any]:
++        """Validate that an L2 depth CSV covers the expected replay window.
++
++        Returns a dict with keys:
++          valid (bool)      — True only when the first row falls inside the expected range
++          first_ts_ms (int) — first timestamp found in the file (or -1 on error)
++          reason (str)      — human-readable explanation
++          label (str)       — 'PRODUCTION-VALID' or 'NON-PRODUCTION-VALID: ...'
++        """
++        result: Dict[str, Any] = {
++            "valid": False,
++            "first_ts_ms": -1,
++            "reason": "",
++            "label": "",
++        }
++        try:
++            import csv as _csv
++            with open(l2_csv_path, "r", encoding="utf-8") as fh:
++                reader = _csv.reader(fh)
++                header = next(reader, None)
++                if header is None:
++                    result["reason"] = f"L2 file '{l2_csv_path}' is empty."
++                    result["label"] = "NON-PRODUCTION-VALID: l2_data_missing_or_mismatched"
++                    logger.warning("[BACKTEST][L2_VALIDATE] %s", result["reason"])
++                    return result
++                first_row = next(reader, None)
++                if first_row is None:
++                    result["reason"] = f"L2 file '{l2_csv_path}' has header but no data rows."
++                    result["label"] = "NON-PRODUCTION-VALID: l2_data_missing_or_mismatched"
++                    logger.warning("[BACKTEST][L2_VALIDATE] %s", result["reason"])
++                    return result
++                # Try the first column as timestamp (ms)
++                try:
++                    first_ts = int(float(first_row[0]))
++                except (ValueError, IndexError):
++                    result["reason"] = (
++                        f"L2 file '{l2_csv_path}' first-row timestamp not parseable: {first_row[:2]}"
++                    )
++                    result["label"] = "NON-PRODUCTION-VALID: l2_data_missing_or_mismatched"
++                    logger.warning("[BACKTEST][L2_VALIDATE] %s", result["reason"])
++                    return result
++                result["first_ts_ms"] = first_ts
++                if not (expected_start_ms <= first_ts <= expected_end_ms):
++                    result["reason"] = (
++                        f"L2 file '{l2_csv_path}' timestamp {first_ts} is OUTSIDE "
++                        f"the expected window [{expected_start_ms}, {expected_end_ms}]. "
++                        "This is a date-mismatched file — OFI features will be synthetic."
++                    )
++                    result["label"] = "NON-PRODUCTION-VALID: l2_data_missing_or_mismatched"
++                    logger.warning("[BACKTEST][L2_VALIDATE] %s", result["reason"])
++                    return result
++                result["valid"] = True
++                result["reason"] = (
++                    f"L2 file '{l2_csv_path}' first_ts_ms={first_ts} is within window."
++                )
++                result["label"] = "PRODUCTION-VALID"
++                logger.info("[BACKTEST][L2_VALIDATE] %s", result["reason"])
++        except FileNotFoundError:
++            result["reason"] = f"L2 file '{l2_csv_path}' not found — OFI features will be synthetic."
++            result["label"] = "NON-PRODUCTION-VALID: l2_data_missing_or_mismatched"
++            logger.warning("[BACKTEST][L2_VALIDATE] %s", result["reason"])
++        except Exception as exc:
++            result["reason"] = f"L2 file '{l2_csv_path}' validation error: {exc}"
++            result["label"] = "NON-PRODUCTION-VALID: l2_data_missing_or_mismatched"
++            logger.warning("[BACKTEST][L2_VALIDATE] %s", result["reason"])
++        return result
++
+     # ------------------------------------------------------------------
+     # Main entry points
+     # ------------------------------------------------------------------
+@@ -740,6 +821,43 @@ class BacktestEngine:
+                 label, n_real, len(data),
+             )
+ 
++        # AUDIT FIX ISSUE-C: validate L2 depth file timestamp alignment.
++        # Dec-2023 replay window in Binance epoch ms.
++        _DEC2023_START_MS = 1_701_388_800_000
++        _DEC2023_END_MS   = 1_704_067_199_000
++        _l2_candidates = [
++            "data/bookDepth.csv",
++            "data/bookDepth_L2.csv",
++            "data/bookDepth_clean.csv",
++        ]
++        _l2_validation: Dict[str, Any] = {
++            "valid": False,
++            "label": "NON-PRODUCTION-VALID: l2_data_missing_or_mismatched",
++        }
++        for _l2_path in _l2_candidates:
++            _v = self._validate_l2_timestamp_alignment(
++                _l2_path, _DEC2023_START_MS, _DEC2023_END_MS
++            )
++            if _v["valid"]:
++                _l2_validation = _v
++                break
++        _l2_valid = _l2_validation["valid"]
++
++        # AUDIT FIX ISSUE-C+PART6: compute BACKTEST_LABEL once per run.
++        _non_production_conditions: Dict[str, bool] = {
++            "l2_data_missing_or_mismatched": not _l2_valid,
++            "orchestration_bypassed": False,      # enforced by Issue D
++            "regime_pipeline_uncalibrated": False, # weights loaded by __init__
++        }
++        _backtest_label = (
++            "PRODUCTION-VALID"
++            if not any(_non_production_conditions.values())
++            else "NON-PRODUCTION-VALID: " + ", ".join(
++                k for k, v in _non_production_conditions.items() if v
++            )
++        )
++        logger.info("[BACKTEST %s] %s", label, _backtest_label)
++
+         # Pre-compute volume stats for the canonical vol_z feature
+         all_vols = np.array([_safe_float(r[5]) for r in data], dtype=float)
+         vol_mean = float(all_vols.mean()) if all_vols.size else 0.0
+@@ -914,8 +1032,8 @@ class BacktestEngine:
+             for s in alpha_signals:
+                 try:
+                     self._all_alpha_convictions.append(float(s.conviction))
+-                except Exception:
+-                    pass
++                except Exception as _swallowed_exc:
++                    logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+ 
+             orch_action_str = "HOLD"
+             orch_conviction = 0.0
+@@ -960,6 +1078,31 @@ class BacktestEngine:
+                 except Exception as exc:
+                     logger.debug("orchestrator.orchestrate failed at i=%d: %s", i, exc)
+ 
++            # AUDIT FIX ISSUE-D: orchestration guard.
++            # In production-valid mode, orch_action_str MUST have come from
++            # AlphaOrchestrator.  If the orchestrator didn't run (too few
++            # alpha signals, dependency None), force HOLD — never let a
++            # raw SignalEngine output bypass the orchestration layer.
++            if not self.cfg.legacy_mode:
++                _valid_orch_actions = {"LONG", "SHORT", "HOLD"}
++                if orch_action_str not in _valid_orch_actions:
++                    logger.warning(
++                        "[BACKTEST %s][ISSUE-D] orch_action_str=%r invalid at i=%d — forcing HOLD",
++                        label, orch_action_str, i,
++                    )
++                    orch_action_str = "HOLD"
++                    orch_conviction = 0.0
++                if (self.orchestrator is None
++                        or len(self._last_alpha_signals) < 2):
++                    if orch_action_str in ("LONG", "SHORT"):
++                        logger.warning(
++                            "[BACKTEST %s][ISSUE-D] orchestrator unavailable/insufficient sources at i=%d "
++                            "— forcing HOLD to prevent signal_engine bypass",
++                            label, i,
++                        )
++                        orch_action_str = "HOLD"
++                        orch_conviction = 0.0
++
+             # The signal that drives execution_logic is the orchestrator's
+             # decision, not the raw SignalEngine output. This is the single
+             # production path; there is no parallel fallback. (CRITICAL-4 d)
+@@ -1169,4 +1312,6 @@ class BacktestEngine:
+             "sharpe": round(_compute_sharpe(returns), 6),
+             "expectancy": round(expectancy, 6),
+             "trade_log": trade_log,
++            "backtest_label": _backtest_label,                  # AUDIT FIX ISSUE-C / PART-6
++            "non_production_conditions": _non_production_conditions,  # AUDIT FIX ISSUE-C / PART-6
+         }

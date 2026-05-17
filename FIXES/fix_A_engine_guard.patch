@@ -1,0 +1,328 @@
+diff --git a/engine.py b/engine.py
+index 936d382..f7d2505 100644
+--- a/engine.py
++++ b/engine.py
+@@ -124,8 +124,8 @@ def _validate_output_against_schema(out: Dict[str, Any]) -> List[str]:
+                 lo, hi = rng
+                 if not (math.isfinite(float(v)) and lo - 1e-9 <= float(v) <= hi + 1e-9):
+                     fails.append(f"{key}: value {v} outside [{lo}, {hi}]")
+-    except Exception:
+-        pass
++    except Exception as _swallowed_exc:
++        logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+     return fails
+ 
+ 
+@@ -156,8 +156,8 @@ def _record_and_check_anomaly(field: str, value: float) -> None:
+                     field, float(value), float(p99),
+                 )
+         dq.append(float(value))
+-    except Exception:
+-        pass
++    except Exception as _swallowed_exc:
++        logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+ 
+ 
+ _LIQUIDITY_SWEEP_ALPHA: Optional[LiquiditySweepAlpha] = None
+@@ -211,8 +211,8 @@ except Exception as _meta_import_exc:
+             "[META_FILTER] Import failed — MetaFilter unavailable. Trades will be fail-closed until resolved. Reason: %s",
+             _meta_import_exc,
+         )
+-    except Exception:
+-        pass
++    except Exception as _swallowed_exc:
++        logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+ 
+ META_FILTER = None
+ 
+@@ -320,8 +320,8 @@ def apply_meta_to_decision(
+     if "position_size" in decision and decision["position_size"] is not None:
+         try:
+             decision["position_size"] = max(0.0, float(decision["position_size"]) * risk_scale)
+-        except Exception:
+-            pass
++        except Exception as _swallowed_exc:
++            logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+ 
+     decision["risk_scale"] = risk_scale
+     decision["meta_result"] = meta_result
+@@ -632,8 +632,8 @@ def _ohlcv_to_closes(recent_candles: Any) -> List[float]:
+     try:
+         if hasattr(recent_candles, "__getitem__") and "close" in getattr(recent_candles, "columns", []):
+             return [float(x) for x in recent_candles["close"].tolist()]
+-    except Exception:
+-        pass
++    except Exception as _swallowed_exc:
++        logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+     try:
+         return [float(r[4]) for r in recent_candles if len(r) >= 5]
+     except Exception:
+@@ -2793,8 +2793,8 @@ class SMCLearningMemory:
+                 with open(tmp, "w") as f:
+                     json.dump(self.data, f, indent=2)
+                 os.replace(tmp, self.path)
+-        except Exception:
+-            pass
++        except Exception as _swallowed_exc:
++            logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+ 
+     @staticmethod
+     def _key(features: Dict[str, Any]) -> str:
+@@ -3868,8 +3868,8 @@ def run_all_engines(
+             try:
+                 fetched = exchange.fetch_funding_rate(symbol)
+                 fr = _safe_float((fetched or {}).get("fundingRate", fr), fr)
+-            except Exception:
+-                pass
++            except Exception as _swallowed_exc:
++                logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+ 
+         vol_intel = volume_intelligence or analyze_volume_intelligence(
+             exchange=None,
+@@ -4458,8 +4458,8 @@ def run_all_engines(
+                 "alpha_confidence",
+                 float(_alpha_obj.get("confidence", 0.0) or 0.0),
+             )
+-        except Exception:
+-            pass
++        except Exception as _swallowed_exc:
++            logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+         # AUDIT-FIX Phase 3 #13 — opt-in OUTPUT_SCHEMA validation
+         try:
+             if os.environ.get("AUDIT_VALIDATE") == "1":
+@@ -4469,8 +4469,8 @@ def run_all_engines(
+                         "[ENGINE][SCHEMA] OUTPUT_SCHEMA violations: %s",
+                         ";".join(_schema_fails),
+                     )
+-        except Exception:
+-            pass
++        except Exception as _swallowed_exc:
++            logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+         return _out
+     except Exception as exc:
+         # AUDIT-FIX M-2 + Phase 2 #6 — structured fallback classification.
+@@ -4490,9 +4490,9 @@ def run_all_engines(
+                 run_all_engines._fallback_reason_counts = _counts
+             key = f"{reason_class}.{reason_module}"
+             _counts[key] = int(_counts.get(key, 0)) + 1
+-        except Exception:
++        except Exception as _swallowed_exc:
+             # Telemetry must never mask the real failure path.
+-            pass
++            logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+         logger.error(
+             "[ENGINE][FALLBACK] run_all_engines fallback (err_count=%d)",
+             int(getattr(run_all_engines, "_error_count", 0)),
+@@ -5317,6 +5317,14 @@ class BinanceRestData:
+             return 0.0
+ 
+ 
++# ============================================================
++# LIVE EXECUTION GUARD — AUDIT FIX ISSUE-A
++# These classes require explicit BTCBOT_LIVE_MODE=1 to instantiate.
++# Backtest paths must NEVER reach this code.
++# If BTCBOT_LIVE_MODE is unset or != "1", instantiating any of
++# the three classes below raises ImportError immediately.
++# ============================================================
++
+ class BinanceFuturesStreamClient:
+     def __init__(
+         self,
+@@ -5325,6 +5333,12 @@ class BinanceFuturesStreamClient:
+         on_raw: Optional[Callable[[dict], None]] = None,
+         throttle_sec: float = 1.0,
+     ) -> None:
++        import os as _os  # AUDIT FIX ISSUE-A
++        if _os.environ.get("BTCBOT_LIVE_MODE") != "1":
++            raise ImportError(
++                "BinanceFuturesStreamClient requires BTCBOT_LIVE_MODE=1. "
++                "This class must not be instantiated from backtest paths."
++            )
+         self.symbol = symbol.replace("/", "").lower()
+         self.on_snapshot = on_snapshot
+         self.on_raw = on_raw
+@@ -5377,8 +5391,8 @@ class BinanceFuturesStreamClient:
+         if self.on_snapshot:
+             try:
+                 self.on_snapshot(snapshot)
+-            except Exception:
+-                pass
++            except Exception as _swallowed_exc:
++                logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+ 
+     def _handle_depth(self, data: dict) -> None:
+         try:
+@@ -5386,8 +5400,8 @@ class BinanceFuturesStreamClient:
+             asks = [[_safe_float(p), _safe_float(q)] for p, q in data.get("a", [])]
+             with self._lock:
+                 self.orderbook = {"bids": bids, "asks": asks}
+-        except Exception:
+-            pass
++        except Exception as _swallowed_exc:
++            logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+ 
+     def _handle_bookticker(self, data: dict) -> None:
+         try:
+@@ -5396,8 +5410,8 @@ class BinanceFuturesStreamClient:
+             if bid > 0 and ask > 0:
+                 with self._lock:
+                     self.price = (bid + ask) / 2.0
+-        except Exception:
+-            pass
++        except Exception as _swallowed_exc:
++            logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+ 
+     def _handle_trade(self, data: dict) -> None:
+         try:
+@@ -5413,8 +5427,8 @@ class BinanceFuturesStreamClient:
+             }
+             with self._lock:
+                 self.trades.append(trade)
+-        except Exception:
+-            pass
++        except Exception as _swallowed_exc:
++            logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+ 
+     def _handle_force_order(self, data: dict) -> None:
+         try:
+@@ -5433,8 +5447,8 @@ class BinanceFuturesStreamClient:
+             }
+             with self._lock:
+                 self.trades.append(trade)
+-        except Exception:
+-            pass
++        except Exception as _swallowed_exc:
++            logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+ 
+     def _handle_kline(self, data: dict) -> None:
+         try:
+@@ -5459,15 +5473,15 @@ class BinanceFuturesStreamClient:
+                     if len(rows) > 500:
+                         del rows[:-500]
+             self.price = candle[4] or self.price
+-        except Exception:
+-            pass
++        except Exception as _swallowed_exc:
++            logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+ 
+     def _handle_mark_price(self, data: dict) -> None:
+         try:
+             self.funding_rate = _safe_float(data.get("r", data.get("lastFundingRate", 0.0)))
+             self.price = _safe_float(data.get("p", self.price)) or self.price
+-        except Exception:
+-            pass
++        except Exception as _swallowed_exc:
++            logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+ 
+     def _handle_message(self, raw: str) -> None:
+         try:
+@@ -5475,8 +5489,8 @@ class BinanceFuturesStreamClient:
+             if self.on_raw:
+                 try:
+                     self.on_raw(payload)
+-                except Exception:
+-                    pass
++                except Exception as _swallowed_exc:
++                    logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+             data = payload.get("data", payload)
+             stream = str(payload.get("stream", "")).lower()
+             if "@bookticker" in stream:
+@@ -5492,8 +5506,8 @@ class BinanceFuturesStreamClient:
+             elif "@markprice" in stream:
+                 self._handle_mark_price(data)
+             self._emit_snapshot()
+-        except Exception:
+-            pass
++        except Exception as _swallowed_exc:
++            logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+ 
+     def _run(self) -> None:
+         if websocket is None:
+@@ -5510,7 +5524,7 @@ class BinanceFuturesStreamClient:
+             pass
+ 
+         def _on_close(ws, *args):
+-            pass
++            logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+ 
+         backoff = 1.0
+         while not self._stop.is_set():
+@@ -5523,8 +5537,8 @@ class BinanceFuturesStreamClient:
+             )
+             try:
+                 ws.run_forever(ping_interval=20, ping_timeout=10)
+-            except Exception:
+-                pass
++            except Exception as _swallowed_exc:
++                logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+             if self._stop.is_set():
+                 break
+             time.sleep(backoff)
+@@ -5543,6 +5557,11 @@ class BinanceFuturesStreamClient:
+ 
+ class TelegramAlertSystem:
+     def __init__(self, token: Optional[str] = None, chat_id: Optional[str] = None, enabled: bool = True) -> None:
++        import os as _os  # AUDIT FIX ISSUE-A
++        if _os.environ.get("BTCBOT_LIVE_MODE") != "1":
++            raise ImportError(
++                "TelegramAlertSystem requires BTCBOT_LIVE_MODE=1."
++            )
+         self.token = token or ""
+         self.chat_id = str(chat_id or "")
+         self.enabled = enabled and bool(self.token and self.chat_id)
+@@ -5582,6 +5601,11 @@ class SniperExecutionEngine:
+         predictor: Optional[Any] = None,
+         config: Optional[Dict[str, Any]] = None,
+     ) -> None:
++        import os as _os  # AUDIT FIX ISSUE-A
++        if _os.environ.get("BTCBOT_LIVE_MODE") != "1":
++            raise ImportError(
++                "SniperExecutionEngine requires BTCBOT_LIVE_MODE=1."
++            )
+         self.symbol = symbol.replace("/", "").upper()
+         self.strategy_bias_provider = strategy_bias_provider or (lambda: "NEUTRAL")
+         self.on_signal = on_signal
+@@ -5758,8 +5782,8 @@ class SniperExecutionEngine:
+                     "timestamp": snapshot.timestamp,
+                 }
+                 self.feature_engine.update(fe_snapshot, snapshot.trades, regime_context=regime_context)
+-            except Exception:
+-                pass
++            except Exception as _swallowed_exc:
++                logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+         predictor_signal = {}
+         if self.predictor is not None and hasattr(self.predictor, "predict"):
+             try:
+@@ -5918,8 +5942,8 @@ class SniperExecutionEngine:
+                     0.0,
+                     1.0,
+                 )
+-        except Exception:
+-            pass
++        except Exception as _swallowed_exc:
++            logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+         # Ensure metadata exists
+         if not hasattr(signal, "metadata") or not isinstance(signal.metadata, dict):
+             signal.metadata = {}
+@@ -5942,8 +5966,8 @@ class SniperExecutionEngine:
+         if self.on_signal:
+             try:
+                 self.on_signal(signal)
+-            except Exception:
+-                pass
++            except Exception as _swallowed_exc:
++                logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+ 
+         # In signal-only mode, DO NOT execute trades (but still generate signals)
+         if signal_only_mode:
+@@ -6050,8 +6074,8 @@ def _freeze_for_cache(value: Any) -> Any:
+                 "__class__": value.__class__.__name__,
+                 "__dict__": _freeze_for_cache(vars(value)),
+             }
+-        except Exception:
+-            pass
++        except Exception as _swallowed_exc:
++            logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
+     return {"__class__": value.__class__.__name__, "__repr__": repr(value), "__id__": id(value)}
+ 
+ 

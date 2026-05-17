@@ -30,8 +30,8 @@ from venue_basis import VenueBasisNormalizer
 try:
     from dotenv import load_dotenv
     load_dotenv()
-except ImportError:
-    pass
+except ImportError as _swallowed_exc:
+    logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -250,8 +250,8 @@ except Exception as _exec_import_err:
         logger.error("[BOOT] Telegram alert failed during import error: %s", _tg_exc, exc_info=True)
     try:
         sys.stderr.write(_boot_msg + "\n")
-    except Exception:
-        pass
+    except Exception as _swallowed_exc:
+        logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
     raise RuntimeError(_boot_msg) from _exec_import_err
 
 try:
@@ -295,8 +295,8 @@ except Exception as _new_module_import_err:
         logger.error("[BOOT] Telegram alert failed during import error: %s", _tg_exc, exc_info=True)
     try:
         sys.stderr.write(_boot_msg + "\n")
-    except Exception:
-        pass
+    except Exception as _swallowed_exc:
+        logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
     raise RuntimeError(_boot_msg) from _new_module_import_err
 
 
@@ -419,8 +419,8 @@ except Exception as _bootstrap_exc:
         logger.error("[BOOT] Telegram alert failed during singleton bootstrap error: %s", _tg_exc, exc_info=True)
     try:
         sys.stderr.write(_boot_msg + "\n")
-    except Exception:
-        pass
+    except Exception as _swallowed_exc:
+        logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
     raise RuntimeError(_boot_msg) from _bootstrap_exc
 
 SIGNAL_PIPELINE_CONFIG: Dict[str, Any] = {
@@ -503,8 +503,8 @@ except Exception as _e:
         )
     try:
         sys.stderr.write(_engine_boot_msg + "\n")
-    except Exception:
-        pass
+    except Exception as _swallowed_exc:
+        logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
 
     def _default_alpha() -> dict:
         return {
@@ -1133,8 +1133,8 @@ def _fetch_open_interest(exchange) -> float:
         if hasattr(exchange, "fapiPublicGetOpenInterest"):
             oi = exchange.fapiPublicGetOpenInterest({"symbol": raw})
             return _safe_float((oi or {}).get("openInterest", 0.0))
-    except Exception:
-        pass
+    except Exception as _swallowed_exc:
+        logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
     return 0.0
 
 
@@ -1220,8 +1220,8 @@ class LiquidationMonitor:
             )
             try:
                 ws.run_forever(ping_interval=20, ping_timeout=10)
-            except Exception:
-                pass
+            except Exception as _swallowed_exc:
+                logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
             if self._stop.is_set():
                 break
             time.sleep(backoff)
@@ -1487,8 +1487,8 @@ def build_alert_message(
             lines.append(
                 f"Volume       : spike={volume_intel.get('volume_spike')} explosion={volume_intel.get('volume_explosion')} strength={_safe_float(volume_intel.get('volume_strength'), 0.0):.2f} mtf={volume_intel.get('mtf_confirmation')}"
             )
-        except Exception:
-            pass
+        except Exception as _swallowed_exc:
+            logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
 
     if engines_out:
         try:
@@ -1501,16 +1501,16 @@ def build_alert_message(
             lines.append(
                 f"OI Spike     : {engines_out.get('oi_spike')} | Cascade: {_safe_float(engines_out.get('cascade_probability'), 0.0):.2%}"
             )
-        except Exception:
-            pass
+        except Exception as _swallowed_exc:
+            logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
 
     if sniper:
         try:
             lines.append(
                 f"Sniper       : trigger={sniper.get('trigger')} | {sniper.get('reason')}"
             )
-        except Exception:
-            pass
+        except Exception as _swallowed_exc:
+            logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
 
     if trade_plan:
         try:
@@ -1524,8 +1524,8 @@ def build_alert_message(
             lines.append(f"🛑 SL: {_safe_float(trade_plan.get('sl')):.2f}")
             lines.append(f"💰 TP: {tp_text}")
             lines.append(f"📊 RR: {trade_plan.get('rr', trade_plan.get('risk_reward', 0.0))}")
-        except Exception:
-            pass
+        except Exception as _swallowed_exc:
+            logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
 
     engines = ai_meta.get("engines", {})
     if engines:
@@ -1535,8 +1535,8 @@ def build_alert_message(
             lines.append(f"[ENGINES] Absorption: {engines.get('absorption')}")
             lines.append(f"[ENGINES] FundingTrap: {engines.get('funding_trap')}")
             lines.append(f"[ENGINES] Spoof: {engines.get('spoof')}")
-        except Exception:
-            pass
+        except Exception as _swallowed_exc:
+            logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
 
     if smc_signal and smc_signal.get("signal") in ("LONG", "SHORT"):
         try:
@@ -1548,8 +1548,8 @@ def build_alert_message(
             lines.append(
                 f"SMC Fib      : {fib.get('low')} → {fib.get('high')} ({fib.get('timeframe', '15m')})"
             )
-        except Exception:
-            pass
+        except Exception as _swallowed_exc:
+            logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
 
     return "\n".join(lines)
 
@@ -1851,8 +1851,8 @@ def _execute_liquidity_trade(
         err_msg = f"❌ Execution Error\nSignal: {execution_signal}\nPrice: {price:,.2f}\nError: {exc}"
         try:
             send_telegram_message(err_msg)
-        except Exception:
-            pass
+        except Exception as _swallowed_exc:
+            logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
         logger.error("Execution failed cid=%s: %s", cid, exc, exc_info=True)
         return {
             "executed": False,
