@@ -3,8 +3,24 @@ from __future__ import annotations
 
 import csv
 import math
+import logging
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
+
+L2_DEPTH_CLASSIFICATION = {
+    "book_ticker_l1": {
+        "levels": 1,
+        "ofi_capable": False,
+        "classification": "L1_ONLY_REPLAY",
+        "warning": "NON-PRODUCTION MICROSTRUCTURE VALIDATION",
+    },
+    "book_depth_10plus": {
+        "levels": 10,
+        "ofi_capable": True,
+        "classification": "REAL_L2_REPLAY",
+        "warning": None,
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -63,7 +79,30 @@ def load_l2_csv(path: str) -> list[BookSnapshot]:
             imbalance = (bq - aq) / max(bq + aq, 1e-12)
             out.append(BookSnapshot(ts, bid, ask, bq, aq, spread_bps, imbalance, ofi_z))
     out.sort(key=lambda s: s.timestamp)
+    _validate_l2_depth(path=path, snapshots=out)
     return out
+
+
+def _validate_l2_depth(path: str, snapshots: list[BookSnapshot], required_levels: int = 2) -> None:
+    """Warn-only classification for OFI depth capability."""
+    logger = logging.getLogger(__name__)
+    if not snapshots:
+        logger.warning(
+            "L2_DEPTH_VALIDATION: %s — no snapshots loaded. OFI computation will return 0.0.",
+            path,
+        )
+        return
+    logger.warning(
+        "L2_DEPTH_VALIDATION: %s loaded %d snapshots. "
+        "BookSnapshot schema provides L1 TOB only (1 bid + 1 ask level). "
+        "OFI will use n_levels=1 → ofi_zscore ≈ 0.0. "
+        "Classification: L1_ONLY_REPLAY. "
+        "This is NOT equivalent to real multi-level L2 OFI validation. "
+        "To enable real OFI: fetch data/bookDepth.csv with ≥%d levels for Dec-2023.",
+        path,
+        len(snapshots),
+        required_levels,
+    )
 
 
 def align_book_to_bars(bars: Sequence[Sequence[Any]], snaps: Iterable[Any]) -> list[BookSnapshot]:
