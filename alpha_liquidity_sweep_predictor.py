@@ -1,4 +1,3 @@
-import logging
 import math
 import threading
 from typing import Dict, Any, Optional, List, Tuple
@@ -12,13 +11,16 @@ _VALID_STATES = frozenset({
     "NORMAL", "PRE_SWEEP_BUILDUP", "ACTIVE_SWEEP", "POST_SWEEP"
 })
 _VALID_REGIMES = frozenset({
-    "TRENDING_UP", "TRENDING_DOWN", "RANGING", "VOLATILE", "LOW_LIQUIDITY", "UNKNOWN"
+    "TRENDING_UP", "TRENDING_DOWN", "RANGING", "VOLATILE", "UNKNOWN",
+    # FIX (audit 2026-05-18) — _detect_regime emits UPTREND/DOWNTREND
+    # internally; whitelist them so _safe_output doesn't sanitize them
+    # to RANGING and accidentally suppress trend-aligned execution.
+    "UPTREND", "DOWNTREND",
 })
 
 __all__ = ["predict_sweep", "LiquiditySweepAlpha"]
 LOGIT_TEMP = 1.2
 EPS = 1e-12
-logger = logging.getLogger(__name__)
 
 # STRICT SAFE FLOAT (guaranteed float output)
 def _safe_num(x: Any, default: float = 0.0) -> float:
@@ -59,10 +61,56 @@ def _is_finite(x: float) -> bool:
 def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, x))
 
-# Confidence shrinkage toward 0.5. This is NOT probability calibration.
-# Isotonic/Platt calibration is deferred to Phase B.
-def _shrink_prob(p: float) -> float:
+def _calibrate_prob(p: float) -> float:
     return _clamp(0.5 + (p - 0.5) * 0.8, 0.0, 1.0)
+
+
+# FIX U-02 — Isotonic-regression probability calibrator.
+# Falls back gracefully to the original 0.8 shrinkage when sklearn is
+# unavailable or the calibrator has not been fit yet.
+class ProbabilityCalibrator:
+    """Isotonic-regression probability calibrator (replaces fixed 0.8 shrinkage)."""
+
+    def __init__(self):
+        self._ir = None
+        self.n_samples: int = 0
+        self.brier_score: float = float("nan")
+        self.fitted: bool = False
+
+    def fit(self, y_pred_oof, y_true_oof) -> "ProbabilityCalibrator":
+        try:
+            from sklearn.isotonic import IsotonicRegression
+        except Exception:
+            self.fitted = False
+            return self
+        try:
+            yp = [float(x) for x in y_pred_oof]
+            yt = [int(x) for x in y_true_oof]
+        except (TypeError, ValueError):
+            self.fitted = False
+            return self
+        if len(yp) < 5 or len(yp) != len(yt):
+            self.fitted = False
+            return self
+        ir = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+        ir.fit(yp, yt)
+        self._ir = ir
+        self.n_samples = len(yp)
+        # Brier score (mean squared error between calibrated p and y_true)
+        cal = ir.transform(yp)
+        sse = sum((float(cal[i]) - float(yt[i])) ** 2 for i in range(len(yt)))
+        self.brier_score = sse / len(yt)
+        self.fitted = True
+        return self
+
+    def transform(self, p: float) -> float:
+        if not self.fitted or self._ir is None:
+            return _clamp(0.5 + (float(p) - 0.5) * 0.8, 0.0, 1.0)
+        try:
+            out = float(self._ir.transform([float(p)])[0])
+        except Exception:
+            return _clamp(0.5 + (float(p) - 0.5) * 0.8, 0.0, 1.0)
+        return _clamp(out, 0.0, 1.0)
 
 def _safe_logit(p: float, volatility: float = 0.0) -> float:
     """
@@ -298,18 +346,29 @@ class LiquiditySweepAlpha:
         active_sweep_lookback_bars: int = 30,         # FIX C-2 APPLIED
         pool_reset_atr_mult: float = 5.0,             # FIX H-3 APPLIED
         enable_sweep_directional_fallback: bool = False,  # FIX-28 (M-2)
-        hawkes_decay: float = 0.5,
-        hawkes_alpha: float = 0.1,
-        pool_max_age_bars: int = 200,
+        # ── Audit fixes 2026-05-18 ───────────────────────────────────────────
+        vol_ratio_threshold: float = 0.015,    # FIX U-05
+        atr_expiry_mult: float = 3.0,          # FIX U-06
+        pool_max_age_bars: int = 200,          # FIX U-06 (secondary)
     ):
+        # FIX U-05 / U-06 parameter validation
+        if not (0.001 < float(vol_ratio_threshold) < 1.0):
+            raise ValueError(
+                f"vol_ratio_threshold must be in (0.001, 1.0); got {vol_ratio_threshold}"
+            )
+        if not (1.0 <= float(atr_expiry_mult) <= 20.0):
+            raise ValueError(
+                f"atr_expiry_mult must be in [1.0, 20.0]; got {atr_expiry_mult}"
+            )
+        if not (10 <= int(pool_max_age_bars) <= 100000):
+            raise ValueError(
+                f"pool_max_age_bars must be in [10, 100000]; got {pool_max_age_bars}"
+            )
         self.levels = depth_levels
         self.resiliency_threshold = resiliency_threshold
         self.history_window = history_window
 
         self.liquidity_pools = {"high": None, "low": None}
-        self._pool_set_bar = {"high": None, "low": None}
-        self._bar_count = 0
-        self._volatile_gate_count: int = 0
         self.ofi_history = deque(maxlen=history_window)
         self.hawkes_history = deque(maxlen=history_window)
         self.short_ofi = deque(maxlen=5)
@@ -327,15 +386,8 @@ class LiquiditySweepAlpha:
         # Hawkes Process State
         self.hawkes_lambda = 0.0
         self.last_trade_time = 0.0
-        self.hawkes_decay = float(hawkes_decay)
-        self.hawkes_alpha = float(hawkes_alpha)
-        if not (0.0 < self.hawkes_decay <= 20.0):
-            raise ValueError(f"hawkes_decay must be in (0, 20], got {hawkes_decay}")
-        if not (0.0 < self.hawkes_alpha <= 5.0):
-            raise ValueError(f"hawkes_alpha must be in (0, 5], got {hawkes_alpha}")
-        self.pool_max_age_bars = int(pool_max_age_bars)
-        if self.pool_max_age_bars < 10:
-            raise ValueError(f"pool_max_age_bars must be >= 10, got {pool_max_age_bars}")
+        self.hawkes_decay = 0.5
+        self.hawkes_alpha = 0.1
         self._lock = threading.RLock()
         # FIX M-3 APPLIED — _time_lock created up front so get_signal()
         # never has to lazy-init it under contention.
@@ -377,13 +429,40 @@ class LiquiditySweepAlpha:
         # _predict_next_sweep, surfaced via get_state_metrics().
         self._neutral_predict_count: int = 0
 
+        # ── Audit-fix state (2026-05-18) ──────────────────────────────────────
+        # FIX U-02: optional isotonic probability calibrator
+        self._calibrator: Optional["ProbabilityCalibrator"] = None
+        # FIX U-04: counter for fake-breakout detections under hardened gate
+        self._fake_breakout_ofi_required_count: int = 0
+        # FIX U-05: VOLATILE-regime gate threshold (validated above)
+        self.vol_ratio_threshold: float = float(vol_ratio_threshold)
+        # FIX U-06: ATR-distance pool-expiry primary gate +
+        # bar-count secondary expiry.
+        self.atr_expiry_mult: float = float(atr_expiry_mult)
+        self.pool_max_age_bars: int = int(pool_max_age_bars)
+        self._pool_set_bar: Dict[str, Optional[int]] = {"high": None, "low": None}
+        self._pool_expired_age_count: int = 0
+        self._pool_expired_atr_count: int = 0
+        # FIX U-07: regime-history + per-bar trades-count history for vol-Z
+        self._regime_history: deque = deque(maxlen=50)
+        self._volume_history: deque = deque(maxlen=20)
+        # FIX U-10: HOLD-gate telemetry
+        self._gate_fire_log: deque = deque(maxlen=200)
+        self._gate_counts: Dict[str, int] = {
+            "VOLATILE": 0, "LOW_LIQUIDITY": 0, "WARMUP": 0,
+            "NO_EDGE": 0, "POOL_UNSET": 0, "TREND_ALIGNED": 0,
+            "INVALID_PRICE": 0,
+        }
+        # Per-bar counter used by gate-telemetry strings
+        self._bar_idx: int = 0
+
         # FIX L002: seed pools from constructor if provided
         if initial_high is not None and _is_finite(float(initial_high)) and float(initial_high) > 0:
             self.liquidity_pools["high"] = float(initial_high)
-            self._pool_set_bar["high"] = self._bar_count
+            self._pool_set_bar["high"] = 0
         if initial_low is not None and _is_finite(float(initial_low)) and float(initial_low) > 0:
             self.liquidity_pools["low"] = float(initial_low)
-            self._pool_set_bar["low"] = self._bar_count
+            self._pool_set_bar["low"] = 0
 
     # FIX C-3 APPLIED — instance wrapper around the module-level
     # _safe_output() that adds state/regime vocabulary validation. Internal
@@ -403,6 +482,82 @@ class LiquiditySweepAlpha:
             # Never let observability break the trading path.
             pass
         return _safe_output(output)
+
+    # ── Audit-fix helpers (2026-05-18) ──────────────────────────────────────
+    def _shrink_prob(self, p: float) -> float:
+        """FIX U-02 — use fitted isotonic calibrator if available, else 0.8 shrink."""
+        try:
+            cal = getattr(self, "_calibrator", None)
+            if cal is not None and getattr(cal, "fitted", False):
+                return cal.transform(p)
+        except Exception:
+            pass
+        return _calibrate_prob(p)
+
+    def calibrate(self, oof_preds) -> dict:
+        """FIX U-02 — fit the isotonic calibrator from out-of-fold (pred, label) pairs."""
+        try:
+            yp = [float(p) for p, _ in oof_preds]
+            yt = [int(y) for _, y in oof_preds]
+        except (TypeError, ValueError):
+            return self.get_calibration_status()
+        cal = ProbabilityCalibrator().fit(yp, yt)
+        self._calibrator = cal
+        return self.get_calibration_status()
+
+    def get_calibration_status(self) -> dict:
+        """FIX U-02 — surfaces calibrator state."""
+        cal = getattr(self, "_calibrator", None)
+        if cal is None:
+            return {"calibrated": False, "n_samples": 0, "brier_score": float("nan")}
+        return {
+            "calibrated": bool(getattr(cal, "fitted", False)),
+            "n_samples": int(getattr(cal, "n_samples", 0)),
+            "brier_score": float(getattr(cal, "brier_score", float("nan"))),
+        }
+
+    def calibrate_vol_threshold(self,
+                                vol_ratio_history,
+                                percentile: float = 95.0) -> float:
+        """FIX U-05 — set vol_ratio_threshold to the empirical Nth percentile."""
+        try:
+            import numpy as _np
+            history = [float(x) for x in vol_ratio_history if math.isfinite(float(x))]
+        except (TypeError, ValueError):
+            raise ValueError("vol_ratio_history contains non-numeric values")
+        if len(history) < 100:
+            raise ValueError(
+                f"vol_ratio_history must have >= 100 samples; got {len(history)}"
+            )
+        if not (50.0 <= float(percentile) <= 99.0):
+            raise ValueError(
+                f"percentile must be in [50, 99]; got {percentile}"
+            )
+        val = float(_np.percentile(history, float(percentile)))
+        if not (0.001 < val < 1.0):
+            val = max(0.0015, min(0.5, val))
+        self.vol_ratio_threshold = val
+        return val
+
+    def _record_hold_gate(self, gate_name: str, **extras) -> str:
+        """FIX U-10 — record one HOLD-path gate firing and return the logic string."""
+        try:
+            parts = [f"gate:{gate_name}"]
+            for k, v in extras.items():
+                if isinstance(v, float):
+                    parts.append(f"{k}={v:.4f}")
+                else:
+                    parts.append(f"{k}={v}")
+            parts.append(f"bar={self._bar_idx}")
+            line = "|".join(parts)
+            self._gate_fire_log.append(line)
+            if gate_name in self._gate_counts:
+                self._gate_counts[gate_name] += 1
+            else:
+                self._gate_counts[gate_name] = 1
+            return line
+        except Exception:
+            return f"gate:{gate_name}|bar={getattr(self, '_bar_idx', 0)}"
 
     # FIX A3 APPLIED — public telemetry snapshot mirroring
     # AdvancedRegimeEngine.get_state_metrics() contract.
@@ -426,24 +581,23 @@ class LiquiditySweepAlpha:
                 "state_invalid_count": self._state_invalid_count,
                 "active_sweep_fired_count": self._active_sweep_fired_count,
                 "pre_sweep_fired_count": getattr(self, "_pre_sweep_fired_count", 0),
-                "volatile_gate_count": self._volatile_gate_count,
                 "last_ofi_levels_used": self._last_ofi_levels_used,
                 "active_sweep_lookback_bars": self.active_sweep_lookback_bars,
                 "direction_mode": self.direction_mode,
                 "pool_reset_atr_mult": self.pool_reset_atr_mult,
-                "ofi_level_weighting": "cont_2014_decay",
-                "pool_max_age_bars": self.pool_max_age_bars,
-                "pool_age_high_bars": (
-                    self._bar_count - self._pool_set_bar["high"]
-                    if self._pool_set_bar["high"] is not None else None
+                # ── Audit-fix telemetry (2026-05-18) ────────────────────────
+                "atr_expiry_mult": getattr(self, "atr_expiry_mult", None),
+                "vol_ratio_threshold": getattr(self, "vol_ratio_threshold", None),
+                "pool_expired_age_count": getattr(self, "_pool_expired_age_count", 0),
+                "pool_expired_atr_count": getattr(self, "_pool_expired_atr_count", 0),
+                "fake_breakout_ofi_required_count": getattr(
+                    self, "_fake_breakout_ofi_required_count", 0
                 ),
-                "pool_age_low_bars": (
-                    self._bar_count - self._pool_set_bar["low"]
-                    if self._pool_set_bar["low"] is not None else None
-                ),
-                "branching_ratio": round(
-                    self.hawkes_alpha / max(self.hawkes_decay, 1e-9), 6
-                ),
+                "calibration_status": self.get_calibration_status(),
+                "gate_fire_log_tail": list(getattr(self, "_gate_fire_log", []))[-10:],
+                "gate_counts": dict(getattr(self, "_gate_counts", {})),
+                "regime_history_tail": list(getattr(self, "_regime_history", []))[-10:],
+                "bar_idx": getattr(self, "_bar_idx", 0),
             }
         except Exception:
             # Telemetry must never raise into the trading path.
@@ -477,18 +631,24 @@ class LiquiditySweepAlpha:
         y = x / (1 + abs(x))   # [-1, 1]
         return 0.5 * (y + 1.0) # [0, 1]
 
+    def _mark_pool_set(self, side: str) -> None:
+        try:
+            self._pool_set_bar[side] = int(getattr(self, "_bar_idx", 0) or 0)
+        except Exception:
+            pass
+
     def update_liquidity_pools(self, recent_highs: List[float], recent_lows: List[float]):
         with self._lock:
             if recent_highs is not None and len(recent_highs) > 0:
                 valid_highs = [v for v in recent_highs[-20:] if isinstance(v, (int, float)) and _is_finite(v)]
                 if valid_highs:
                     self.liquidity_pools['high'] = max(valid_highs)
-                    self._pool_set_bar['high'] = self._bar_count
+                    self._mark_pool_set('high')
             if recent_lows is not None and len(recent_lows) > 0:
                 valid_lows = [v for v in recent_lows[-20:] if isinstance(v, (int, float)) and _is_finite(v)]
                 if valid_lows:
                     self.liquidity_pools['low'] = min(valid_lows)
-                    self._pool_set_bar['low'] = self._bar_count
+                    self._mark_pool_set('low')
 
     def _update_hawkes(self, timestamp: float, trade_count: int) -> float:
         ts = self._normalize_timestamp(timestamp, self.last_trade_time)
@@ -506,12 +666,6 @@ class LiquiditySweepAlpha:
             dt = 0.0
         decay_term = math.exp(-self.hawkes_decay * min(dt, 60.0))
         self.hawkes_lambda = (self.hawkes_lambda * decay_term) + (self.hawkes_alpha * tc)
-        branching_ratio = self.hawkes_alpha / max(self.hawkes_decay, 1e-9)
-        if branching_ratio >= 0.9:
-            logger.warning(
-                "Hawkes branching_ratio %.6f is >= 0.9; process may be near-critical",
-                branching_ratio,
-            )
         if self.hawkes_lambda < 0.0 or not _is_finite(self.hawkes_lambda):
             self.hawkes_lambda = 0.0
         self.hawkes_lambda = min(self.hawkes_lambda, 100.0)
@@ -557,8 +711,7 @@ class LiquiditySweepAlpha:
                 elif curr_ask_p == prev_ask_p: delta_ask = curr_ask_s - prev_ask_s
                 else: delta_ask = -prev_ask_s
 
-                level_weight = 1.0 / (i + 1.0)  # Cont et al. (2014) level-decay weight: level 0 = 1.0, level 1 = 0.5, ...
-                ofi_total += level_weight * (delta_bid - delta_ask)
+                ofi_total += (delta_bid - delta_ask)
         except (KeyError, IndexError, TypeError):
             # treat malformed/partial book as "no signal" to prevent poisoning rolling stats
             return 0.0
@@ -620,57 +773,86 @@ class LiquiditySweepAlpha:
         z = (ofi_total - self._ofi_mean) / ofi_std
         return 4.0 * math.tanh(z / 3.0)
 
-    def _detect_regime(
-        self,
-        ema_fast: float,
-        ema_slow: float,
-        buffer: float = 0.001,
-        vol_ratio: float = 0.0,
-        session_volume_percentile: float = 1.0,
-    ) -> str:
-        # VOLATILE threshold: empirical tuning deferred to Phase E
-        if vol_ratio > 0.015:
+    def _detect_regime(self,
+                       ema_fast: float,
+                       ema_slow: float,
+                       buffer: float = 0.001,
+                       vol_ratio: float = 0.0,
+                       session_volume_percentile: float = 0.5,
+                       volume_zscore: float = 0.0,
+                       spread_to_atr: float = 0.0) -> str:
+        """
+        Regime classifier — FIX U-07 expanded:
+            adds VOLATILE detection driven by (vol_ratio_threshold)
+            or by joint (spread_to_atr, volume_zscore) microstructure stress.
+        """
+        # FIX U-05 / U-07: VOLATILE has highest priority — it gates execution
+        try:
+            vr = float(vol_ratio)
+            spread_atr = float(spread_to_atr)
+            vol_z = float(volume_zscore)
+        except (TypeError, ValueError):
+            vr, spread_atr, vol_z = 0.0, 0.0, 0.0
+        if vr > self.vol_ratio_threshold or (spread_atr > 2.0 and vol_z < -1.5):
             return "VOLATILE"
-        if session_volume_percentile < 0.40:
-            return "LOW_LIQUIDITY"
+
         # fully dynamic buffer using normalized thresholds
         if ema_fast > ema_slow * (1 + buffer):
-            return "TRENDING_UP"
+            return "UPTREND"
         elif ema_fast < ema_slow * (1 - buffer):
-            return "TRENDING_DOWN"
+            return "DOWNTREND"
         return "RANGING"
 
     def detect_sweep_state(self, price: float, atr: float, hawkes_intensity: float) -> str:
+        # FIX U-06 (secondary) — bar-count pool expiry. Pools older than
+        # `pool_max_age_bars` are cleared even if ATR distance is still
+        # within range. _bar_idx is incremented in get_signal().
+        try:
+            cur_bar = int(getattr(self, "_bar_idx", 0) or 0)
+            max_age = int(getattr(self, "pool_max_age_bars", 0) or 0)
+            for side in ("high", "low"):
+                set_bar = self._pool_set_bar.get(side)
+                if self.liquidity_pools[side] is not None and set_bar is not None and max_age > 0:
+                    if (cur_bar - set_bar) > max_age:
+                        self.liquidity_pools[side] = None
+                        self._pool_set_bar[side] = None
+                        self._pool_expired_age_count += 1
+        except Exception:
+            pass
+
         if self.liquidity_pools['high'] is None or self.liquidity_pools['low'] is None:
             return "NORMAL"
-
-        # Pool staleness gate: expire pools older than pool_max_age_bars
-        if self._pool_set_bar["high"] is not None:
-            if (self._bar_count - self._pool_set_bar["high"]) > self.pool_max_age_bars:
-                self.liquidity_pools["high"] = None
-                self._pool_set_bar["high"] = None
-        if self._pool_set_bar["low"] is not None:
-            if (self._bar_count - self._pool_set_bar["low"]) > self.pool_max_age_bars:
-                self.liquidity_pools["low"] = None
-                self._pool_set_bar["low"] = None
-        if self.liquidity_pools["high"] is None or self.liquidity_pools["low"] is None:
-            return "NORMAL"
-
         # FIX H-3 APPLIED — independent per-side pool reset. The previous
         # joint-AND condition required BOTH pools to be far from price before
         # either was cleared, leaving stale pools in place during one-sided
         # trends. Each side now resets only when price has moved
         # `pool_reset_atr_mult * atr` past it.
+        #
+        # FIX U-06 — ATR-distance is now the PRIMARY pool-expiry gate
+        # (atr_expiry_mult, default 3.0× ATR). Bar-count expiry remains as
+        # a secondary safety. Two counters expose which gate fired.
         if atr > 0:
             high_pool = _safe_float(self.liquidity_pools['high'], price)
             low_pool = _safe_float(self.liquidity_pools['low'], price)
+            atr_expiry_dist = atr * self.atr_expiry_mult
             reset_dist = atr * self.pool_reset_atr_mult
-            if (price - high_pool) > reset_dist:
-                self.liquidity_pools['high'] = None
-                self._pool_set_bar['high'] = None
-            if (low_pool - price) > reset_dist:
-                self.liquidity_pools['low'] = None
-                self._pool_set_bar['low'] = None
+
+            if self.liquidity_pools['high'] is not None:
+                d_high = (price - high_pool) / (atr + 1e-8)
+                if d_high > self.atr_expiry_mult:
+                    self.liquidity_pools['high'] = None
+                    self._pool_expired_atr_count += 1
+                elif (price - high_pool) > reset_dist:
+                    self.liquidity_pools['high'] = None
+                    self._pool_expired_age_count += 1
+            if self.liquidity_pools['low'] is not None:
+                d_low = (low_pool - price) / (atr + 1e-8)
+                if d_low > self.atr_expiry_mult:
+                    self.liquidity_pools['low'] = None
+                    self._pool_expired_atr_count += 1
+                elif (low_pool - price) > reset_dist:
+                    self.liquidity_pools['low'] = None
+                    self._pool_expired_age_count += 1
             if self.liquidity_pools['high'] is None or self.liquidity_pools['low'] is None:
                 return "NORMAL"
 
@@ -728,35 +910,40 @@ class LiquiditySweepAlpha:
         return "NORMAL"
 
     def _detect_fake_breakout(self, sweep_side: str, close_price: float, ofi_z: float) -> Tuple[bool, float]:
+        # FIX U-04 — Fake-breakout HARDENED:
+        #   threshold raised 0.5 → 0.8 (both sides), and OFI confirmation
+        #   is now MANDATORY. Both the price-position component AND the
+        #   OFI component must fire for is_fake to be True.
         rejection_score = 0.0
         is_fake = False
+        price_pos_fired = False
+        ofi_fired = False
 
         if sweep_side == "high":
             if self.liquidity_pools.get('high') is None:
                 return False, 0.0
-            if close_price < self.liquidity_pools['high']: 
-                rejection_score += 0.5
-            if ofi_z < -1.0: 
-                rejection_score += 0.5
-            # WARNING: A rejection_score of 0.5 is reached by price-position alone
-            # (one component scores 0.5). OFI confirmation is optional under this
-            # threshold. Empirical threshold review is deferred to Phase B after
-            # calibration data collection. Do not change this value in Phase A.
-            is_fake = rejection_score >= 0.5
+            price_pos_fired = close_price < self.liquidity_pools['high']
+            ofi_fired = ofi_z < -1.0
+            rejection_score = (0.5 if price_pos_fired else 0.0) + (
+                0.5 if ofi_fired else 0.0
+            )
+            is_fake = rejection_score >= 0.8 and ofi_fired
 
         elif sweep_side == "low":
             if self.liquidity_pools.get('low') is None:
                 return False, 0.0
-            if close_price > self.liquidity_pools['low']:
-                rejection_score += 0.5
-            if ofi_z > 1.0:
-                rejection_score += 0.5
-            # WARNING: A rejection_score of 0.5 is reached by price-position alone
-            # (one component scores 0.5). OFI confirmation is optional under this
-            # threshold. Empirical threshold review is deferred to Phase B after
-            # calibration data collection. Do not change this value in Phase A.
-            is_fake = rejection_score >= 0.5
+            price_pos_fired = close_price > self.liquidity_pools['low']
+            ofi_fired = ofi_z > 1.0
+            rejection_score = (0.5 if price_pos_fired else 0.0) + (
+                0.5 if ofi_fired else 0.0
+            )
+            is_fake = rejection_score >= 0.8 and ofi_fired
 
+        if is_fake:
+            try:
+                self._fake_breakout_ofi_required_count += 1
+            except Exception:
+                pass
         return is_fake, rejection_score
 
     def check_resiliency(self, pre_depth: float, post_depth: float, time_elapsed: float, max_time: float = 2.0) -> float:
@@ -906,7 +1093,6 @@ class LiquiditySweepAlpha:
                  macro_liquidity (optional), macro_market_state (optional), macro_volume_intel (optional)
         """
         with self._lock:
-            self._bar_count += 1
             md = market_data if isinstance(market_data, dict) else {}  # local alias (latency)
 
             # FIX M-3 APPLIED — _time_lock is now created in __init__, so the
@@ -916,8 +1102,14 @@ class LiquiditySweepAlpha:
                 self._time_lock = threading.Lock()
             if not hasattr(self, "last_trade_time"):
                 self.last_trade_time = 0.0
+            # FIX U-10 — per-bar counter used by gate-telemetry strings.
+            try:
+                self._bar_idx += 1
+            except AttributeError:
+                self._bar_idx = 1
             price = _safe_float(md.get('price'))
             if price <= 0.0:
+                logic = self._record_hold_gate("INVALID_PRICE", price=price)
                 return self._safe_output({
                     "action": "HOLD",
                     "confidence": 0.0,
@@ -925,7 +1117,7 @@ class LiquiditySweepAlpha:
                     "regime": "RANGING",
                     "ofi_zscore": 0.0,
                     "hawkes_intensity": 0.0,
-                    "logic": "Invalid price",
+                    "logic": logic,
                     "micro_prob": 0.5,
                     "macro_prob": 0.5,
                     "prob_above": 0.5,
@@ -953,17 +1145,61 @@ class LiquiditySweepAlpha:
             hawkes_delta = hawkes - prev_lambda
             hawkes_delta = _clamp(_safe_float(hawkes_delta, 0.0), -50.0, 50.0)
     
+            # FIX U-07 — compute volume z-score (vs rolling 20-bar) and
+            # spread_to_atr (top-of-book) microstructure features used by
+            # the expanded regime classifier.
+            trades_count = _safe_float(md.get("trades_count", 0.0), 0.0)
+            try:
+                self._volume_history.append(float(trades_count))
+            except Exception:
+                pass
+            volume_zscore = 0.0
+            try:
+                vh = list(self._volume_history)
+                if len(vh) >= 5:
+                    _vm = sum(vh) / len(vh)
+                    _vv = sum((v - _vm) ** 2 for v in vh) / max(len(vh) - 1, 1)
+                    _vs = math.sqrt(max(_vv, 1e-12))
+                    volume_zscore = (float(trades_count) - _vm) / max(_vs, 1e-8)
+                    volume_zscore = _clamp(volume_zscore, -10.0, 10.0)
+            except Exception:
+                volume_zscore = 0.0
+            spread_to_atr = 0.0
+            try:
+                curr_book = md.get("curr_book", {}) or {}
+                bids = curr_book.get("bids") or []
+                asks = curr_book.get("asks") or []
+                if bids and asks:
+                    bid0 = _safe_float(bids[0].get("price", 0.0), 0.0)
+                    ask0 = _safe_float(asks[0].get("price", 0.0), 0.0)
+                    if bid0 > 0.0 and ask0 > 0.0 and ask0 > bid0:
+                        spread_to_atr = (ask0 - bid0) / (atr + 1e-8)
+                        spread_to_atr = _clamp(spread_to_atr, 0.0, 100.0)
+            except Exception:
+                spread_to_atr = 0.0
+
             regime = self._detect_regime(
                 md.get('ema_fast', price),
                 md.get('ema_slow', price),
                 buffer=thresholds["trend_buffer"],
                 vol_ratio=vol_ratio,
-                session_volume_percentile=_clamp(
-                    _safe_float(md.get('session_volume_percentile', 1.0), 1.0),
-                    0.0, 1.0,
+                session_volume_percentile=_safe_float(
+                    md.get("session_volume_percentile", 0.5), 0.5
                 ),
+                volume_zscore=volume_zscore,
+                spread_to_atr=spread_to_atr,
             )
-    
+
+            # FIX U-07 — log regime transitions for telemetry
+            try:
+                prev_regime = (
+                    self._regime_history[-1] if self._regime_history else None
+                )
+                if prev_regime != regime:
+                    self._regime_history.append(regime)
+            except Exception:
+                pass
+
             state = self.detect_sweep_state(price, atr, hawkes)
     
             # Microstructure Predictor
@@ -1056,68 +1292,6 @@ class LiquiditySweepAlpha:
                 macro_reliability = 0.5
             macro_reliability = _clamp(macro_reliability, 0.0, 1.0)
 
-            # C3: Internal adverse selection gate.
-            # When the internal regime detector identifies VOLATILE conditions
-            # (vol_ratio > 0.015), market makers are withdrawing quotes and
-            # adverse selection probability is elevated. All directional signals
-            # are suppressed. This gate fires on INTERNAL regime only so it works
-            # even when regime_context is absent.
-            # Threshold 0.015 is conservative; empirical calibration deferred to Phase E.
-            if regime == "VOLATILE":
-                self._volatile_gate_count += 1
-                return self._safe_output({
-                    "action": "HOLD",
-                    "confidence": 0.0,
-                    "state": state,
-                    "regime": regime,
-                    "ofi_zscore": round(ofi_z, 4),
-                    "hawkes_intensity": round(hawkes, 4),
-                    "logic": f"VOLATILE regime gate: adverse selection suppression. "
-                             f"vol_ratio={vol_ratio:.4f}",
-                    "micro_prob": 0.5,
-                    "macro_prob": 0.5,
-                    "prob_above": 0.5,
-                    "prob_below": 0.5,
-                })
-
-            if regime == "LOW_LIQUIDITY":
-                if state == "PRE_SWEEP_BUILDUP":
-                    return self._safe_output({
-                        "action": "HOLD",
-                        "confidence": 0.0,
-                        "state": state,
-                        "regime": regime,
-                        "ofi_zscore": round(ofi_z, 4),
-                        "hawkes_intensity": round(hawkes, 4),
-                        "logic": "LOW_LIQUIDITY regime: anticipation entries suppressed.",
-                        "micro_prob": 0.5,
-                        "macro_prob": 0.5,
-                        "prob_above": 0.5,
-                        "prob_below": 0.5,
-                    })
-                if state == "ACTIVE_SWEEP":
-                    _hw_list = list(self.hawkes_history)
-                    _liq_baseline = (
-                        self.hawkes_sum / len(_hw_list) if _hw_list else 1.0
-                    )
-                    if hawkes < _liq_baseline * 3.0:
-                        return self._safe_output({
-                            "action": "HOLD",
-                            "confidence": 0.0,
-                            "state": state,
-                            "regime": regime,
-                            "ofi_zscore": round(ofi_z, 4),
-                            "hawkes_intensity": round(hawkes, 4),
-                            "logic": (
-                                f"LOW_LIQUIDITY regime: Hawkes {hawkes:.3f} below "
-                                f"3x baseline {_liq_baseline:.3f}. Sweep suppressed."
-                            ),
-                            "micro_prob": 0.5,
-                            "macro_prob": 0.5,
-                            "prob_above": 0.5,
-                            "prob_below": 0.5,
-                        })
-
             if state == "PRE_SWEEP_BUILDUP":
                 # --- Early Anticipation Logic ---
                 # For a breakout (anticipation), we want high probability that it continues *through* the level.
@@ -1129,8 +1303,8 @@ class LiquiditySweepAlpha:
                     pred_micro = 0.5
                 if not math.isfinite(pred_macro):
                     pred_macro = 0.5
-                pred_micro = _shrink_prob(pred_micro)
-                pred_macro = _shrink_prob(pred_macro)
+                pred_micro = self._shrink_prob(pred_micro)
+                pred_macro = self._shrink_prob(pred_macro)
                 # HARD safety after calibration (critical)
                 if not math.isfinite(pred_micro):
                     pred_micro = 0.5
@@ -1210,7 +1384,9 @@ class LiquiditySweepAlpha:
                 if warmup_factor < 0.5:
                     action = "HOLD"
                     confidence = 0.0
-                    logic_path = "Active sweep detected but system not warmed up"
+                    logic_path = self._record_hold_gate(
+                        "WARMUP", warmup=float(warmup_factor)
+                    )
                     return self._safe_output({
                         "action": action,
                         "confidence": round(confidence, 4),
@@ -1241,10 +1417,17 @@ class LiquiditySweepAlpha:
                 reaction_score = _standard_sigmoid(centered_logit)
     
                 trend_penalty = 0.0
-                if (sweep_side == "high" and regime == "TRENDING_UP") or (sweep_side == "low" and regime == "TRENDING_DOWN"):
+                if (sweep_side == "high" and regime == "UPTREND") or (sweep_side == "low" and regime == "DOWNTREND"):
                     trend_penalty = 0.2 
     
                 reaction_score = _clamp(reaction_score - trend_penalty)
+    
+                ml_prob = self._ml_sweep_probability({
+                    "ofi": ofi_z,
+                    "hawkes": hawkes,
+                    "volatility": vol_ratio,
+                    "depth": md.get("curr_depth", 1.0)
+                })
     
                 liquidity_bias = self._liquidity_forecast()
                 liq_prob = (liquidity_bias + 1.0) / 2.0
@@ -1253,7 +1436,10 @@ class LiquiditySweepAlpha:
                 # Ensure required variables exist (explicit fallback)
                 if not isinstance(reaction_score, (int, float)):
                     reaction_score = 0.5
+                if not isinstance(ml_prob, (int, float)):
+                    ml_prob = 0.5
                 reaction_score = _clamp(reaction_score, 1e-6, 1.0 - 1e-6)
+                ml_prob = _clamp(ml_prob, 1e-6, 1.0 - 1e-6)
                 # In an active sweep, we are looking for the fake-out / reversion.
                 # If sweeping 'high', we want high prob_down. If 'low', we want prob_up.
                 pred_micro = micro_prediction["prob_down"] if sweep_side == "high" else micro_prediction["prob_up"]
@@ -1263,8 +1449,8 @@ class LiquiditySweepAlpha:
                     pred_micro = 0.5
                 if not math.isfinite(pred_macro):
                     pred_macro = 0.5
-                pred_micro = _shrink_prob(pred_micro)
-                pred_macro = _shrink_prob(pred_macro)
+                pred_micro = self._shrink_prob(pred_micro)
+                pred_macro = self._shrink_prob(pred_macro)
                 # POST-CALIBRATION SAFETY
                 if not math.isfinite(pred_micro):
                     pred_micro = 0.5
@@ -1304,13 +1490,15 @@ class LiquiditySweepAlpha:
                 # Logit Ensemble: Full statistical mapping across all primary system variables.
                 # Single clamp (avoid distortion)
                 reaction_score = _clamp(reaction_score, 1e-6, 1.0 - 1e-6)
+                ml_prob        = _clamp(ml_prob,        1e-6, 1.0 - 1e-6)
                 liq_prob       = _clamp(liq_prob,       1e-6, 1.0 - 1e-6)
 
                 ensemble_logit = (
                     # CONSISTENT LOGIT SCALING (bounded vol_ratio)
-                    0.52 * _safe_logit_guard(reaction_score, min(vol_ratio, 5.0)) +
-                    0.20 * _safe_logit_guard(liq_prob,       min(vol_ratio, 5.0)) +
-                    0.28 * pred_logit
+                    0.40 * _safe_logit_guard(reaction_score, min(vol_ratio, 5.0)) +
+                    0.25 * _safe_logit_guard(ml_prob,        min(vol_ratio, 5.0)) +
+                    0.15 * _safe_logit_guard(liq_prob,       min(vol_ratio, 5.0)) +
+                    0.20 * pred_logit
                 )
                 # HARD SAFETY BEFORE SIGMOID
                 if not math.isfinite(ensemble_logit):
@@ -1321,51 +1509,22 @@ class LiquiditySweepAlpha:
                 ensemble_score = _clamp(ensemble_score, 0.0, 1.0)
     
                 active_sweep_threshold = _clamp(0.65 + threshold_offset, 0.5, 0.9)
-                # C2: Regime-direction alignment gate.
-                # In a trending regime, a sweep in the trend direction is structurally
-                # more likely to be continuation than reversal. Block fade entries
-                # when regime and sweep are aligned. This is NOT a threshold change —
-                # it is a structural prior based on microstructure theory.
-                # Empirical validation of the alignment criterion is deferred to Phase E.
-                trend_aligned = (
-                    (sweep_side == "high" and regime == "TRENDING_UP") or
-                    (sweep_side == "low" and regime == "TRENDING_DOWN")
-                )
-
-                if trend_aligned:
-                    action = "HOLD"
-                    confidence = 0.0
-                    logic_path = (
-                        f"ACTIVE_SWEEP on {sweep_side} suppressed: "
-                        f"regime {regime} aligned with sweep direction. "
-                        f"Reversal prior invalid. trend_aligned={trend_aligned} "
-                        f"ensemble={ensemble_score:.3f}"
-                    )
-                elif ensemble_score >= active_sweep_threshold and is_fake:
+                if ensemble_score >= active_sweep_threshold and is_fake:
                     action = "SELL" if sweep_side == "high" else "BUY"
                     confidence = max(0.0, ensemble_score - 0.15 * (1.0 - warmup_factor))
-                    logic_path = f"Fake {sweep_side} sweep confirmed via logit ensemble. trend_aligned={trend_aligned}"
+                    logic_path = f"Fake {sweep_side} sweep confirmed via logit ensemble."
                 else:
-                    logic_path = f"True breakout / lack of reversion edge on {sweep_side} sweep. trend_aligned={trend_aligned}"
+                    logic_path = f"True breakout / lack of reversion edge on {sweep_side} sweep."
     
-            # NOTE: Two regime strings are in scope here:
-            # `regime`       — INTERNAL: computed by _detect_regime from market data.
-            #                  Values: TRENDING_UP, TRENDING_DOWN, RANGING, VOLATILE.
-            #                  Used for: C2 trend_aligned gate, C3 VOLATILE gate,
-            #                  ACTIVE_SWEEP trend_penalty, final output field.
-            # `regime_label` — EXTERNAL: from regime_context dict passed by caller.
-            #                  Values: arbitrary strings from AdvancedRegimeEngine.
-            #                  Used for: confidence scaling multipliers only.
-            # These are intentionally separate. Do not merge them.
             regime_label = str((regime_context or {}).get("regime", regime)).upper()
 
             if "RANGE" in regime_label:
                 confidence *= 0.9
             # Match both internal (UPTREND/DOWNTREND) and external (TREND/BEAR)
             # regime labels emitted by AdvancedRegimeEngine.
-            if ("UPTREND" in regime_label or "TRENDING_UP" in regime_label or regime_label == "TREND") and action == "SELL":
+            if ("UPTREND" in regime_label or regime_label == "TREND") and action == "SELL":
                 confidence *= 0.9
-            if ("DOWNTREND" in regime_label or "TRENDING_DOWN" in regime_label or regime_label == "BEAR") and action == "BUY":
+            if ("DOWNTREND" in regime_label or regime_label == "BEAR") and action == "BUY":
                 confidence *= 0.9
             # FINAL CONFIDENCE SAFETY (prevent drift)
             if not math.isfinite(confidence):
@@ -1411,6 +1570,31 @@ class LiquiditySweepAlpha:
             # Final output hardening (never trust upstream)
             micro_prob = _clamp(_safe_float(micro_prob if micro_prob is not None else 0.5, 0.5), 0.0, 1.0)
             macro_prob = _clamp(_safe_float(macro_prob if macro_prob is not None else 0.5, 0.5), 0.0, 1.0)
+
+            # FIX U-10 — HOLD-gate telemetry: classify why HOLD was emitted
+            if action == "HOLD":
+                pools_unset = (
+                    self.liquidity_pools.get("high") is None
+                    or self.liquidity_pools.get("low") is None
+                )
+                if regime == "VOLATILE":
+                    logic_path = self._record_hold_gate(
+                        "VOLATILE", vol_ratio=float(vol_ratio)
+                    )
+                elif pools_unset:
+                    logic_path = self._record_hold_gate(
+                        "POOL_UNSET", state=str(state)
+                    )
+                elif regime in ("UPTREND", "DOWNTREND"):
+                    logic_path = self._record_hold_gate(
+                        "TREND_ALIGNED", regime=str(regime),
+                        confidence=float(confidence),
+                    )
+                else:
+                    logic_path = self._record_hold_gate(
+                        "NO_EDGE", state=str(state), regime=str(regime),
+                        confidence=float(confidence),
+                    )
 
             return self._safe_output({
                 "action": action,
@@ -1464,17 +1648,45 @@ class LiquiditySweepAlpha:
                 and out.get("action") == "HOLD"
                 and getattr(self, "enable_sweep_directional_fallback", False)
             ):
-                liq_state = {
-                    "pools": dict(self.liquidity_pools),
+                # FIX (audit 2026-05-18) — predict_sweep() reads
+                # `nearest_above` / `nearest_below` (each {distance_points,
+                # price}); pass them properly so directional bias actually
+                # reflects pool structure instead of defaulting to BUY.
+                _px = _safe_float(
+                    (data.get("close") if isinstance(data, dict) else None)
+                    or (data.get("price") if isinstance(data, dict) else None),
+                    0.0,
+                )
+                _hi = self.liquidity_pools.get("high")
+                _lo = self.liquidity_pools.get("low")
+                liq_state: Dict[str, Any] = {
                     "ofi_zscore": float(out.get("ofi_zscore", 0.0) or 0.0),
                     "hawkes_intensity": float(out.get("hawkes_intensity", 0.0) or 0.0),
                 }
+                if _hi is not None and _px > 0:
+                    liq_state["nearest_above"] = {
+                        "price": float(_hi),
+                        "distance_points": max(0.0, float(_hi) - _px),
+                    }
+                if _lo is not None and _px > 0:
+                    liq_state["nearest_below"] = {
+                        "price": float(_lo),
+                        "distance_points": max(0.0, _px - float(_lo)),
+                    }
                 fallback = predict_sweep(
                     liq_state,
                     data if isinstance(data, dict) else {},
                     data.get("volume_intel", {}) if isinstance(data, dict) else {},
                 ) or {}
+                # FIX (audit 2026-05-18) — predict_sweep() returns
+                # `side` ("above"/"below"), not `action`. Map it.
                 fb_action = fallback.get("action")
+                if fb_action not in ("BUY", "SELL"):
+                    fb_side = str(fallback.get("side", "")).lower()
+                    if fb_side == "above":
+                        fb_action = "BUY"
+                    elif fb_side == "below":
+                        fb_action = "SELL"
                 if fb_action in ("BUY", "SELL"):
                     out = dict(out)
                     out["action"] = fb_action

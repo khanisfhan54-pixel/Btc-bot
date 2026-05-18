@@ -1,0 +1,241 @@
+{
+  "run_timestamp": "2026-05-18T09:01:02.660923",
+  "run_status": {
+    "ohlcv": "OK",
+    "l2": "OK"
+  },
+  "verdict": "WEAK",
+  "production_readiness": "Research-only",
+  "data_provenance": {
+    "type": "synthetic_historical",
+    "n_bars": 500,
+    "bar_size_sec": 300,
+    "live_exchange": false,
+    "real_l2_data": false
+  },
+  "cost_assumptions": {
+    "fee_bps": 7.5,
+    "slippage_bps": 5.0,
+    "total_cost_bps": 12.5,
+    "hold_bars": 6
+  },
+  "calibration_status": {
+    "prob_calibration": "UNCALIBRATED \u2014 fixed 0.8 shrinkage only",
+    "hawkes_params": "UNCALIBRATED \u2014 hard-coded defaults",
+    "vol_ratio_threshold": "UNCALIBRATED \u2014 fixed 0.015"
+  },
+  "ohlcv_metrics": {
+    "total_bars": 500,
+    "long_count": 277,
+    "short_count": 223,
+    "hold_count": 0,
+    "signal_coverage": 1.0,
+    "hold_rate": 0.0,
+    "long_precision": 0.439,
+    "short_precision": 0.2727,
+    "conf_mean": 0.5082,
+    "conf_median": 0.5,
+    "conf_std": 0.0582,
+    "conf_entropy": 0.1591,
+    "n_trades": 74,
+    "win_rate": 0.3649,
+    "avg_win": 0.000691,
+    "avg_loss": -0.00051,
+    "profit_factor": 0.7793,
+    "expectancy": -7.1e-05,
+    "sharpe": -4.6823,
+    "sortino": -8.1984,
+    "max_drawdown": 0.006,
+    "avg_hold_bars": 5.72,
+    "final_equity": 0.994707,
+    "regime_dist": {
+      "RANGING": 8,
+      "UPTREND": 302,
+      "DOWNTREND": 117,
+      "VOLATILE": 73
+    },
+    "state_dist": {
+      "NORMAL": 312,
+      "PRE_SWEEP_BUILDUP": 10,
+      "ACTIVE_SWEEP": 178
+    },
+    "ofi_mean": 0.0,
+    "ofi_std": 0.0,
+    "hawkes_mean": 0.0049,
+    "hawkes_max": 0.0357,
+    "errors": 0,
+    "warnings": [
+      "INIT: dropped unsupported kwargs for local class: ['hawkes_alpha', 'hawkes_decay']",
+      "WARMUP: {'hawkes_fitted': True, 'hawkes_decay': 20.0, 'hawkes_alpha': 0.0001, 'vol_threshold': 0.010823127773738953, 'vol_n_samples': 125, 'calibrator_fitted': True, 'calibrator_n': 119, 'calibrator_brier': 0.0, 'warmup_bars': 125}"
+    ],
+    "blockers": [],
+    "run_status": "OK"
+  },
+  "l2_metrics": {
+    "total_bars": 500,
+    "long_count": 277,
+    "short_count": 223,
+    "hold_count": 0,
+    "signal_coverage": 1.0,
+    "hold_rate": 0.0,
+    "long_precision": 0.439,
+    "short_precision": 0.2727,
+    "conf_mean": 0.5053,
+    "conf_median": 0.5,
+    "conf_std": 0.0489,
+    "conf_entropy": 0.1048,
+    "n_trades": 74,
+    "win_rate": 0.3649,
+    "avg_win": 0.000643,
+    "avg_loss": -0.000517,
+    "profit_factor": 0.7142,
+    "expectancy": -9.4e-05,
+    "sharpe": -6.5375,
+    "sortino": -10.7812,
+    "max_drawdown": 0.0075,
+    "avg_hold_bars": 5.72,
+    "final_equity": 0.99306,
+    "regime_dist": {
+      "RANGING": 8,
+      "UPTREND": 302,
+      "DOWNTREND": 117,
+      "VOLATILE": 73
+    },
+    "state_dist": {
+      "NORMAL": 319,
+      "ACTIVE_SWEEP": 175,
+      "PRE_SWEEP_BUILDUP": 6
+    },
+    "ofi_mean": -0.0381,
+    "ofi_std": 1.2784,
+    "hawkes_mean": 0.0047,
+    "hawkes_max": 0.0731,
+    "errors": 0,
+    "warnings": [
+      "INIT: dropped unsupported kwargs for local class: ['hawkes_alpha', 'hawkes_decay']",
+      "WARMUP: {'hawkes_fitted': True, 'hawkes_decay': 20.0, 'hawkes_alpha': 0.0001, 'vol_threshold': 0.010823127773738953, 'vol_n_samples': 125, 'calibrator_fitted': True, 'calibrator_n': 119, 'calibrator_brier': 0.0, 'warmup_bars': 125}"
+    ],
+    "blockers": [],
+    "run_status": "OK",
+    "walk_forward": {
+      "available": true,
+      "n_folds": 0,
+      "mean_sharpe": 0.0,
+      "std_sharpe": 0.0,
+      "folds": []
+    }
+  },
+  "comparison": {
+    "metric": [
+      "hold_rate",
+      "signal_coverage",
+      "n_trades",
+      "win_rate",
+      "profit_factor",
+      "expectancy",
+      "sharpe",
+      "sortino",
+      "max_drawdown",
+      "conf_mean",
+      "conf_entropy"
+    ],
+    "ohlcv": [
+      0.0,
+      1.0,
+      74,
+      0.3649,
+      0.7793,
+      -7.1e-05,
+      -4.6823,
+      -8.1984,
+      0.006,
+      0.5082,
+      0.1591
+    ],
+    "l2": [
+      0.0,
+      1.0,
+      74,
+      0.3649,
+      0.7142,
+      -9.4e-05,
+      -6.5375,
+      -10.7812,
+      0.0075,
+      0.5053,
+      0.1048
+    ],
+    "delta_l2_minus_ohlcv": [
+      0.0,
+      0.0,
+      0,
+      0.0,
+      -0.0651,
+      -2.3e-05,
+      -1.8552,
+      -2.5828,
+      0.0015,
+      -0.0029,
+      -0.0543
+    ]
+  },
+  "issues": [
+    {
+      "severity": "HIGH",
+      "code": "I-006",
+      "message": "Profit factor=0.78 < 1.0 \u2014 system is losing money after costs.",
+      "fix": "Check cost assumptions (FEE_BPS+SLIP_BPS) and direction_mode.",
+      "run": "OHLCV"
+    },
+    {
+      "severity": "HIGH",
+      "code": "I-008",
+      "message": "Sharpe=-4.68 is significantly negative \u2014 system destroys value.",
+      "fix": "Inspect direction_mode and ensemble threshold calibration.",
+      "run": "OHLCV"
+    },
+    {
+      "severity": "MEDIUM",
+      "code": "I-010",
+      "message": "Confidence entropy=0.16 \u2014 outputs cluster near a single value. Probability calibration (_shrink_prob) may be over-regularising.",
+      "fix": "Run isotonic/Platt calibration on held-out OOF labels.",
+      "run": "OHLCV"
+    },
+    {
+      "severity": "HIGH",
+      "code": "I-006",
+      "message": "Profit factor=0.71 < 1.0 \u2014 system is losing money after costs.",
+      "fix": "Check cost assumptions (FEE_BPS+SLIP_BPS) and direction_mode.",
+      "run": "L2"
+    },
+    {
+      "severity": "HIGH",
+      "code": "I-008",
+      "message": "Sharpe=-6.54 is significantly negative \u2014 system destroys value.",
+      "fix": "Inspect direction_mode and ensemble threshold calibration.",
+      "run": "L2"
+    },
+    {
+      "severity": "MEDIUM",
+      "code": "I-010",
+      "message": "Confidence entropy=0.10 \u2014 outputs cluster near a single value. Probability calibration (_shrink_prob) may be over-regularising.",
+      "fix": "Run isotonic/Platt calibration on held-out OOF labels.",
+      "run": "L2"
+    }
+  ],
+  "unavailable_metrics": [
+    "exposure_pct (no position sizing model)",
+    "turnover_rate (no dollar PnL)",
+    "regime_persistence (single pass only)",
+    "walk_forward_sharpe (not implemented)",
+    "calibration_brier_score (no isotonic calibration)"
+  ],
+  "prior_run_comparison": "NO_PRIOR_RUN \u2014 first execution",
+  "blockers": [],
+  "warnings": [
+    "INIT: dropped unsupported kwargs for local class: ['hawkes_alpha', 'hawkes_decay']",
+    "WARMUP: {'hawkes_fitted': True, 'hawkes_decay': 20.0, 'hawkes_alpha': 0.0001, 'vol_threshold': 0.010823127773738953, 'vol_n_samples': 125, 'calibrator_fitted': True, 'calibrator_n': 119, 'calibrator_brier': 0.0, 'warmup_bars': 125}",
+    "INIT: dropped unsupported kwargs for local class: ['hawkes_alpha', 'hawkes_decay']",
+    "WARMUP: {'hawkes_fitted': True, 'hawkes_decay': 20.0, 'hawkes_alpha': 0.0001, 'vol_threshold': 0.010823127773738953, 'vol_n_samples': 125, 'calibrator_fitted': True, 'calibrator_n': 119, 'calibrator_brier': 0.0, 'warmup_bars': 125}"
+  ]
+}
