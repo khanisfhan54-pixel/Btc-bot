@@ -1,17 +1,4 @@
-# FIX-M3: pin numpy<2.0 — advanced_regime_engine.py GARCH/NHHMM internals
-# were written for the numpy 1.x API surface and have not been swept for
-# 2.x deprecations (np.bool / np.int / np.float / np.complex aliases,
-# default-dtype changes for object arrays, etc.). Loosen this pin only
-# after a full 2.x compatibility sweep of advanced_regime_engine.py.
-numpy>=1.26,<2.0.0
-scipy>=1.11,<2
-pytest>=9,<10
-prometheus-client>=0.20,<1
-websocket-client>=1.8,<2
-ccxt>=4.0.0
-ccxt
-prometheus-client
+numpy
+scikit-learn
+joblib
 pytest
-python-dotenv
-scipy
-websocket-client
