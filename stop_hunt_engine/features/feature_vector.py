@@ -28,7 +28,7 @@ class StopHuntFeatureVector:
 
 _DIM_NAMES = ("pool", "funding", "oi", "volume", "lob", "liquidation", "regime")
 
-def compute_feature_vector(i: int, candles: Sequence[Candle], *, l2_snapshots: Sequence[L2Snapshot] = (), funding: Sequence[FundingPoint] = (), open_interest: Sequence[OpenInterestPoint] = (), liquidation_clusters: Sequence[LiquidationCluster] = (), regime_output: Optional[Mapping[str, Any]] = None) -> StopHuntFeatureVector:
+def compute_feature_vector(i: int, candles: Sequence[Candle], *, l2_snapshots: Sequence[L2Snapshot] = (), funding: Sequence[FundingPoint] = (), open_interest: Sequence[OpenInterestPoint] = (), liquidation_clusters: Sequence[LiquidationCluster] = (), regime_output: Optional[Mapping[str, Any]] = None, liq_stale_seconds: int = 3600) -> StopHuntFeatureVector:
     if not candles or i < 0 or i >= len(candles):
         raise ValueError(f"bar_index {i} out of range for {len(candles)} candles")
     bar = candles[i]
@@ -38,8 +38,8 @@ def compute_feature_vector(i: int, candles: Sequence[Candle], *, l2_snapshots: S
     oi = compute_oi_dynamics(as_of_ts, open_interest, candles)
     vol = compute_volume_trap(i, candles)
     lob = compute_lob_imbalance(as_of_ts, l2_snapshots)
-    liq = compute_liquidation_proximity(as_of_ts, bar.close, liquidation_clusters)
-    reg = project_regime_context(regime_output)
+    liq = compute_liquidation_proximity(as_of_ts, bar.close, liquidation_clusters, stale_seconds=liq_stale_seconds)
+    reg = project_regime_context(regime_output, as_of_ts=as_of_ts)
     dims = (pool, fund, oi, vol, lob, liq, reg)
     stale = [name for name, d in zip(_DIM_NAMES, dims) if d.stale]
     return StopHuntFeatureVector(i, as_of_ts, pool, fund, oi, vol, lob, liq, reg, stale)

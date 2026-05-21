@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import logging
-from typing import TypedDict
+import os
+from typing import Optional, TypedDict
 
 from ..model.engine import StopHuntProbabilityEngine
 from .feature_pipeline import PipelineInput, build_feature_vector
@@ -16,8 +17,10 @@ class SHPEOutput(TypedDict):
     regime_used: str
 
 
-def get_shpe_probability(engine: StopHuntProbabilityEngine, input_data: PipelineInput, bar_index: int) -> SHPEOutput:
+def get_shpe_probability(engine: Optional[StopHuntProbabilityEngine], input_data: PipelineInput, bar_index: int) -> SHPEOutput:
     try:
+        if os.getenv("SHPE_ENABLED", "true").strip().lower() in {"0", "false", "no", "off"} or engine is None:
+            return {"probability": 0.5, "degraded": True, "regime_used": "<disabled>"}
         feature_vector = build_feature_vector(input_data, bar_index)
         prediction = engine.predict(feature_vector)
         return {

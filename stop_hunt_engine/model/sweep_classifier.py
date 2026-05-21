@@ -31,7 +31,7 @@ class SweepClassifier:
     def fit(self, X: np.ndarray, y: np.ndarray, *, run_importance_audit: bool = True) -> "SweepClassifier":
         X=np.asarray(X,dtype=float); y=np.asarray(y).astype(int)
         if LogisticRegression is not None:
-            self.model = LogisticRegression(C=self.C,max_iter=self.max_iter,random_state=self.random_state,solver="lbfgs",multi_class="ovr")
+            self.model = LogisticRegression(C=self.C,max_iter=self.max_iter,random_state=self.random_state,solver="lbfgs")
             self.model.fit(X, y); self._classes = self.model.classes_; self._coef=None
         else:
             Xb=np.hstack([X,np.ones((X.shape[0],1))])
