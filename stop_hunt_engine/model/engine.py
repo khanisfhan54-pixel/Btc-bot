@@ -102,5 +102,13 @@ class StopHuntProbabilityEngine:
             raw = np.array([clf.predict_proba(X[i:i+1], regs[i])[0] for i in range(split, n)], dtype=float)
             cal = ProbabilityCalibrator(method=calibrate_method).fit(raw, y[split:])
             clf.last_routing_log.clear()
+        elif calibrate_method is not None:
+            log.warning(
+                "shpe_calibration_skipped: holdout_size=%d unique_labels=%d "
+                "calibrate_method=%s — falling back to uncalibrated probabilities",
+                n - split,
+                int(np.unique(y[split:]).size) if n > split else 0,
+                calibrate_method,
+            )
 
         return cls(classifier=clf, calibrator=cal, feature_names=SHPE_FEATURE_NAMES, model_version=model_version)

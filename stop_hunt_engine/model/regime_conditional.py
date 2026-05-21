@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -20,7 +20,7 @@ class RegimeConditionalClassifier:
     global_model: Optional[SweepClassifier] = field(default=None, repr=False)
     sub_models: Dict[str, SweepClassifier] = field(default_factory=dict, repr=False)
     _train_counts: Dict[str, int] = field(default_factory=dict, repr=False)
-    _undertrained: set[str] = field(default_factory=set, repr=False)
+    _undertrained: Set[str] = field(default_factory=set, repr=False)
     last_routing_log: List[Dict[str, str]] = field(default_factory=list, repr=False)
 
     def fit(
@@ -67,7 +67,7 @@ class RegimeConditionalClassifier:
             ).fit(X[mask], y_sub, run_importance_audit=False)
         return self
 
-    def predict_proba(self, x: np.ndarray, regime_label: Optional[str]) -> tuple[float, str]:
+    def predict_proba(self, x: np.ndarray, regime_label: Optional[str]) -> Tuple[float, str]:
         if self.global_model is None:
             raise RuntimeError("RegimeConditionalClassifier.predict_proba called before fit")
         xx = np.atleast_2d(np.asarray(x, dtype=float))

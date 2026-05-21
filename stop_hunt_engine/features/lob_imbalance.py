@@ -35,6 +35,7 @@ def compute_lob_imbalance(as_of_ts: float, l2_snapshots: Sequence[L2Snapshot], *
     top_bid = curr.bids[0].price if curr.bids else np.nan
     top_ask = curr.asks[0].price if curr.asks else np.nan
     spread_valid = bool(np.isfinite(top_bid) and np.isfinite(top_ask) and top_ask > top_bid)
+    stale = (as_of_ts - curr.timestamp) > stale_seconds
     if not spread_valid:
         return LOBImbalanceFeatures(stale=True)
 
@@ -57,5 +58,4 @@ def compute_lob_imbalance(as_of_ts: float, l2_snapshots: Sequence[L2Snapshot], *
     else:
         repl = 1.0
 
-    stale = (as_of_ts - curr.timestamp) > stale_seconds
     return LOBImbalanceFeatures(ofi_z, queue_imb, repl, stale)

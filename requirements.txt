@@ -1,12 +1,11 @@
-# FIX-M3: pin numpy<2.0 — advanced_regime_engine.py internals currently target numpy 1.x.
+# ── original BTC bot dependencies (do not remove or loosen) ──────────
 numpy>=1.26,<2.0.0
 scipy>=1.11,<2
-pytest>=9,<10
 prometheus-client>=0.20,<1
 websocket-client>=1.8,<2
 ccxt>=4.0.0
 python-dotenv>=1.0,<2
 
-# SHPE minimal dependencies (model + persistence only).
+# ── SHPE additions (minimum required) ───────────────────────────────
 scikit-learn>=1.4,<2
 joblib>=1.3,<2
