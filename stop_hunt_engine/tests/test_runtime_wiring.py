@@ -53,13 +53,32 @@ def test_run_cycle_injects_shpe_not_equal_legacy(monkeypatch: pytest.MonkeyPatch
     import main
 
     monkeypatch.setattr(main, "_validate_exchange_symbol_format", lambda *_a, **_k: True)
+    monkeypatch.setattr(main, "SIGNAL_ONLY_MODE", False)
+    monkeypatch.setitem(main.SIGNAL_PIPELINE_CONFIG, "signal_only_mode", False)
     monkeypatch.setattr(main, "_prune_reconciliation_blocks", lambda: None)
     monkeypatch.setattr(main, "_fetch_open_interest", lambda *_a, **_k: 1.0)
     monkeypatch.setattr(main, "_fetch_funding_rate", lambda *_a, **_k: 0.0)
     monkeypatch.setattr(main, "analyze_volume_intelligence", lambda **_k: {})
     monkeypatch.setattr(main, "_append_orderbook_snapshot", lambda *_a, **_k: None)
     monkeypatch.setattr(main, "_get_orderbook_snapshot_history", lambda: [{}, {}, {}])
-    monkeypatch.setattr(main, "run_all_engines", lambda **_k: {"stop_hunt_detected": False, "liquidation_data": {"events": []}})
+    monkeypatch.setattr(main, "run_all_engines", lambda **_k: {
+        "stop_hunt_detected": False,
+        "liquidation_data": {"events": []},
+        "cascade_probability": 0.0,
+        "market_state": {"allow_trade": False},
+        "alpha": {},
+        "smc_signal": {},
+        "liquidity_map": {},
+        "liquidation_heatmap": {"heat_score": 0, "color": "green"},
+    })
+    monkeypatch.setattr(main, "evaluate_meta_filter", lambda **_k: {
+        "allow_trade": False, "risk_scale": 0.0, "reason": "test_block", "meta_state": {}
+    })
+    monkeypatch.setattr(main.trade_lifecycle, "update", lambda *_a, **_k: {
+        "block_new_entries": True, "reason": "test"
+    })
+    monkeypatch.setattr(main.trade_lifecycle, "session_guard", lambda: {})
+    monkeypatch.setattr(main.position_manager, "has_position", lambda: False)
     monkeypatch.setattr(main, "_fetch_market_snapshot", lambda *_a, **_k: {
         "snapshot_ts": 1_700_000_000.0,
         "candles_by_tf": {
@@ -76,7 +95,15 @@ def test_run_cycle_injects_shpe_not_equal_legacy(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(main.fill_model, "enrich", lambda x: x)
     monkeypatch.setattr(main.tox_filter, "enrich", lambda x: x)
     monkeypatch.setattr(main.impact_tracker, "update", lambda *_a, **_k: {})
+    monkeypatch.setattr(main.order_router, "route", lambda *_a, **_k: {"execute": False, "reason": "test", "order_type": "market"})
     monkeypatch.setattr(main.signal_engine, "generate", lambda _f: {"signal": "HOLD", "confidence": 0.0})
+    monkeypatch.setattr(main.alpha_orchestrator, "orchestrate", lambda *_a, **_k: type("Sig", (), {"action": type("A", (), {"value": 0})(), "net_conviction": 0.0, "meta_info": {}})())
+    monkeypatch.setattr(main.basis_normalizer, "set_venues", lambda *_a, **_k: None)
+    monkeypatch.setattr(main.basis_normalizer, "seed", lambda **_k: None)
+    monkeypatch.setattr(main.basis_normalizer, "update", lambda **_k: None)
+    monkeypatch.setattr(main.basis_normalizer, "validate", lambda: type("S", (), {"ok": True, "reason": "", "basis": 0.0, "basis_pct": 0.0})())
+    monkeypatch.setattr(main, "log_trade", lambda *_a, **_k: None)
+    monkeypatch.setattr(main, "send_telegram_message", lambda *_a, **_k: None)
     monkeypatch.setattr(main, "_execute_liquidity_trade", lambda **_k: {})
 
     captured = {}
