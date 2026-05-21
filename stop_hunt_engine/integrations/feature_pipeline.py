@@ -25,6 +25,28 @@ class PipelineInput:
     regime_output: Mapping[str, object]
 
 
+def _nearest_past_snapshot(snapshots, candle_ts: float, max_skew_sec: int):
+    """
+    Return the snapshot with the largest timestamp that is still <= candle_ts.
+    If none exists at or before candle_ts, fall back to the absolute-nearest
+    within max_skew_sec (handles minor clock drift at sequence boundaries).
+    Returns (snapshot, delta_seconds) or (None, None) if sequence is empty.
+    Never returns a snapshot whose timestamp exceeds candle_ts by more than
+    max_skew_sec (no lookahead leakage).
+    """
+    if not snapshots:
+        return None, None
+    past = [s for s in snapshots if s.timestamp <= candle_ts]
+    if past:
+        best = max(past, key=lambda s: s.timestamp)
+        return best, abs(candle_ts - best.timestamp)
+    nearest = min(snapshots, key=lambda s: abs(s.timestamp - candle_ts))
+    delta = abs(nearest.timestamp - candle_ts)
+    if nearest.timestamp > candle_ts and delta > max_skew_sec:
+        return None, None
+    return nearest, delta
+
+
 def build_feature_vector(
     input_data: PipelineInput,
     bar_index: int,
@@ -34,18 +56,33 @@ def build_feature_vector(
     if not input_data.candles_5m:
         raise ValueError("candles_5m is empty")
     timestamp = input_data.candles_5m[bar_index].timestamp
+
     if input_data.l2_snapshots:
-        l2_timestamp = input_data.l2_snapshots[-1].timestamp
-        l2_delta = abs(timestamp - l2_timestamp)
-        if l2_delta > max_clock_skew_sec:
-            _log.warning("shpe_pipeline_clock_skew source=l2 candle_ts=%s source_ts=%s delta=%s", timestamp, l2_timestamp, l2_delta)
+        best_l2, l2_delta = _nearest_past_snapshot(
+            input_data.l2_snapshots, timestamp, max_clock_skew_sec
+        )
+        if best_l2 is None or l2_delta is None or l2_delta > max_clock_skew_sec:
+            _log.warning(
+                "shpe_pipeline_clock_skew source=l2 candle_ts=%s best_ts=%s delta=%s",
+                timestamp,
+                getattr(best_l2, "timestamp", "none"),
+                l2_delta,
+            )
             raise ValueError("L2 snapshot timestamp mismatch")
+
     if input_data.open_interest:
-        oi_timestamp = input_data.open_interest[-1].timestamp
-        oi_delta = abs(timestamp - oi_timestamp)
-        if oi_delta > max_clock_skew_sec:
-            _log.warning("shpe_pipeline_clock_skew source=open_interest candle_ts=%s source_ts=%s delta=%s", timestamp, oi_timestamp, oi_delta)
+        best_oi, oi_delta = _nearest_past_snapshot(
+            input_data.open_interest, timestamp, max_clock_skew_sec
+        )
+        if best_oi is None or oi_delta is None or oi_delta > max_clock_skew_sec:
+            _log.warning(
+                "shpe_pipeline_clock_skew source=open_interest candle_ts=%s best_ts=%s delta=%s",
+                timestamp,
+                getattr(best_oi, "timestamp", "none"),
+                oi_delta,
+            )
             raise ValueError("open_interest timestamp mismatch")
+
     return compute_feature_vector(
         bar_index,
         input_data.candles_5m,

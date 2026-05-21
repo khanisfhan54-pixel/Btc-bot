@@ -2857,7 +2857,7 @@ def run_analysis_cycle(
                 "signal": normalized_signal,
                 "confidence": float(_safe_float(confidence, 0.0)),
             },
-            features_payload=feat_dict,
+            features=feat_dict,
             snapshot=execution_orderbook,
             account_equity=balance,
             meta_result=meta_result,
