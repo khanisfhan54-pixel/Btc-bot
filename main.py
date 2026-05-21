@@ -66,6 +66,10 @@ RECONCILIATION_BLOCK_SECONDS = int(os.environ.get("RECONCILIATION_BLOCK_SECONDS"
 FETCH_TIMEOUT_SECONDS = float(os.environ.get("FETCH_TIMEOUT_SECONDS", "30"))
 MAX_CONSECUTIVE_CYCLE_ERRORS = int(os.environ.get("MAX_CONSECUTIVE_CYCLE_ERRORS", "10"))
 CIRCUIT_BREAKER_SLEEP_SECONDS = float(os.environ.get("CIRCUIT_BREAKER_SLEEP_SECONDS", "300"))
+SHPE_ENABLED = os.environ.get("SHPE_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+SHPE_HIGH_PROB_THRESHOLD = float(os.environ.get("SHPE_HIGH_PROB_THRESHOLD", "0.70"))
+SHPE_CONFIDENCE_PENALTY = float(os.environ.get("SHPE_CONFIDENCE_PENALTY", "0.20"))
+SHPE_SIZE_PENALTY = float(os.environ.get("SHPE_SIZE_PENALTY", "0.50"))
 _reconciliation_blocks: Dict[str, float] = {}
 _ORDERBOOK_SNAPSHOTS: Deque[Dict[str, Any]] = deque(maxlen=8)
 _ORDERBOOK_SNAPSHOTS_LOCK = threading.RLock()
@@ -299,6 +303,24 @@ except Exception as _new_module_import_err:
         logger.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
     raise RuntimeError(_boot_msg) from _new_module_import_err
 
+try:
+    from stop_hunt_engine.integrations.signal_adapter import (
+        get_shpe_probability, SHPEOutput,
+    )
+    from stop_hunt_engine.integrations.feature_pipeline import PipelineInput
+    from stop_hunt_engine.data.candle_store import Candle
+    from stop_hunt_engine.data.l2_snapshot import L2Snapshot, BookLevel
+    from stop_hunt_engine.data.derivatives import (
+        FundingPoint, OpenInterestPoint, LiquidationCluster,
+    )
+    from stop_hunt_engine.model.engine import StopHuntProbabilityEngine
+    _SHPE_IMPORT_OK = True
+except Exception as _shpe_import_err:
+    logger.warning("SHPE import failed (non-fatal): %s", _shpe_import_err)
+    _SHPE_IMPORT_OK = False
+    get_shpe_probability = None
+    PipelineInput = None
+
 
 try:
     from learning_engine import LEARNING_ENGINE
@@ -405,6 +427,19 @@ try:
     trade_lifecycle = TradeLifecycleManager()
     _bootstrap_stage = "CapitalAllocator"
     capital_allocator = CapitalAllocator()
+    _shpe_engine: Optional[StopHuntProbabilityEngine] = None
+    if _SHPE_IMPORT_OK and SHPE_ENABLED:
+        try:
+            from stop_hunt_engine.model.regime_conditional import RegimeConditionalClassifier
+            from stop_hunt_engine.model.engine import SHPE_FEATURE_NAMES
+            _shpe_clf = RegimeConditionalClassifier(
+                feature_names=list(SHPE_FEATURE_NAMES)
+            )
+            _shpe_engine = StopHuntProbabilityEngine(classifier=_shpe_clf)
+            logger.info("[BOOT] SHPE engine constructed (untrained shell — degraded mode active until model loaded)")
+        except Exception as _shpe_boot_err:
+            logger.warning("[BOOT] SHPE engine construction failed (non-fatal): %s", _shpe_boot_err)
+            _shpe_engine = None
     _bootstrap_stage = "VenueBasisNormalizer"
     basis_normalizer = VenueBasisNormalizer(halt_threshold_pct=BASIS_HALT_THRESHOLD_PCT)
 except Exception as _bootstrap_exc:
@@ -1984,9 +2019,87 @@ def run_analysis_cycle(
         or {}
     )
 
-    # Base features + advanced regime context (signal-only safe path)
     with _ANALYSIS_STATE_LOCK:
         regime_context: Dict[str, Any] = dict(_last_regime_context)
+
+    # ── SHPE probability gate ──────────────────────────────────────────
+    shpe_result: dict = {"probability": 0.5, "degraded": True, "regime_used": "<disabled>"}
+    if _SHPE_IMPORT_OK and SHPE_ENABLED and _shpe_engine is not None and get_shpe_probability is not None:
+        try:
+            _shpe_raw_candles = candles_by_tf.get("5m") or candles_by_tf.get("1m") or []
+            _shpe_candles: list = []
+            for _row in _shpe_raw_candles:
+                try:
+                    _shpe_candles.append(Candle(
+                        timestamp=float(_row[0]) / 1000.0,
+                        open=float(_row[1]),
+                        high=float(_row[2]),
+                        low=float(_row[3]),
+                        close=float(_row[4]),
+                        volume=float(_row[5]),
+                    ))
+                except Exception:
+                    continue
+
+            if len(_shpe_candles) >= 2:
+                _bar_ts = _shpe_candles[-1].timestamp
+                _shpe_l2: list = []
+                _raw_bids = (analysis_orderbook.get("bids") or [])[:20]
+                _raw_asks = (analysis_orderbook.get("asks") or [])[:20]
+                if _raw_bids and _raw_asks:
+                    _shpe_l2 = [L2Snapshot(
+                        timestamp=_bar_ts,
+                        bids=tuple(BookLevel(float(b[0]), float(b[1])) for b in _raw_bids if len(b) >= 2),
+                        asks=tuple(BookLevel(float(a[0]), float(a[1])) for a in _raw_asks if len(a) >= 2),
+                    )]
+                _shpe_funding: list = []
+                if funding_rate != 0.0:
+                    _shpe_funding = [FundingPoint(timestamp=_bar_ts, rate_8h=float(funding_rate))]
+                _shpe_oi: list = []
+                if open_interest > 0.0:
+                    _shpe_oi = [OpenInterestPoint(timestamp=_bar_ts, oi_usd=float(open_interest))]
+                _shpe_liqs: list = []
+                for _ev in (engines_out.get("liquidation_data", {}).get("events") or []):
+                    try:
+                        _shpe_liqs.append(LiquidationCluster(
+                            price=float(_ev.get("price", current_price)),
+                            size_usd=float(_ev.get("usd", 0.0)),
+                            side=str(_ev.get("side", "long")).lower(),
+                            as_of=_bar_ts,
+                        ))
+                    except Exception:
+                        continue
+                _shpe_regime_payload = {
+                    "regime_label": str(regime_context.get("regime", "")),
+                    "confidence": float(_safe_float(regime_context.get("confidence", 0.0))),
+                    "timestamp": float(_regime_context_timestamp),
+                }
+                _pipeline_input = PipelineInput(
+                    candles_5m=_shpe_candles,
+                    l2_snapshots=_shpe_l2,
+                    funding=_shpe_funding,
+                    open_interest=_shpe_oi,
+                    liquidation_clusters=_shpe_liqs,
+                    regime_output=_shpe_regime_payload,
+                )
+                shpe_result = get_shpe_probability(
+                    _shpe_engine, _pipeline_input, len(_shpe_candles) - 1
+                )
+                logger.info(
+                    "[SHPE] probability=%.4f degraded=%s regime=%s",
+                    shpe_result["probability"],
+                    shpe_result["degraded"],
+                    shpe_result["regime_used"],
+                )
+            else:
+                logger.warning("[SHPE] insufficient candles (%d) — degraded fallback", len(_shpe_candles))
+        except Exception as _shpe_exc:
+            logger.warning("[SHPE] runtime error (non-fatal, degraded fallback): %s", _shpe_exc)
+            shpe_result = {"probability": 0.5, "degraded": True, "regime_used": "<error>"}
+
+    # Base features + advanced regime context (signal-only safe path)
+    with _ANALYSIS_STATE_LOCK:
+        regime_context = dict(_last_regime_context)
     update_freq = _safe_float(SIGNAL_PIPELINE_CONFIG.get("regime_update_frequency_sec", 1.0), 1.0)
     if update_freq <= 0:
         update_freq = 1.0
@@ -2144,6 +2257,9 @@ def run_analysis_cycle(
             "[FEATURE] Required feature keys missing: %s — this indicates a degraded FeatureEngine. "
             "Failsafe gate may be bypassed.", sorted(_missing_keys)
         )
+    feat_dict["shpe_probability"] = float(shpe_result.get("probability", 0.5))
+    feat_dict["shpe_degraded"] = bool(shpe_result.get("degraded", True))
+    feat_dict["shpe_regime_used"] = str(shpe_result.get("regime_used", "<disabled>"))
     feat_dict["candles"] = candles_by_tf.get("1h", [])
 
     # Update impact decay using raw features
@@ -2878,6 +2994,24 @@ def run_analysis_cycle(
                 )
         except Exception as _ptq_exc:
             logger.warning("[PRE_TRADE_QUALITY] non-fatal: %s", _ptq_exc)
+
+    _shpe_prob = float(feat_dict.get("shpe_probability", 0.5))
+    _shpe_degraded = bool(feat_dict.get("shpe_degraded", True))
+    if SHPE_ENABLED and not _shpe_degraded and normalized_signal in ("LONG", "SHORT"):
+        if _shpe_prob >= SHPE_HIGH_PROB_THRESHOLD:
+            confidence = max(0.0, float(confidence) - SHPE_CONFIDENCE_PENALTY)
+            if decision.get("position_size", 0.0):
+                decision["position_size"] = _safe_float(decision["position_size"]) * SHPE_SIZE_PENALTY
+            logger.warning(
+                "[SHPE] high stop-hunt probability=%.4f — confidence penalised, size halved",
+                _shpe_prob,
+            )
+        logger.info(
+            "[SHPE] gate applied probability=%.4f degraded=%s regime=%s",
+            _shpe_prob, _shpe_degraded, feat_dict.get("shpe_regime_used"),
+        )
+    elif SHPE_ENABLED and _shpe_degraded:
+        logger.info("[SHPE] degraded mode — gate skipped, no penalty applied")
 
     capital_decision: Dict[str, Any] = {
         "capital_scale": 1.0,
