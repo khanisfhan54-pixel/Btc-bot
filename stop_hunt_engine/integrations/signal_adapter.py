@@ -1,10 +1,13 @@
 """Signal adapter exposing SHPE probability only (no execution side-effects)."""
 from __future__ import annotations
 
+import logging
 from typing import TypedDict
 
 from ..model.engine import StopHuntProbabilityEngine
 from .feature_pipeline import PipelineInput, build_feature_vector
+
+_log = logging.getLogger("shpe.signal_adapter")
 
 
 class SHPEOutput(TypedDict):
@@ -14,10 +17,14 @@ class SHPEOutput(TypedDict):
 
 
 def get_shpe_probability(engine: StopHuntProbabilityEngine, input_data: PipelineInput, bar_index: int) -> SHPEOutput:
-    fv = build_feature_vector(input_data, bar_index)
-    pred = engine.predict(fv)
-    return {
-        "probability": float(max(0.0, min(1.0, pred.p_sweep))),
-        "degraded": bool(pred.degraded),
-        "regime_used": str(pred.regime_used),
-    }
+    try:
+        feature_vector = build_feature_vector(input_data, bar_index)
+        prediction = engine.predict(feature_vector)
+        return {
+            "probability": float(max(0.0, min(1.0, prediction.p_sweep))),
+            "degraded": bool(prediction.degraded),
+            "regime_used": str(prediction.regime_used),
+        }
+    except Exception as exc:
+        _log.error("shpe_signal_adapter_error bar_index=%d exc=%r", bar_index, exc)
+        return {"probability": 0.5, "degraded": True, "regime_used": "<error>"}

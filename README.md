@@ -1,99 +1,56 @@
-🚀 BTC Quant Trading System
+# Stop Hunt Probability Engine (SHPE)
 
-A modular, production-grade Bitcoin trading system built with advanced execution, feature engineering, and adaptive learning architecture.
+Probability layer for the BTC trading bot that estimates the likelihood of
+a stop-hunt sweep at each 5-minute bar. SHPE never places orders; it exposes
+a single probability score consumed by the bot's risk gate.
 
-⸻
+## Integration
 
-🧠 System Overview
+```python
+from stop_hunt_engine.integrations.signal_adapter import get_shpe_probability
+from stop_hunt_engine.integrations.feature_pipeline import PipelineInput
 
-This project is a multi-layered quantitative trading engine designed for:
-	•	High-frequency decision making
-	•	Smart liquidity detection
-	•	Adaptive learning-based optimization
-	•	Advanced execution & risk management
+output = get_shpe_probability(engine, pipeline_input, bar_index)
+# output == {"probability": float, "degraded": bool, "regime_used": str}
+```
 
-⸻
+## Feature dimensions
 
-🏗️ Architecture
+| Dimension | Module | Stale threshold |
+|---|---|---|
+| Pool distance | `pool_distance.py` | never (candle-derived) |
+| Funding pressure | `funding_pressure.py` | 12 h |
+| OI dynamics | `oi_dynamics.py` | 20 min |
+| Volume trap | `volume_trap.py` | never (candle-derived) |
+| LOB imbalance | `lob_imbalance.py` | 120 s |
+| Liquidation proximity | `liquidation_proximity.py` | 1 h |
+| Regime context | `regime_context.py` | 5 min |
 
-The system is structured into multiple independent modules:
+## Safety rules
 
-🔹 Core Engine
-	•	engine.py → Central orchestrator of all trading logic
-	•	main.py → Entry point for system execution
+- If > 2 feature dimensions are stale: `degraded=True`, `p_sweep=0.5`.
+- Unknown regime falls back to the global model.
+- All probabilities are bounded to [0, 1].
+- No crashes from missing data, NaNs, or missing snapshots.
 
-⸻
+## Validation
 
-🔹 Execution Layer
-	•	execution.py → Order execution logic
-	•	execution_liquidation_engine.py → Liquidation handling
-	•	execution_quality.py → Execution performance tracking
-	•	exit_quality_engine.py → Exit optimization
+```bash
+pytest stop_hunt_engine/tests/ -v
+```
 
-⸻
+## What is production-safe (post PR #214)
 
-🔹 Feature Engineering
-	•	feature_engine.py → Market feature generation
-	•	impact_decay.py → Market impact modeling
+- Dependency restore: all original bot deps present.
+- Feature modules: real implementations, no stubs.
+- Calibration: leakage-free holdout split (temporal, not random).
+- Integration adapters: safe, no execution side-effects.
+- Walk-forward CV: expanding-window and rolling-window variants.
+- Permutation audit: implemented and tested.
 
-⸻
+## What still requires market validation
 
-🔹 Learning System
-	•	learning_engine.py → Adaptive learning & strategy improvement
-
-⸻
-
-🔹 Market Intelligence
-	•	liquidity_hunting_engine.py → Liquidity detection
-	•	meta_filter.py → Meta decision filter
-
-⸻
-
-🔹 Backtesting
-	•	backtest_engine.py → Strategy validation & simulation
-
-⸻
-
-⚙️ Key Features
-	•	📊 Multi-timeframe market analysis
-	•	⚡ Advanced execution logic
-	•	🧠 Self-improving learning system
-	•	🛡️ Risk-aware position management
-	•	🔍 Liquidity & order flow analysis
-	•	🧩 Modular & scalable architecture
-
-
-🚀 Getting Started
-
-1. Clone Repository
-2. git clone https://github.com/Khanisfhan54-pixel
-/Btc-bot.git
-cd Btc-bot
-
-2. Install Dependencies
-3. pip install -r requirements.txt
-
-4.  Run System
-    python main.py
-
-    📌 Development Philosophy
-
-This system is built with:
-	•	Clean modular design
-	•	High scalability
-	•	Production readiness
-	•	Mathematical consistency
-
-⸻
-
-⚠️ Disclaimer
-
-This project is for research and educational purposes only.
-Trading cryptocurrencies involves significant risk.
-
-⸻
-
-👨‍💻 Author
-
-Developed by Khanisfhan54-pixel
-
+- Probability thresholds for risk gating (requires live paper-trading data).
+- Per-regime sub-model sample sizes (requires labelled regime history).
+- Calibration stability across exchange feed outages.
+- Feature importance rankings under real market microstructure.

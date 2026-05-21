@@ -15,7 +15,13 @@ class LiquidationProximityFeatures:
     stale: bool = True
 
 
-def compute_liquidation_proximity(as_of_ts: float, price: float, liquidation_clusters: Sequence[LiquidationCluster]) -> LiquidationProximityFeatures:
+def compute_liquidation_proximity(
+    as_of_ts: float,
+    price: float,
+    liquidation_clusters: Sequence[LiquidationCluster],
+    *,
+    stale_seconds: int = 3600,
+) -> LiquidationProximityFeatures:
     clusters = [c for c in liquidation_clusters if c.as_of <= as_of_ts]
     if not clusters or price <= 0:
         return LiquidationProximityFeatures(stale=True)
@@ -35,5 +41,7 @@ def compute_liquidation_proximity(as_of_ts: float, price: float, liquidation_clu
         sum(max(0.0, c.size_usd) for c in nearby if str(c.side).lower() == "short"),
     )
     cascade = bool(total_nearby > 0 and directional / total_nearby >= 0.65)
+    freshest_ts = max(c.as_of for c in clusters)
+    stale = (as_of_ts - freshest_ts) > stale_seconds
 
-    return LiquidationProximityFeatures(float(long_dist), float(short_dist), cascade, False)
+    return LiquidationProximityFeatures(float(long_dist), float(short_dist), cascade, stale)
