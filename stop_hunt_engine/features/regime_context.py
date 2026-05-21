@@ -25,11 +25,16 @@ def project_regime_context(
     if not regime_output:
         return RegimeContextFeatures(regime_label="", stale=True)
 
+    regime_label = str(regime_output.get("regime_label", ""))
     regime_ts = float(regime_output.get("timestamp", 0.0))
-    stale = as_of_ts > 0 and regime_ts > 0 and (as_of_ts - regime_ts) > stale_seconds
+    stale = (
+        not regime_label
+        or regime_ts <= 0
+        or (as_of_ts > 0 and regime_ts > 0 and (as_of_ts - regime_ts) > stale_seconds)
+    )
 
     return RegimeContextFeatures(
-        regime_label=str(regime_output.get("regime_label", "")),
+        regime_label=regime_label,
         confidence=float(regime_output.get("confidence", 0.0)),
         conviction=float(regime_output.get("conviction", 0.0)),
         edge_score=float(regime_output.get("edge_score", 0.0)),
