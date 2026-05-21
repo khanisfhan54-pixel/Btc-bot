@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Literal, Optional, Sequence, Tuple
 
@@ -8,6 +9,8 @@ import numpy as np
 from ..features.feature_vector import StopHuntFeatureVector
 from .calibrator import ProbabilityCalibrator
 from .regime_conditional import RegimeConditionalClassifier
+
+log = logging.getLogger("shpe.engine")
 
 SHPE_FEATURE_NAMES: Tuple[str, ...] = ("pool_dist_to_high_pct","pool_dist_to_low_pct","pool_high_pool_age_bars","pool_low_pool_age_bars","pool_round_number_proximity_bps","funding_rate_8h","funding_z30d","funding_oi_sign_divergence","oi_delta_oi_velocity","oi_pct_change_1h","oi_buildup_flag","oi_price_divergence_sign","volume_wick_to_body_ratio","volume_upper_wick_pct","volume_lower_wick_pct","volume_zscore","volume_at_extreme_vs_close","volume_exhaustion_candle_flag","lob_ofi_zscore","lob_queue_imbalance","lob_depth_replenishment_ratio","liq_nearest_long_cluster_dist_pct","liq_nearest_short_cluster_dist_pct","liq_cascade_amplification_flag","regime_confidence","regime_conviction","regime_edge_score","regime_signal_valid","regime_expected_volatility")
 
@@ -57,6 +60,7 @@ class StopHuntProbabilityEngine:
     def predict(self, fv: StopHuntFeatureVector) -> SHPEPrediction:
         stale = tuple(fv.stale_dimensions)
         if len(stale) > self.staleness_limit:
+            log.warning("shpe_degraded_fallback stale_dims=%s limit=%d", stale, self.staleness_limit)
             return SHPEPrediction(DEGRADED_FALLBACK_P, True, "<degraded>", stale, self.model_version, None)
         x = feature_vector_to_array(fv).reshape(1, -1)
         raw_p, used = self.classifier.predict_proba(x, fv.regime.regime_label)
