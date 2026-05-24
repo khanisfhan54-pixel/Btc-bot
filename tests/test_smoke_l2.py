@@ -26,6 +26,8 @@ def test_real_l2_smoke_200_bars():
     # for unrelated test sessions.
     from audit_engine_dec2023 import run  # type: ignore
 
+    if not os.path.exists("data/ohlcv_1m.csv"):
+        pytest.skip("data/ohlcv_1m.csv missing")
     result = run(num_bars=200, start_offset=60, out_prefix="smoke_l2")
     assert result, "audit_engine_dec2023.run returned a falsy result"
 
