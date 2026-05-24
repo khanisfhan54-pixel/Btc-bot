@@ -350,6 +350,8 @@ class LiquiditySweepAlpha:
         vol_ratio_threshold: float = 0.015,    # FIX U-05
         atr_expiry_mult: float = 3.0,          # FIX U-06
         pool_max_age_bars: int = 200,          # FIX U-06 (secondary)
+        hawkes_alpha: float = 0.1,
+        hawkes_decay: float = 0.5,
     ):
         # FIX U-05 / U-06 parameter validation
         if not (0.001 < float(vol_ratio_threshold) < 1.0):
@@ -364,6 +366,10 @@ class LiquiditySweepAlpha:
             raise ValueError(
                 f"pool_max_age_bars must be in [10, 100000]; got {pool_max_age_bars}"
             )
+        if float(hawkes_decay) <= 0.0:
+            raise ValueError(f"hawkes_decay must be > 0; got {hawkes_decay}")
+        if float(hawkes_alpha) <= 0.0:
+            raise ValueError(f"hawkes_alpha must be > 0; got {hawkes_alpha}")
         self.levels = depth_levels
         self.resiliency_threshold = resiliency_threshold
         self.history_window = history_window
@@ -386,8 +392,8 @@ class LiquiditySweepAlpha:
         # Hawkes Process State
         self.hawkes_lambda = 0.0
         self.last_trade_time = 0.0
-        self.hawkes_decay = 0.5
-        self.hawkes_alpha = 0.1
+        self.hawkes_decay = float(hawkes_decay)
+        self.hawkes_alpha = float(hawkes_alpha)
         self._lock = threading.RLock()
         # FIX M-3 APPLIED — _time_lock created up front so get_signal()
         # never has to lazy-init it under contention.

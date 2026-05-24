@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os as _os
+import pickle as _pickle
 from dataclasses import dataclass
 from typing import Literal, Optional, Sequence, Tuple
 
@@ -11,6 +13,7 @@ from .calibrator import ProbabilityCalibrator
 from .regime_conditional import RegimeConditionalClassifier
 
 log = logging.getLogger("shpe.engine")
+_persist_log = logging.getLogger("shpe.engine")
 
 SHPE_FEATURE_NAMES: Tuple[str, ...] = ("pool_dist_to_high_pct","pool_dist_to_low_pct","pool_high_pool_age_bars","pool_low_pool_age_bars","pool_round_number_proximity_bps","funding_rate_8h","funding_z30d","funding_oi_sign_divergence","oi_delta_oi_velocity","oi_pct_change_1h","oi_buildup_flag","oi_price_divergence_sign","volume_wick_to_body_ratio","volume_upper_wick_pct","volume_lower_wick_pct","volume_zscore","volume_at_extreme_vs_close","volume_exhaustion_candle_flag","lob_ofi_zscore","lob_queue_imbalance","lob_depth_replenishment_ratio","liq_nearest_long_cluster_dist_pct","liq_nearest_short_cluster_dist_pct","liq_cascade_amplification_flag","regime_confidence","regime_conviction","regime_edge_score","regime_signal_valid","regime_expected_volatility")
 
@@ -66,6 +69,36 @@ class StopHuntProbabilityEngine:
         raw_p, used = self.classifier.predict_proba(x, fv.regime.regime_label)
         cal_p = float(self.calibrator.transform(np.array([raw_p]))[0]) if self.calibrator is not None else float(raw_p)
         return SHPEPrediction(cal_p, False, used, stale, self.model_version, float(raw_p))
+
+    def save(self, path: str) -> None:
+        """Persist trained engine to disk (classifier + calibrator + metadata)."""
+        payload = {
+            "classifier": self.classifier,
+            "calibrator": self.calibrator,
+            "feature_names": self.feature_names,
+            "model_version": self.model_version,
+            "staleness_limit": self.staleness_limit,
+        }
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as fh:
+            _pickle.dump(payload, fh, protocol=5)
+        _os.replace(tmp, path)
+        _persist_log.info("shpe_saved path=%s version=%s", path, self.model_version)
+
+    @classmethod
+    def load(cls, path: str) -> "StopHuntProbabilityEngine":
+        """Load a previously saved engine. Raises FileNotFoundError if path missing."""
+        with open(path, "rb") as fh:
+            payload = _pickle.load(fh)
+        engine = cls(
+            classifier=payload["classifier"],
+            calibrator=payload.get("calibrator"),
+            feature_names=tuple(payload.get("feature_names", SHPE_FEATURE_NAMES)),
+            model_version=str(payload.get("model_version", "unknown")),
+            staleness_limit=int(payload.get("staleness_limit", STALENESS_LIMIT)),
+        )
+        _persist_log.info("shpe_loaded path=%s version=%s", path, engine.model_version)
+        return engine
 
     @classmethod
     def train(

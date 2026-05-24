@@ -770,20 +770,24 @@ class ExecutionEngine:
         self,
         config: ExecutionConfig | None = None,
         learning_engine: Any = None,
+        *,
+        exchange: Any = None,
     ) -> None:
-        api_key = os.getenv("BINANCE_API_KEY", "")
-        secret = os.getenv("BINANCE_SECRET", "")
-
-        self.exchange = ccxt.binance(
-            {
-                "apiKey": api_key or None,
-                "secret": secret or None,
-                "enableRateLimit": True,
-                "options": {
-                    "defaultType": "future",
-                },
-            }
-        )
+        if exchange is not None:
+            self.exchange = exchange
+        else:
+            api_key = os.getenv("BINANCE_API_KEY", "")
+            secret = os.getenv("BINANCE_SECRET", "")
+            self.exchange = ccxt.binance(
+                {
+                    "apiKey": api_key or None,
+                    "secret": secret or None,
+                    "enableRateLimit": True,
+                    "options": {
+                        "defaultType": "future",
+                    },
+                }
+            )
         # Strict assignment: use the provided learning_engine if given (even if falsey), else default.
         self.learning_engine = learning_engine if learning_engine is not None else LEARNING_ENGINE
         self.execution_logic = ExecutionLogic(

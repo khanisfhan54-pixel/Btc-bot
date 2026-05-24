@@ -305,7 +305,7 @@ except Exception as _new_module_import_err:
 
 try:
     from stop_hunt_engine.integrations.signal_adapter import (
-        get_shpe_probability, SHPEOutput,
+        get_shpe_probability, SHPEOutput, load_shpe_engine_at_boot,
     )
     from stop_hunt_engine.integrations.feature_pipeline import PipelineInput
     from stop_hunt_engine.data.candle_store import Candle
@@ -319,6 +319,7 @@ except Exception as _shpe_import_err:
     logger.warning("SHPE import failed (non-fatal): %s", _shpe_import_err)
     _SHPE_IMPORT_OK = False
     get_shpe_probability = None
+    load_shpe_engine_at_boot = None
     PipelineInput = None
 
 
@@ -428,15 +429,21 @@ try:
     _bootstrap_stage = "CapitalAllocator"
     capital_allocator = CapitalAllocator()
     _shpe_engine: Optional[StopHuntProbabilityEngine] = None
-    if _SHPE_IMPORT_OK and SHPE_ENABLED:
+    if _SHPE_IMPORT_OK and SHPE_ENABLED and load_shpe_engine_at_boot is not None:
         try:
-            from stop_hunt_engine.model.regime_conditional import RegimeConditionalClassifier
-            from stop_hunt_engine.model.engine import SHPE_FEATURE_NAMES
-            _shpe_clf = RegimeConditionalClassifier(
-                feature_names=list(SHPE_FEATURE_NAMES)
-            )
-            _shpe_engine = StopHuntProbabilityEngine(classifier=_shpe_clf)
-            logger.info("[BOOT] SHPE engine constructed (untrained shell — degraded mode active until model loaded)")
+            _shpe_engine = load_shpe_engine_at_boot(require_trained=False)
+            if _shpe_engine is not None:
+                logger.info(
+                    "SHPE boot: model loaded, version=%s, calibrated=%s",
+                    _shpe_engine.model_version,
+                    _shpe_engine.calibrator is not None,
+                )
+            else:
+                logger.warning(
+                    "SHPE boot: no model loaded — running in degraded mode (p=0.5). "
+                    "calibrator.pkl present=%s. Train a full model and call save().",
+                    os.path.exists("calibrator.pkl"),
+                )
         except Exception as _shpe_boot_err:
             logger.warning("[BOOT] SHPE engine construction failed (non-fatal): %s", _shpe_boot_err)
             _shpe_engine = None
@@ -2024,7 +2031,7 @@ def run_analysis_cycle(
 
     # ── SHPE probability gate ──────────────────────────────────────────
     shpe_result: dict = {"probability": 0.5, "degraded": True, "regime_used": "<disabled>"}
-    if _SHPE_IMPORT_OK and SHPE_ENABLED and _shpe_engine is not None and get_shpe_probability is not None:
+    if _SHPE_IMPORT_OK and SHPE_ENABLED and get_shpe_probability is not None:
         try:
             _shpe_raw_candles = candles_by_tf.get("5m") or candles_by_tf.get("1m") or []
             _shpe_candles: list = []
@@ -2085,12 +2092,15 @@ def run_analysis_cycle(
                 shpe_result = get_shpe_probability(
                     _shpe_engine, _pipeline_input, len(_shpe_candles) - 1
                 )
-                logger.info(
-                    "[SHPE] probability=%.4f degraded=%s regime=%s",
-                    shpe_result["probability"],
-                    shpe_result["degraded"],
-                    shpe_result["regime_used"],
-                )
+                p_sweep = float(shpe_result.get("probability", 0.5))
+                shpe_degraded = bool(shpe_result.get("degraded", True))
+                stop_hunt_detected = bool(p_sweep > SHPE_HIGH_PROB_THRESHOLD) and not shpe_degraded
+                engines_out["stop_hunt_detected"] = stop_hunt_detected
+                feat_dict["stop_hunt_detected"] = stop_hunt_detected
+                feat_dict["shpe_probability"] = p_sweep
+                feat_dict["shpe_degraded"] = shpe_degraded
+                feat_dict["shpe_regime_used"] = str(shpe_result.get("regime_used", ""))
+                logger.info("[SHPE] probability=%.4f degraded=%s regime=%s", p_sweep, shpe_degraded, shpe_result.get("regime_used"))
             else:
                 logger.warning("[SHPE] insufficient candles (%d) — degraded fallback", len(_shpe_candles))
         except Exception as _shpe_exc:

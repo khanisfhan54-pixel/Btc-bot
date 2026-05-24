@@ -73,13 +73,18 @@ class RegimeConditionalClassifier:
         xx = np.atleast_2d(np.asarray(x, dtype=float))
         r = str(regime_label) if regime_label is not None else ""
         sub = self.sub_models.get(r) if r else None
+        _MAX_ROUTING_LOG = 1000
         if sub is not None:
             p = float(sub.predict_proba(xx)[0])
+            if len(self.last_routing_log) >= _MAX_ROUTING_LOG:
+                self.last_routing_log.pop(0)
             self.last_routing_log.append({"regime": r, "used": r})
             return p, r
 
         p = float(self.global_model.predict_proba(xx)[0])
         reason = "no_regime" if not r else ("insufficient_samples" if r in self._undertrained else ("seen_but_unusable" if r in self._train_counts else "missing_regime"))
+        if len(self.last_routing_log) >= _MAX_ROUTING_LOG:
+            self.last_routing_log.pop(0)
         self.last_routing_log.append({"regime": r or "<none>", "used": "<global>", "reason": reason})
         return p, "<global>"
 

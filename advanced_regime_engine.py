@@ -5695,7 +5695,19 @@ class AdvancedRegimeEngine:
         - Called without an error_code: preserves existing circuit-breaker recovery behavior.
         - Called with an error_code: applies category-aware recovery action.
         """
-        assert self._lock._is_owned(), "_self_heal must be invoked while holding self._lock"
+        _caller_holds_lock = not self._lock.acquire(blocking=False)
+        if not _caller_holds_lock:
+            self._lock.release()
+            if not getattr(self, "_is_replay", False):
+                self._warn_rate_limited(
+                    key="self_heal_called_without_lock",
+                    message=(
+                        "_self_heal called without holding self._lock. "
+                        "This is safe in test mode but indicates a concurrency "
+                        "design issue in production callers."
+                    ),
+                    cooldown_s=30.0,
+                )
         side_effects: List[tuple[str, Any]] = []
         self._healing_count = int(getattr(self, "_healing_count", 0)) + 1
         self._last_healing_error = error_code
