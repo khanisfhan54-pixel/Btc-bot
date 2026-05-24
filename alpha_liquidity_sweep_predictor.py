@@ -844,7 +844,7 @@ class LiquiditySweepAlpha:
             reset_dist = atr * self.pool_reset_atr_mult
 
             if self.liquidity_pools['high'] is not None:
-                d_high = (price - high_pool) / (atr + 1e-8)
+                d_high = abs(price - high_pool) / (atr + 1e-8)
                 if d_high > self.atr_expiry_mult:
                     self.liquidity_pools['high'] = None
                     self._pool_expired_atr_count += 1
@@ -852,7 +852,7 @@ class LiquiditySweepAlpha:
                     self.liquidity_pools['high'] = None
                     self._pool_expired_age_count += 1
             if self.liquidity_pools['low'] is not None:
-                d_low = (low_pool - price) / (atr + 1e-8)
+                d_low = abs(low_pool - price) / (atr + 1e-8)
                 if d_low > self.atr_expiry_mult:
                     self.liquidity_pools['low'] = None
                     self._pool_expired_atr_count += 1
