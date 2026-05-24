@@ -257,14 +257,23 @@ class BacktestEngine:
             → position management
     """
 
-    def __init__(self, config: BacktestConfig | None = None, learning_engine: Any = None) -> None:
+    def __init__(
+        self,
+        config: BacktestConfig | None = None,
+        learning_engine: Any = None,
+        *,
+        signal_only: bool = False,
+    ) -> None:
         import os as _os  # AUDIT FIX ISSUE-A
         if _os.environ.get("BTCBOT_LIVE_MODE") == "1":
             raise RuntimeError(
                 "BacktestEngine must not be instantiated while BTCBOT_LIVE_MODE=1. "
                 "Unset BTCBOT_LIVE_MODE before running backtests."
             )
-        self.cfg = config or BacktestConfig()
+        _cfg = config or BacktestConfig()
+        if signal_only:
+            _cfg = BacktestConfig(**{**_cfg.__dict__, "legacy_mode": True})
+        self.cfg = _cfg
         self.learning_engine = learning_engine if learning_engine is not None else LEARNING_ENGINE
 
         self.feature_engine = FeatureEngine() if FeatureEngine is not None else _FallbackFeatureEngine()
