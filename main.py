@@ -2257,9 +2257,13 @@ def run_analysis_cycle(
             "[FEATURE] Required feature keys missing: %s — this indicates a degraded FeatureEngine. "
             "Failsafe gate may be bypassed.", sorted(_missing_keys)
         )
-    feat_dict["shpe_probability"] = float(shpe_result.get("probability", 0.5))
-    feat_dict["shpe_degraded"] = bool(shpe_result.get("degraded", True))
-    feat_dict["shpe_regime_used"] = str(shpe_result.get("regime_used", "<disabled>"))
+    def _inject_shpe_features(target: Dict[str, Any]) -> Dict[str, Any]:
+        target["shpe_probability"] = float(shpe_result.get("probability", 0.5))
+        target["shpe_degraded"] = bool(shpe_result.get("degraded", True))
+        target["shpe_regime_used"] = str(shpe_result.get("regime_used", "<disabled>"))
+        return target
+
+    _inject_shpe_features(feat_dict)
     feat_dict["candles"] = candles_by_tf.get("1h", [])
 
     # Update impact decay using raw features
@@ -2852,6 +2856,7 @@ def run_analysis_cycle(
 
     balance = _safe_float(engine.get_balance(), 0.0)
     try:
+        _inject_shpe_features(feat_dict)
         decision = execution_engine.decide(
             signal_payload={
                 "signal": normalized_signal,

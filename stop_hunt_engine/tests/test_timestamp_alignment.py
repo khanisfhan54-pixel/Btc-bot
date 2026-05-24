@@ -59,7 +59,7 @@ def test_nearest_past_rejects_future_snapshot_beyond_skew():
     assert snap is None or delta is None or delta > 3600
 
 
-def test_nearest_past_accepts_minor_boundary_drift():
+def test_nearest_past_rejects_future_boundary_drift():
     candles = _make_candles(3)
     slightly_ahead = L2Snapshot(
         timestamp=candles[1].timestamp + 30,
@@ -67,8 +67,8 @@ def test_nearest_past_accepts_minor_boundary_drift():
         asks=(BookLevel(50_001, 1.0),),
     )
     snap, delta = _nearest_past_snapshot([slightly_ahead], candles[1].timestamp, max_skew_sec=3600)
-    assert snap is not None
-    assert delta <= 3600
+    assert snap is None
+    assert delta is None
 
 
 def test_stale_past_snapshot_rejected_by_build():
@@ -176,3 +176,24 @@ def test_degraded_only_on_genuinely_stale_data():
     out_stale = get_shpe_probability(engine, payload_stale, len(candles) - 1)
     assert out_stale["degraded"] is True
     assert out_stale["probability"] == 0.5
+
+
+def test_clock_skew_warning_is_throttled(caplog: pytest.LogCaptureFixture):
+    from stop_hunt_engine.integrations import feature_pipeline as _fp
+
+    _fp._rate_limited_log._last.clear()
+    _fp._rate_limited_log._counts.clear()
+    candles = _make_candles(4)
+    stale_snap = L2Snapshot(
+        timestamp=candles[0].timestamp - 10_000,
+        bids=(BookLevel(49_999, 1.0),),
+        asks=(BookLevel(50_001, 1.0),),
+    )
+    payload = PipelineInput(candles, [stale_snap], [], [], [], {})
+
+    with caplog.at_level("WARNING", logger="shpe.feature_pipeline"):
+        for _ in range(3):
+            with pytest.raises(ValueError, match="timestamp mismatch"):
+                build_feature_vector(payload, len(candles) - 1, max_clock_skew_sec=60)
+    hits = [r for r in caplog.records if "shpe_pipeline_clock_skew source=l2" in r.message]
+    assert len(hits) == 1

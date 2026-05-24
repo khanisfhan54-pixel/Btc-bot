@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from bisect import bisect_right
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
@@ -9,9 +10,11 @@ from ..data.candle_store import Candle
 from ..data.derivatives import FundingPoint, LiquidationCluster, OpenInterestPoint
 from ..data.l2_snapshot import L2Snapshot
 from ..features.feature_vector import StopHuntFeatureVector, compute_feature_vector
+from utils.log_rate_limit import RateLimitedLogger
 from .regime_adapter import map_regime_output
 
 _log = logging.getLogger("shpe.feature_pipeline")
+_rate_limited_log = RateLimitedLogger(_log, default_cooldown=60.0)
 DEFAULT_MAX_CLOCK_SKEW_SEC: int = 3600
 
 
@@ -36,15 +39,15 @@ def _nearest_past_snapshot(snapshots, candle_ts: float, max_skew_sec: int):
     """
     if not snapshots:
         return None, None
-    past = [s for s in snapshots if s.timestamp <= candle_ts]
-    if past:
-        best = max(past, key=lambda s: s.timestamp)
-        return best, abs(candle_ts - best.timestamp)
-    nearest = min(snapshots, key=lambda s: abs(s.timestamp - candle_ts))
-    delta = abs(nearest.timestamp - candle_ts)
-    if nearest.timestamp > candle_ts and delta > max_skew_sec:
+    timestamps = [float(s.timestamp) for s in snapshots]
+    idx = bisect_right(timestamps, float(candle_ts)) - 1
+    if idx < 0:
         return None, None
-    return nearest, delta
+    best = snapshots[idx]
+    delta = abs(float(candle_ts) - float(best.timestamp))
+    if delta > max_skew_sec:
+        return None, None
+    return best, delta
 
 
 def build_feature_vector(
@@ -62,11 +65,12 @@ def build_feature_vector(
             input_data.l2_snapshots, timestamp, max_clock_skew_sec
         )
         if best_l2 is None or l2_delta is None or l2_delta > max_clock_skew_sec:
-            _log.warning(
-                "shpe_pipeline_clock_skew source=l2 candle_ts=%s best_ts=%s delta=%s",
-                timestamp,
-                getattr(best_l2, "timestamp", "none"),
-                l2_delta,
+            _rate_limited_log.warning(
+                "clock_skew:l2",
+                (
+                    "shpe_pipeline_clock_skew source=l2 candle_ts=%s best_ts=%s delta=%s"
+                    % (timestamp, getattr(best_l2, "timestamp", "none"), l2_delta)
+                ),
             )
             raise ValueError("L2 snapshot timestamp mismatch")
 
@@ -75,11 +79,12 @@ def build_feature_vector(
             input_data.open_interest, timestamp, max_clock_skew_sec
         )
         if best_oi is None or oi_delta is None or oi_delta > max_clock_skew_sec:
-            _log.warning(
-                "shpe_pipeline_clock_skew source=open_interest candle_ts=%s best_ts=%s delta=%s",
-                timestamp,
-                getattr(best_oi, "timestamp", "none"),
-                oi_delta,
+            _rate_limited_log.warning(
+                "clock_skew:open_interest",
+                (
+                    "shpe_pipeline_clock_skew source=open_interest candle_ts=%s best_ts=%s delta=%s"
+                    % (timestamp, getattr(best_oi, "timestamp", "none"), oi_delta)
+                ),
             )
             raise ValueError("open_interest timestamp mismatch")
 
