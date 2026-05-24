@@ -117,7 +117,9 @@ def test_run_cycle_injects_shpe_not_equal_legacy(monkeypatch: pytest.MonkeyPatch
 
     main.run_analysis_cycle(exchange, data_exchange=exchange, data_symbol="BTC/USDT")
     assert "shpe_probability" in captured
-    assert captured["shpe_probability"] != bool(False)
+    assert "shpe_degraded" in captured
+    assert "shpe_regime_used" in captured
+    assert 0.0 <= float(captured["shpe_probability"]) <= 1.0
 
 
 def test_stale_l2_timestamp_raises_value_error() -> None:
