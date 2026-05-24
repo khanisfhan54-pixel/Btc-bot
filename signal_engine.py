@@ -286,6 +286,9 @@ class SignalEngine:
                 if sweep_side is None:
                     sweep_side = _safe_get(stop_hunt_payload, "direction", None)
 
+        if sweep_side is not None:
+            sweep_side = str(sweep_side).lower()
+
         # ── 2. Displacement ────────────────────────────────────────────
         body = abs(last_close - _safe_float(last.get("open", last_close), last_close))
         range_ = abs(_safe_float(last.get("high", last_close), last_close) - _safe_float(last.get("low", last_close), last_close))
