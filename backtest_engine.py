@@ -661,6 +661,55 @@ class BacktestEngine:
             logger.warning("[BACKTEST][L2_VALIDATE] %s", result["reason"])
         return result
 
+
+    def _run_calibration_pass(
+        self,
+        ohlcv_data: List[list],
+        ema_fast: float,
+        ema_slow: float,
+    ) -> dict:
+        data = [row for row in (ohlcv_data or []) if isinstance(row, (list, tuple)) and len(row) >= 6]
+        if self.lsa is None or len(data) < 2:
+            return {"fitted": False, "n_samples": 0, "brier_score": float("nan")}
+        split_idx = int(len(data) * 0.6)
+        split_idx = max(26, min(split_idx, len(data) - 1))
+        raw_probs: List[float] = []
+        realized_labels: List[int] = []
+        prev_snapshot: Dict[str, Any] = _simulate_snapshot_from_candle(data[0])
+        ema_fast_alpha = 2.0 / (12.0 + 1.0)
+        ema_slow_alpha = 2.0 / (26.0 + 1.0)
+        ef = float(ema_fast)
+        es = float(ema_slow)
+
+        for i in range(25, split_idx):
+            candle = data[i]
+            prev_candle = data[i - 1]
+            current_price = _safe_float(candle[4])
+            prev_close = _safe_float(prev_candle[4]) if prev_candle else current_price
+            ef = (1 - ema_fast_alpha) * ef + ema_fast_alpha * current_price
+            es = (1 - ema_slow_alpha) * es + ema_slow_alpha * current_price
+            snapshot = _simulate_snapshot_from_candle(candle, prev_close)
+            trades = _simulate_trades_from_candle(candle)
+            lsa_md = self._build_lsa_market_data(
+                candle=candle, snapshot=snapshot, prev_snapshot=prev_snapshot,
+                trades=trades, features={}, ema_fast=ef, ema_slow=es,
+            )
+            prev_snapshot = snapshot
+            try:
+                lsa_out = self.lsa.predict(lsa_md, regime_context={"regime": "UNKNOWN"}) or {}
+                raw_prob = _safe_float(lsa_out.get("micro_prob", 0.5), 0.5)
+                label = 1 if _safe_float(data[i + 1][4]) > _safe_float(data[i][4]) else 0
+                raw_probs.append(raw_prob)
+                realized_labels.append(label)
+            except Exception as exc:
+                logger.debug("calibration pass predict failed at i=%d: %s", i, exc)
+        pairs = list(zip(raw_probs, realized_labels))
+        if pairs:
+            self.lsa.calibrate(pairs)
+        status = self.lsa.get_calibration_status()
+        logger.info("[CALIBRATION] fitted=%s n_samples=%d brier=%.4f", status.get("fitted"), int(status.get("n_samples", 0)), float(status.get("brier_score", float('nan'))))
+        return status
+
     # ------------------------------------------------------------------
     # Main entry points
     # ------------------------------------------------------------------
@@ -761,6 +810,46 @@ class BacktestEngine:
         if not snaps:
             return None
         return align_book_to_bars(bars_target, snaps)
+
+    def run_walk_forward_validation(
+        self,
+        ohlcv_data: List[list],
+        n_splits: int = 5,
+        purge_bars: int = 10,
+        min_train_bars: int = 100,
+        min_test_bars: int = 50,
+    ) -> Dict[str, Any]:
+        data = [row for row in (ohlcv_data or []) if isinstance(row, (list, tuple)) and len(row) >= 6]
+        fold_results: List[Dict[str, Any]] = []
+        n = len(data)
+        for k in range(max(0, int(n_splits))):
+            train_end = int(n * (k + 1) / (n_splits + 1))
+            test_start = train_end + int(purge_bars)
+            test_end = int(n * (k + 2) / (n_splits + 1))
+            if train_end < min_train_bars or (test_end - test_start) < min_test_bars:
+                continue
+            test_slice = data[test_start:test_end]
+            if not test_slice:
+                continue
+            eng = BacktestEngine(config=BacktestConfig(legacy_mode=True))
+            res = eng._run_single_pass(test_slice, label=f"wf_{k}")
+            fold_results.append({
+                "fold": k, "train_start": 0, "train_end": train_end,
+                "test_start": test_start, "test_end": test_end,
+                "sharpe": _safe_float(res.get("sharpe", 0.0)),
+                "win_rate": _safe_float(res.get("win_rate", 0.0)),
+                "max_drawdown": _safe_float(res.get("max_drawdown", 0.0)),
+                "total_trades": int(res.get("total_trades", 0)),
+            })
+        if not fold_results:
+            logger.warning("[WALK_FORWARD] insufficient data; no folds executed")
+            return {"n_splits_requested": n_splits, "n_splits_executed": 0, "purge_bars": purge_bars, "fold_results": [], "mean_sharpe": 0.0, "std_sharpe": 0.0, "mean_win_rate": 0.0, "mean_max_drawdown": 0.0, "wf_label": "WALK_FORWARD_INSUFFICIENT_DATA"}
+        sharps = [f["sharpe"] for f in fold_results]
+        wins = [f["win_rate"] for f in fold_results]
+        dds = [f["max_drawdown"] for f in fold_results]
+        out = {"n_splits_requested": n_splits, "n_splits_executed": len(fold_results), "purge_bars": purge_bars, "fold_results": fold_results, "mean_sharpe": float(np.mean(sharps)), "std_sharpe": float(np.std(sharps)), "mean_win_rate": float(np.mean(wins)), "mean_max_drawdown": float(np.mean(dds)), "wf_label": "WALK_FORWARD_COMPLETE"}
+        logger.info("[WALK_FORWARD] n_folds=%d mean_sharpe=%.4f std_sharpe=%.4f mean_win_rate=%.4f", len(fold_results), out["mean_sharpe"], out["std_sharpe"], out["mean_win_rate"])
+        return out
 
     # ------------------------------------------------------------------
     # Internal: single-pass backtest
@@ -890,10 +979,18 @@ class BacktestEngine:
         ema_fast = _safe_float(data[0][4])
         ema_slow = ema_fast
 
+        if not self.cfg.legacy_mode and self.lsa is not None and len(data) >= 100:
+            try:
+                cal_status = self._run_calibration_pass(data, ema_fast, ema_slow)
+                logger.info("[BACKTEST %s] calibration pass complete: %s", label, cal_status)
+            except Exception as exc:
+                logger.warning("[BACKTEST %s] calibration pass failed: %s", label, exc)
+
         # Running snapshot of the previous order book (LSA OFI z-score input)
         prev_snapshot: Dict[str, Any] = _simulate_snapshot_from_candle(data[0])
 
         position: Optional[Dict[str, Any]] = None
+        _bars_with_insufficient_signals: int = 0
 
         for i in range(25, len(data)):
             window = data[: i + 1]
@@ -1037,6 +1134,8 @@ class BacktestEngine:
 
             # ---- FIX CRITICAL-6+7: AlphaOrchestrator with ≥2 sources ---------
             alpha_signals = self._build_alpha_signals(signal_engine_out, lsa_out, ts_seconds)
+            if not self.cfg.legacy_mode and len(alpha_signals) < 2:
+                _bars_with_insufficient_signals += 1
             self._last_alpha_signals = list(alpha_signals)
             for s in alpha_signals:
                 try:
@@ -1312,6 +1411,21 @@ class BacktestEngine:
         avg_loss = sum(gross_losses) / len(gross_losses) if gross_losses else 0.0
         expectancy = (avg_win * win_rate) - (avg_loss * (1.0 - win_rate))
 
+        _orch_degraded_fraction = (_bars_with_insufficient_signals / max(len(data) - 25, 1))
+        _non_production_conditions["orchestration_degraded"] = (not self.cfg.legacy_mode and _orch_degraded_fraction > 0.05)
+        _calibration_fitted = (
+            self.lsa is not None
+            and getattr(getattr(self.lsa, "_calibrator", None), "fitted", False)
+        )
+        _non_production_conditions["calibrator_not_fitted"] = not _calibration_fitted
+        _backtest_label = (
+            "PRODUCTION-VALID"
+            if not any(_non_production_conditions.values())
+            else "NON-PRODUCTION-VALID: " + ", ".join(
+                k for k, v in _non_production_conditions.items() if v
+            )
+        )
+
         logger.info("[BACKTEST %s] cache hits=%d misses=%d trades=%d", label, cache_hits, cache_misses, total_trades)
         return {
             "total_trades": total_trades,
@@ -1323,4 +1437,5 @@ class BacktestEngine:
             "trade_log": trade_log,
             "backtest_label": _backtest_label,                  # AUDIT FIX ISSUE-C / PART-6
             "non_production_conditions": _non_production_conditions,  # AUDIT FIX ISSUE-C / PART-6
+            "orch_degraded_fraction": round(_orch_degraded_fraction, 4),
         }
