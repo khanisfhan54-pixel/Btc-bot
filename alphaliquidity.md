@@ -1,7 +1,7 @@
 # Alpha Liquidity Sweep Predictor — Full Audit Report
 
-**Generated:** 2026-05-18 09:01 UTC  
-**Verdict:** `WEAK`  
+**Generated:** 2026-05-25 20:44 UTC
+**Verdict:** `BROKEN`
 **Production Readiness:** `Research-only`  
 **Import Status:** `OK`
 
@@ -67,34 +67,34 @@ alpha_liquidity_sweep_predictor.py
 | Metric | OHLCV Run | L2 Run |
 |---|---|---|
 | total_bars | 500 | 500 |
-| long_count | 277 | 277 |
-| short_count | 223 | 223 |
+| long_count | 304 | 304 |
+| short_count | 196 | 196 |
 | hold_count | 0 | 0 |
 | signal_coverage | 1.0 | 1.0 |
 | hold_rate | 0.0 | 0.0 |
-| long_precision | 0.439 | 0.439 |
-| short_precision | 0.2727 | 0.2727 |
-| conf_mean | 0.5082 | 0.5053 |
+| long_precision | 0.6444 | 0.6444 |
+| short_precision | 0.5 | 0.5 |
+| conf_mean | 0.5006 | 0.5 |
 | conf_median | 0.5 | 0.5 |
-| conf_std | 0.0582 | 0.0489 |
-| conf_entropy | 0.1591 | 0.1048 |
+| conf_std | 0.0084 | 0.0 |
+| conf_entropy | 0.0376 | 0.0 |
 
 ---
 ## 3. Trading Metrics
 
 | Metric | OHLCV Run | L2 Run |
 |---|---|---|
-| n_trades | 74 | 74 |
-| win_rate | 0.3649 | 0.3649 |
-| avg_win | 0.000691 | 0.000643 |
-| avg_loss | -0.00051 | -0.000517 |
-| profit_factor | 0.7793 | 0.7142 |
-| expectancy | -7.1e-05 | -9.4e-05 |
-| sharpe | -4.6823 | -6.5375 |
-| sortino | -8.1984 | -10.7812 |
-| max_drawdown | 0.006 | 0.0075 |
-| avg_hold_bars | 5.72 | 5.72 |
-| final_equity | 0.994707 | 0.99306 |
+| n_trades | 73 | 73 |
+| win_rate | 0.589 | 0.589 |
+| avg_win | 0.000767 | 0.000767 |
+| avg_loss | -0.000298 | -0.000298 |
+| profit_factor | 3.6837 | 3.6857 |
+| expectancy | 0.000329 | 0.000329 |
+| sharpe | 24.0664 | 24.0725 |
+| sortino | 48.3644 | 48.3584 |
+| max_drawdown | 0.0028 | 0.0028 |
+| avg_hold_bars | 5.81 | 5.81 |
+| final_equity | 1.024283 | 1.024289 |
 
 ---
 ## 4. L2 vs OHLCV Comparison
@@ -103,15 +103,15 @@ alpha_liquidity_sweep_predictor.py
 |---|---|---|---|
 | hold_rate | 0.0 | 0.0 | 0.0 |
 | signal_coverage | 1.0 | 1.0 | 0.0 |
-| n_trades | 74 | 74 | 0 |
-| win_rate | 0.3649 | 0.3649 | 0.0 |
-| profit_factor | 0.7793 | 0.7142 | -0.0651 |
-| expectancy | -7.1e-05 | -9.4e-05 | -2.3e-05 |
-| sharpe | -4.6823 | -6.5375 | -1.8552 |
-| sortino | -8.1984 | -10.7812 | -2.5828 |
-| max_drawdown | 0.006 | 0.0075 | 0.0015 |
-| conf_mean | 0.5082 | 0.5053 | -0.0029 |
-| conf_entropy | 0.1591 | 0.1048 | -0.0543 |
+| n_trades | 73 | 73 | 0 |
+| win_rate | 0.589 | 0.589 | 0.0 |
+| profit_factor | 3.6837 | 3.6857 | 0.002 |
+| expectancy | 0.000329 | 0.000329 | 0.0 |
+| sharpe | 24.0664 | 24.0725 | 0.0061 |
+| sortino | 48.3644 | 48.3584 | -0.006 |
+| max_drawdown | 0.0028 | 0.0028 | 0.0 |
+| conf_mean | 0.5006 | 0.5 | -0.0006 |
+| conf_entropy | 0.0376 | 0.0 | -0.0376 |
 
 ---
 ## 5. Regime & State Distribution
@@ -135,35 +135,19 @@ alpha_liquidity_sweep_predictor.py
 ### OHLCV Run — Sweep State Labels
 | State | Bar Count |
 |---|---|
-| NORMAL | 312 |
-| PRE_SWEEP_BUILDUP | 10 |
-| ACTIVE_SWEEP | 178 |
+| NORMAL | 456 |
+| PRE_SWEEP_BUILDUP | 4 |
+| ACTIVE_SWEEP | 40 |
 
 ---
 ## 6. Issues Found
 
-### 🟠 [HIGH] I-006 — OHLCV
-**Problem:** Profit factor=0.78 < 1.0 — system is losing money after costs.  
-**Fix:** Check cost assumptions (FEE_BPS+SLIP_BPS) and direction_mode.
-
-### 🟠 [HIGH] I-008 — OHLCV
-**Problem:** Sharpe=-4.68 is significantly negative — system destroys value.  
-**Fix:** Inspect direction_mode and ensemble threshold calibration.
-
 ### 🟡 [MEDIUM] I-010 — OHLCV
-**Problem:** Confidence entropy=0.16 — outputs cluster near a single value. Probability calibration (_shrink_prob) may be over-regularising.  
+**Problem:** Confidence entropy=0.04 — outputs cluster near a single value. Probability calibration (_shrink_prob) may be over-regularising.
 **Fix:** Run isotonic/Platt calibration on held-out OOF labels.
 
-### 🟠 [HIGH] I-006 — L2
-**Problem:** Profit factor=0.71 < 1.0 — system is losing money after costs.  
-**Fix:** Check cost assumptions (FEE_BPS+SLIP_BPS) and direction_mode.
-
-### 🟠 [HIGH] I-008 — L2
-**Problem:** Sharpe=-6.54 is significantly negative — system destroys value.  
-**Fix:** Inspect direction_mode and ensemble threshold calibration.
-
 ### 🟡 [MEDIUM] I-010 — L2
-**Problem:** Confidence entropy=0.10 — outputs cluster near a single value. Probability calibration (_shrink_prob) may be over-regularising.  
+**Problem:** Confidence entropy=0.00 — outputs cluster near a single value. Probability calibration (_shrink_prob) may be over-regularising.
 **Fix:** Run isotonic/Platt calibration on held-out OOF labels.
 
 
@@ -249,13 +233,16 @@ Single unlucky trade could exceed tolerable drawdown.
 | Assessment | Status |
 |---|---|
 | Research-only (understand structure) | ✅ YES |
-| Paper-trading ready | ✅ YES — with risk model added |
+| Paper-trading ready | ❌ NO |
 | Live trading ready | ❌ NO — missing calibration, walk-forward validation, and risk model |
 
 ---
 ## 12. Run Errors & Blockers
 
-No runtime errors or blockers encountered.
+### OHLCV Run
+
+### L2 Run
+- BLOCKER: [BLOCKER] L2 replay path incomplete: bookDepth.csv contains only relative percentage levels, cannot reconstruct absolute prices for alpha_liquidity_sweep_predictor without synthetic assumptions.
 
 ---
-*Report auto-generated by run_backtest.py — 2026-05-18 09:01 UTC*
+*Report auto-generated by run_backtest.py — 2026-05-25 20:44 UTC*

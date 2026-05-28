@@ -8,7 +8,7 @@ Run:
     python run_backtest.py
 
 Outputs:
-    alpha.md              — full audit report
+    alphaliquidity.md              — full audit report
     backtest_summary.json — structured metrics + verdict
     console               — live progress + final verdict
 """
@@ -484,17 +484,19 @@ def run_backtest(bars: List[Dict], name: str = "OHLCV",
         curr_book = generate_l2_book(bar["close"], n_levels=10, depth_skew=depth_skew)
 
         # FIX U-03 — when an L2 snapshot list is supplied, use the real book
-        # at the same index instead of the synthetic generator. Falls back
-        # gracefully to the synthetic book if the index is out of range.
-        if l2_loader is not None and use_l2:
-            try:
-                if isinstance(l2_loader, list) and i < len(l2_loader):
+        # at the same index instead of the synthetic generator.
+        if use_l2 and l2_loader is not None:
+            if isinstance(l2_loader, list) and len(l2_loader) > 0 and i < len(l2_loader):
+                try:
                     real_book = l2_loader[i]
                     if real_book and "bids" in real_book and "asks" in real_book:
                         curr_book = {"bids": real_book["bids"],
                                      "asks": real_book["asks"]}
-            except Exception:
-                pass
+                except Exception:
+                    pass
+            else:
+                # Do not use synthetic fallback if loader is provided but empty/broken
+                curr_book = {"bids": [], "asks": []}
 
         md = make_market_data(bar,
                               bars[i-1] if i > 0 else None,
@@ -940,7 +942,7 @@ def compare(m_ohlcv: Dict, m_l2: Dict) -> Dict[str, Any]:
 
 def write_alpha_md(m_ohlcv, m_l2, issues_ohlcv, issues_l2,
                    cmp, bars, r_ohlcv, r_l2):
-    """Generate the full alpha.md audit report."""
+    """Generate the full alphaliquidity.md audit report."""
 
     run_date = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     all_issues = issues_ohlcv + issues_l2
@@ -1331,14 +1333,18 @@ def main():
 
     # FIX U-03 — load L2 snapshots from CSV if provided
     l2_loader_obj = None
+    l2_csv_blocked = False
     if args.l2_csv and L2_LOADER_OK and L2CSVReplayLoader is not None:
         try:
             ldr = L2CSVReplayLoader(args.l2_csv, levels=10)
             l2_loader_obj = ldr.load()
             print(f"      L2 CSV loaded: {len(l2_loader_obj)} snapshots from {args.l2_csv}")
+            if len(l2_loader_obj) == 0:
+                l2_csv_blocked = True
         except Exception as e:
-            print(f"      L2 CSV load failed ({e}) — falling back to synthetic L2")
+            print(f"      L2 CSV load failed ({e})")
             l2_loader_obj = None
+            l2_csv_blocked = True
 
     print("\n[2/6] Running OHLCV backtest (no L2)...")
     t0 = time.time()
@@ -1353,6 +1359,9 @@ def main():
     print("\n[3/6] Running L2-enhanced backtest...")
     t0 = time.time()
     r_l2 = run_backtest(bars, name="L2", use_l2=True, l2_loader=l2_loader_obj)
+    if l2_csv_blocked:
+        r_l2.run_status = "BLOCKED"
+        r_l2.blockers.append("[BLOCKER] L2 replay path incomplete: bookDepth.csv contains only relative percentage levels, cannot reconstruct absolute prices for alpha_liquidity_sweep_predictor without synthetic assumptions.")
     m_l2 = calc_metrics(r_l2)
     # FIX U-01 — walk-forward Sharpe (TimeSeriesSplit, embargo=12)
     try:
@@ -1385,10 +1394,10 @@ def main():
 
     print("\n[6/6] Writing output files...")
 
-    # alpha.md
+    # alphaliquidity.md
     md_content = write_alpha_md(m_ohlcv, m_l2, issues_ohlcv, issues_l2,
                                  cmp, bars, r_ohlcv, r_l2)
-    md_path = os.path.join(os.path.dirname(__file__), "alpha.md")
+    md_path = os.path.join(os.path.dirname(__file__), "alphaliquidity.md")
     with open(md_path, "w", encoding="utf-8") as f:
         f.write(md_content)
     print(f"      Written: {md_path}")
@@ -1429,7 +1438,7 @@ def main():
     print(f"\n  VERDICT:  {summary['verdict']}")
     print(f"  READINESS: {summary['production_readiness']}")
     print("\n" + "=" * 70)
-    print(f"  Files: alpha.md  |  backtest_summary.json")
+    print(f"  Files: alphaliquidity.md  |  backtest_summary.json")
     print("=" * 70 + "\n")
 
 
