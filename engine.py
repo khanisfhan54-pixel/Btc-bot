@@ -1618,7 +1618,8 @@ def smart_money_detection_engine(orderbook: dict, trades: List[dict], price: flo
             if levels:
                 sizes = [_safe_float(x[1]) for x in levels]
                 thresh = _mean(sizes, 0.0) + (statistics.pstdev(sizes) if len(sizes) > 2 else 0.0)
-                for p, s in levels:
+                for lvl in levels:
+                    p, s = lvl[0], lvl[1]
                     if _safe_float(s) >= thresh:
                         z.append({"side": side[:-1], "price": _safe_float(p), "size": _safe_float(s)})
         smart_score = 0.0
@@ -1652,7 +1653,8 @@ def smart_money_absorption_engine(orderbook: dict, trades: List[dict], price: fl
             if levels:
                 sizes = [_safe_float(x[1]) for x in levels]
                 thresh = _mean(sizes, 0.0) + (statistics.pstdev(sizes) if len(sizes) > 2 else 0.0)
-                for p, s in levels:
+                for lvl in levels:
+                    p, s = lvl[0], lvl[1]
                     if _safe_float(s) >= thresh:
                         zones.append(
                             {
