@@ -500,7 +500,12 @@ try:
 except Exception as _ao_exc:
     logger.critical("alpha_orchestrator import failed: %s", _ao_exc)
     raise
-alpha_orchestrator = AlphaOrchestrator(OrchestratorConfig(signal_weights={"signal_engine": 1.0}))
+alpha_orchestrator = AlphaOrchestrator(OrchestratorConfig(
+    signal_weights={
+        "signal_engine": 0.5,
+        "liquidity_magnet_alpha": 0.5,
+    }
+))
 
 _ENGINE_IMPORT_SUCCEEDED: bool = False
 try:
@@ -752,6 +757,13 @@ if LiquiditySweepAlpha is not None:
     except Exception as _alpha_shared_err:
         logger.warning("Shared alpha predictor init failed; disabling alpha predictor: %s", _alpha_shared_err)
         alpha_predictor = None
+from engine import get_shared_magnet_predictor as _get_magnet
+try:
+    _magnet_predictor = _get_magnet()
+    logger.info("[BOOT] LiquidityMagnetPredictor singleton initialized")
+except Exception as _mp_err:
+    logger.warning("[BOOT] LiquidityMagnetPredictor init failed: %s", _mp_err)
+    _magnet_predictor = None
 if globals().get("SniperExecutionEngine") is not None:
     try:
         _signal_pipeline_engine = SniperExecutionEngine(
@@ -2743,6 +2755,22 @@ def run_analysis_cycle(
             correlation_group_id="directional",
         )
     ]
+    _magnet_out = engines_out.get("liquidity_magnet_signal") or {}
+    _magnet_conf = _clamp(_safe_float(
+        _magnet_out.get("confidence", 0.05), 0.05), 0.01, 0.99)
+    _magnet_dir = (
+        1 if _magnet_out.get("zone_side") == "above" else
+        -1 if _magnet_out.get("zone_side") == "below" else 0
+    )
+    alpha_signals.append(AlphaSignal(
+        source_id="liquidity_magnet_alpha",
+        direction=_magnet_dir,
+        conviction=_magnet_conf,
+        expected_edge_bps=float(_magnet_conf * 25.0),
+        timestamp=now_ts if now_ts > 0 else time.time(),
+        timeframe="1m",
+        correlation_group_id="directional",
+    ))
     feature_quality = FeatureQuality(
         staleness_ratio=_clamp(_safe_float(feat_dict.get("staleness_ratio", 0.0), 0.0), 0.0, 1.0),
         missing_data_ratio=_clamp(_safe_float(feat_dict.get("missing_data_ratio", 0.0), 0.0), 0.0, 1.0),

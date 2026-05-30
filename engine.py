@@ -4048,7 +4048,9 @@ def run_all_engines(
         fvg_5 = detect_fvg(candles_by_tf.get("5m") or primary_1m) or {}
         fvg = fvg_15 if fvg_15.get("exists") else fvg_5
         orderflow = analyze_orderflow(trades, orderbook) or {}
-        regime = detect_market_regime(primary_15m if primary_15m else primary_1m, _estimate_volatility_from_ohlcv(ohlcv_data)) or {}
+        reg_vol = _estimate_volatility_from_ohlcv(ohlcv_data)
+        regime = detect_market_regime(primary_15m if primary_15m else primary_1m, reg_vol) or {}
+        reg_name = str(regime.get("type", "unknown"))
         liquidity_magnet = compute_liquidity_magnet(liquidity_intent.get("liquidity_zones", []), price) or {}
         nearest_above = liquidity_intent.get("nearest_above") or {}
         nearest_below = liquidity_intent.get("nearest_below") or {}
@@ -4134,6 +4136,24 @@ def run_all_engines(
                 market_state=market_state,
                 volume_intel=vol_intel,
             ) or {}
+
+        try:
+            magnet_raw = get_shared_magnet_predictor().predict(
+                candidates=liquidity_intent.get("liquidity_zones", []),
+                current_price=price,
+                current_time=time.time(),
+                market_state={
+                    "regime": reg_name,
+                    "volatility": reg_vol,
+                    "trend_direction": "up" if ob_imbalance > 0 else "down",
+                    "atr": atr_for_alpha,
+                },
+                stop_hunt_data=stop_hunt,
+                volume_intel=vol_intel,
+            ) or {}
+        except Exception as _magnet_exc:
+            logger.warning("[ALPHA] liquidity magnet predict failed; fail-closed: %s", _magnet_exc)
+            magnet_raw = {}
 
         alpha_confidence = _clamp(_safe_float(alpha_raw.get("confidence", alpha_raw.get("probability", 0.5)), 0.5), 0.0, 1.0)
         alpha_prob_above = _clamp(_safe_float(alpha_raw.get("prob_above", 0.5), 0.5), 0.0, 1.0)
@@ -4417,6 +4437,7 @@ def run_all_engines(
             "spoof_detected": market_data.get("spoof_detected", False),
             "spoof_details": market_data.get("spoof_details", {}),
             "alpha": market_data.get("alpha", {}),
+            "liquidity_magnet_signal": magnet_raw,
             "volume_intelligence": vol_intel,
             "volume_spike": vol_intel.get("volume_spike", False),
             "volume_explosion": vol_intel.get("volume_explosion", False),
