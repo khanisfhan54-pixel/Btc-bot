@@ -9,3 +9,4 @@ python-dotenv>=1.0,<2
 # ── SHPE additions (minimum required) ───────────────────────────────
 scikit-learn>=1.4,<2
 joblib>=1.3,<2
+pytest

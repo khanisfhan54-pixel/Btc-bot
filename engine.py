@@ -52,11 +52,13 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 from alpha_liquidity_sweep_predictor import LiquiditySweepAlpha, predict_sweep
+from liquidity_magnet_predictor import LiquidityMagnetPredictor, predict_liquidity_magnet
 from trading_utils import safe_float, clamp, validate_alpha
 from thread_safe_wrappers import ordered_lock
 
 logger = logging.getLogger(__name__)
 
+_OI_PRIOR_MULTIPLIER = 0.98
 
 # =============================================================================
 # AUDIT-FIX Phase 2 #6 — fallback offender identification helper.
@@ -162,6 +164,8 @@ def _record_and_check_anomaly(field: str, value: float) -> None:
 
 _LIQUIDITY_SWEEP_ALPHA: Optional[LiquiditySweepAlpha] = None
 _LIQUIDITY_SWEEP_ALPHA_INIT_LOCK = threading.Lock()
+_LIQUIDITY_MAGNET_PREDICTOR: Optional[LiquidityMagnetPredictor] = None
+_LIQUIDITY_MAGNET_PREDICTOR_INIT_LOCK = threading.Lock()
 _ALPHA_STATE: Dict[str, Dict[str, Any]] = {}
 _ALPHA_STATE_LOCK = threading.Lock()
 _LIQUIDITY_UPDATE_LOCK = threading.RLock()
@@ -281,6 +285,17 @@ def get_shared_alpha_predictor() -> LiquiditySweepAlpha:
             _LIQUIDITY_SWEEP_ALPHA = LiquiditySweepAlpha()
             logger.info("[ALPHA] Initialized shared LiquiditySweepAlpha singleton")
     return _LIQUIDITY_SWEEP_ALPHA
+
+
+def get_shared_magnet_predictor() -> LiquidityMagnetPredictor:
+    global _LIQUIDITY_MAGNET_PREDICTOR
+    if _LIQUIDITY_MAGNET_PREDICTOR is not None:
+        return _LIQUIDITY_MAGNET_PREDICTOR
+    with _LIQUIDITY_MAGNET_PREDICTOR_INIT_LOCK:
+        if _LIQUIDITY_MAGNET_PREDICTOR is None:
+            _LIQUIDITY_MAGNET_PREDICTOR = LiquidityMagnetPredictor()
+            logger.info("[ALPHA] Initialized shared LiquidityMagnetPredictor singleton")
+    return _LIQUIDITY_MAGNET_PREDICTOR
 
 
 def apply_meta_to_decision(
@@ -3946,7 +3961,7 @@ def run_all_engines(
             current_oi = _safe_float(open_interest, 0.0)
         oi = oi_spike_detection(
             current_oi=current_oi,
-            oi_history=oi_hist or [current_oi * 0.98, current_oi],
+            oi_history=oi_hist or [current_oi * _OI_PRIOR_MULTIPLIER, current_oi],
             price=price,
         ) or {}
         cprob = _safe_float(cascade_prob, 0.0)
@@ -3958,7 +3973,7 @@ def run_all_engines(
                 # default used a few lines above). Both call sites now use
                 # the same expansion factor so cascade probability and the
                 # spike detector see a consistent synthetic history.
-                oi_history=oi_hist or [oi_value * 0.98, oi_value],
+                oi_history=oi_hist or [oi_value * _OI_PRIOR_MULTIPLIER, oi_value],
                 liquidation_cluster=liquid_cluster_usd,
                 bid=best_bid or price,
                 ask=best_ask or price,

@@ -22,6 +22,9 @@ def test_real_l2_smoke_200_bars():
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     os.chdir(repo_root)
 
+    if not os.path.exists("data/ohlcv_1m.csv"):
+        pytest.skip("data/ohlcv_1m.csv not found")
+
     # Import inside the test to avoid paying the ARE/engine import cost
     # for unrelated test sessions.
     from audit_engine_dec2023 import run  # type: ignore
