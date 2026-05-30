@@ -317,7 +317,14 @@ class BacktestEngine:
         if AlphaOrchestrator is not None and OrchestratorConfig is not None:
             try:
                 cfg = OrchestratorConfig(
-                    signal_weights={"signal_engine": 0.5, "liquidity_sweep_alpha": 0.5},
+                    signal_weights={
+                        "signal_engine": 0.5,
+                        "liquidity_sweep_alpha": 0.5,
+                        # NOTE: liquidity_magnet_alpha excluded from backtest —
+                        # LiquidityMagnetPredictor requires a live zone-memory state
+                        # that cannot be seeded from historical OHLCV alone. Re-include
+                        # when a warmup seed strategy is implemented.
+                    },
                     action_threshold=float(self.cfg.orchestrator_action_threshold),
                     allow_unknown_sources=False,
                     feedback_enabled=False,
