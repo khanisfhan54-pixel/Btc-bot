@@ -2765,13 +2765,7 @@ def run_analysis_cycle(
     elif _magnet_zone_side == "below":
         _magnet_dir = -1
     else:
-        # Fallback: derive direction from target_price vs current_price
-        # when zone_side is absent, "none", or unrecognised.
-        _magnet_target = _safe_float(_magnet_out.get("target_price", 0.0), 0.0)
-        if _magnet_target > 0.0 and current_price > 0.0:
-            _magnet_dir = 1 if _magnet_target > current_price else -1
-        else:
-            _magnet_dir = 0
+        _magnet_dir = 0
 
     # Use sweep_likelihood_estimate to scale conviction when available,
     # so the magnet source carries calibrated directional weight.
@@ -2779,7 +2773,7 @@ def run_analysis_cycle(
         _safe_float(_magnet_out.get("sweep_likelihood_estimate", 0.0), 0.0),
         0.0, 1.0,
     )
-    if _sweep_est > 0.0:
+    if _sweep_est > 0.0 and _magnet_dir != 0:
         _magnet_conv = _clamp(
             0.6 * _magnet_conf + 0.4 * _sweep_est, 0.01, 0.99
         )
@@ -2801,9 +2795,8 @@ def run_analysis_cycle(
     # Log for observability when magnet is neutral after fallback.
     if _magnet_dir == 0:
         logger.debug(
-            "[MAGNET] direction=0 after fallback: zone_side=%r target=%.2f price=%.2f",
+            "[MAGNET] direction=0: zone_side=%r price=%.2f",
             _magnet_zone_side,
-            _safe_float(_magnet_out.get("target_price", 0.0), 0.0),
             _safe_float(current_price, 0.0),
         )
     feature_quality = FeatureQuality(

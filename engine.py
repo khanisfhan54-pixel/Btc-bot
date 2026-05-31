@@ -3834,6 +3834,7 @@ def run_all_engines(
                 "spoof_details": {"spoof": False, "evidence": [], "reliable": False, "reason": "invalid_price"},
             },
             "alpha": _default_alpha(),
+            "liquidity_magnet_signal": {},
             "direction": "HOLD",
             "confidence": 0.0,
             "composite": {"direction": "HOLD", "confidence": 0.0},
