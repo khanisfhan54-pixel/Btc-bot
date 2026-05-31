@@ -672,6 +672,7 @@ except Exception as _e:
                 "invalidations": [],
                 "features": {},
             },
+            "liquidity_magnet_signal": {},
             "alpha": _default_alpha(),
         }
 
