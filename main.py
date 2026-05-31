@@ -2759,19 +2759,53 @@ def run_analysis_cycle(
     _magnet_out = engines_out.get("liquidity_magnet_signal") or {}
     _magnet_conf = _clamp(_safe_float(
         _magnet_out.get("confidence", 0.05), 0.05), 0.01, 0.99)
-    _magnet_dir = (
-        1 if _magnet_out.get("zone_side") == "above" else
-        -1 if _magnet_out.get("zone_side") == "below" else 0
+    _magnet_zone_side = _magnet_out.get("zone_side", "")
+    if _magnet_zone_side == "above":
+        _magnet_dir = 1
+    elif _magnet_zone_side == "below":
+        _magnet_dir = -1
+    else:
+        # Fallback: derive direction from target_price vs current_price
+        # when zone_side is absent, "none", or unrecognised.
+        _magnet_target = _safe_float(_magnet_out.get("target_price", 0.0), 0.0)
+        if _magnet_target > 0.0 and current_price > 0.0:
+            _magnet_dir = 1 if _magnet_target > current_price else -1
+        else:
+            _magnet_dir = 0
+
+    # Use sweep_likelihood_estimate to scale conviction when available,
+    # so the magnet source carries calibrated directional weight.
+    _sweep_est = _clamp(
+        _safe_float(_magnet_out.get("sweep_likelihood_estimate", 0.0), 0.0),
+        0.0, 1.0,
     )
+    if _sweep_est > 0.0:
+        _magnet_conv = _clamp(
+            0.6 * _magnet_conf + 0.4 * _sweep_est, 0.01, 0.99
+        )
+    else:
+        _magnet_conv = _magnet_conf
+
     alpha_signals.append(AlphaSignal(
         source_id="liquidity_magnet_alpha",
         direction=_magnet_dir,
-        conviction=_magnet_conf,
-        expected_edge_bps=float(_magnet_conf * 25.0),
+        conviction=_magnet_conv,
+        expected_edge_bps=float(_magnet_conv * 25.0),
         timestamp=now_ts if now_ts > 0 else time.time(),
         timeframe="1m",
         correlation_group_id="directional",
     ))
+    # If both alpha_signals are direction=0 (neutral), the orchestrator
+    # will return HOLD via low_aggregate_weight. No intervention needed;
+    # this is correct fail-closed behaviour.
+    # Log for observability when magnet is neutral after fallback.
+    if _magnet_dir == 0:
+        logger.debug(
+            "[MAGNET] direction=0 after fallback: zone_side=%r target=%.2f price=%.2f",
+            _magnet_zone_side,
+            _safe_float(_magnet_out.get("target_price", 0.0), 0.0),
+            _safe_float(current_price, 0.0),
+        )
     feature_quality = FeatureQuality(
         staleness_ratio=_clamp(_safe_float(feat_dict.get("staleness_ratio", 0.0), 0.0), 0.0, 1.0),
         missing_data_ratio=_clamp(_safe_float(feat_dict.get("missing_data_ratio", 0.0), 0.0), 0.0, 1.0),
