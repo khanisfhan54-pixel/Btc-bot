@@ -44,11 +44,13 @@ class FeatureBookSnapshot:
     spread_bps: float
     imbalance: float
     ofi_z: float
+    ofi_norm: float
     liquidity_score: float
     fill_prob: float
     impact_cost_bps: float
     log_ret: float
     vol_z: float
+    feature_available_ts_ms: int
 
 
 def _read_parquet(path: str) -> List[Dict[str, Any]]:
@@ -121,11 +123,16 @@ def _to_engine_inputs(rows: Sequence[Dict[str, Any]]) -> Tuple[List[list], List[
     snaps: List[Optional[FeatureBookSnapshot]] = []
     for row in rows:
         ts = int(row["timestamp_ms"])
-        bars.append([ts, _as_float(row, "open"), _as_float(row, "high"), _as_float(row, "low"), _as_float(row, "close"), _as_float(row, "volume")])
+        feature_ts = int(row["feature_available_ts_ms"])
+        # BacktestEngine timestamps represent when the feature row is actionable.
+        # The parquet keeps timestamp_ms == bar_start_ts_ms for bot compatibility,
+        # but the adapter uses feature_available_ts_ms (bar end) to avoid trading
+        # on a completed bar before it exists.
+        bars.append([feature_ts, _as_float(row, "open"), _as_float(row, "high"), _as_float(row, "low"), _as_float(row, "close"), _as_float(row, "volume")])
         # Always pass the parquet L1 snapshot to avoid BacktestEngine synthetic snapshot fallback.
         # Stale-but-present snapshots retain liquidity_score=0 from preprocessing.
         snaps.append(FeatureBookSnapshot(
-                timestamp=ts,
+                timestamp=feature_ts,
                 bid_price=_as_float(row, "bid_price"),
                 ask_price=_as_float(row, "ask_price"),
                 bid_qty=_as_float(row, "bid_qty"),
@@ -133,11 +140,13 @@ def _to_engine_inputs(rows: Sequence[Dict[str, Any]]) -> Tuple[List[list], List[
                 spread_bps=_as_float(row, "spread_bps"),
                 imbalance=_as_float(row, "book_imbalance"),
                 ofi_z=_as_float(row, "ofi_zscore"),
+                ofi_norm=_as_float(row, "ofi_norm"),
                 liquidity_score=_as_float(row, "liquidity_score"),
                 fill_prob=_as_float(row, "fill_prob"),
                 impact_cost_bps=_as_float(row, "impact_cost_bps"),
                 log_ret=_as_float(row, "log_ret"),
                 vol_z=_as_float(row, "vol_z"),
+                feature_available_ts_ms=feature_ts,
         ))
     return bars, snaps
 
