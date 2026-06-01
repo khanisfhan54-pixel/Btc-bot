@@ -54,3 +54,25 @@ pytest stop_hunt_engine/tests/ -v
 - Per-regime sub-model sample sizes (requires labelled regime history).
 - Calibration stability across exchange feed outages.
 - Feature importance rankings under real market microstructure.
+
+## Offline L1 BookTicker feature parquet workflow
+
+The offline feature builder in `preprocess/build_btc_feature_parquets.py` converts Binance BTCUSDT BookTicker (L1/top-of-book only) plus AggTrades CSV files into native 1-minute and 5-minute parquet feature datasets. The `l1_order_flow_proxy` and compatibility aliases `ofi_zscore`/`ofi_norm` are explicitly L1 proxy features; they are not true multi-level L2 OFI and must not be routed through the L2-only CSV loader.
+
+Example VPS preprocessing command:
+
+```bash
+python3 preprocess/build_btc_feature_parquets.py \
+  --bookticker /home/ubuntu/btc_bot_data/raw/BTCUSDT_240329-bookTicker-2024-01.csv \
+  --aggtrades /home/ubuntu/btc_bot_data/raw/BTCUSDT_240329-aggTrades-2024-01.csv \
+  --outdir /home/ubuntu/btc_bot_data/processed \
+  --symbol BTCUSDT
+```
+
+Example feature-parquet backtest command:
+
+```bash
+python3 run_backtest_from_features.py \
+  --features-1m /home/ubuntu/btc_bot_data/processed/features_1m.parquet \
+  --features-5m /home/ubuntu/btc_bot_data/processed/features_5m.parquet
+```
