@@ -69,10 +69,20 @@ python3 preprocess/build_btc_feature_parquets.py \
   --symbol BTCUSDT
 ```
 
-Example feature-parquet backtest command:
+Example feature validation command:
+
+```bash
+python3 preprocess/build_btc_feature_parquets.py \
+  --validate-parquet /home/ubuntu/btc_bot_data/processed/features_1m.parquet \
+  --validate-parquet /home/ubuntu/btc_bot_data/processed/features_5m.parquet
+```
+
+Example feature-parquet backtest command, using the public BacktestEngine API and production-valid mode by default:
 
 ```bash
 python3 run_backtest_from_features.py \
   --features-1m /home/ubuntu/btc_bot_data/processed/features_1m.parquet \
   --features-5m /home/ubuntu/btc_bot_data/processed/features_5m.parquet
 ```
+
+Use `--legacy-mode` only for explicit diagnostic runs.
