@@ -467,7 +467,7 @@ class BacktestEngine:
         v = _safe_float(candle[5])
         log_ret = math.log(c / prev_close) if (prev_close > 0 and c > 0) else 0.0
         ofi_z_raw = _safe_float(features.get("ofi_zscore", features.get("ofi_norm", 0.0)))
-        vol_z_raw = (v - vol_mean) / vol_std if vol_std > 0 else 0.0
+        vol_z_raw = _safe_float(features.get("vol_z"), (v - vol_mean) / vol_std if vol_std > 0 else 0.0)
         raw = np.array([float(log_ret), float(ofi_z_raw), float(vol_z_raw)], dtype=float)
 
         fm = self._calibration_feature_mean
@@ -926,26 +926,36 @@ class BacktestEngine:
                 label, n_real, len(data),
             )
 
-        # AUDIT FIX ISSUE-C: validate L2 depth file timestamp alignment.
-        # Dec-2023 replay window in Binance epoch ms.
-        _DEC2023_START_MS = 1_701_388_800_000
-        _DEC2023_END_MS   = 1_704_067_199_000
-        _l2_candidates = [
-            "data/bookDepth.csv",
-            "data/bookDepth_L2.csv",
-            "data/bookDepth_clean.csv",
-        ]
-        _l2_validation: Dict[str, Any] = {
-            "valid": False,
-            "label": "NON-PRODUCTION-VALID: l2_data_missing_or_mismatched",
-        }
-        for _l2_path in _l2_candidates:
-            _v = self._validate_l2_timestamp_alignment(
-                _l2_path, _DEC2023_START_MS, _DEC2023_END_MS
-            )
-            if _v["valid"]:
-                _l2_validation = _v
-                break
+        # Feature-parquet runs supply per-bar L1 snapshots directly. Do not probe
+        # legacy L2 depth CSV filenames on this path; BookTicker is L1-only and
+        # the adapter must not depend on any true-L2 file existing.
+        if use_real_book:
+            _l2_validation: Dict[str, Any] = {
+                "valid": True,
+                "label": "FEATURE-PARQUET-L1-ONLY",
+                "reason": "L2 depth validation skipped for supplied L1 feature parquet snapshots.",
+            }
+        else:
+            # AUDIT FIX ISSUE-C: validate L2 depth file timestamp alignment.
+            # Dec-2023 replay window in Binance epoch ms.
+            _DEC2023_START_MS = 1_701_388_800_000
+            _DEC2023_END_MS   = 1_704_067_199_000
+            _l2_candidates = [
+                "data/bookDepth.csv",
+                "data/bookDepth_L2.csv",
+                "data/bookDepth_clean.csv",
+            ]
+            _l2_validation = {
+                "valid": False,
+                "label": "NON-PRODUCTION-VALID: l2_data_missing_or_mismatched",
+            }
+            for _l2_path in _l2_candidates:
+                _v = self._validate_l2_timestamp_alignment(
+                    _l2_path, _DEC2023_START_MS, _DEC2023_END_MS
+                )
+                if _v["valid"]:
+                    _l2_validation = _v
+                    break
         _l2_valid = _l2_validation["valid"]
 
         # AUDIT FIX ISSUE-C+PART6: compute BACKTEST_LABEL once per run.
@@ -963,12 +973,9 @@ class BacktestEngine:
         )
         logger.info("[BACKTEST %s] %s", label, _backtest_label)
 
-        # Pre-compute volume stats for the canonical vol_z feature
-        all_vols = np.array([_safe_float(r[5]) for r in data], dtype=float)
-        vol_mean = float(all_vols.mean()) if all_vols.size else 0.0
-        vol_std = float(all_vols.std()) if all_vols.size else 0.0
-        if vol_std <= 0.0:
-            vol_std = 1.0
+        # Volume normalization must be past/current-only. A full-sample mean/std
+        # would leak future bars into production-valid backtests.
+        rolling_vol_window = 50
 
         # Per-run alpha telemetry reset
         self._last_alpha_signals = []
@@ -986,12 +993,12 @@ class BacktestEngine:
         ema_fast = _safe_float(data[0][4])
         ema_slow = ema_fast
 
-        if not self.cfg.legacy_mode and self.lsa is not None and len(data) >= 100:
+        if self.cfg.legacy_mode and self.lsa is not None and len(data) >= 100:
             try:
                 cal_status = self._run_calibration_pass(data, ema_fast, ema_slow)
-                logger.info("[BACKTEST %s] calibration pass complete: %s", label, cal_status)
+                logger.info("[BACKTEST %s] diagnostic calibration pass complete: %s", label, cal_status)
             except Exception as exc:
-                logger.warning("[BACKTEST %s] calibration pass failed: %s", label, exc)
+                logger.warning("[BACKTEST %s] diagnostic calibration pass failed: %s", label, exc)
 
         # Running snapshot of the previous order book (LSA OFI z-score input)
         prev_snapshot: Dict[str, Any] = _simulate_snapshot_from_candle(data[0])
@@ -1030,13 +1037,18 @@ class BacktestEngine:
                 feat_inner_seed = features_outer.get("features", features_outer)
                 if isinstance(feat_inner_seed, dict):
                     feat_inner_seed["ofi_zscore"] = float(real_snap.ofi_z)
-                    feat_inner_seed["ofi_norm"]   = float(real_snap.imbalance)
+                    feat_inner_seed["ofi_norm"]   = float(getattr(real_snap, "ofi_norm", real_snap.imbalance))
                     feat_inner_seed["imbalance"]  = float(real_snap.imbalance)
                     feat_inner_seed["spread_bps"] = float(real_snap.spread_bps)
                     feat_inner_seed["bid_price"]  = float(real_snap.bid_price)
                     feat_inner_seed["ask_price"]  = float(real_snap.ask_price)
                     feat_inner_seed["bid_qty"]    = float(real_snap.bid_qty)
                     feat_inner_seed["ask_qty"]    = float(real_snap.ask_qty)
+                    feat_inner_seed["liquidity_score"] = float(getattr(real_snap, "liquidity_score", feat_inner_seed.get("liquidity_score", 0.0)))
+                    feat_inner_seed["fill_prob"] = float(getattr(real_snap, "fill_prob", feat_inner_seed.get("fill_prob", 0.5)))
+                    feat_inner_seed["fill_probability"] = float(getattr(real_snap, "fill_prob", feat_inner_seed.get("fill_probability", 0.5)))
+                    feat_inner_seed["impact_cost_bps"] = float(getattr(real_snap, "impact_cost_bps", feat_inner_seed.get("impact_cost_bps", 0.0)))
+                    feat_inner_seed["vol_z"] = float(getattr(real_snap, "vol_z", feat_inner_seed.get("vol_z", 0.0)))
             else:
                 cache_key = (int(candle[0]), float(current_price))
                 cached = self._analysis_cache.get(cache_key)
@@ -1100,6 +1112,12 @@ class BacktestEngine:
             regime_conf = 0.5
             volatility_score = 0.0
             if self.are is not None:
+                vol_window = data[max(0, i - rolling_vol_window + 1): i + 1]
+                vols = np.array([_safe_float(r[5]) for r in vol_window], dtype=float)
+                vol_mean = float(vols.mean()) if vols.size else 0.0
+                vol_std = float(vols.std()) if vols.size else 1.0
+                if vol_std <= 0.0:
+                    vol_std = 1.0
                 are_payload = self._build_canonical_are_payload(
                     candle=candle,
                     prev_close=prev_close,
