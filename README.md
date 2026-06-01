@@ -86,3 +86,9 @@ python3 run_backtest_from_features.py \
 ```
 
 Use `--legacy-mode` only for explicit diagnostic runs.
+
+Example deterministic smoke test (creates tiny temporary raw CSVs, writes parquets, validates them, and calls the public backtest API; no live access):
+
+```bash
+python3 run_backtest_from_features.py --smoke-test
+```

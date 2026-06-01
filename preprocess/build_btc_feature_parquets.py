@@ -144,6 +144,7 @@ class TradeEvent:
     price: float
     qty: float
     is_buyer_maker: bool
+    row_order: int
 
     @property
     def quote_qty(self) -> float:
@@ -246,6 +247,34 @@ class TradeAgg:
         self.signed_quote_volume += ev.signed_quote
 
 
+def _normalize_trade_id(raw: Any) -> Optional[str]:
+    if raw in (None, ""):
+        return None
+    normalized = str(raw).strip()
+    return normalized if normalized else None
+
+
+def _sortable_trade_id(agg_trade_id: Optional[str]) -> Tuple[int, int, str]:
+    """Normalize mixed numeric/string aggregate trade IDs into a stable sort key."""
+    if agg_trade_id is None:
+        return (2, 0, "")
+    try:
+        # Numeric IDs sort numerically and never compare directly with strings.
+        return (0, int(agg_trade_id), "")
+    except (TypeError, ValueError):
+        return (1, 0, str(agg_trade_id))
+
+
+def _same_trade_payload(a: TradeEvent, b: TradeEvent) -> bool:
+    return (
+        a.ts_ms == b.ts_ms
+        and a.agg_trade_id == b.agg_trade_id
+        and a.price == b.price
+        and a.qty == b.qty
+        and a.is_buyer_maker == b.is_buyer_maker
+    )
+
+
 def read_trades(path: str, intervals: Dict[str, int]) -> Tuple[Dict[str, Dict[int, TradeAgg]], Dict[str, int], Tuple[Optional[int], Optional[int]]]:
     counts = {"raw": 0, "invalid": 0, "duplicates_dropped": 0}
     events: List[TradeEvent] = []
@@ -258,21 +287,24 @@ def read_trades(path: str, intervals: Dict[str, int]) -> Tuple[Dict[str, Dict[in
             price = _to_float(_first(row, ["price", "p"]))
             qty = _to_float(_first(row, ["quantity", "qty", "q"]))
             agg_id_raw = _first(row, ["agg_trade_id", "aggregate_trade_id", "a", "id"])
-            agg_id = str(agg_id_raw).strip() if agg_id_raw not in (None, "") else None
+            agg_id = _normalize_trade_id(agg_id_raw)
             if ts is None or price <= 0.0 or qty < 0.0:
                 counts["invalid"] += 1
                 continue
-            ev = TradeEvent(ts, agg_id, price, qty, _truthy(_first(row, ["is_buyer_maker", "m", "buyer_maker"])))
+            ev = TradeEvent(ts, agg_id, price, qty, _truthy(_first(row, ["is_buyer_maker", "m", "buyer_maker"])), counts["raw"])
             if agg_id is not None:
                 prior = by_id.get(agg_id)
                 if prior is not None:
-                    if prior != ev:
-                        raise ValueError(f"Conflicting duplicate agg_trade_id={agg_id!r} at {path}:{line_no}")
+                    if not _same_trade_payload(prior, ev):
+                        raise ValueError(
+                            f"Conflicting duplicate agg_trade_id={agg_id!r} at {path}:{line_no}; "
+                            "duplicate aggregate trade IDs must have identical timestamp/price/qty/side"
+                        )
                     counts["duplicates_dropped"] += 1
                     continue
                 by_id[agg_id] = ev
             events.append(ev)
-    events.sort(key=lambda e: (e.ts_ms, int(e.agg_trade_id) if e.agg_trade_id and e.agg_trade_id.isdigit() else e.agg_trade_id or ""))
+    events.sort(key=lambda e: (e.ts_ms, _sortable_trade_id(e.agg_trade_id), e.row_order))
     bars: Dict[str, Dict[int, TradeAgg]] = {k: defaultdict(TradeAgg) for k in intervals}
     for ev in events:
         for name, ms in intervals.items():
@@ -419,8 +451,8 @@ def build_interval(
             flags.append("BOOK_MISSING")
         elif snap.ts_ms < bar:
             flags.append("BOOK_FFILLED")
-        book_stale_ms = (bar_end - snap.ts_ms) if snap is not None else None
-        stale = snap is None or (book_stale_ms is not None and book_stale_ms > stale_limit_ms)
+        book_stale_ms = int(bar_end - snap.ts_ms) if snap is not None else -1
+        stale = snap is None or book_stale_ms > stale_limit_ms
         if stale:
             flags.append("BOOK_STALE" if snap is not None else "BOOK_MISSING")
         if snap is not None and snap.ask == snap.bid:
@@ -656,6 +688,8 @@ def validate_rows(rows: List[Dict[str, Any]], interval_ms: Optional[int] = None)
             (int(r["timestamp_ms"]) == bs, "bad timestamp_ms"),
             (float(r["open"]) > 0 and float(r["close"]) > 0, "non-positive open/close"),
             (float(r["high"]) >= float(r["low"]), "high < low"),
+            (isinstance(r.get("book_stale_ms"), int), "book_stale_ms must be an integer sentinel/value"),
+            (int(r["book_stale_ms"]) >= -1, "book_stale_ms must be >= -1"),
             (float(r["spread"]) >= 0, "negative spread"),
             (float(r["best_ask"]) >= float(r["best_bid"]), "ask < bid"),
             (-1.0 <= float(r["book_imbalance"]) <= 1.0, "book_imbalance out of range"),
@@ -670,6 +704,11 @@ def validate_rows(rows: List[Dict[str, Any]], interval_ms: Optional[int] = None)
             raise ValueError(f"last_trade_ts_ms lookahead at row {i}")
         if r.get("last_book_event_ts_ms") is not None and int(r["last_book_event_ts_ms"]) >= be:
             raise ValueError(f"last_book_event_ts_ms lookahead at row {i}")
+        if r.get("last_book_event_ts_ms") is None:
+            if int(r["book_stale_ms"]) != -1 or bool(r.get("has_book_data")):
+                raise ValueError(f"missing book row must use book_stale_ms=-1 and has_book_data=False at row {i}")
+        elif int(r["book_stale_ms"]) != be - int(r["last_book_event_ts_ms"]):
+            raise ValueError(f"book_stale_ms inconsistent with last_book_event_ts_ms at row {i}")
         if "WARMUP" in str(r.get("data_quality_flags", "")):
             warmup += 1
     return {"rows": len(rows), "warmup_rows": warmup}

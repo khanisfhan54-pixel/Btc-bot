@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import tempfile
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -27,7 +28,7 @@ REQUIRED_COLUMNS = [
     "log_ret", "log_ret_close", "ofi_zscore", "ofi_norm", "vol_z", "spread_bps",
     "liquidity_score", "fill_prob", "fill_probability", "impact_cost_bps",
     "bid_price", "ask_price", "bid_qty", "ask_qty", "book_imbalance",
-    "last_trade_ts_ms", "last_book_event_ts_ms", "data_quality_flags",
+    "book_stale_ms", "has_book_data", "last_trade_ts_ms", "last_book_event_ts_ms", "data_quality_flags",
 ]
 
 
@@ -58,8 +59,8 @@ def _read_parquet(path: str) -> List[Dict[str, Any]]:
     if not os.path.exists(path):
         raise FileNotFoundError(path)
     rows = pq.read_table(path).to_pylist()
-    validate_feature_rows(rows, path)
     rows.sort(key=lambda r: int(r["timestamp_ms"]))
+    validate_feature_rows(rows, path)
     return rows
 
 
@@ -88,6 +89,8 @@ def validate_feature_rows(rows: Sequence[Dict[str, Any]], path: str = "<memory>"
             (int(row["feature_available_ts_ms"]) == be, "feature_available_ts_ms must equal bar_end_ts_ms"),
             (_as_float(row, "open") > 0 and _as_float(row, "close") > 0, "open/close must be positive"),
             (_as_float(row, "high") >= _as_float(row, "low"), "high < low"),
+            (row.get("book_stale_ms") is not None, "book_stale_ms must not be null"),
+            (int(row["book_stale_ms"]) >= -1, "book_stale_ms must be >= -1"),
             (_as_float(row, "spread_bps") >= 0, "negative spread_bps"),
             (_as_float(row, "bid_price") > 0 and _as_float(row, "ask_price") > 0, "bid/ask must be positive; adapter refuses synthetic fallback"),
             (_as_float(row, "ask_price") >= _as_float(row, "bid_price"), "ask_price < bid_price"),
@@ -103,6 +106,11 @@ def validate_feature_rows(rows: Sequence[Dict[str, Any]], path: str = "<memory>"
             raise ValueError(f"{path}: last_trade_ts_ms lookahead at row {i}")
         if row.get("last_book_event_ts_ms") is not None and int(row["last_book_event_ts_ms"]) >= be:
             raise ValueError(f"{path}: last_book_event_ts_ms lookahead at row {i}")
+        if row.get("last_book_event_ts_ms") is None:
+            if int(row["book_stale_ms"]) != -1 or bool(row.get("has_book_data")):
+                raise ValueError(f"{path}: missing book row must use book_stale_ms=-1 and has_book_data=False at row {i}")
+        elif int(row["book_stale_ms"]) != be - int(row["last_book_event_ts_ms"]):
+            raise ValueError(f"{path}: book_stale_ms inconsistent with last_book_event_ts_ms at row {i}")
         if "WARMUP" in str(row.get("data_quality_flags", "")):
             warmup += 1
     return {"rows": len(rows), "warmup_rows": warmup}
@@ -151,18 +159,89 @@ def run_one(path: str, label: str, initial_balance: float, legacy_mode: bool) ->
     return result
 
 
+def _write_smoke_raw_csvs(tmpdir: str, n_minutes: int) -> Tuple[str, str]:
+    import csv
+
+    book_path = os.path.join(tmpdir, "BTCUSDT-smoke-bookTicker.csv")
+    trade_path = os.path.join(tmpdir, "BTCUSDT-smoke-aggTrades.csv")
+    start_ms = 1_704_067_200_000
+    with open(book_path, "w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["E", "b", "B", "a", "A"])
+        w.writeheader()
+        for i in range(n_minutes):
+            ts = start_ms + i * 60_000 + 100
+            mid = 43_000.0 + i * 2.0
+            w.writerow({"E": ts, "b": f"{mid - 0.5:.2f}", "B": "2.0", "a": f"{mid + 0.5:.2f}", "A": "2.5"})
+    with open(trade_path, "w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["a", "T", "p", "q", "m"])
+        w.writeheader()
+        for i in range(n_minutes):
+            base = start_ms + i * 60_000
+            price = 43_000.0 + i * 2.0
+            w.writerow({"a": str(i * 2), "T": base + 1_000, "p": f"{price:.2f}", "q": "0.010", "m": "false"})
+            w.writerow({"a": str(i * 2 + 1), "T": base + 30_000, "p": f"{price + 1.0:.2f}", "q": "0.005", "m": "true"})
+    return book_path, trade_path
+
+
+def run_smoke_test(initial_balance: float, legacy_mode: bool, n_minutes: int = 80) -> Dict[str, Any]:
+    """Deterministic raw CSV -> parquet -> public BacktestEngine smoke test; no live access."""
+    from preprocess.build_btc_feature_parquets import INTERVALS_MS, build_interval, read_books, read_trades, write_parquet
+
+    with tempfile.TemporaryDirectory(prefix="btc_l1_feature_smoke_") as tmpdir:
+        book_path, trade_path = _write_smoke_raw_csvs(tmpdir, n_minutes=n_minutes)
+        outdir = os.path.join(tmpdir, "processed")
+        trade_bars, trade_counts, trade_bounds = read_trades(trade_path, INTERVALS_MS)
+        books, book_counts, book_bounds = read_books(book_path)
+        source_min = min(x for x in [trade_bounds[0], book_bounds[0]] if x is not None)
+        source_max = max(x for x in [trade_bounds[1], book_bounds[1]] if x is not None)
+        paths: Dict[str, str] = {}
+        for name, ms in INTERVALS_MS.items():
+            rows, _stats = build_interval("BTCUSDT", name, ms, trade_bars[name], books, 120_000, 20, source_min, source_max)
+            path = os.path.join(outdir, f"features_{name}.parquet")
+            write_parquet(rows, path)
+            paths[name] = path
+        result_1m = run_one(paths["1m"], "smoke_1m", initial_balance, legacy_mode)
+        result_5m = run_one(paths["5m"], "smoke_5m", initial_balance, legacy_mode)
+        if not isinstance(result_1m, dict) or not isinstance(result_5m, dict):
+            raise RuntimeError("BacktestEngine did not return result dictionaries during smoke test")
+        summary = {
+            "raw_trade_rows": trade_counts["raw"],
+            "raw_book_rows": book_counts["raw"],
+            "rows_1m": result_1m["input_rows"],
+            "rows_5m": result_5m["input_rows"],
+            "legacy_mode": bool(legacy_mode),
+        }
+        print(f"SMOKE TEST OK: raw CSV -> parquet -> BacktestEngine public API ({summary})")
+        return summary
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Run public BacktestEngine APIs from generated L1 feature parquets")
-    ap.add_argument("--features-1m", required=True)
-    ap.add_argument("--features-5m", required=True)
+    ap.add_argument("--features-1m")
+    ap.add_argument("--features-5m")
     ap.add_argument("--initial-balance", type=float, default=10_000.0)
     ap.add_argument("--legacy-mode", action="store_true", help="Explicit diagnostic mode; default uses production-valid BacktestEngine configuration")
     ap.add_argument("--output", default="backtest_from_features_summary.json")
+    ap.add_argument("--smoke-test", action="store_true", help="Run a deterministic raw CSV -> parquet -> public BacktestEngine smoke test")
+    ap.add_argument("--smoke-minutes", type=int, default=80, help="Number of one-minute sample bars for --smoke-test")
     args = ap.parse_args()
+    if args.smoke_test:
+        try:
+            run_smoke_test(args.initial_balance, args.legacy_mode, n_minutes=args.smoke_minutes)
+        except Exception as exc:
+            raise SystemExit(f"SMOKE TEST FAILED: {exc}") from exc
+        return
+    if not (args.features_1m and args.features_5m):
+        raise SystemExit("--features-1m and --features-5m are required unless --smoke-test is used")
     rows_1m = _read_parquet(args.features_1m)
     rows_5m = _read_parquet(args.features_5m)
     stats_1m = validate_feature_rows(rows_1m, args.features_1m)
     stats_5m = validate_feature_rows(rows_5m, args.features_5m)
+    print(json.dumps({
+        "input_rows": {"1m": len(rows_1m), "5m": len(rows_5m)},
+        "validation": {"1m": stats_1m, "5m": stats_5m},
+        "legacy_mode": bool(args.legacy_mode),
+    }, indent=2))
     summary = {
         "mode": "feature_parquet_l1_only",
         "l2_loader_used_by_adapter": False,
@@ -177,7 +256,8 @@ def main() -> None:
     }
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, default=str)
-    print(json.dumps({"written": args.output, "validation": summary["validation"]}, indent=2))
+    metrics = {k: {mk: v.get(mk) for mk in ("total_trades", "win_rate", "pnl", "max_drawdown", "sharpe") if mk in v} for k, v in summary["results"].items()}
+    print(json.dumps({"written": args.output, "metrics": metrics}, indent=2))
 
 
 if __name__ == "__main__":
