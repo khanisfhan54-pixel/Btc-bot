@@ -2044,6 +2044,7 @@ def run_analysis_cycle(
 
     # ── SHPE probability gate ──────────────────────────────────────────
     shpe_result: dict = {"probability": 0.5, "degraded": True, "regime_used": "<disabled>"}
+    shpe_payload: Dict[str, Any] = {}
     if _SHPE_IMPORT_OK and SHPE_ENABLED and get_shpe_probability is not None:
         try:
             _shpe_raw_candles = candles_by_tf.get("5m") or candles_by_tf.get("1m") or []
@@ -2109,10 +2110,10 @@ def run_analysis_cycle(
                 shpe_degraded = bool(shpe_result.get("degraded", True))
                 stop_hunt_detected = bool(p_sweep > SHPE_HIGH_PROB_THRESHOLD) and not shpe_degraded
                 engines_out["stop_hunt_detected"] = stop_hunt_detected
-                feat_dict["stop_hunt_detected"] = stop_hunt_detected
-                feat_dict["shpe_probability"] = p_sweep
-                feat_dict["shpe_degraded"] = shpe_degraded
-                feat_dict["shpe_regime_used"] = str(shpe_result.get("regime_used", ""))
+                shpe_payload["stop_hunt_detected"] = stop_hunt_detected
+                shpe_payload["shpe_probability"] = p_sweep
+                shpe_payload["shpe_degraded"] = shpe_degraded
+                shpe_payload["shpe_regime_used"] = str(shpe_result.get("regime_used", ""))
                 logger.info("[SHPE] probability=%.4f degraded=%s regime=%s", p_sweep, shpe_degraded, shpe_result.get("regime_used"))
             else:
                 logger.warning("[SHPE] insufficient candles (%d) — degraded fallback", len(_shpe_candles))
@@ -2269,6 +2270,8 @@ def run_analysis_cycle(
 
     # Normalize to a single raw feature dict for all downstream modules
     feat_dict: Dict[str, Any] = features.get("features", features) if isinstance(features, dict) else {}
+    if shpe_payload:
+        feat_dict.update(shpe_payload)
     if getattr(getattr(feature_engine, "_wrapped", None), "_FEATURE_ENGINE_IS_FALLBACK", False):
         logger.warning("[CYCLE] FeatureEngine is in FALLBACK MODE — feature quality is non-production this cycle")
     if getattr(signal_engine, "_SIGNAL_ENGINE_IS_FALLBACK", False):
