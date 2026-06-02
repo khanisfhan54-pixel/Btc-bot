@@ -2,3 +2,6 @@ __pycache__/
 
 # Model weights
 weights/*.npz
+
+# Generated offline SHPE artifacts
+artifacts/
