@@ -92,3 +92,29 @@ Example deterministic smoke test (creates tiny temporary raw CSVs, writes parque
 ```bash
 python3 run_backtest_from_features.py --smoke-test
 ```
+
+## Offline SHPE ML workflow
+
+The offline SHPE training workflow is separate from inference and execution. It
+uses the documented temporary target in `docs/SHPE_TARGET_DEFINITION.md`, builds
+or loads a 5-minute BTCUSDT feature dataset, generates future-only labels,
+trains/calibrates the existing SHPE model stack, saves versioned artifacts, runs
+expanding-window walk-forward validation, and writes JSON/Markdown reports.
+
+Deterministic local smoke command:
+
+```bash
+python -m stop_hunt_engine.training --smoke-test --run-version smoke
+```
+
+For real processed data, pass the 5-minute parquet produced by
+`preprocess/build_btc_feature_parquets.py`:
+
+```bash
+python -m stop_hunt_engine.training \
+  --features-5m /home/ubuntu/btc_bot_data/processed/features_5m.parquet \
+  --run-version btcusdt_5m_YYYYMM
+```
+
+Artifacts are written under `artifacts/shpe/datasets/`, `artifacts/shpe/labels/`,
+`artifacts/shpe/models/`, and `artifacts/shpe/reports/`.
