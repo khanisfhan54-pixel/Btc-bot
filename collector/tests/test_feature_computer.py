@@ -1,5 +1,5 @@
 import pytest
-from collector.collector.feature_computer import compute_orderbook_features, compute_trades_features, compute_markprice_features
+from collector.feature_computer import compute_orderbook_features, compute_trades_features, compute_markprice_features
 
 def test_compute_orderbook_features():
     msg = {

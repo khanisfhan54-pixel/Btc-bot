@@ -1,6 +1,5 @@
 import os
-import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Any, List
 import pyarrow as pa
 import pyarrow.parquet as pa_parquet
@@ -17,6 +16,8 @@ class ParquetWriter:
         self.buffer: List[Dict[str, Any]] = []
         self.current_hour = self._get_current_hour_str()
         self.writer: pa_parquet.ParquetWriter = None
+        self.active_schema = self.schema
+        self.record_count = 0
 
         self._init_writer()
 
@@ -29,9 +30,17 @@ class ParquetWriter:
     def _init_writer(self):
         filepath = self._get_filename(self.current_hour)
         try:
+            interval_start_dt = datetime.strptime(self.current_hour, "%Y-%m-%d-%H")
+            interval_end_dt = interval_start_dt + timedelta(hours=1)
+            existing_metadata = dict(self.schema.metadata or {})
+            interval_metadata = {
+                b"interval_start": (interval_start_dt.isoformat() + "Z").encode(),
+                b"interval_end": (interval_end_dt.isoformat() + "Z").encode(),
+            }
+            self.active_schema = self.schema.with_metadata({**existing_metadata, **interval_metadata})
             self.writer = pa_parquet.ParquetWriter(
                 filepath,
-                self.schema,
+                self.active_schema,
                 compression="snappy"
             )
             logger.info("Initialized parquet writer", stream=self.stream_name, file=filepath)
@@ -42,8 +51,6 @@ class ParquetWriter:
             raise
 
     def write(self, record: Dict[str, Any]):
-        self.buffer.append(record)
-
         # Check rotation
         now_hour = self._get_current_hour_str()
         if now_hour != self.current_hour:
@@ -53,6 +60,8 @@ class ParquetWriter:
             # Re-init for new hour
             self.current_hour = now_hour
             self._init_writer()
+
+        self.buffer.append(record)
 
         # Flush buffer if it gets too large
         if len(self.buffer) >= 1000:
@@ -69,8 +78,9 @@ class ParquetWriter:
                 for k in cols.keys():
                     cols[k].append(rec.get(k))
 
-            table = pa.Table.from_pydict(cols, schema=self.schema)
+            table = pa.Table.from_pydict(cols, schema=self.active_schema)
             self.writer.write_table(table)
+            self.record_count += len(self.buffer)
             self.buffer.clear()
         except Exception as e:
             msg = f"File Write Failure: Could not flush to parquet for {self.stream_name}"
@@ -84,6 +94,7 @@ class ParquetWriter:
                 filepath = self._get_filename(self.current_hour)
                 self.writer.close()
                 file_size = os.path.getsize(filepath) if os.path.exists(filepath) else 0
-                logger.info("Closed parquet file", stream=self.stream_name, file=filepath, size_bytes=file_size)
+                logger.info("Closed parquet file", stream=self.stream_name, file=filepath, size_bytes=file_size, record_count=self.record_count)
+                self.record_count = 0
             except Exception as e:
                 logger.error("Failed to close parquet writer", stream=self.stream_name, error=str(e))

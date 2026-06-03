@@ -18,10 +18,17 @@ class Validator:
     def check_failure_rate(self) -> bool:
         now = time.time()
         if now - self.window_start > 60:
-            rate = self.failures_in_window / self.total_in_window if self.total_in_window > 0 else 0
+            # Validation failure alerts are intentionally evaluated once per completed
+            # 60-second window, using a snapshot before resetting counters for the
+            # next window so rate calculation and reset stay atomic.
+            failures = self.failures_in_window
+            total = self.total_in_window
             self.failures_in_window = 0
             self.total_in_window = 0
             self.window_start = now
+            if total == 0:
+                return False
+            rate = failures / total
             if rate > 0.001:
                 return True
         return False

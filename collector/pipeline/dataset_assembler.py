@@ -1,3 +1,4 @@
+import calendar
 import os
 import pandas as pd
 import numpy as np
@@ -45,8 +46,8 @@ def assemble_dataset(date_str: str, grid_ms: int = 100, data_dir: str = "data"):
     start_dt = datetime.strptime(date_str, "%Y-%m-%d")
     end_dt = start_dt + timedelta(days=1)
 
-    start_ts = int(start_dt.timestamp() * 1000)
-    end_ts = int(end_dt.timestamp() * 1000)
+    start_ts = calendar.timegm(start_dt.timetuple()) * 1000
+    end_ts = calendar.timegm(end_dt.timetuple()) * 1000
 
     grid_ts = np.arange(start_ts, end_ts, grid_ms)
     df_grid = pd.DataFrame({"timestamp": grid_ts})
