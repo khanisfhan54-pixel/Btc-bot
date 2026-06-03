@@ -1,0 +1,200 @@
+[
+  {
+    "timestamp": "2026-06-03T12:34:00.533325+00:00",
+    "symbol": "BTC/USDT",
+    "signal": "HOLD",
+    "confidence": 0.0,
+    "execution_skipped": true,
+    "reason": "signal_only_mode",
+    "regime": "UNKNOWN"
+  },
+  {
+    "timestamp": "2026-06-03T12:38:17.586052+00:00",
+    "symbol": "BTC/USDT",
+    "price": 100.0,
+    "direction": "HOLD",
+    "execution_direction": "HOLD",
+    "ai_score": 0.216,
+    "confidence": 0.0,
+    "long_score": null,
+    "short_score": null,
+    "dry_run": true,
+    "sma_signal": "NEUTRAL",
+    "sma10": null,
+    "sma30": null,
+    "ob_imbalance": 0.0,
+    "whale_signal": "NEUTRAL",
+    "cascade_prob": 0.0,
+    "basis_okx": 100.05,
+    "basis_binance": 100.05,
+    "heat_score": 0,
+    "heat_color": "green",
+    "liq_buy": 0,
+    "liq_sell": 0,
+    "engines": {
+      "alpha": {},
+      "liquidity_map": {
+        "liquidity_map": [
+          {
+            "side": "bid",
+            "level": 0,
+            "price": 100.0,
+            "size": 1.0,
+            "distance_points": 0.0,
+            "source": "book"
+          },
+          {
+            "side": "ask",
+            "level": 0,
+            "price": 100.1,
+            "size": 1.0,
+            "distance_points": 0.09999999999999432,
+            "source": "book"
+          }
+        ],
+        "largest_zone": {
+          "side": "bid",
+          "level": 0,
+          "price": 100.0,
+          "size": 1.0,
+          "distance_points": 0.0,
+          "source": "book"
+        },
+        "nearest_zone": {
+          "side": "bid",
+          "level": 0,
+          "price": 100.0,
+          "size": 1.0,
+          "distance_points": 0.0,
+          "source": "book"
+        },
+        "zone_count": 2
+      },
+      "volume_intelligence": {},
+      "volume_spike": false,
+      "volume_explosion": false,
+      "volume_strength": 0.0,
+      "mtf_confirmation": false
+    },
+    "sniper": {},
+    "trade_plan": null,
+    "volume_intel": {},
+    "signal_notes": [
+      "low_vol_relax",
+      "force_relax_333.40"
+    ],
+    "thresholds": {
+      "long": 0.0007648470305938813,
+      "strong": 0.001274745050989802,
+      "short": -0.0007648470305938813,
+      "strong_short": -0.001274745050989802,
+      "threshold_scale": 1.0,
+      "confidence_scale": 1.0
+    },
+    "smc_signal": {},
+    "execution": {
+      "executed": false,
+      "paper": false,
+      "reason": "not_attempted"
+    }
+  },
+  {
+    "timestamp": "2026-06-03T12:38:17.601667+00:00",
+    "symbol": "BTC/USDT",
+    "price": 100.0,
+    "direction": "HOLD",
+    "execution_direction": "HOLD",
+    "ai_score": 0.216,
+    "confidence": 0.0,
+    "long_score": null,
+    "short_score": null,
+    "dry_run": true,
+    "sma_signal": "NEUTRAL",
+    "sma10": null,
+    "sma30": null,
+    "ob_imbalance": 0.0,
+    "whale_signal": "NEUTRAL",
+    "cascade_prob": 0.0,
+    "basis_okx": 100.05,
+    "basis_binance": 100.05,
+    "heat_score": 0,
+    "heat_color": "green",
+    "liq_buy": 0,
+    "liq_sell": 0,
+    "engines": {
+      "alpha": {},
+      "liquidity_map": {
+        "liquidity_map": [
+          {
+            "side": "bid",
+            "level": 0,
+            "price": 100.0,
+            "size": 1.0,
+            "distance_points": 0.0,
+            "source": "book"
+          },
+          {
+            "side": "ask",
+            "level": 0,
+            "price": 100.1,
+            "size": 1.0,
+            "distance_points": 0.09999999999999432,
+            "source": "book"
+          }
+        ],
+        "largest_zone": {
+          "side": "bid",
+          "level": 0,
+          "price": 100.0,
+          "size": 1.0,
+          "distance_points": 0.0,
+          "source": "book"
+        },
+        "nearest_zone": {
+          "side": "bid",
+          "level": 0,
+          "price": 100.0,
+          "size": 1.0,
+          "distance_points": 0.0,
+          "source": "book"
+        },
+        "zone_count": 2
+      },
+      "volume_intelligence": {},
+      "volume_spike": false,
+      "volume_explosion": false,
+      "volume_strength": 0.0,
+      "mtf_confirmation": false
+    },
+    "sniper": {},
+    "trade_plan": null,
+    "volume_intel": {},
+    "signal_notes": [
+      "low_vol_relax",
+      "force_relax_333.43"
+    ],
+    "thresholds": {
+      "long": 0.0007647705688293511,
+      "strong": 0.0012746176147155853,
+      "short": -0.0007647705688293511,
+      "strong_short": -0.0012746176147155853,
+      "threshold_scale": 1.0,
+      "confidence_scale": 1.0
+    },
+    "smc_signal": {},
+    "execution": {
+      "executed": false,
+      "paper": false,
+      "reason": "not_attempted"
+    }
+  },
+  {
+    "timestamp": "2026-06-03T12:38:29.512423+00:00",
+    "symbol": "BTC/USDT",
+    "signal": "HOLD",
+    "confidence": 0.0,
+    "execution_skipped": true,
+    "reason": "signal_only_mode",
+    "regime": "HALTED"
+  }
+]
