@@ -1,0 +1,18 @@
+[Unit]
+Description=BTCUSDT Perpetual ML Training Data Collector
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/path/to/collector
+Environment="TELEGRAM_BOT_TOKEN=YOUR_BOT_TOKEN"
+Environment="TELEGRAM_CHAT_ID=YOUR_CHAT_ID"
+ExecStart=/usr/bin/python3 run_collector.py
+Restart=always
+RestartSec=5
+# Give the system time to cleanly flush parquets on stop
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

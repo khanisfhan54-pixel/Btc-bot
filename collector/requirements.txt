@@ -1,0 +1,8 @@
+websockets==16.0
+pyarrow==24.0.0
+pandas==3.0.3
+structlog==25.5.0
+numpy==2.4.6
+requests==2.34.2
+pytest==9.0.3
+pytest-asyncio==1.4.0
