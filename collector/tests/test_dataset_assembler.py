@@ -2,7 +2,7 @@ import pytest
 import os
 import pandas as pd
 import numpy as np
-from collector.pipeline.dataset_assembler import assemble_dataset
+from pipeline.dataset_assembler import assemble_dataset
 
 @pytest.fixture
 def test_data(tmp_path):
@@ -14,7 +14,7 @@ def test_data(tmp_path):
     os.makedirs(os.path.join(data_dir, "raw", "trades"))
     os.makedirs(os.path.join(data_dir, "raw", "markprice"))
 
-    start_ts = int(pd.Timestamp(f"{date_str} 00:00:00").timestamp() * 1000)
+    start_ts = int(pd.Timestamp(f"{date_str} 00:00:00", tz="UTC").timestamp() * 1000)
 
     # Orderbook data
     ob_df = pd.DataFrame({

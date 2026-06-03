@@ -17,7 +17,7 @@ class CollectorApp:
     def __init__(self):
         self.running = False
 
-        self.disk_monitor = DiskMonitor()
+        self.disk_monitor = DiskMonitor(shutdown_callback=self.shutdown)
         self.disk_monitor.check_disk_space()
 
         self.validator = Validator()

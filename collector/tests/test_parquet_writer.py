@@ -3,7 +3,7 @@ import os
 import shutil
 import pyarrow as pa
 import pandas as pd
-from collector.collector.parquet_writer import ParquetWriter
+from collector.parquet_writer import ParquetWriter
 
 @pytest.fixture
 def temp_dir(tmp_path):
@@ -53,7 +53,7 @@ def test_parquet_writer_rotation(temp_dir, monkeypatch):
             return datetime.datetime(2026, 6, 3, 10)
 
     # Init writer at hour 10
-    monkeypatch.setattr("collector.collector.parquet_writer.datetime", MockDatetime)
+    monkeypatch.setattr("collector.parquet_writer.datetime", MockDatetime)
     writer = ParquetWriter("test_stream2", schema, base_dir=temp_dir)
 
     assert writer.current_hour == "2026-06-03-10"
@@ -68,7 +68,7 @@ def test_parquet_writer_rotation(temp_dir, monkeypatch):
         def utcnow(cls):
             return datetime.datetime(2026, 6, 3, 11)
 
-    monkeypatch.setattr("collector.collector.parquet_writer.datetime", MockDatetime11)
+    monkeypatch.setattr("collector.parquet_writer.datetime", MockDatetime11)
 
     writer.write({"timestamp": 2000, "value": 2.5})
 

@@ -12,6 +12,7 @@ class WebSocketClient:
         self.running = False
         self.connected = False
         self.retry_delay = 1.0
+        self.attempt = 0
 
     async def start(self):
         self.running = True
@@ -22,6 +23,7 @@ class WebSocketClient:
                 async with websockets.connect(self.url) as ws:
                     self.connected = True
                     self.retry_delay = 1.0
+                    self.attempt = 0
                     logger.info("WebSocket connected")
 
                     if self.on_reconnect:
@@ -44,7 +46,8 @@ class WebSocketClient:
                 logger.error("WebSocket error", error=str(e))
 
             if self.running:
-                logger.info(f"Reconnecting in {self.retry_delay}s...")
+                self.attempt += 1
+                logger.info("Reconnecting WebSocket", attempt=self.attempt, delay=self.retry_delay)
                 await asyncio.sleep(self.retry_delay)
                 self.retry_delay = min(self.retry_delay * 2, 60.0)
 

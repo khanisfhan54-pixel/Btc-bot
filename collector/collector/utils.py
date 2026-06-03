@@ -54,7 +54,7 @@ def send_telegram_alert(message: str):
         return
 
     # Validate bot token defensively
-    if not re.match(r"^\d+:[a-zA-Z0-9_-]{35}$", bot_token):
+    if not re.match(r"^\d+:[a-zA-Z0-9_-]{30,50}$", bot_token):
         logger.error("Invalid Telegram bot token format", message=message)
         return
 

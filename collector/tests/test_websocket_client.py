@@ -1,6 +1,6 @@
 import pytest
 import asyncio
-from collector.collector.websocket_client import WebSocketClient
+from collector.websocket_client import WebSocketClient
 
 @pytest.mark.asyncio
 async def test_websocket_client_lifecycle():

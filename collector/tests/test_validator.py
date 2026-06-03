@@ -1,6 +1,6 @@
 import pytest
 import time
-from collector.collector.validator import Validator
+from collector.validator import Validator
 
 @pytest.fixture
 def validator():
