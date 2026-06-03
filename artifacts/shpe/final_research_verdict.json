@@ -1,0 +1,14 @@
+{
+  "acceptance": false,
+  "checks": {
+    "Calibration": false,
+    "Dataset Quality": true,
+    "Leakage Audit": true,
+    "Overfitting Risk": true,
+    "Regime Stability": false,
+    "Trading Expectancy": false
+  },
+  "confidence": 70,
+  "production_readiness": 0,
+  "required_failure": true
+}

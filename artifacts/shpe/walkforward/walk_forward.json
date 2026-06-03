@@ -1,0 +1,573 @@
+{
+  "folds": [
+    {
+      "first_test_row_index": 49,
+      "fold": 0,
+      "last_train_label_horizon_end_index": 48,
+      "purge_bars": 3,
+      "purged_rows": 3,
+      "test_range": [
+        "2026-03-27T04:05:00+00:00",
+        "2026-03-27T04:50:00+00:00"
+      ],
+      "test_rows": 10,
+      "train_range": [
+        "2026-03-27T01:35:00+00:00",
+        "2026-03-27T03:45:00+00:00"
+      ],
+      "train_rows": 27
+    },
+    {
+      "first_test_row_index": 59,
+      "fold": 1,
+      "last_train_label_horizon_end_index": 58,
+      "purge_bars": 3,
+      "purged_rows": 3,
+      "test_range": [
+        "2026-03-27T04:55:00+00:00",
+        "2026-03-27T05:40:00+00:00"
+      ],
+      "test_rows": 10,
+      "train_range": [
+        "2026-03-27T01:35:00+00:00",
+        "2026-03-27T04:35:00+00:00"
+      ],
+      "train_rows": 37
+    },
+    {
+      "first_test_row_index": 69,
+      "fold": 2,
+      "last_train_label_horizon_end_index": 68,
+      "purge_bars": 3,
+      "purged_rows": 3,
+      "test_range": [
+        "2026-03-27T05:45:00+00:00",
+        "2026-03-27T06:30:00+00:00"
+      ],
+      "test_rows": 10,
+      "train_range": [
+        "2026-03-27T01:35:00+00:00",
+        "2026-03-27T05:25:00+00:00"
+      ],
+      "train_rows": 47
+    },
+    {
+      "first_test_row_index": 79,
+      "fold": 3,
+      "last_train_label_horizon_end_index": 78,
+      "purge_bars": 3,
+      "purged_rows": 3,
+      "test_range": [
+        "2026-03-27T06:35:00+00:00",
+        "2026-03-27T07:20:00+00:00"
+      ],
+      "test_rows": 10,
+      "train_range": [
+        "2026-03-27T01:35:00+00:00",
+        "2026-03-27T06:15:00+00:00"
+      ],
+      "train_rows": 57
+    },
+    {
+      "first_test_row_index": 89,
+      "fold": 4,
+      "last_train_label_horizon_end_index": 88,
+      "purge_bars": 3,
+      "purged_rows": 3,
+      "test_range": [
+        "2026-03-27T07:25:00+00:00",
+        "2026-03-27T07:45:00+00:00"
+      ],
+      "test_rows": 5,
+      "train_range": [
+        "2026-03-27T01:35:00+00:00",
+        "2026-03-27T07:05:00+00:00"
+      ],
+      "train_rows": 67
+    }
+  ],
+  "metrics": {
+    "brier_score": 0.4565661653559647,
+    "expected_calibration_error": 0.4807571970635677,
+    "max_drawdown": -7.780524125230993,
+    "number_of_trades": 21,
+    "sharpe_ratio": -6.6492532721337145,
+    "win_rate": 0.09523809523809523
+  },
+  "predictions": [
+    {
+      "degraded": false,
+      "fold": 0,
+      "label": 0,
+      "probability": 0.00860253617910687,
+      "raw_probability": 0.00860253617910687,
+      "regime_used": "<global>",
+      "row_index": 49,
+      "timestamp_ms": 1774584300000
+    },
+    {
+      "degraded": false,
+      "fold": 0,
+      "label": 0,
+      "probability": 0.3900700355359974,
+      "raw_probability": 0.3900700355359974,
+      "regime_used": "<global>",
+      "row_index": 50,
+      "timestamp_ms": 1774584600000
+    },
+    {
+      "degraded": false,
+      "fold": 0,
+      "label": 0,
+      "probability": 0.9903650573553348,
+      "raw_probability": 0.9903650573553348,
+      "regime_used": "<global>",
+      "row_index": 51,
+      "timestamp_ms": 1774584900000
+    },
+    {
+      "degraded": false,
+      "fold": 0,
+      "label": 0,
+      "probability": 0.9034843466550535,
+      "raw_probability": 0.9034843466550535,
+      "regime_used": "<global>",
+      "row_index": 52,
+      "timestamp_ms": 1774585200000
+    },
+    {
+      "degraded": false,
+      "fold": 0,
+      "label": 0,
+      "probability": 0.9509694346445398,
+      "raw_probability": 0.9509694346445398,
+      "regime_used": "<global>",
+      "row_index": 53,
+      "timestamp_ms": 1774585500000
+    },
+    {
+      "degraded": false,
+      "fold": 0,
+      "label": 0,
+      "probability": 0.5828125357330391,
+      "raw_probability": 0.5828125357330391,
+      "regime_used": "<global>",
+      "row_index": 54,
+      "timestamp_ms": 1774585800000
+    },
+    {
+      "degraded": false,
+      "fold": 0,
+      "label": 0,
+      "probability": 0.9813577085851646,
+      "raw_probability": 0.9813577085851646,
+      "regime_used": "<global>",
+      "row_index": 55,
+      "timestamp_ms": 1774586100000
+    },
+    {
+      "degraded": false,
+      "fold": 0,
+      "label": 0,
+      "probability": 0.9956482518268727,
+      "raw_probability": 0.9956482518268727,
+      "regime_used": "<global>",
+      "row_index": 56,
+      "timestamp_ms": 1774586400000
+    },
+    {
+      "degraded": false,
+      "fold": 0,
+      "label": 0,
+      "probability": 0.9720713297839209,
+      "raw_probability": 0.9720713297839209,
+      "regime_used": "<global>",
+      "row_index": 57,
+      "timestamp_ms": 1774586700000
+    },
+    {
+      "degraded": false,
+      "fold": 0,
+      "label": 0,
+      "probability": 0.9623653591364331,
+      "raw_probability": 0.9623653591364331,
+      "regime_used": "<global>",
+      "row_index": 58,
+      "timestamp_ms": 1774587000000
+    },
+    {
+      "degraded": false,
+      "fold": 1,
+      "label": 0,
+      "probability": 0.9999507381477064,
+      "raw_probability": 0.9999507381477064,
+      "regime_used": "<global>",
+      "row_index": 59,
+      "timestamp_ms": 1774587300000
+    },
+    {
+      "degraded": false,
+      "fold": 1,
+      "label": 0,
+      "probability": 0.9999586240816629,
+      "raw_probability": 0.9999586240816629,
+      "regime_used": "<global>",
+      "row_index": 60,
+      "timestamp_ms": 1774587600000
+    },
+    {
+      "degraded": false,
+      "fold": 1,
+      "label": 0,
+      "probability": 0.5471692545964573,
+      "raw_probability": 0.5471692545964573,
+      "regime_used": "<global>",
+      "row_index": 61,
+      "timestamp_ms": 1774587900000
+    },
+    {
+      "degraded": false,
+      "fold": 1,
+      "label": 0,
+      "probability": 0.006502462773582677,
+      "raw_probability": 0.006502462773582677,
+      "regime_used": "<global>",
+      "row_index": 62,
+      "timestamp_ms": 1774588200000
+    },
+    {
+      "degraded": false,
+      "fold": 1,
+      "label": 0,
+      "probability": 0.042051267471316385,
+      "raw_probability": 0.042051267471316385,
+      "regime_used": "<global>",
+      "row_index": 63,
+      "timestamp_ms": 1774588500000
+    },
+    {
+      "degraded": false,
+      "fold": 1,
+      "label": 0,
+      "probability": 0.9329399171613041,
+      "raw_probability": 0.9329399171613041,
+      "regime_used": "<global>",
+      "row_index": 64,
+      "timestamp_ms": 1774588800000
+    },
+    {
+      "degraded": false,
+      "fold": 1,
+      "label": 0,
+      "probability": 0.9999999850109966,
+      "raw_probability": 0.9999999850109966,
+      "regime_used": "<global>",
+      "row_index": 65,
+      "timestamp_ms": 1774589100000
+    },
+    {
+      "degraded": false,
+      "fold": 1,
+      "label": 0,
+      "probability": 0.9999999963974142,
+      "raw_probability": 0.9999999963974142,
+      "regime_used": "<global>",
+      "row_index": 66,
+      "timestamp_ms": 1774589400000
+    },
+    {
+      "degraded": false,
+      "fold": 1,
+      "label": 0,
+      "probability": 0.9999999976724807,
+      "raw_probability": 0.9999999976724807,
+      "regime_used": "<global>",
+      "row_index": 67,
+      "timestamp_ms": 1774589700000
+    },
+    {
+      "degraded": false,
+      "fold": 1,
+      "label": 0,
+      "probability": 0.9999999521770463,
+      "raw_probability": 0.9999999521770463,
+      "regime_used": "<global>",
+      "row_index": 68,
+      "timestamp_ms": 1774590000000
+    },
+    {
+      "degraded": false,
+      "fold": 2,
+      "label": 0,
+      "probability": 0.8021038634565217,
+      "raw_probability": 0.8021038634565217,
+      "regime_used": "<global>",
+      "row_index": 69,
+      "timestamp_ms": 1774590300000
+    },
+    {
+      "degraded": false,
+      "fold": 2,
+      "label": 0,
+      "probability": 0.8452114085724439,
+      "raw_probability": 0.8452114085724439,
+      "regime_used": "<global>",
+      "row_index": 70,
+      "timestamp_ms": 1774590600000
+    },
+    {
+      "degraded": false,
+      "fold": 2,
+      "label": 0,
+      "probability": 0.6558719639625172,
+      "raw_probability": 0.6558719639625172,
+      "regime_used": "<global>",
+      "row_index": 71,
+      "timestamp_ms": 1774590900000
+    },
+    {
+      "degraded": false,
+      "fold": 2,
+      "label": 0,
+      "probability": 0.7054136548705396,
+      "raw_probability": 0.7054136548705396,
+      "regime_used": "<global>",
+      "row_index": 72,
+      "timestamp_ms": 1774591200000
+    },
+    {
+      "degraded": false,
+      "fold": 2,
+      "label": 0,
+      "probability": 0.10888865515611935,
+      "raw_probability": 0.10888865515611935,
+      "regime_used": "<global>",
+      "row_index": 73,
+      "timestamp_ms": 1774591500000
+    },
+    {
+      "degraded": false,
+      "fold": 2,
+      "label": 0,
+      "probability": 0.11363802934313323,
+      "raw_probability": 0.11363802934313323,
+      "regime_used": "<global>",
+      "row_index": 74,
+      "timestamp_ms": 1774591800000
+    },
+    {
+      "degraded": false,
+      "fold": 2,
+      "label": 0,
+      "probability": 0.00014036114812763644,
+      "raw_probability": 0.00014036114812763644,
+      "regime_used": "<global>",
+      "row_index": 75,
+      "timestamp_ms": 1774592100000
+    },
+    {
+      "degraded": false,
+      "fold": 2,
+      "label": 0,
+      "probability": 0.006084304653990757,
+      "raw_probability": 0.006084304653990757,
+      "regime_used": "<global>",
+      "row_index": 76,
+      "timestamp_ms": 1774592400000
+    },
+    {
+      "degraded": false,
+      "fold": 2,
+      "label": 0,
+      "probability": 0.004748739085660092,
+      "raw_probability": 0.004748739085660092,
+      "regime_used": "<global>",
+      "row_index": 77,
+      "timestamp_ms": 1774592700000
+    },
+    {
+      "degraded": false,
+      "fold": 2,
+      "label": 0,
+      "probability": 0.0033820228626092698,
+      "raw_probability": 0.0033820228626092698,
+      "regime_used": "<global>",
+      "row_index": 78,
+      "timestamp_ms": 1774593000000
+    },
+    {
+      "degraded": false,
+      "fold": 3,
+      "label": 0,
+      "probability": 0.0034671925453614375,
+      "raw_probability": 0.0034671925453614375,
+      "regime_used": "<global>",
+      "row_index": 79,
+      "timestamp_ms": 1774593300000
+    },
+    {
+      "degraded": false,
+      "fold": 3,
+      "label": 0,
+      "probability": 0.0014167845447348275,
+      "raw_probability": 0.0014167845447348275,
+      "regime_used": "<global>",
+      "row_index": 80,
+      "timestamp_ms": 1774593600000
+    },
+    {
+      "degraded": false,
+      "fold": 3,
+      "label": 0,
+      "probability": 0.023966099397139333,
+      "raw_probability": 0.023966099397139333,
+      "regime_used": "<global>",
+      "row_index": 81,
+      "timestamp_ms": 1774593900000
+    },
+    {
+      "degraded": false,
+      "fold": 3,
+      "label": 0,
+      "probability": 0.001774010383923158,
+      "raw_probability": 0.001774010383923158,
+      "regime_used": "<global>",
+      "row_index": 82,
+      "timestamp_ms": 1774594200000
+    },
+    {
+      "degraded": false,
+      "fold": 3,
+      "label": 1,
+      "probability": 0.8075998977696596,
+      "raw_probability": 0.8075998977696596,
+      "regime_used": "<global>",
+      "row_index": 83,
+      "timestamp_ms": 1774594500000
+    },
+    {
+      "degraded": false,
+      "fold": 3,
+      "label": 1,
+      "probability": 0.30652691553028594,
+      "raw_probability": 0.30652691553028594,
+      "regime_used": "<global>",
+      "row_index": 84,
+      "timestamp_ms": 1774594800000
+    },
+    {
+      "degraded": false,
+      "fold": 3,
+      "label": 1,
+      "probability": 0.47857419348321584,
+      "raw_probability": 0.47857419348321584,
+      "regime_used": "<global>",
+      "row_index": 85,
+      "timestamp_ms": 1774595100000
+    },
+    {
+      "degraded": false,
+      "fold": 3,
+      "label": 1,
+      "probability": 0.76012086768472,
+      "raw_probability": 0.76012086768472,
+      "regime_used": "<global>",
+      "row_index": 86,
+      "timestamp_ms": 1774595400000
+    },
+    {
+      "degraded": false,
+      "fold": 3,
+      "label": 1,
+      "probability": 0.11891832560570878,
+      "raw_probability": 0.11891832560570878,
+      "regime_used": "<global>",
+      "row_index": 87,
+      "timestamp_ms": 1774595700000
+    },
+    {
+      "degraded": false,
+      "fold": 3,
+      "label": 0,
+      "probability": 0.1737138553369827,
+      "raw_probability": 0.1737138553369827,
+      "regime_used": "<global>",
+      "row_index": 88,
+      "timestamp_ms": 1774596000000
+    },
+    {
+      "degraded": false,
+      "fold": 4,
+      "label": 0,
+      "probability": 0.23072643442475246,
+      "raw_probability": 0.033436912286978385,
+      "regime_used": "<global>",
+      "row_index": 89,
+      "timestamp_ms": 1774596300000
+    },
+    {
+      "degraded": false,
+      "fold": 4,
+      "label": 1,
+      "probability": 0.23171169969466027,
+      "raw_probability": 0.08831803379105373,
+      "regime_used": "<global>",
+      "row_index": 90,
+      "timestamp_ms": 1774596600000
+    },
+    {
+      "degraded": false,
+      "fold": 4,
+      "label": 1,
+      "probability": 0.23668354176621467,
+      "raw_probability": 0.3628080267904377,
+      "regime_used": "<global>",
+      "row_index": 91,
+      "timestamp_ms": 1774596900000
+    },
+    {
+      "degraded": false,
+      "fold": 4,
+      "label": 1,
+      "probability": 0.24103855648780176,
+      "raw_probability": 0.5999919877405842,
+      "regime_used": "<global>",
+      "row_index": 92,
+      "timestamp_ms": 1774597200000
+    },
+    {
+      "degraded": false,
+      "fold": 4,
+      "label": 1,
+      "probability": 0.2329858161019606,
+      "raw_probability": 0.15904763137997846,
+      "regime_used": "<global>",
+      "row_index": 93,
+      "timestamp_ms": 1774597500000
+    }
+  ],
+  "target_definition": {
+    "bar_interval": "5m",
+    "event": "future stop-hunt sweep with rejection through prior high/low liquidity pool",
+    "horizon_bars": 3,
+    "ignore_zone": "insufficient past pool bars, missing full future horizon, or invalid prices",
+    "negative_condition": "full horizon exists and no positive sweep occurs",
+    "no_lookahead_rule": "features/pools use bars <= t; labels use bars t+1..t+horizon after features are fixed",
+    "pool_lookback_bars": 20,
+    "positive_condition": "future high sweeps prior high pool and closes back below it, or future low sweeps prior low pool and closes back above it",
+    "regime_conditioning": "existing regime label used for model routing only; not used to create labels",
+    "sweep_buffer_bps": 1.0,
+    "symbol": "BTCUSDT",
+    "version": "shpe-target.v1.0.0-temporary"
+  },
+  "tested_date_range": [
+    1774584300000,
+    1774597500000
+  ],
+  "walk_forward_config": {
+    "min_train": 30,
+    "mode": "expanding_window_purged",
+    "purge_bars": 3,
+    "test_size": 10
+  }
+}

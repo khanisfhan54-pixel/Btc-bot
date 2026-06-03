@@ -1,0 +1,902 @@
+{
+  "labels": [
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774569900000,
+      "horizon_bars": 3,
+      "label": null,
+      "reason": "insufficient_past",
+      "row_index": 0,
+      "timestamp_ms": 1774569600000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774570200000,
+      "horizon_bars": 3,
+      "label": null,
+      "reason": "insufficient_past",
+      "row_index": 1,
+      "timestamp_ms": 1774569900000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774570500000,
+      "horizon_bars": 3,
+      "label": null,
+      "reason": "insufficient_past",
+      "row_index": 2,
+      "timestamp_ms": 1774570200000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774570800000,
+      "horizon_bars": 3,
+      "label": null,
+      "reason": "insufficient_past",
+      "row_index": 3,
+      "timestamp_ms": 1774570500000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774571100000,
+      "horizon_bars": 3,
+      "label": null,
+      "reason": "insufficient_past",
+      "row_index": 4,
+      "timestamp_ms": 1774570800000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774571400000,
+      "horizon_bars": 3,
+      "label": null,
+      "reason": "insufficient_past",
+      "row_index": 5,
+      "timestamp_ms": 1774571100000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774571700000,
+      "horizon_bars": 3,
+      "label": null,
+      "reason": "insufficient_past",
+      "row_index": 6,
+      "timestamp_ms": 1774571400000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774572000000,
+      "horizon_bars": 3,
+      "label": null,
+      "reason": "insufficient_past",
+      "row_index": 7,
+      "timestamp_ms": 1774571700000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774572300000,
+      "horizon_bars": 3,
+      "label": null,
+      "reason": "insufficient_past",
+      "row_index": 8,
+      "timestamp_ms": 1774572000000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774572600000,
+      "horizon_bars": 3,
+      "label": null,
+      "reason": "insufficient_past",
+      "row_index": 9,
+      "timestamp_ms": 1774572300000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774572900000,
+      "horizon_bars": 3,
+      "label": null,
+      "reason": "insufficient_past",
+      "row_index": 10,
+      "timestamp_ms": 1774572600000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774573200000,
+      "horizon_bars": 3,
+      "label": null,
+      "reason": "insufficient_past",
+      "row_index": 11,
+      "timestamp_ms": 1774572900000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774573500000,
+      "horizon_bars": 3,
+      "label": null,
+      "reason": "insufficient_past",
+      "row_index": 12,
+      "timestamp_ms": 1774573200000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774573800000,
+      "horizon_bars": 3,
+      "label": null,
+      "reason": "insufficient_past",
+      "row_index": 13,
+      "timestamp_ms": 1774573500000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774574100000,
+      "horizon_bars": 3,
+      "label": null,
+      "reason": "insufficient_past",
+      "row_index": 14,
+      "timestamp_ms": 1774573800000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774574400000,
+      "horizon_bars": 3,
+      "label": null,
+      "reason": "insufficient_past",
+      "row_index": 15,
+      "timestamp_ms": 1774574100000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774574700000,
+      "horizon_bars": 3,
+      "label": null,
+      "reason": "insufficient_past",
+      "row_index": 16,
+      "timestamp_ms": 1774574400000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774575000000,
+      "horizon_bars": 3,
+      "label": null,
+      "reason": "insufficient_past",
+      "row_index": 17,
+      "timestamp_ms": 1774574700000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774575300000,
+      "horizon_bars": 3,
+      "label": null,
+      "reason": "insufficient_past",
+      "row_index": 18,
+      "timestamp_ms": 1774575000000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774575600000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 19,
+      "timestamp_ms": 1774575300000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774575900000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 20,
+      "timestamp_ms": 1774575600000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774576200000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 21,
+      "timestamp_ms": 1774575900000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774576500000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 22,
+      "timestamp_ms": 1774576200000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774576800000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 23,
+      "timestamp_ms": 1774576500000
+    },
+    {
+      "event_timestamp_ms": 1774577700000,
+      "feature_available_ts_ms": 1774577100000,
+      "horizon_bars": 3,
+      "label": 1,
+      "reason": "high",
+      "row_index": 24,
+      "timestamp_ms": 1774576800000
+    },
+    {
+      "event_timestamp_ms": 1774577700000,
+      "feature_available_ts_ms": 1774577400000,
+      "horizon_bars": 3,
+      "label": 1,
+      "reason": "high",
+      "row_index": 25,
+      "timestamp_ms": 1774577100000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774577700000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 26,
+      "timestamp_ms": 1774577400000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774578000000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 27,
+      "timestamp_ms": 1774577700000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774578300000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 28,
+      "timestamp_ms": 1774578000000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774578600000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 29,
+      "timestamp_ms": 1774578300000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774578900000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 30,
+      "timestamp_ms": 1774578600000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774579200000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 31,
+      "timestamp_ms": 1774578900000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774579500000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 32,
+      "timestamp_ms": 1774579200000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774579800000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 33,
+      "timestamp_ms": 1774579500000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774580100000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 34,
+      "timestamp_ms": 1774579800000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774580400000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 35,
+      "timestamp_ms": 1774580100000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774580700000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 36,
+      "timestamp_ms": 1774580400000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774581000000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 37,
+      "timestamp_ms": 1774580700000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774581300000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 38,
+      "timestamp_ms": 1774581000000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774581600000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 39,
+      "timestamp_ms": 1774581300000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774581900000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 40,
+      "timestamp_ms": 1774581600000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774582200000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 41,
+      "timestamp_ms": 1774581900000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774582500000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 42,
+      "timestamp_ms": 1774582200000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774582800000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 43,
+      "timestamp_ms": 1774582500000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774583100000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 44,
+      "timestamp_ms": 1774582800000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774583400000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 45,
+      "timestamp_ms": 1774583100000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774583700000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 46,
+      "timestamp_ms": 1774583400000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774584000000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 47,
+      "timestamp_ms": 1774583700000
+    },
+    {
+      "event_timestamp_ms": 1774584900000,
+      "feature_available_ts_ms": 1774584300000,
+      "horizon_bars": 3,
+      "label": 1,
+      "reason": "low",
+      "row_index": 48,
+      "timestamp_ms": 1774584000000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774584600000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 49,
+      "timestamp_ms": 1774584300000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774584900000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 50,
+      "timestamp_ms": 1774584600000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774585200000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 51,
+      "timestamp_ms": 1774584900000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774585500000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 52,
+      "timestamp_ms": 1774585200000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774585800000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 53,
+      "timestamp_ms": 1774585500000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774586100000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 54,
+      "timestamp_ms": 1774585800000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774586400000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 55,
+      "timestamp_ms": 1774586100000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774586700000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 56,
+      "timestamp_ms": 1774586400000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774587000000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 57,
+      "timestamp_ms": 1774586700000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774587300000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 58,
+      "timestamp_ms": 1774587000000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774587600000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 59,
+      "timestamp_ms": 1774587300000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774587900000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 60,
+      "timestamp_ms": 1774587600000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774588200000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 61,
+      "timestamp_ms": 1774587900000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774588500000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 62,
+      "timestamp_ms": 1774588200000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774588800000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 63,
+      "timestamp_ms": 1774588500000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774589100000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 64,
+      "timestamp_ms": 1774588800000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774589400000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 65,
+      "timestamp_ms": 1774589100000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774589700000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 66,
+      "timestamp_ms": 1774589400000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774590000000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 67,
+      "timestamp_ms": 1774589700000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774590300000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 68,
+      "timestamp_ms": 1774590000000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774590600000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 69,
+      "timestamp_ms": 1774590300000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774590900000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 70,
+      "timestamp_ms": 1774590600000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774591200000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 71,
+      "timestamp_ms": 1774590900000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774591500000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 72,
+      "timestamp_ms": 1774591200000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774591800000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 73,
+      "timestamp_ms": 1774591500000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774592100000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 74,
+      "timestamp_ms": 1774591800000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774592400000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 75,
+      "timestamp_ms": 1774592100000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774592700000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 76,
+      "timestamp_ms": 1774592400000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774593000000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 77,
+      "timestamp_ms": 1774592700000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774593300000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 78,
+      "timestamp_ms": 1774593000000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774593600000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 79,
+      "timestamp_ms": 1774593300000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774593900000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 80,
+      "timestamp_ms": 1774593600000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774594200000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 81,
+      "timestamp_ms": 1774593900000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774594500000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 82,
+      "timestamp_ms": 1774594200000
+    },
+    {
+      "event_timestamp_ms": 1774595700000,
+      "feature_available_ts_ms": 1774594800000,
+      "horizon_bars": 3,
+      "label": 1,
+      "reason": "high",
+      "row_index": 83,
+      "timestamp_ms": 1774594500000
+    },
+    {
+      "event_timestamp_ms": 1774595700000,
+      "feature_available_ts_ms": 1774595100000,
+      "horizon_bars": 3,
+      "label": 1,
+      "reason": "high",
+      "row_index": 84,
+      "timestamp_ms": 1774594800000
+    },
+    {
+      "event_timestamp_ms": 1774595700000,
+      "feature_available_ts_ms": 1774595400000,
+      "horizon_bars": 3,
+      "label": 1,
+      "reason": "high",
+      "row_index": 85,
+      "timestamp_ms": 1774595100000
+    },
+    {
+      "event_timestamp_ms": 1774596000000,
+      "feature_available_ts_ms": 1774595700000,
+      "horizon_bars": 3,
+      "label": 1,
+      "reason": "high",
+      "row_index": 86,
+      "timestamp_ms": 1774595400000
+    },
+    {
+      "event_timestamp_ms": 1774596300000,
+      "feature_available_ts_ms": 1774596000000,
+      "horizon_bars": 3,
+      "label": 1,
+      "reason": "high",
+      "row_index": 87,
+      "timestamp_ms": 1774595700000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774596300000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 88,
+      "timestamp_ms": 1774596000000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774596600000,
+      "horizon_bars": 3,
+      "label": 0,
+      "reason": "no_sweep",
+      "row_index": 89,
+      "timestamp_ms": 1774596300000
+    },
+    {
+      "event_timestamp_ms": 1774597500000,
+      "feature_available_ts_ms": 1774596900000,
+      "horizon_bars": 3,
+      "label": 1,
+      "reason": "low",
+      "row_index": 90,
+      "timestamp_ms": 1774596600000
+    },
+    {
+      "event_timestamp_ms": 1774597500000,
+      "feature_available_ts_ms": 1774597200000,
+      "horizon_bars": 3,
+      "label": 1,
+      "reason": "low",
+      "row_index": 91,
+      "timestamp_ms": 1774596900000
+    },
+    {
+      "event_timestamp_ms": 1774598400000,
+      "feature_available_ts_ms": 1774597500000,
+      "horizon_bars": 3,
+      "label": 1,
+      "reason": "low",
+      "row_index": 92,
+      "timestamp_ms": 1774597200000
+    },
+    {
+      "event_timestamp_ms": 1774598400000,
+      "feature_available_ts_ms": 1774597800000,
+      "horizon_bars": 3,
+      "label": 1,
+      "reason": "low",
+      "row_index": 93,
+      "timestamp_ms": 1774597500000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774598100000,
+      "horizon_bars": 3,
+      "label": null,
+      "reason": "insufficient_future",
+      "row_index": 94,
+      "timestamp_ms": 1774597800000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774598400000,
+      "horizon_bars": 3,
+      "label": null,
+      "reason": "insufficient_future",
+      "row_index": 95,
+      "timestamp_ms": 1774598100000
+    },
+    {
+      "event_timestamp_ms": null,
+      "feature_available_ts_ms": 1774598700000,
+      "horizon_bars": 3,
+      "label": null,
+      "reason": "insufficient_future",
+      "row_index": 96,
+      "timestamp_ms": 1774598400000
+    }
+  ],
+  "labels_version": "btc_repo_history_20260327",
+  "metadata": {
+    "exclusions": [
+      "insufficient_past",
+      "insufficient_future"
+    ],
+    "horizon_bars": 3,
+    "pool_lookback_bars": 20,
+    "sweep_buffer_bps": 1.0
+  },
+  "schema_version": "shpe-labels.v1.0.0",
+  "target_definition": {
+    "bar_interval": "5m",
+    "event": "future stop-hunt sweep with rejection through prior high/low liquidity pool",
+    "horizon_bars": 3,
+    "ignore_zone": "insufficient past pool bars, missing full future horizon, or invalid prices",
+    "negative_condition": "full horizon exists and no positive sweep occurs",
+    "no_lookahead_rule": "features/pools use bars <= t; labels use bars t+1..t+horizon after features are fixed",
+    "pool_lookback_bars": 20,
+    "positive_condition": "future high sweeps prior high pool and closes back below it, or future low sweeps prior low pool and closes back above it",
+    "regime_conditioning": "existing regime label used for model routing only; not used to create labels",
+    "sweep_buffer_bps": 1.0,
+    "symbol": "BTCUSDT",
+    "version": "shpe-target.v1.0.0-temporary"
+  }
+}
