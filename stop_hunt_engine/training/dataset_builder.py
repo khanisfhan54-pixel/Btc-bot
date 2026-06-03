@@ -1,15 +1,33 @@
 from __future__ import annotations
 
+import logging
 import math
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 from ..model.engine import SHPE_FEATURE_NAMES
 from .io import atomic_write_json, ensure_dir, read_json
 from .target import DEFAULT_TARGET, TargetDefinition
 
 DATASET_SCHEMA_VERSION = "shpe-dataset.v1.0.0"
+LOGGER = logging.getLogger(__name__)
+
+_EXTERNAL_SOURCE_FEATURE_FIELDS = {
+    "funding": ("funding_rate_8h", "funding_z30d", "funding_oi_sign_divergence"),
+    "open_interest": ("delta_oi_velocity", "oi_pct_change_1h", "oi_buildup_flag", "oi_price_divergence_sign"),
+    "liquidation": ("nearest_long_cluster_dist_pct", "nearest_short_cluster_dist_pct", "cascade_amplification_flag"),
+    "lob": ("ofi_zscore", "l1_order_flow_proxy_z", "book_imbalance", "imbalance", "depth_replenishment_ratio"),
+    "regime": ("regime", "regime_label", "regime_confidence", "regime_conviction", "regime_edge_score", "regime_signal_valid", "regime_expected_volatility"),
+}
+
+_EXTERNAL_SOURCE_TIMESTAMP_FIELDS = {
+    "funding": ("funding_timestamp_ms", "funding_ts_ms"),
+    "open_interest": ("oi_timestamp_ms", "open_interest_timestamp_ms", "open_interest_ts_ms"),
+    "liquidation": ("liquidation_timestamp_ms", "liq_timestamp_ms", "liquidation_ts_ms"),
+    "lob": ("last_book_event_ts_ms",),
+    "regime": ("regime_timestamp_ms", "regime_ts_ms"),
+}
 
 
 def _f(row: Dict[str, Any], key: str, default: float = 0.0) -> float:
@@ -31,6 +49,43 @@ def _date(ts_ms: int) -> str:
     return datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).isoformat()
 
 
+def _present(row: Dict[str, Any], key: str) -> bool:
+    return key in row and row.get(key) not in (None, "")
+
+
+def _validate_timestamp_not_after_availability(row_idx: int, source: str, field: str, row: Dict[str, Any], feature_available_ts_ms: int) -> None:
+    if not _present(row, field):
+        return
+    source_timestamp = _i(row, field)
+    if source_timestamp > feature_available_ts_ms:
+        raise ValueError(
+            "external feature timestamp lookahead: "
+            f"row={row_idx} source={source} field={field} "
+            f"timestamp={source_timestamp} feature_available_ts_ms={feature_available_ts_ms}"
+        )
+
+
+def _validate_external_feature_timestamps(row_idx: int, row: Dict[str, Any], feature_available_ts_ms: int, warned_sources: Set[str]) -> None:
+    for source, feature_fields in _EXTERNAL_SOURCE_FEATURE_FIELDS.items():
+        if not any(_present(row, field) for field in feature_fields):
+            continue
+        timestamp_fields = _EXTERNAL_SOURCE_TIMESTAMP_FIELDS[source]
+        present_timestamp_fields = [field for field in timestamp_fields if _present(row, field)]
+        if not present_timestamp_fields:
+            if source not in warned_sources:
+                LOGGER.warning(
+                    "external feature timestamp NOT VERIFIED: source=%s row=%s feature_available_ts_ms=%s missing_timestamp_fields=%s",
+                    source,
+                    row_idx,
+                    feature_available_ts_ms,
+                    ",".join(timestamp_fields),
+                )
+                warned_sources.add(source)
+            continue
+        for field in present_timestamp_fields:
+            _validate_timestamp_not_after_availability(row_idx, source, field, row, feature_available_ts_ms)
+
+
 def validate_feature_rows(rows: Sequence[Dict[str, Any]], *, interval: str = "5m") -> None:
     if not rows:
         raise ValueError("SHPE dataset requires at least one feature row")
@@ -39,6 +94,7 @@ def validate_feature_rows(rows: Sequence[Dict[str, Any]], *, interval: str = "5m
     if missing:
         raise ValueError(f"feature rows missing required columns: {missing}")
     prev: Optional[int] = None
+    warned_sources: Set[str] = set()
     for idx, row in enumerate(rows):
         ts = _i(row, "timestamp_ms")
         end = _i(row, "bar_end_ts_ms")
@@ -54,9 +110,8 @@ def validate_feature_rows(rows: Sequence[Dict[str, Any]], *, interval: str = "5m
             raise ValueError(f"row {idx} contains non-positive OHLC")
         if _f(row, "high") < _f(row, "low"):
             raise ValueError(f"row {idx} high < low")
-        for k in ("last_trade_ts_ms", "last_book_event_ts_ms"):
-            if row.get(k) not in (None, "") and _i(row, k) >= end:
-                raise ValueError(f"row {idx} {k} lookahead leak past feature availability")
+        _validate_timestamp_not_after_availability(idx, "trade", "last_trade_ts_ms", row, avail)
+        _validate_external_feature_timestamps(idx, row, avail, warned_sources)
 
 
 def derive_features(rows: Sequence[Dict[str, Any]], idx: int, target: TargetDefinition = DEFAULT_TARGET) -> Dict[str, float]:
