@@ -38,7 +38,7 @@ def _smoke_rows(n: int = 80) -> List[Dict[str, Any]]:
             "symbol": "BTCUSDT", "bar_interval": "5m", "timestamp_ms": ts, "bar_start_ts_ms": ts, "bar_end_ts_ms": ts + interval, "feature_available_ts_ms": ts + interval,
             "open": round(open_, 6), "high": round(max(high, open_, close), 6), "low": round(min(low, open_, close), 6), "close": round(close, 6), "volume": round(10.0 + (i % 7), 6),
             "ofi_zscore": math.sin(i / 5.0), "book_imbalance": max(-1.0, min(1.0, math.sin(i / 4.0))), "volatility": 0.01 + abs(math.sin(i / 8.0)) * 0.01,
-            "regime": "range" if i % 2 == 0 else "trend", "last_trade_ts_ms": ts + interval - 1_000, "last_book_event_ts_ms": ts + interval - 1_000,
+            "regime": "range" if i % 2 == 0 else "trend", "regime_timestamp_ms": ts + interval, "last_trade_ts_ms": ts + interval - 1_000, "last_book_event_ts_ms": ts + interval - 1_000,
         })
     return rows
 
