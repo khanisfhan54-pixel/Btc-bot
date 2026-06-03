@@ -1,17 +1,15 @@
 from __future__ import annotations
 
-import logging
 import math
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence, Set
+from typing import Any, Dict, List, Optional, Sequence
 
 from ..model.engine import SHPE_FEATURE_NAMES
 from .io import atomic_write_json, ensure_dir, read_json
 from .target import DEFAULT_TARGET, TargetDefinition
 
 DATASET_SCHEMA_VERSION = "shpe-dataset.v1.0.0"
-LOGGER = logging.getLogger(__name__)
 
 _EXTERNAL_SOURCE_FEATURE_FIELDS = {
     "funding": ("funding_rate_8h", "funding_z30d", "funding_oi_sign_divergence"),
@@ -53,10 +51,27 @@ def _present(row: Dict[str, Any], key: str) -> bool:
     return key in row and row.get(key) not in (None, "")
 
 
+def _parse_source_timestamp(row_idx: int, source: str, field: str, row: Dict[str, Any]) -> int:
+    raw = row.get(field)
+    try:
+        timestamp = int(float(raw))
+    except Exception as exc:
+        raise ValueError(
+            "external feature timestamp invalid: "
+            f"row={row_idx} source={source} field={field} timestamp={raw!r}"
+        ) from exc
+    if timestamp < 0:
+        raise ValueError(
+            "external feature timestamp invalid: "
+            f"row={row_idx} source={source} field={field} timestamp={timestamp}"
+        )
+    return timestamp
+
+
 def _validate_timestamp_not_after_availability(row_idx: int, source: str, field: str, row: Dict[str, Any], feature_available_ts_ms: int) -> None:
     if not _present(row, field):
         return
-    source_timestamp = _i(row, field)
+    source_timestamp = _parse_source_timestamp(row_idx, source, field, row)
     if source_timestamp > feature_available_ts_ms:
         raise ValueError(
             "external feature timestamp lookahead: "
@@ -65,23 +80,18 @@ def _validate_timestamp_not_after_availability(row_idx: int, source: str, field:
         )
 
 
-def _validate_external_feature_timestamps(row_idx: int, row: Dict[str, Any], feature_available_ts_ms: int, warned_sources: Set[str]) -> None:
+def _validate_external_feature_timestamps(row_idx: int, row: Dict[str, Any], feature_available_ts_ms: int) -> None:
     for source, feature_fields in _EXTERNAL_SOURCE_FEATURE_FIELDS.items():
         if not any(_present(row, field) for field in feature_fields):
             continue
         timestamp_fields = _EXTERNAL_SOURCE_TIMESTAMP_FIELDS[source]
         present_timestamp_fields = [field for field in timestamp_fields if _present(row, field)]
         if not present_timestamp_fields:
-            if source not in warned_sources:
-                LOGGER.warning(
-                    "external feature timestamp NOT VERIFIED: source=%s row=%s feature_available_ts_ms=%s missing_timestamp_fields=%s",
-                    source,
-                    row_idx,
-                    feature_available_ts_ms,
-                    ",".join(timestamp_fields),
-                )
-                warned_sources.add(source)
-            continue
+            raise ValueError(
+                "external feature timestamp missing: "
+                f"row={row_idx} source={source} feature_available_ts_ms={feature_available_ts_ms} "
+                f"required_timestamp_fields={','.join(timestamp_fields)}"
+            )
         for field in present_timestamp_fields:
             _validate_timestamp_not_after_availability(row_idx, source, field, row, feature_available_ts_ms)
 
@@ -94,7 +104,6 @@ def validate_feature_rows(rows: Sequence[Dict[str, Any]], *, interval: str = "5m
     if missing:
         raise ValueError(f"feature rows missing required columns: {missing}")
     prev: Optional[int] = None
-    warned_sources: Set[str] = set()
     for idx, row in enumerate(rows):
         ts = _i(row, "timestamp_ms")
         end = _i(row, "bar_end_ts_ms")
@@ -111,7 +120,7 @@ def validate_feature_rows(rows: Sequence[Dict[str, Any]], *, interval: str = "5m
         if _f(row, "high") < _f(row, "low"):
             raise ValueError(f"row {idx} high < low")
         _validate_timestamp_not_after_availability(idx, "trade", "last_trade_ts_ms", row, avail)
-        _validate_external_feature_timestamps(idx, row, avail, warned_sources)
+        _validate_external_feature_timestamps(idx, row, avail)
 
 
 def derive_features(rows: Sequence[Dict[str, Any]], idx: int, target: TargetDefinition = DEFAULT_TARGET) -> Dict[str, float]:

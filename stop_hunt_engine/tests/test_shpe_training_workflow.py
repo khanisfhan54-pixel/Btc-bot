@@ -40,6 +40,22 @@ EXTERNAL_TIMESTAMP_CASES = (
     ("regime", "regime_confidence", "regime_timestamp_ms"),
 )
 
+EXTERNAL_FEATURE_FIELDS = {
+    "funding": ("funding_rate_8h", "funding_z30d", "funding_oi_sign_divergence"),
+    "open_interest": ("delta_oi_velocity", "oi_pct_change_1h", "oi_buildup_flag", "oi_price_divergence_sign"),
+    "liquidation": ("nearest_long_cluster_dist_pct", "nearest_short_cluster_dist_pct", "cascade_amplification_flag"),
+    "lob": ("ofi_zscore", "l1_order_flow_proxy_z", "book_imbalance", "imbalance", "depth_replenishment_ratio"),
+    "regime": ("regime", "regime_label", "regime_confidence", "regime_conviction", "regime_edge_score", "regime_signal_valid", "regime_expected_volatility"),
+}
+
+EXTERNAL_TIMESTAMP_FIELDS = {
+    "funding": ("funding_timestamp_ms", "funding_ts_ms"),
+    "open_interest": ("oi_timestamp_ms", "open_interest_timestamp_ms", "open_interest_ts_ms"),
+    "liquidation": ("liquidation_timestamp_ms", "liq_timestamp_ms", "liquidation_ts_ms"),
+    "lob": ("last_book_event_ts_ms",),
+    "regime": ("regime_timestamp_ms", "regime_ts_ms"),
+}
+
 
 @pytest.mark.parametrize("source,feature_field,timestamp_field", EXTERNAL_TIMESTAMP_CASES)
 def test_external_feature_timestamp_asof_validation_passes(tmp_path, source, feature_field, timestamp_field):
@@ -51,24 +67,85 @@ def test_external_feature_timestamp_asof_validation_passes(tmp_path, source, fea
     build_dataset(rows, str(tmp_path / f"valid_{source}"))
 
 
-@pytest.mark.parametrize("source,feature_field,timestamp_field", EXTERNAL_TIMESTAMP_CASES)
-def test_external_feature_timestamp_asof_validation_fails_closed(tmp_path, source, feature_field, timestamp_field):
+def _rows_with_only_source_feature(source: str, feature_field: str, timestamp_field: str, timestamp_value=0):
     rows = _smoke_rows(5)
-    rows[0][feature_field] = 0.1
-    rows[0][timestamp_field] = rows[0]["feature_available_ts_ms"] + 1
+    for row in rows:
+        for other_source, fields in EXTERNAL_FEATURE_FIELDS.items():
+            if other_source != source:
+                for field in fields:
+                    row.pop(field, None)
+        for other_source, fields in EXTERNAL_TIMESTAMP_FIELDS.items():
+            if other_source != source:
+                for field in fields:
+                    row.pop(field, None)
+        row[feature_field] = 0.1
+        if timestamp_value is None:
+            for field in EXTERNAL_TIMESTAMP_FIELDS[source]:
+                row.pop(field, None)
+        else:
+            row[timestamp_field] = timestamp_value(row) if callable(timestamp_value) else timestamp_value
+    return rows
+
+
+@pytest.mark.parametrize("source,feature_field,timestamp_field", EXTERNAL_TIMESTAMP_CASES)
+def test_external_feature_timestamp_asof_validation_fails_closed_when_future(tmp_path, source, feature_field, timestamp_field):
+    rows = _rows_with_only_source_feature(source, feature_field, timestamp_field, lambda row: row["feature_available_ts_ms"] + 1)
 
     with pytest.raises(ValueError, match=rf"source={source}.*timestamp=.*feature_available_ts_ms="):
-        build_dataset(rows, str(tmp_path / f"invalid_{source}"))
+        build_dataset(rows, str(tmp_path / f"future_{source}"))
 
 
-def test_external_feature_missing_timestamp_warns_and_preserves_behavior(tmp_path, caplog):
+@pytest.mark.parametrize("source,feature_field,timestamp_field", EXTERNAL_TIMESTAMP_CASES)
+def test_external_feature_timestamp_asof_validation_fails_closed_when_missing(tmp_path, source, feature_field, timestamp_field):
+    rows = _rows_with_only_source_feature(source, feature_field, timestamp_field, None)
+
+    with pytest.raises(ValueError, match=rf"external feature timestamp missing: .*source={source}"):
+        build_dataset(rows, str(tmp_path / f"missing_{source}"))
+
+
+@pytest.mark.parametrize("source,feature_field,timestamp_field", EXTERNAL_TIMESTAMP_CASES)
+def test_external_feature_timestamp_asof_validation_fails_closed_when_null(tmp_path, source, feature_field, timestamp_field):
+    rows = _rows_with_only_source_feature(source, feature_field, timestamp_field, None)
+    for row in rows:
+        row[timestamp_field] = None
+
+    with pytest.raises(ValueError, match=rf"external feature timestamp missing: .*source={source}"):
+        build_dataset(rows, str(tmp_path / f"null_{source}"))
+
+
+@pytest.mark.parametrize("source,feature_field,timestamp_field", EXTERNAL_TIMESTAMP_CASES)
+def test_external_feature_timestamp_asof_validation_fails_closed_when_non_numeric(tmp_path, source, feature_field, timestamp_field):
+    rows = _rows_with_only_source_feature(source, feature_field, timestamp_field, "not-a-timestamp")
+
+    with pytest.raises(ValueError, match=rf"external feature timestamp invalid: .*source={source}"):
+        build_dataset(rows, str(tmp_path / f"nonnumeric_{source}"))
+
+
+@pytest.mark.parametrize("source,feature_field,timestamp_field", EXTERNAL_TIMESTAMP_CASES)
+def test_external_feature_timestamp_asof_validation_fails_closed_when_negative(tmp_path, source, feature_field, timestamp_field):
+    rows = _rows_with_only_source_feature(source, feature_field, timestamp_field, -1)
+
+    with pytest.raises(ValueError, match=rf"external feature timestamp invalid: .*source={source}"):
+        build_dataset(rows, str(tmp_path / f"negative_{source}"))
+
+
+def test_dataset_integrity_rejects_all_external_features_without_timestamps(tmp_path):
     rows = _smoke_rows(5)
-    rows[0]["funding_rate_8h"] = 0.0001
+    for row in rows:
+        for timestamp_fields in EXTERNAL_TIMESTAMP_FIELDS.values():
+            for timestamp_field in timestamp_fields:
+                row.pop(timestamp_field, None)
+        row["funding_rate_8h"] = 0.0001
+        row["delta_oi_velocity"] = 10.0
+        row["nearest_long_cluster_dist_pct"] = 0.01
+        row["ofi_zscore"] = 0.2
+        row["regime_confidence"] = 0.8
 
-    with caplog.at_level("WARNING", logger="stop_hunt_engine.training.dataset_builder"):
-        build_dataset(rows, str(tmp_path / "missing_external_ts"))
+    out_dir = tmp_path / "all_missing_timestamps"
+    with pytest.raises(ValueError, match="external feature timestamp missing"):
+        build_dataset(rows, str(out_dir))
 
-    assert "external feature timestamp NOT VERIFIED: source=funding" in caplog.text
+    assert not out_dir.exists()
 
 
 def _label_rows(event_offset: int):
