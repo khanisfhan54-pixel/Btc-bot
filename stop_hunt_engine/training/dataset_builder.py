@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import glob
 import math
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from ..model.engine import SHPE_FEATURE_NAMES
 from .io import atomic_write_json, ensure_dir, read_json
@@ -203,21 +204,49 @@ def build_dataset(rows: Sequence[Dict[str, Any]], out_dir: str, *, target: Targe
     payload = {"schema_version": DATASET_SCHEMA_VERSION, "dataset_version": dataset_version, "target_definition": target.to_dict(), "feature_schema": list(SHPE_FEATURE_NAMES), "samples": samples}
     path = os.path.join(base, "dataset.json")
     atomic_write_json(payload, path)
-    manifest = {"dataset_path": path, "rows": len(samples), "date_range": [samples[0]["timestamp_utc"], samples[-1]["timestamp_utc"]] if samples else []}
+    manifest = {"dataset_path": path, "rows": len(samples), "date_range": [samples[0]["timestamp_utc"], samples[-1]["timestamp_utc"]] if samples else [], "feature_schema": list(SHPE_FEATURE_NAMES), "target_definition_version": target.version, "source_file_count": len({str(r.get("_source_path", "<memory>")) for r in ordered}), "created_for": "research_only_reproducible_dataset_manifest"}
     atomic_write_json(manifest, os.path.join(base, "manifest.json"))
     return {"path": path, "manifest_path": os.path.join(base, "manifest.json"), "payload": payload}
 
 
-def load_feature_rows(path: str) -> List[Dict[str, Any]]:
+def _read_feature_rows_one(path: str, *, chunk_size: int = 50_000) -> Iterable[Dict[str, Any]]:
     if path.endswith(".json"):
         data = read_json(path)
         rows = data.get("samples", data.get("rows"))
         if isinstance(rows, list):
-            return [dict(r.get("raw_sample", r)) for r in rows]
+            for row in rows:
+                raw = dict(row.get("raw_sample", row))
+                raw.setdefault("_source_path", path)
+                yield raw
+            return
     if path.endswith(".parquet"):
         try:
             import pyarrow.parquet as pq  # type: ignore
         except Exception as exc:
             raise RuntimeError("pyarrow is required to read parquet feature files") from exc
-        return pq.read_table(path).to_pylist()
+        parquet_file = pq.ParquetFile(path)
+        for batch in parquet_file.iter_batches(batch_size=chunk_size):
+            for row in batch.to_pylist():
+                out = dict(row)
+                out.setdefault("_source_path", path)
+                yield out
+        return
     raise ValueError(f"unsupported feature input: {path}")
+
+
+def load_feature_rows_many(paths: Sequence[str], *, chunk_size: int = 50_000) -> List[Dict[str, Any]]:
+    expanded: List[str] = []
+    for item in paths:
+        matches = sorted(glob.glob(item))
+        expanded.extend(matches or [item])
+    rows: List[Dict[str, Any]] = []
+    for path in expanded:
+        rows.extend(_read_feature_rows_one(path, chunk_size=chunk_size))
+    if not rows:
+        raise ValueError("no feature rows loaded")
+    return rows
+
+
+def load_feature_rows(path: str) -> List[Dict[str, Any]]:
+    parts = [p for p in path.split(",") if p]
+    return load_feature_rows_many(parts or [path])

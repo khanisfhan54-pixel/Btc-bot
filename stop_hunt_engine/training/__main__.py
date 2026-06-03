@@ -6,10 +6,11 @@ import math
 import os
 from typing import Any, Dict, List
 
-from .dataset_builder import build_dataset, load_feature_rows
+from .dataset_builder import build_dataset, load_feature_rows_many
 from .io import read_json
 from .label_generator import generate_labels
 from .report import write_reports
+from .research_audit import run_research_audit
 from .target import DEFAULT_TARGET
 from .trainer import train_and_save
 from .walk_forward import run_walk_forward
@@ -45,16 +46,17 @@ def _smoke_rows(n: int = 80) -> List[Dict[str, Any]]:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Run the full offline SHPE ML workflow")
-    ap.add_argument("--features-5m", help="Existing 5m BTCUSDT feature parquet/json built by preprocess/build_btc_feature_parquets.py")
+    ap.add_argument("--features-5m", nargs="+", help="Existing 5m BTCUSDT feature parquet/json file(s) or glob(s) built by preprocess/build_btc_feature_parquets.py")
     ap.add_argument("--smoke-test", action="store_true", help="Use deterministic local feature rows; no live or network access")
     ap.add_argument("--artifact-root", default="artifacts/shpe")
     ap.add_argument("--run-version", default="dev")
     ap.add_argument("--min-train", type=int, default=12)
     ap.add_argument("--test-size", type=int, default=4)
+    ap.add_argument("--research-audit", action="store_true", help="Generate research-only SHPE validation audit artifacts and final verdict")
     args = ap.parse_args()
     if not args.smoke_test and not args.features_5m:
         raise SystemExit("provide --features-5m or --smoke-test")
-    rows = _smoke_rows() if args.smoke_test else load_feature_rows(args.features_5m)
+    rows = _smoke_rows() if args.smoke_test else load_feature_rows_many(args.features_5m)
     dataset_res = build_dataset(rows, os.path.join(args.artifact_root, "datasets"), dataset_version=args.run_version)
     dataset = dataset_res["payload"]
     labels_res = generate_labels(dataset, os.path.join(args.artifact_root, "labels"), labels_version=args.run_version)
@@ -62,7 +64,8 @@ def main() -> None:
     model_res = train_and_save(dataset, labels, os.path.join(args.artifact_root, "models"), model_version=f"shpe.v1.0.0-{args.run_version}")
     wf = run_walk_forward(dataset, labels, os.path.join(args.artifact_root, "reports", args.run_version), min_train=args.min_train, test_size=args.test_size)
     reports = write_reports(dataset, labels, model_res["manifest"], wf, os.path.join(args.artifact_root, "reports"), report_version=args.run_version)
-    out = {"dataset": dataset_res["path"], "labels": labels_res["path"], "model": model_res["model_path"], "manifest": model_res["manifest_path"], "walk_forward": wf["path"], "reports": reports, "metrics": wf["metrics"], "target_definition_version": DEFAULT_TARGET.version}
+    research = run_research_audit(dataset, labels, wf, args.artifact_root, min_train=args.min_train, test_size=args.test_size) if args.research_audit else None
+    out = {"dataset": dataset_res["path"], "labels": labels_res["path"], "model": model_res["model_path"], "manifest": model_res["manifest_path"], "walk_forward": wf["path"], "reports": reports, "research_audit": research, "metrics": wf["metrics"], "target_definition_version": DEFAULT_TARGET.version}
     print(json.dumps(out, indent=2, sort_keys=True))
 
 
