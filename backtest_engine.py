@@ -60,6 +60,14 @@ except Exception as _lsa_err:
     )
 
 try:
+    from liquidity_magnet_predictor import LiquidityMagnetPredictor
+except Exception as _magnet_err:
+    LiquidityMagnetPredictor = None  # type: ignore[assignment,misc]
+    logging.getLogger(__name__).warning(
+        "backtest_engine: LiquidityMagnetPredictor import failed (%s)", _magnet_err
+    )
+
+try:
     from alpha_orchestrator import (
         AlphaOrchestrator,
         AlphaSignal,
@@ -311,19 +319,19 @@ class BacktestEngine:
         # from the input price window.
         self.lsa: Optional[Any] = None  # set by _seed_lsa(data)
 
-        # FIX CRITICAL-6: AlphaOrchestrator requires ≥2 alpha sources to
-        # produce a non-HOLD action. We register signal_engine and
-        # liquidity_sweep_alpha as the two sources (CRITICAL-6 compliant).
+        # Fix: backtest validation previously omitted liquidity_magnet_alpha,
+        # creating silent non-parity with live routing. Root cause: only two
+        # sources were registered here. After: include the magnet source; if
+        # production-equivalent liquidity zones are unavailable in replay,
+        # run_backtest marks the result NON-PRODUCTION-VALID instead of
+        # fabricating parity.
         if AlphaOrchestrator is not None and OrchestratorConfig is not None:
             try:
                 cfg = OrchestratorConfig(
                     signal_weights={
                         "signal_engine": 0.5,
                         "liquidity_sweep_alpha": 0.5,
-                        # NOTE: liquidity_magnet_alpha excluded from backtest —
-                        # LiquidityMagnetPredictor requires a live zone-memory state
-                        # that cannot be seeded from historical OHLCV alone. Re-include
-                        # when a warmup seed strategy is implemented.
+                        "liquidity_magnet_alpha": 0.5,
                     },
                     action_threshold=float(self.cfg.orchestrator_action_threshold),
                     allow_unknown_sources=False,
@@ -335,6 +343,8 @@ class BacktestEngine:
                 self.orchestrator = None
         else:
             self.orchestrator = None
+
+        self.magnet_predictor: Optional[Any] = None
 
         self.basis = VenueBasisNormalizer(halt_threshold_pct=0.5)
         self.basis.set_venues("backtest", "backtest")
@@ -547,11 +557,64 @@ class BacktestEngine:
 
         return market_data
 
+    def _build_magnet_prediction(
+        self,
+        *,
+        features: Dict[str, Any],
+        lsa_market_data: Dict[str, Any],
+        current_price: float,
+        ts_seconds: float,
+        regime_label: str,
+        atr: float,
+    ) -> Tuple[Dict[str, Any], bool]:
+        """Build replay magnet output and report whether parity inputs exist.
+
+        Fix issue/root cause/proof: production validation silently excluded the
+        magnet because live liquidity-zone inputs were not guaranteed in replay.
+        This function includes the alpha on the path and returns False when the
+        replay lacks production-origin liquidity_zones, causing an explicit
+        NON-PRODUCTION-VALID label rather than a false parity claim.
+        """
+        candidates = features.get("liquidity_zones")
+        parity_inputs = isinstance(candidates, list) and len(candidates) > 0
+        if not parity_inputs:
+            macro = lsa_market_data.get("macro_liquidity", {}) if isinstance(lsa_market_data, dict) else {}
+            candidates = []
+            high_pool = _safe_float(macro.get("high_pool"), 0.0) if isinstance(macro, dict) else 0.0
+            low_pool = _safe_float(macro.get("low_pool"), 0.0) if isinstance(macro, dict) else 0.0
+            if high_pool > 0.0:
+                candidates.append({"price": high_pool, "side": "above", "type": "replay_high_pool", "age_bars": 0.0, "base_strength": 1.0})
+            if low_pool > 0.0:
+                candidates.append({"price": low_pool, "side": "below", "type": "replay_low_pool", "age_bars": 0.0, "base_strength": 1.0})
+
+        if self.magnet_predictor is None and LiquidityMagnetPredictor is not None:
+            self.magnet_predictor = LiquidityMagnetPredictor()
+        if self.magnet_predictor is None:
+            return {"zone_side": "none", "confidence": 0.0, "sweep_likelihood_estimate": 0.0}, False
+        try:
+            return self.magnet_predictor.predict(
+                candidates=candidates if isinstance(candidates, list) else [],
+                current_price=current_price,
+                current_time=ts_seconds,
+                market_state={
+                    "regime": regime_label,
+                    "volatility": 1.0,
+                    "trend_direction": "up" if _safe_float(features.get("imbalance", 0.0), 0.0) >= 0.0 else "down",
+                    "atr": max(_safe_float(atr, 0.0), 1e-8),
+                },
+                stop_hunt_data={"probability": _safe_float(features.get("stop_hunt_probability", 0.5), 0.5)},
+                volume_intel={"liquidity_score": _safe_float(features.get("liquidity_score", 1.0), 1.0)},
+            ), parity_inputs
+        except Exception as exc:
+            logger.debug("LiquidityMagnetPredictor replay predict failed: %s", exc)
+            return {"zone_side": "none", "confidence": 0.0, "sweep_likelihood_estimate": 0.0}, False
+
     def _build_alpha_signals(
         self,
         signal_engine_out: Dict[str, Any],
         lsa_out: Dict[str, Any],
         ts_seconds: float,
+        magnet_out: Optional[Dict[str, Any]] = None,
     ) -> List[Any]:
         """FIX CRITICAL-6 + CRITICAL-7: emit two AlphaSignal sources whose
         conviction values are CONTINUOUS (never exactly 0.0 or 1.0)."""
@@ -590,6 +653,26 @@ class BacktestEngine:
             ))
         except Exception as exc:
             logger.debug("liquidity_sweep_alpha AlphaSignal build failed: %s", exc)
+
+        # Source 3: LiquidityMagnetPredictor. Regression protection for the
+        # backtest-inclusion finding: the alpha is always represented on the
+        # orchestrator path. If inputs are unavailable, the predictor emits a
+        # neutral signal and run_backtest labels the result NON-PRODUCTION-VALID.
+        magnet_out = magnet_out if isinstance(magnet_out, dict) else {}
+        zone_side = str(magnet_out.get("zone_side", "none")).lower()
+        magnet_dir = 1 if zone_side == "above" else (-1 if zone_side == "below" else 0)
+        magnet_raw_conf = _safe_float(magnet_out.get("confidence", 0.0), 0.0)
+        magnet_conv = _to_continuous_conviction(magnet_raw_conf)
+        try:
+            out.append(AlphaSignal(
+                source_id="liquidity_magnet_alpha",
+                direction=int(magnet_dir),
+                conviction=float(magnet_conv),
+                expected_edge_bps=float(magnet_conv * 25.0),
+                timestamp=float(ts_seconds),
+            ))
+        except Exception as exc:
+            logger.debug("liquidity_magnet_alpha AlphaSignal build failed: %s", exc)
 
         return out
 
@@ -963,7 +1046,10 @@ class BacktestEngine:
             "l2_data_missing_or_mismatched": not _l2_valid,
             "orchestration_bypassed": False,      # enforced by Issue D
             "regime_pipeline_uncalibrated": False, # weights loaded by __init__
+            "magnet_inputs_unavailable_or_non_parity": False,
         }
+        _magnet_non_parity_seen = False
+        self.magnet_predictor = LiquidityMagnetPredictor() if LiquidityMagnetPredictor is not None else None
         _backtest_label = (
             "PRODUCTION-VALID"
             if not any(_non_production_conditions.values())
@@ -1143,6 +1229,7 @@ class BacktestEngine:
 
             # ---- FIX CRITICAL-5: LiquiditySweepAlpha (seeded) ----------------
             lsa_out: Dict[str, Any] = {"action": "HOLD", "confidence": 0.0}
+            lsa_md: Dict[str, Any] = {}
             if self.lsa is not None:
                 lsa_md = self._build_lsa_market_data(
                     candle=candle, snapshot=snapshot, prev_snapshot=prev_snapshot,
@@ -1154,11 +1241,23 @@ class BacktestEngine:
                 except Exception as exc:
                     logger.debug("LSA.predict failed at i=%d: %s", i, exc)
 
+            # ---- LiquidityMagnetPredictor (alpha source #3) ------------------
+            magnet_out, magnet_parity_inputs = self._build_magnet_prediction(
+                features=features,
+                lsa_market_data=lsa_md,
+                current_price=current_price,
+                ts_seconds=ts_seconds,
+                regime_label=regime_label,
+                atr=max(1e-8, _safe_float(candle[2]) - _safe_float(candle[3])),
+            )
+            if not magnet_parity_inputs:
+                _magnet_non_parity_seen = True
+
             # ---- SignalEngine (alpha source #1) -----------------------------
             signal_engine_out = self.signal_engine.generate(features)
 
             # ---- FIX CRITICAL-6+7: AlphaOrchestrator with ≥2 sources ---------
-            alpha_signals = self._build_alpha_signals(signal_engine_out, lsa_out, ts_seconds)
+            alpha_signals = self._build_alpha_signals(signal_engine_out, lsa_out, ts_seconds, magnet_out)
             if not self.cfg.legacy_mode and len(alpha_signals) < 2:
                 _bars_with_insufficient_signals += 1
             self._last_alpha_signals = list(alpha_signals)
@@ -1246,7 +1345,7 @@ class BacktestEngine:
                 "orchestrator_meta": orch_meta,
                 "regime": regime_label,
                 "regime_confidence": regime_conf,
-                "alpha_sources": ["signal_engine", "liquidity_sweep_alpha"],
+                "alpha_sources": ["signal_engine", "liquidity_sweep_alpha", "liquidity_magnet_alpha"],
             }
 
             meta = self.meta_filter.evaluate(
@@ -1443,6 +1542,7 @@ class BacktestEngine:
             and getattr(getattr(self.lsa, "_calibrator", None), "fitted", False)
         )
         _non_production_conditions["calibrator_not_fitted"] = not _calibration_fitted
+        _non_production_conditions["magnet_inputs_unavailable_or_non_parity"] = bool(_magnet_non_parity_seen)
         _backtest_label = (
             "PRODUCTION-VALID"
             if not any(_non_production_conditions.values())

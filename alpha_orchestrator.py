@@ -2893,6 +2893,45 @@ class AlphaOrchestrator:
 
         conviction_gate_active = any(bool(r.get("conviction_gate_applies", False)) for r in breakdown)
 
+        # Diagnostics-only overlap visibility for the magnet/sweep/stop-hunt
+        # finding. Root cause: these related directional alphas could stack in
+        # the same direction without a dedicated observability hook. Before:
+        # operators had to infer overlap from raw breakdown rows. After: expose
+        # a schema-stable diagnostic without changing thresholds, weights,
+        # penalties, or routing semantics. Regression tests assert presence only.
+        overlap_source_ids = {
+            "liquidity_magnet_alpha",
+            "liquidity_sweep_alpha",
+            "stop_hunt_engine",
+            "stop_hunt_alpha",
+        }
+        overlap_by_direction: Dict[int, List[str]] = {}
+        for row in breakdown:
+            src = str(row.get("source_id", ""))
+            direction = int(row.get("direction", 0)) if row.get("direction") in (-1, 0, 1) else 0
+            if src in overlap_source_ids and direction in (-1, 1):
+                overlap_by_direction.setdefault(direction, []).append(src)
+        overlap_pairs = []
+        for direction, sources in sorted(overlap_by_direction.items()):
+            uniq_sources = sorted(set(sources))
+            if "liquidity_magnet_alpha" in uniq_sources and (
+                "liquidity_sweep_alpha" in uniq_sources
+                or "stop_hunt_engine" in uniq_sources
+                or "stop_hunt_alpha" in uniq_sources
+            ):
+                overlap_pairs.append({
+                    "direction": direction,
+                    "sources": uniq_sources,
+                    "duplicate_direction": True,
+                    "diagnostic_only": True,
+                })
+        overlap_diagnostics = {
+            "sources_observed": sorted({s for values in overlap_by_direction.values() for s in values}),
+            "pairs": overlap_pairs,
+            "overlap_risk": bool(overlap_pairs),
+            "policy_changed": False,
+        }
+
         logger.debug(
             "CORRELATION | groups=%d | largest=%d | raw_denom=%.6f | adj_denom=%.6f",
             len(correlation_groups),
@@ -3061,6 +3100,7 @@ class AlphaOrchestrator:
             ),
             "low_aggregate_weight": low_aggregate_weight,
             "aggregate_weight_threshold": _safe_float(self.config.min_aggregate_weight, 0.0, 0.0),
+            "overlap_diagnostics": overlap_diagnostics,
         }
         meta_payload: Dict[str, Any] = {
             "breakdown": breakdown,

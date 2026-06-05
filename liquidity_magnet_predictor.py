@@ -43,6 +43,7 @@ class MagnetPrediction(TypedDict):
     horizon_bars: int
     warnings: List[str]
     candidate_zones: List[ZoneCandidate]
+    diagnostics: Dict[str, Any]
 
 
 def validate_market_state(market_state: dict[str, Any]) -> List[str]:
@@ -81,6 +82,7 @@ class LiquidityMagnetPredictor:
         zone_price_bucket: float = 10.0,
         bars_per_atr: float = 0.5,
         max_horizon_bars: int = 500,
+        memory_ttl_bars: float = 500.0,
     ):
         self.memory_maxlen = max(1, int(memory_maxlen))
         self.decay_half_life = _safe_float(decay_half_life, 24.0)
@@ -89,6 +91,12 @@ class LiquidityMagnetPredictor:
         self.zone_price_bucket = max(_safe_float(zone_price_bucket, 10.0), 1e-8)
         self.bars_per_atr = max(_safe_float(bars_per_atr, 0.5), 1e-8)
         self.max_horizon_bars = max(1, int(max_horizon_bars))
+        # Fix: zone memory previously had capacity eviction only, so very old
+        # interactions could affect later scores indefinitely. Root cause: no
+        # deterministic TTL pruning before reads/writes. After: stale entries
+        # are pruned by bar-time before scoring and memory updates, while the
+        # existing maxlen eviction remains intact as the capacity backstop.
+        self.memory_ttl_bars = max(0.0, _safe_float(memory_ttl_bars, 500.0))
 
         # Track historical zone touches, sweeps, rejections.
         # key: str (price/side/type bucket string)
@@ -102,6 +110,23 @@ class LiquidityMagnetPredictor:
         bucketed_price = round(price / self.zone_price_bucket) * self.zone_price_bucket
         return f"{side}_{zone_type}_{bucketed_price:.2f}"
 
+    def _expire_memory(self, current_time: float) -> int:
+        """Remove zone-memory entries older than ``memory_ttl_bars``.
+
+        Regression protection: callers invoke this before scoring and before
+        writes so stale state cannot silently affect live or replay outputs.
+        """
+        if self.memory_ttl_bars <= 0.0:
+            return 0
+        now = _safe_float(current_time, 0.0)
+        expired = [
+            key for key, state in self.zone_memory.items()
+            if now - _safe_float(state.get("last_interaction_time", 0.0), 0.0) > self.memory_ttl_bars
+        ]
+        for key in expired:
+            self.zone_memory.pop(key, None)
+        return len(expired)
+
     def update_memory(self, price: float, side: str, zone_type: str, interaction: str, time: float) -> None:
         """
         Interaction types: "touch", "rejection", "sweep", "breakout"
@@ -112,6 +137,7 @@ class LiquidityMagnetPredictor:
 
         key = self._get_zone_key(price, side, zone_type)
         with self._lock:
+            self._expire_memory(time)
             if key not in self.zone_memory:
                 if len(self.zone_memory) >= self.memory_maxlen:
                     self.zone_memory.popitem(last=False)
@@ -131,9 +157,11 @@ class LiquidityMagnetPredictor:
             state["last_interaction_time"] = time
             state["last_outcome"] = interaction
 
-    def get_memory_state(self, price: float, side: str, zone_type: str) -> Dict[str, Any]:
+    def get_memory_state(self, price: float, side: str, zone_type: str, current_time: Optional[float] = None) -> Dict[str, Any]:
         key = self._get_zone_key(price, side, zone_type)
         with self._lock:
+            if current_time is not None:
+                self._expire_memory(current_time)
             if key in self.zone_memory:
                 return copy.deepcopy(self.zone_memory[key])
         return {
@@ -247,6 +275,25 @@ class LiquidityMagnetPredictor:
         safe_market_state = market_state if isinstance(market_state, dict) else {}
         safe_stop_hunt = stop_hunt_data if isinstance(stop_hunt_data, dict) else {}
         safe_vol = volume_intel if isinstance(volume_intel, dict) else {}
+
+        regime_name = str(safe_market_state.get("regime", "")).lower()
+        if "toxic" in regime_name or "illiquid" in regime_name:
+            # Fix: toxic/illiquid regimes were only down-weighted, allowing the
+            # magnet alpha to participate in extreme-risk books. Root cause:
+            # _score_regime returned 0.5 instead of hard disabling. After:
+            # return neutral/empty before scoring; existing fail-closed paths
+            # for missing candidates and exceptions remain unchanged.
+            disabled = self._empty_prediction()
+            disabled["warnings"] = ["hard_disabled_toxic_or_illiquid_regime"]
+            disabled["diagnostics"] = {
+                "hard_disabled": True,
+                "disabled_regime": regime_name,
+                "overlap_source_id": "liquidity_magnet_alpha",
+            }
+            return disabled
+
+        with self._lock:
+            expired_before_scoring = self._expire_memory(current_time)
 
         logger.debug(
             "predict liquidity magnet start: candidate_count=%s current_price=%s current_time=%s",
@@ -371,6 +418,13 @@ class LiquidityMagnetPredictor:
             "horizon_bars": max(1, horizon_bars),
             "warnings": ["degraded_inputs"] if safe_stop_hunt.get("degraded", False) else [],
             "candidate_zones": scored_candidates,
+            "diagnostics": {
+                "hard_disabled": False,
+                "expired_memory_entries": expired_before_scoring,
+                "overlap_source_id": "liquidity_magnet_alpha",
+                "overlap_zone_side": top_cand["side"],
+                "stop_hunt_probability": _safe_float(safe_stop_hunt.get("probability", 0.0), 0.0),
+            },
         }
 
         logger.debug(
@@ -387,19 +441,24 @@ class LiquidityMagnetPredictor:
         return prediction
 
     def _empty_prediction(self) -> MagnetPrediction:
-        return {
-            "zone_side": "none",
-            "target_price": 0.0,
-            "zone_type": "none",
-            "score": 0.0,
-            "confidence": 0.0,
-            "sweep_likelihood_estimate": 0.0,
-            "components": {},
-            "memory_state": {},
-            "horizon_bars": 0,
-            "warnings": ["empty_candidates"],
-            "candidate_zones": [],
-        }
+        return _neutral_prediction()
+
+
+def _neutral_prediction(warning: str = "empty_candidates") -> MagnetPrediction:
+    return {
+        "zone_side": "none",
+        "target_price": 0.0,
+        "zone_type": "none",
+        "score": 0.0,
+        "confidence": 0.0,
+        "sweep_likelihood_estimate": 0.0,
+        "components": {},
+        "memory_state": {},
+        "horizon_bars": 0,
+        "warnings": [warning],
+        "candidate_zones": [],
+        "diagnostics": {"hard_disabled": False, "overlap_source_id": "liquidity_magnet_alpha"},
+    }
 
 
 def predict_liquidity_magnet(
@@ -416,10 +475,13 @@ def predict_liquidity_magnet(
     Returns a dictionary matching MagnetPrediction TypedDict keys.
     """
     if predictor_instance is None:
-        logger.warning(
-            "No persistent LiquidityMagnetPredictor instance provided; zone memory will be empty for this call"
-        )
-    inst = predictor_instance if predictor_instance is not None else LiquidityMagnetPredictor()
+        # Fix: the helper previously instantiated a fresh stateless fallback,
+        # silently bypassing singleton-managed memory in supported live paths.
+        # After: fail closed unless the caller supplies the persistent instance
+        # (engine.get_shared_magnet_predictor is the canonical live entry point).
+        logger.warning("No persistent LiquidityMagnetPredictor instance provided; fail-closed neutral prediction")
+        return _neutral_prediction("missing_persistent_predictor")
+    inst = predictor_instance
     return inst.predict(
         candidates=candidates,
         current_price=current_price,
