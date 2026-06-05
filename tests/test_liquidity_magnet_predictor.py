@@ -126,13 +126,17 @@ def test_no_lookahead_integration_smoke():
     stop_hunt = {"probability": 0.8, "degraded": False}
     volume_intel = {"liquidity_score": 1.2}
 
+    # Regression protection for singleton-only usage: direct helper scoring must
+    # receive an explicit persistent predictor instance instead of creating a
+    # stateless fallback.
     result = predict_liquidity_magnet(
         candidates=candidates,
         current_price=50000.0,
         current_time=100.0,
         market_state=market_state,
         stop_hunt_data=stop_hunt,
-        volume_intel=volume_intel
+        volume_intel=volume_intel,
+        predictor_instance=LiquidityMagnetPredictor(),
     )
 
     # Output schema verification
@@ -234,8 +238,11 @@ def test_fix03_warning_when_no_persistent_instance(caplog):
         _full_market_state(),
     )
 
-    assert result["zone_side"] == "above"
-    assert "zone memory will be empty" in caplog.text
+    # Critical singleton-only fix: before this helper silently instantiated a
+    # fresh stateless predictor; after it fails closed and requires callers to
+    # pass the singleton-managed persistent instance.
+    assert result["zone_side"] == "none"
+    assert "fail-closed neutral prediction" in caplog.text
 
 
 def test_fix03_concurrent_update_memory_calls_do_not_raise():
