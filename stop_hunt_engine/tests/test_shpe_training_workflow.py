@@ -206,7 +206,7 @@ def test_walk_forward_purges_train_label_horizons_from_test_folds(tmp_path):
     horizon_bars = int(wf["target_definition"]["horizon_bars"])
     samples, _, _ = align_samples(ds["payload"], labs["payload"])
 
-    assert wf["walk_forward_config"]["mode"] == "expanding_window_purged"
+    assert wf["walk_forward_config"]["mode"] == "purged"
     assert wf["walk_forward_config"]["purge_bars"] == horizon_bars
     for fold in wf["folds"]:
         first_test_row_index = int(fold["first_test_row_index"])

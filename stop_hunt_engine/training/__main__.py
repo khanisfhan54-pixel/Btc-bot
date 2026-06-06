@@ -52,6 +52,8 @@ def main() -> None:
     ap.add_argument("--run-version", default="dev")
     ap.add_argument("--min-train", type=int, default=12)
     ap.add_argument("--test-size", type=int, default=4)
+    ap.add_argument("--validation-mode", choices=("expanding", "rolling", "purged"), default="purged")
+    ap.add_argument("--embargo-size", type=int, default=0)
     ap.add_argument("--research-audit", action="store_true", help="Generate research-only SHPE validation audit artifacts and final verdict")
     args = ap.parse_args()
     if not args.smoke_test and not args.features_5m:
@@ -62,7 +64,7 @@ def main() -> None:
     labels_res = generate_labels(dataset, os.path.join(args.artifact_root, "labels"), labels_version=args.run_version)
     labels = labels_res["payload"]
     model_res = train_and_save(dataset, labels, os.path.join(args.artifact_root, "models"), model_version=f"shpe.v1.0.0-{args.run_version}")
-    wf = run_walk_forward(dataset, labels, os.path.join(args.artifact_root, "reports", args.run_version), min_train=args.min_train, test_size=args.test_size)
+    wf = run_walk_forward(dataset, labels, os.path.join(args.artifact_root, "reports", args.run_version), min_train=args.min_train, test_size=args.test_size, validation_mode=args.validation_mode, embargo_size=args.embargo_size)
     reports = write_reports(dataset, labels, model_res["manifest"], wf, os.path.join(args.artifact_root, "reports"), report_version=args.run_version)
     research = run_research_audit(dataset, labels, wf, args.artifact_root, min_train=args.min_train, test_size=args.test_size) if args.research_audit else None
     out = {"dataset": dataset_res["path"], "labels": labels_res["path"], "model": model_res["model_path"], "manifest": model_res["manifest_path"], "walk_forward": wf["path"], "reports": reports, "research_audit": research, "metrics": wf["metrics"], "target_definition_version": DEFAULT_TARGET.version}
