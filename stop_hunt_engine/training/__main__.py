@@ -14,6 +14,7 @@ from .research_audit import run_research_audit
 from .target import DEFAULT_TARGET
 from .trainer import train_and_save
 from .walk_forward import run_walk_forward
+from ..validation.timestamp_alignment_audit import run_timestamp_alignment_audit
 
 
 def _smoke_rows(n: int = 80) -> List[Dict[str, Any]]:
@@ -61,13 +62,14 @@ def main() -> None:
     rows = _smoke_rows() if args.smoke_test else load_feature_rows_many(args.features_5m)
     dataset_res = build_dataset(rows, os.path.join(args.artifact_root, "datasets"), dataset_version=args.run_version)
     dataset = dataset_res["payload"]
+    timestamp_audit = run_timestamp_alignment_audit(dataset, "artifacts", fail_on_violation=True)
     labels_res = generate_labels(dataset, os.path.join(args.artifact_root, "labels"), labels_version=args.run_version)
     labels = labels_res["payload"]
     model_res = train_and_save(dataset, labels, os.path.join(args.artifact_root, "models"), model_version=f"shpe.v1.0.0-{args.run_version}")
     wf = run_walk_forward(dataset, labels, os.path.join(args.artifact_root, "reports", args.run_version), min_train=args.min_train, test_size=args.test_size, validation_mode=args.validation_mode, embargo_size=args.embargo_size)
     reports = write_reports(dataset, labels, model_res["manifest"], wf, os.path.join(args.artifact_root, "reports"), report_version=args.run_version)
     research = run_research_audit(dataset, labels, wf, args.artifact_root, min_train=args.min_train, test_size=args.test_size) if args.research_audit else None
-    out = {"dataset": dataset_res["path"], "labels": labels_res["path"], "model": model_res["model_path"], "manifest": model_res["manifest_path"], "walk_forward": wf["path"], "reports": reports, "research_audit": research, "metrics": wf["metrics"], "target_definition_version": DEFAULT_TARGET.version}
+    out = {"dataset": dataset_res["path"], "timestamp_alignment_audit": timestamp_audit, "labels": labels_res["path"], "model": model_res["model_path"], "manifest": model_res["manifest_path"], "walk_forward": wf["path"], "reports": reports, "research_audit": research, "metrics": wf["metrics"], "target_definition_version": DEFAULT_TARGET.version}
     print(json.dumps(out, indent=2, sort_keys=True))
 
 
