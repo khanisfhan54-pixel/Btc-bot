@@ -86,10 +86,15 @@ class CollectorApp:
 
         self.running = True
 
-        # Start health monitor
-        self.tasks.append(asyncio.create_task(self.health_monitor.start()))
+        # BUG 4 FIX: Register signals inside the running event loop for safe async shutdown.
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(
+                sig,
+                lambda s=sig: asyncio.create_task(self._async_shutdown(s))
+            )
 
-        # Start websocket client
+        self.tasks.append(asyncio.create_task(self.health_monitor.start()))
         self.tasks.append(asyncio.create_task(self.ws_client.start()))
 
         try:
@@ -98,6 +103,13 @@ class CollectorApp:
             pass
         finally:
             self.shutdown()
+
+    async def _async_shutdown(self, signum: int):
+        logger.info("Received signal, initiating async shutdown", signum=signum)
+        self.shutdown()
+        for task in asyncio.all_tasks():
+            if task is not asyncio.current_task():
+                task.cancel()
 
     def shutdown(self):
         if not self.running:
@@ -120,18 +132,8 @@ class CollectorApp:
         logger.info(msg)
         send_telegram_alert(msg)
 
-def handle_sigint(signum, frame):
-    logger.info(f"Received signal {signum}, initiating shutdown...")
-    if app:
-        app.shutdown()
-    sys.exit(0)
-
 if __name__ == "__main__":
-    signal.signal(signal.SIGINT, handle_sigint)
-    signal.signal(signal.SIGTERM, handle_sigint)
-
     app = CollectorApp()
-
     try:
         asyncio.run(app.start())
     except KeyboardInterrupt:

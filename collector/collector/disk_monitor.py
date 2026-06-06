@@ -1,7 +1,7 @@
 import shutil
 import sys
 from typing import Callable, Optional
-from collector.utils import logger, send_telegram_alert
+from .utils import logger, send_telegram_alert
 
 class DiskMonitor:
     def __init__(self, data_dir: str = "data", shutdown_callback: Optional[Callable[[], None]] = None):

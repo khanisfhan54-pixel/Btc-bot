@@ -1,6 +1,6 @@
 import pytest
 import time
-from collector.health_monitor import HealthMonitor
+from collector.collector.health_monitor import HealthMonitor
 
 class MockDiskMonitor:
     def get_free_gb(self):
@@ -39,7 +39,7 @@ def test_health_monitor_check_health(monitor, monkeypatch):
         nonlocal alert_sent
         alert_sent = msg
 
-    monkeypatch.setattr("collector.health_monitor.send_telegram_alert", mock_alert)
+    monkeypatch.setattr("collector.collector.health_monitor.send_telegram_alert", mock_alert)
 
     monitor._check_health()
 

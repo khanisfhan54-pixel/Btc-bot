@@ -1,9 +1,10 @@
 import os
 from datetime import datetime, timedelta
+import datetime as _datetime_module
 from typing import Dict, Any, List
 import pyarrow as pa
 import pyarrow.parquet as pa_parquet
-from collector.utils import logger, send_telegram_alert
+from .utils import logger, send_telegram_alert
 
 class ParquetWriter:
     def __init__(self, stream_name: str, schema: pa.Schema, base_dir: str = "data"):
@@ -29,21 +30,52 @@ class ParquetWriter:
 
     def _init_writer(self):
         filepath = self._get_filename(self.current_hour)
+
+        # BUG 2 FIX: On same-hour restart, load existing rows back into buffer
+        # so they are rewritten when flush() is called, preventing data loss.
+        if os.path.exists(filepath):
+            try:
+                existing = pa_parquet.read_table(filepath)
+                existing_dict = existing.to_pydict()
+                n = existing.num_rows
+                pre_records = [
+                    {col: existing_dict[col][i] for col in existing_dict}
+                    for i in range(n)
+                ]
+                self.buffer = pre_records + self.buffer
+                logger.warning(
+                    "Same-hour restart: reloaded existing records into buffer",
+                    stream=self.stream_name,
+                    file=filepath,
+                    reloaded_count=n,
+                )
+            except Exception as e:
+                logger.error(
+                    "Could not reload existing parquet file; data may be incomplete",
+                    stream=self.stream_name,
+                    file=filepath,
+                    error=str(e),
+                )
+
         try:
-            interval_start_dt = datetime.strptime(self.current_hour, "%Y-%m-%d-%H")
+            interval_start_dt = _datetime_module.datetime.strptime(self.current_hour, "%Y-%m-%d-%H")
             interval_end_dt = interval_start_dt + timedelta(hours=1)
             existing_metadata = dict(self.schema.metadata or {})
             interval_metadata = {
                 b"interval_start": (interval_start_dt.isoformat() + "Z").encode(),
                 b"interval_end": (interval_end_dt.isoformat() + "Z").encode(),
             }
-            self.active_schema = self.schema.with_metadata({**existing_metadata, **interval_metadata})
+            self.active_schema = self.schema.with_metadata(
+                {**existing_metadata, **interval_metadata}
+            )
             self.writer = pa_parquet.ParquetWriter(
                 filepath,
                 self.active_schema,
-                compression="snappy"
+                compression="snappy",
             )
-            logger.info("Initialized parquet writer", stream=self.stream_name, file=filepath)
+            logger.info(
+                "Initialized parquet writer", stream=self.stream_name, file=filepath
+            )
         except Exception as e:
             msg = f"File Write Failure: Could not initialize parquet writer for {self.stream_name}"
             logger.error(msg, error=str(e))
@@ -93,8 +125,14 @@ class ParquetWriter:
             try:
                 filepath = self._get_filename(self.current_hour)
                 self.writer.close()
+                self.writer = None  # BUG 2 FIX: prevent write to closed writer
                 file_size = os.path.getsize(filepath) if os.path.exists(filepath) else 0
-                logger.info("Closed parquet file", stream=self.stream_name, file=filepath, size_bytes=file_size, record_count=self.record_count)
+                logger.info(
+                    "Closed parquet file",
+                    stream=self.stream_name,
+                    file=filepath,
+                    size_bytes=file_size,
+                )
                 self.record_count = 0
             except Exception as e:
                 logger.error("Failed to close parquet writer", stream=self.stream_name, error=str(e))
