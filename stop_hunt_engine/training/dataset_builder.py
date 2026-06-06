@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from ..model.engine import SHPE_FEATURE_NAMES
+from ..validation.leakage import assert_feature_availability_alignment
 from ..validation.timestamp_alignment_audit import assert_no_timestamp_leakage
 from .io import atomic_write_json, ensure_dir, read_json
 from .target import DEFAULT_TARGET, TargetDefinition
@@ -141,6 +142,7 @@ def validate_feature_rows(rows: Sequence[Dict[str, Any]], *, interval: str = "5m
             raise ValueError(f"row {idx} high < low")
         _validate_timestamp_not_after_availability(idx, "trade", "last_trade_ts_ms", row, avail)
         _validate_external_feature_timestamps(idx, row, avail)
+    assert_feature_availability_alignment(rows)
     assert_no_timestamp_leakage(rows)
 
 
