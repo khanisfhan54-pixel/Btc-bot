@@ -298,6 +298,17 @@ def get_shared_magnet_predictor() -> LiquidityMagnetPredictor:
     return _LIQUIDITY_MAGNET_PREDICTOR
 
 
+def create_backtest_magnet_predictor() -> LiquidityMagnetPredictor:
+    """Return an isolated LiquidityMagnetPredictor for one backtest run.
+
+    Live trading must use get_shared_magnet_predictor() so zone memory persists
+    on the canonical production path. Backtests require deterministic run-local
+    state, so this explicit factory creates a clean predictor without touching
+    or replacing the live singleton.
+    """
+    return LiquidityMagnetPredictor()
+
+
 def apply_meta_to_decision(
     decision: Dict[str, Any],
     meta_result: Dict[str, Any],
@@ -6230,6 +6241,7 @@ __all__ = [
     "reset_alpha_state",
     "get_shared_alpha_predictor",
     "get_shared_magnet_predictor",
+    "create_backtest_magnet_predictor",
     "_freeze_for_cache",
     "_build_run_all_engines_cache_key",
     "analyze_liquidity_intent",

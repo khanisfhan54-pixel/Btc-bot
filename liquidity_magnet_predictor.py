@@ -210,7 +210,7 @@ class LiquidityMagnetPredictor:
         return min(weight, 3.0)
 
     def _score_memory(self, price: float, side: str, zone_type: str, current_time: float) -> float:
-        mem = self.get_memory_state(price, side, zone_type)
+        mem = self.get_memory_state(price, side, zone_type, current_time=current_time)
         bonus = 0.0
 
         # Multiple touches typically weaken a level, making it more likely to break (attract).
@@ -239,7 +239,7 @@ class LiquidityMagnetPredictor:
 
         weight = 1.0
         if "toxic" in regime or "illiquid" in regime:
-            weight = 0.5
+            return 0.0
         elif "trending" in regime:
             trend_dir = market_state.get("trend_direction", "none")
             if (trend_dir == "up" and side == "above") or (trend_dir == "down" and side == "below"):
@@ -457,7 +457,11 @@ def _neutral_prediction(warning: str = "empty_candidates") -> MagnetPrediction:
         "horizon_bars": 0,
         "warnings": [warning],
         "candidate_zones": [],
-        "diagnostics": {"hard_disabled": False, "overlap_source_id": "liquidity_magnet_alpha"},
+        "diagnostics": {
+            "hard_disabled": False,
+            "disabled_reason": warning,
+            "overlap_source_id": "liquidity_magnet_alpha",
+        },
     }
 
 

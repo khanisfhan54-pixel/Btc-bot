@@ -72,6 +72,40 @@ def test_backtest_includes_magnet_alpha_and_marks_unproven_parity_non_production
     assert 'return self.magnet_predictor.predict' in source
 
 
+def test_backtest_uses_isolated_canonical_magnet_factory_without_hidden_fresh_fallback():
+    """Issue/root cause/proof: replay uses an explicit backtest factory, not the live singleton or helper fallback."""
+    source = Path("backtest_engine.py").read_text()
+    assert "from engine import create_backtest_magnet_predictor" in source
+    assert "self.magnet_predictor = create_backtest_magnet_predictor()" in source
+    assert "from engine import get_shared_magnet_predictor" not in source
+    assert "self.magnet_predictor = get_shared_magnet_predictor()" not in source
+    assert "LiquidityMagnetPredictor()" not in source
+    assert "from liquidity_magnet_predictor import LiquidityMagnetPredictor" not in source
+
+
+def test_backtest_magnet_factory_isolates_two_runs_and_does_not_touch_live_singleton():
+    """Issue/root cause/proof: consecutive backtest runs in one process must not inherit shared/live or prior replay zone memory."""
+    shared = engine.get_shared_magnet_predictor()
+    shared.zone_memory.clear()
+    try:
+        shared.update_memory(50100.0, "above", "equal_highs", "touch", 1.0)
+
+        run1 = engine.create_backtest_magnet_predictor()
+        run2 = engine.create_backtest_magnet_predictor()
+
+        assert run1 is not run2
+        assert run1 is not shared
+        assert run2 is not shared
+        assert len(run1.zone_memory) == 0
+        assert len(run2.zone_memory) == 0
+
+        run1.update_memory(50200.0, "above", "equal_highs", "touch", 2.0)
+        assert len(run1.zone_memory) == 1
+        assert len(run2.zone_memory) == 0
+        assert len(shared.zone_memory) == 1
+    finally:
+        shared.zone_memory.clear()
+
 def test_overlap_diagnostics_for_magnet_sweep_and_stop_hunt_are_available():
     """Diagnostics only: duplicate-direction magnet/sweep/stop-hunt overlap is reported without changing threshold or decision policy."""
     cfg = ao.OrchestratorConfig(

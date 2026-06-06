@@ -60,11 +60,11 @@ except Exception as _lsa_err:
     )
 
 try:
-    from liquidity_magnet_predictor import LiquidityMagnetPredictor
+    from engine import create_backtest_magnet_predictor
 except Exception as _magnet_err:
-    LiquidityMagnetPredictor = None  # type: ignore[assignment,misc]
+    create_backtest_magnet_predictor = None  # type: ignore[assignment,misc]
     logging.getLogger(__name__).warning(
-        "backtest_engine: LiquidityMagnetPredictor import failed (%s)", _magnet_err
+        "backtest_engine: isolated LiquidityMagnetPredictor factory import failed (%s)", _magnet_err
     )
 
 try:
@@ -259,8 +259,8 @@ class BacktestEngine:
 
       OHLCV → FeatureEngine → AdvancedRegimeEngine (canonical payload)
             → LiquiditySweepAlpha (seeded from warmup window)
-            → SignalEngine
-            → AlphaOrchestrator.orchestrate([signal_engine, liquidity_sweep_alpha])
+            → SignalEngine + LiquidityMagnetPredictor (isolated canonical backtest instance)
+            → AlphaOrchestrator.orchestrate([signal_engine, liquidity_sweep_alpha, liquidity_magnet_alpha])
             → ExecutionLogic.decide() (only when orchestrator action != HOLD)
             → position management
     """
@@ -587,8 +587,8 @@ class BacktestEngine:
             if low_pool > 0.0:
                 candidates.append({"price": low_pool, "side": "below", "type": "replay_low_pool", "age_bars": 0.0, "base_strength": 1.0})
 
-        if self.magnet_predictor is None and LiquidityMagnetPredictor is not None:
-            self.magnet_predictor = LiquidityMagnetPredictor()
+        if self.magnet_predictor is None and create_backtest_magnet_predictor is not None:
+            self.magnet_predictor = create_backtest_magnet_predictor()
         if self.magnet_predictor is None:
             return {"zone_side": "none", "confidence": 0.0, "sweep_likelihood_estimate": 0.0}, False
         try:
@@ -1049,7 +1049,11 @@ class BacktestEngine:
             "magnet_inputs_unavailable_or_non_parity": False,
         }
         _magnet_non_parity_seen = False
-        self.magnet_predictor = LiquidityMagnetPredictor() if LiquidityMagnetPredictor is not None else None
+        # Backtest boundary: create clean run-local magnet state so zone memory
+        # from prior replay/live contexts cannot influence this run. Live keeps
+        # using engine.get_shared_magnet_predictor(); this isolated factory does
+        # not touch the production singleton.
+        self.magnet_predictor = create_backtest_magnet_predictor() if create_backtest_magnet_predictor is not None else None
         _backtest_label = (
             "PRODUCTION-VALID"
             if not any(_non_production_conditions.values())

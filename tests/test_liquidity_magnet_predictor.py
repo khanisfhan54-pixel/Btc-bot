@@ -82,7 +82,7 @@ def test_regime_filtering():
     score_trending_up_above = predictor._score_regime(market_trending_up, side)
 
     assert score_normal == 1.0
-    assert score_toxic == 0.5
+    assert score_toxic == 0.0
     assert score_volatile < 1.0 # Due to > 2.0 vol multiplier
     assert score_trending_up_above == 1.2 # Continuation
 
