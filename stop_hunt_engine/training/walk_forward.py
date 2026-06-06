@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import logging
 import math
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Sequence
 
 import numpy as np
 
@@ -11,7 +12,11 @@ from ..model.engine import StopHuntProbabilityEngine
 from .feature_codec import record_to_fv
 from .io import atomic_write_json, ensure_dir
 from .target import DEFAULT_TARGET, TargetDefinition
+from ..validation.purged_walk_forward import purged_walk_forward_splits
+from ..validation.walk_forward import walk_forward_splits, walk_forward_splits_rolling
 from .trainer import align_samples
+
+log = logging.getLogger(__name__)
 
 
 def _metrics(predictions: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -67,33 +72,72 @@ def _assert_no_train_label_horizon_overlap(samples: List[Dict[str, Any]], train_
         )
 
 
-def run_walk_forward(dataset: Dict[str, Any], labels_payload: Dict[str, Any], out_dir: str, *, target: TargetDefinition = DEFAULT_TARGET, min_train: int = 12, test_size: int = 4, model_version_prefix: str = "shpe.wf") -> Dict[str, Any]:
+def _assert_train_indices_do_not_leak(samples: List[Dict[str, Any]], train_indices: Sequence[int], test_indices: Sequence[int], horizon_bars: int) -> None:
+    if not train_indices or not test_indices:
+        return
+    first_test_index = int(samples[test_indices[0]]["row_index"])
+    first_test_timestamp = int(samples[test_indices[0]]["timestamp_ms"])
+    if max(int(samples[i]["timestamp_ms"]) for i in train_indices) >= first_test_timestamp:
+        raise RuntimeError("walk-forward validation failed closed: non-chronological fold boundary")
+    leaking = [
+        int(samples[i]["row_index"])
+        for i in train_indices
+        if _label_horizon_end_index(samples[i], horizon_bars) >= first_test_index
+    ]
+    if leaking:
+        raise RuntimeError(
+            "walk-forward validation failed closed: train label horizon overlaps test fold "
+            f"(first_test_index={first_test_index}, leaking_train_row_indices={leaking})"
+        )
+
+
+def run_walk_forward(dataset: Dict[str, Any], labels_payload: Dict[str, Any], out_dir: str, *, target: TargetDefinition = DEFAULT_TARGET, min_train: int = 12, test_size: int = 4, model_version_prefix: str = "shpe.wf", validation_mode: str = "purged", embargo_size: int = 0) -> Dict[str, Any]:
     samples, labels, regimes = align_samples(dataset, labels_payload)
     horizon_bars = int(target.horizon_bars)
+    if validation_mode not in {"expanding", "rolling", "purged"}:
+        raise ValueError(f"validation_mode={validation_mode!r} must be one of: expanding, rolling, purged")
+    if validation_mode == "expanding":
+        split_iter = walk_forward_splits(len(samples), min_train, test_size, test_size)
+    elif validation_mode == "rolling":
+        split_iter = walk_forward_splits_rolling(len(samples), min_train, test_size, test_size)
+    else:
+        split_iter = purged_walk_forward_splits(len(samples), min_train, test_size, test_size, horizon_bars, embargo_size)
     preds: List[Dict[str, Any]] = []
     folds: List[Dict[str, Any]] = []
     fold = 0
-    start = min_train
-    while start < len(samples):
-        end = min(start + test_size, len(samples))
-        train_end = _purged_train_end(samples, start, horizon_bars)
-        _assert_no_train_label_horizon_overlap(samples, train_end, start, end, horizon_bars)
-        if train_end < 1 or len(set(labels[:train_end])) < 2:
-            start += test_size
+    for train_range, test_range in split_iter:
+        train_indices = list(train_range)
+        test_indices = list(test_range)
+        if validation_mode == "purged":
+            log.info(
+                "purged_walk_forward "
+                "train=%d "
+                "test=%d "
+                "purge=%d "
+                "embargo=%d",
+                len(train_indices),
+                len(test_indices),
+                horizon_bars,
+                embargo_size,
+            )
+        if validation_mode == "expanding":
+            train_end = _purged_train_end(samples, test_indices[0], horizon_bars)
+            train_indices = list(range(train_end))
+        _assert_train_indices_do_not_leak(samples, train_indices, test_indices, horizon_bars)
+        if not train_indices or len(set(labels[i] for i in train_indices)) < 2:
             continue
-        engine = StopHuntProbabilityEngine.train([record_to_fv(s) for s in samples[:train_end]], labels[:train_end], regimes[:train_end], calibrate_method="platt", calibration_holdout_frac=0.2, min_samples_per_regime=30, run_importance_audit=False, model_version=f"{model_version_prefix}.{fold}")
-        fold_preds = []
-        for j in range(start, end):
+        engine = StopHuntProbabilityEngine.train([record_to_fv(samples[i]) for i in train_indices], [labels[i] for i in train_indices], [regimes[i] for i in train_indices], calibrate_method="platt", calibration_holdout_frac=0.2, min_samples_per_regime=30, run_importance_audit=False, model_version=f"{model_version_prefix}.{fold}")
+        for j in test_indices:
             pr = engine.predict(record_to_fv(samples[j]))
             row = {"fold": fold, "row_index": samples[j]["row_index"], "timestamp_ms": samples[j]["timestamp_ms"], "probability": pr.p_sweep, "raw_probability": pr.raw_p_sweep, "label": labels[j], "regime_used": pr.regime_used, "degraded": pr.degraded}
-            preds.append(row); fold_preds.append(row)
-        purged_rows = start - train_end
-        folds.append({"fold": fold, "train_rows": train_end, "test_rows": end - start, "purged_rows": purged_rows, "purge_bars": horizon_bars, "train_range": [samples[0]["timestamp_utc"], samples[train_end - 1]["timestamp_utc"]], "test_range": [samples[start]["timestamp_utc"], samples[end - 1]["timestamp_utc"]], "first_test_row_index": samples[start]["row_index"], "last_train_label_horizon_end_index": _label_horizon_end_index(samples[train_end - 1], horizon_bars)})
-        fold += 1; start = end
+            preds.append(row)
+        purged_rows = test_indices[0] - max(train_indices) - 1
+        folds.append({"fold": fold, "train_rows": len(train_indices), "test_rows": len(test_indices), "purged_rows": purged_rows, "purge_bars": horizon_bars, "embargo_bars": embargo_size, "validation_mode": validation_mode, "train_range": [samples[train_indices[0]]["timestamp_utc"], samples[train_indices[-1]]["timestamp_utc"]], "test_range": [samples[test_indices[0]]["timestamp_utc"], samples[test_indices[-1]]["timestamp_utc"]], "first_test_row_index": samples[test_indices[0]]["row_index"], "last_train_label_horizon_end_index": _label_horizon_end_index(samples[train_indices[-1]], horizon_bars)})
+        fold += 1
     if not preds:
         raise RuntimeError("walk-forward validation failed: no valid folds")
     metrics = _metrics(preds)
-    result = {"target_definition": target.to_dict(), "walk_forward_config": {"mode": "expanding_window_purged", "min_train": min_train, "test_size": test_size, "purge_bars": horizon_bars}, "folds": folds, "predictions": preds, "metrics": metrics, "tested_date_range": [preds[0]["timestamp_ms"], preds[-1]["timestamp_ms"]]}
+    result = {"target_definition": target.to_dict(), "walk_forward_config": {"mode": validation_mode, "min_train": min_train, "test_size": test_size, "purge_bars": horizon_bars, "embargo_bars": embargo_size}, "folds": folds, "predictions": preds, "metrics": metrics, "tested_date_range": [preds[0]["timestamp_ms"], preds[-1]["timestamp_ms"]]}
     base = ensure_dir(out_dir)
     path = os.path.join(base, "walk_forward.json")
     atomic_write_json(result, path)
