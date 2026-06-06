@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 import numpy as np
 
 from ..model.engine import SHPE_FEATURE_NAMES, StopHuntProbabilityEngine
+from ..validation.timestamp_alignment_audit import assert_no_timestamp_leakage
 from .feature_codec import record_to_fv
 from .io import atomic_write_json, ensure_dir
 from .target import DEFAULT_TARGET, TargetDefinition
@@ -15,6 +16,7 @@ MODEL_SCHEMA_VERSION = "shpe-model-artifact.v1.0.0"
 
 
 def align_samples(dataset: Dict[str, Any], labels_payload: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[int], List[str]]:
+    assert_no_timestamp_leakage(dataset)
     labels_by_idx = {int(x["row_index"]): x for x in labels_payload.get("labels", [])}
     samples: List[Dict[str, Any]] = []
     labels: List[int] = []

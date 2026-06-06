@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from ..model.engine import SHPE_FEATURE_NAMES
+from ..validation.timestamp_alignment_audit import assert_no_timestamp_leakage
 from .io import atomic_write_json, ensure_dir, read_json
 from .target import DEFAULT_TARGET, TargetDefinition
 
@@ -97,6 +98,24 @@ def _validate_external_feature_timestamps(row_idx: int, row: Dict[str, Any], fea
             _validate_timestamp_not_after_availability(row_idx, source, field, row, feature_available_ts_ms)
 
 
+def _external_timestamps(row: Dict[str, Any]) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for source, fields in _EXTERNAL_SOURCE_TIMESTAMP_FIELDS.items():
+        feature = "liquidations" if source == "liquidation" else source
+        for field in fields:
+            if _present(row, field):
+                out[feature] = _parse_source_timestamp(-1, feature, field, row)
+                break
+    return out
+
+
+def _prediction_timestamp_ms(row: Dict[str, Any]) -> int:
+    for field in ("prediction_timestamp_ms", "prediction_ts_ms", "prediction_ts", "feature_available_ts_ms", "timestamp_ms"):
+        if _present(row, field):
+            return _i(row, field)
+    return _i(row, "timestamp_ms")
+
+
 def validate_feature_rows(rows: Sequence[Dict[str, Any]], *, interval: str = "5m") -> None:
     if not rows:
         raise ValueError("SHPE dataset requires at least one feature row")
@@ -122,6 +141,7 @@ def validate_feature_rows(rows: Sequence[Dict[str, Any]], *, interval: str = "5m
             raise ValueError(f"row {idx} high < low")
         _validate_timestamp_not_after_availability(idx, "trade", "last_trade_ts_ms", row, avail)
         _validate_external_feature_timestamps(idx, row, avail)
+    assert_no_timestamp_leakage(rows)
 
 
 def derive_features(rows: Sequence[Dict[str, Any]], idx: int, target: TargetDefinition = DEFAULT_TARGET) -> Dict[str, float]:
@@ -190,7 +210,9 @@ def build_dataset(rows: Sequence[Dict[str, Any]], out_dir: str, *, target: Targe
         samples.append({
             "row_index": idx,
             "timestamp_ms": ts,
+            "prediction_timestamp_ms": _prediction_timestamp_ms(row),
             "feature_available_ts_ms": _i(row, "feature_available_ts_ms"),
+            "external_feature_timestamps": _external_timestamps(row),
             "timestamp_utc": _date(ts),
             "symbol": str(row.get("symbol", target.symbol)),
             "bar_interval": str(row.get("bar_interval", target.bar_interval)),

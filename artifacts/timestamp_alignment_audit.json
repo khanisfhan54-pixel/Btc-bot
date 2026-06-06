@@ -1,0 +1,13 @@
+{
+  "created_at_utc": "2026-06-06T07:57:01.097324+00:00",
+  "status": "PASS",
+  "summary": {
+    "average_leak_ms": 0.0,
+    "max_leak_ms": 0,
+    "rows_audited": 0,
+    "total_rows": 0,
+    "violation_rate": 0.0,
+    "violations": 0
+  },
+  "violations": []
+}

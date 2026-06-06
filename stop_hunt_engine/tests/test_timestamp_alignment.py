@@ -197,3 +197,103 @@ def test_clock_skew_warning_is_throttled(caplog: pytest.LogCaptureFixture):
                 build_feature_vector(payload, len(candles) - 1, max_clock_skew_sec=60)
     hits = [r for r in caplog.records if "shpe_pipeline_clock_skew source=l2" in r.message]
     assert len(hits) == 1
+
+from stop_hunt_engine.validation.timestamp_alignment_audit import run_timestamp_alignment_audit
+
+
+def _audit_row(prediction_ts=1_712_000_000_000, **overrides):
+    row = {
+        "row_index": 0,
+        "prediction_timestamp_ms": prediction_ts,
+        "funding_rate_8h": 0.0001,
+        "funding_timestamp_ms": prediction_ts,
+    }
+    row.update(overrides)
+    return row
+
+
+def test_timestamp_alignment_future_timestamp_detected():
+    row = _audit_row(funding_timestamp_ms=1_712_000_005_000)
+
+    report = run_timestamp_alignment_audit([row], fail_on_violation=False)
+
+    assert report["status"] == "FAIL"
+    assert report["violations"] == [
+        {
+            "feature": "funding",
+            "row": 0,
+            "prediction_ts": 1_712_000_000_000,
+            "feature_ts": 1_712_000_005_000,
+            "leak_ms": 5_000,
+        }
+    ]
+    with pytest.raises(ValueError, match="Timestamp leakage detected"):
+        run_timestamp_alignment_audit([row])
+
+
+def test_timestamp_alignment_equal_timestamp_allowed():
+    row = _audit_row(funding_timestamp_ms=1_712_000_000_000)
+
+    report = run_timestamp_alignment_audit([row])
+
+    assert report["status"] == "PASS"
+    assert report["summary"]["violations"] == 0
+
+
+def test_timestamp_alignment_older_timestamp_allowed():
+    row = _audit_row(funding_timestamp_ms=1_711_999_995_000)
+
+    report = run_timestamp_alignment_audit([row])
+
+    assert report["status"] == "PASS"
+    assert report["summary"]["violations"] == 0
+
+
+def test_timestamp_alignment_mixed_feature_sources():
+    prediction_ts = 1_712_000_000_000
+    row = _audit_row(
+        prediction_ts,
+        funding_timestamp_ms=prediction_ts,
+        delta_oi_velocity=1.0,
+        oi_timestamp_ms=prediction_ts - 1,
+        nearest_long_cluster_dist_pct=0.01,
+        liquidation_timestamp_ms=prediction_ts - 2,
+        ofi_zscore=0.4,
+        last_book_event_ts_ms=prediction_ts - 3,
+        regime="range",
+        regime_timestamp_ms=prediction_ts + 10,
+    )
+
+    report = run_timestamp_alignment_audit([row], fail_on_violation=False)
+
+    assert report["status"] == "FAIL"
+    assert report["summary"]["violations"] == 1
+    assert report["violations"][0]["feature"] == "regime"
+    assert report["violations"][0]["leak_ms"] == 10
+
+
+def test_timestamp_alignment_multiple_violations(tmp_path):
+    prediction_ts = 1_712_000_000_000
+    rows = [
+        _audit_row(prediction_ts, row_index=3, funding_timestamp_ms=prediction_ts + 5),
+        _audit_row(
+            prediction_ts,
+            row_index=4,
+            funding_timestamp_ms=prediction_ts - 1,
+            ofi_zscore=0.1,
+            last_book_event_ts_ms=prediction_ts + 20,
+            delta_oi_velocity=1.0,
+            oi_timestamp_ms=prediction_ts + 10,
+        ),
+    ]
+
+    report = run_timestamp_alignment_audit(rows, tmp_path, fail_on_violation=False)
+
+    assert report["summary"]["total_rows"] == 2
+    assert report["summary"]["rows_audited"] == 2
+    assert report["summary"]["violations"] == 3
+    assert report["summary"]["max_leak_ms"] == 20
+    assert report["summary"]["average_leak_ms"] == pytest.approx((5 + 20 + 10) / 3)
+    assert {v["row"] for v in report["violations"]} == {3, 4}
+    assert (tmp_path / "timestamp_alignment_audit.json").exists()
+    assert (tmp_path / "timestamp_alignment_summary.md").exists()
