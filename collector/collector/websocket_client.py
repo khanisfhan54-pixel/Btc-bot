@@ -2,7 +2,7 @@ import asyncio
 import json
 import websockets
 from typing import Callable, Awaitable
-from collector.utils import logger
+from .utils import logger
 
 class WebSocketClient:
     def __init__(self, url: str, on_message: Callable[[dict], Awaitable[None]], on_reconnect: Callable[[], None] = None):
@@ -20,7 +20,11 @@ class WebSocketClient:
 
         while self.running:
             try:
-                async with websockets.connect(self.url) as ws:
+                connection = websockets.connect(self.url)
+                if hasattr(connection, "__await__"):
+                    connection = await connection
+
+                async with connection as ws:
                     self.connected = True
                     self.retry_delay = 1.0
                     self.attempt = 0

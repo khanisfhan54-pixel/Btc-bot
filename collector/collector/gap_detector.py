@@ -1,5 +1,5 @@
 from typing import Dict, Any
-from collector.utils import logger, send_telegram_alert
+from .utils import logger, send_telegram_alert
 
 class GapDetector:
     def __init__(self):

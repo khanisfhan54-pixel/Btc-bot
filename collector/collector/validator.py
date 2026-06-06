@@ -1,6 +1,6 @@
 import time
 from typing import Dict, Any, Tuple, Optional
-from collector.utils import logger
+from .utils import logger
 
 class Validator:
     def __init__(self):
@@ -38,9 +38,11 @@ class Validator:
         if ts is None or ts <= 0:
             return False, "Invalid timestamp"
 
+        # BUG 3 FIX: Check exchange_timestamp against local clock, not local vs local.
+        exchange_ts = record.get("exchange_timestamp", ts)
         sys_time = int(time.time() * 1000)
-        if abs(ts - sys_time) > 5000:
-            return False, "Timestamp out of 5s tolerance"
+        if abs(exchange_ts - sys_time) > 5000:
+            return False, f"Exchange timestamp out of 5s tolerance: {exchange_ts} vs {sys_time}"
 
         if ts <= self.last_timestamps[stream_name]:
             return False, "Timestamp regression"

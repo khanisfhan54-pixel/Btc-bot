@@ -1,8 +1,8 @@
 import time
 import asyncio
 from typing import Dict
-from collector.utils import logger, send_telegram_alert
-from collector.disk_monitor import DiskMonitor
+from .utils import logger, send_telegram_alert
+from .disk_monitor import DiskMonitor
 
 class HealthMonitor:
     def __init__(self, disk_monitor: DiskMonitor, validator_ref: any, ws_client_ref: any):

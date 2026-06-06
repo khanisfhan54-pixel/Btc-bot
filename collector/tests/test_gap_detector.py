@@ -1,5 +1,5 @@
 import pytest
-from collector.gap_detector import GapDetector
+from collector.collector.gap_detector import GapDetector
 
 @pytest.fixture
 def detector():
@@ -11,7 +11,7 @@ def test_gap_detector_no_gap(detector, monkeypatch):
         nonlocal alerted
         alerted = True
 
-    monkeypatch.setattr("collector.gap_detector.send_telegram_alert", mock_alert)
+    monkeypatch.setattr("collector.collector.gap_detector.send_telegram_alert", mock_alert)
 
     detector.check_gap("orderbook", 1000)
     detector.check_gap("orderbook", 1400) # 400ms gap, threshold is 500
@@ -25,7 +25,7 @@ def test_gap_detector_with_gap(detector, monkeypatch):
         nonlocal alerted
         alerted = True
 
-    monkeypatch.setattr("collector.gap_detector.send_telegram_alert", mock_alert)
+    monkeypatch.setattr("collector.collector.gap_detector.send_telegram_alert", mock_alert)
 
     detector.check_gap("orderbook", 1000)
     detector.check_gap("orderbook", 4000) # 3000ms gap, threshold is 500
