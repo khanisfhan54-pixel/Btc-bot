@@ -2,7 +2,9 @@ import pyarrow as pa
 
 # Constants
 SYMBOL = "BTCUSDT"
-BINANCE_WS_URL = "wss://fstream.binance.com/stream?streams=btcusdt@depth10@100ms/btcusdt@aggTrade/btcusdt@markPrice@1s"
+BINANCE_PUBLIC_WS_URL = "wss://fstream.binance.com/public/stream?streams=btcusdt@depth10@100ms"
+BINANCE_MARKET_WS_URL = "wss://fstream.binance.com/market/stream?streams=btcusdt@aggTrade/btcusdt@markPrice@1s"
+BINANCE_WS_URL = BINANCE_PUBLIC_WS_URL
 
 # Intervals and Thresholds
 ORDERBOOK_STALE_MS = 500
