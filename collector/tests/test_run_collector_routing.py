@@ -55,6 +55,7 @@ def _app_without_init():
         "markprice": {"received": 0, "computed": 0, "empty_features": 0, "validated": 0, "rejected": 0, "written": 0},
         "unrouted": {"received": 0},
     }
+    app.validation_fail_reasons = {"orderbook": {}, "trades": {}, "markprice": {}}
     app.validator = MagicMock()
     app.validator.validate_orderbook.return_value = (True, "")
     app.validator.validate_trade.return_value = (True, "")
@@ -95,3 +96,26 @@ async def test_handle_message_routes_lowercase_trade_and_markprice_to_health_mon
     assert app.stream_counters["trades"]["validated"] == 1
     assert app.stream_counters["markprice"]["validated"] == 1
     assert app.stream_counters["unrouted"]["received"] == 0
+
+@pytest.mark.asyncio
+async def test_startup_verification_uses_cumulative_received_counters(monkeypatch):
+    app = _app_without_init()
+    app.stream_counters["orderbook"]["received"] = 533
+    app.stream_counters["trades"]["received"] = 651
+    app.stream_counters["markprice"]["received"] = 59
+    app.health_monitor.messages_per_minute = {"orderbook": 0, "trades": 0, "markprice": 0}
+
+    monkeypatch.setattr(_run_collector, "STREAM_INACTIVE_STARTUP_SECONDS", 0)
+
+    await app._verify_startup_streams()
+
+
+def test_trade_validation_rejections_are_grouped_by_reason():
+    app = _app_without_init()
+    app.validator.validate_trade.return_value = (False, "Timestamp regression")
+
+    app._handle_trades(_valid_trade_msg(), "btcusdt@aggtrade")
+    app._handle_trades(_valid_trade_msg(trade_id=124), "btcusdt@aggtrade")
+
+    assert app.stream_counters["trades"]["rejected"] == 2
+    assert app.validation_fail_reasons["trades"] == {"Timestamp regression": 2}

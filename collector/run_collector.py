@@ -31,6 +31,7 @@ class CollectorApp:
             "markprice": {"received": 0, "computed": 0, "empty_features": 0, "validated": 0, "rejected": 0, "written": 0},
             "unrouted": {"received": 0},
         }
+        self.validation_fail_reasons = {"orderbook": {}, "trades": {}, "markprice": {}}
 
         self.disk_monitor = DiskMonitor(shutdown_callback=self.shutdown)
         self.disk_monitor.check_disk_space()
@@ -89,6 +90,10 @@ class CollectorApp:
         logger.info(f"RAW_MESSAGE={msg}")
         self.raw_messages_logged += 1
 
+    def _record_validation_rejection(self, stream_name: str, reason: str):
+        reasons = self.validation_fail_reasons.setdefault(stream_name, {})
+        reasons[reason] = reasons.get(reason, 0) + 1
+
     async def handle_message(self, msg: dict):
         if "stream" not in msg or "data" not in msg:
             return
@@ -124,6 +129,7 @@ class CollectorApp:
         valid, reason = self.validator.validate_orderbook(features)
         if not valid:
             self.stream_counters["orderbook"]["rejected"] += 1
+            self._record_validation_rejection("orderbook", reason)
             logger.info("Validation result", stream="orderbook", validation_pass=False, validation_fail_reason=reason)
             return
 
@@ -146,6 +152,7 @@ class CollectorApp:
         valid, reason = self.validator.validate_trade(features)
         if not valid:
             self.stream_counters["trades"]["rejected"] += 1
+            self._record_validation_rejection("trades", reason)
             logger.info("Validation result", stream="trades", validation_pass=False, validation_fail_reason=reason)
             return
 
@@ -168,6 +175,7 @@ class CollectorApp:
         valid, reason = self.validator.validate_markprice(features)
         if not valid:
             self.stream_counters["markprice"]["rejected"] += 1
+            self._record_validation_rejection("markprice", reason)
             logger.info("Validation result", stream="markprice", validation_pass=False, validation_fail_reason=reason)
             return
 
@@ -216,14 +224,14 @@ class CollectorApp:
         inactive_streams = [
             stream_name
             for stream_name in ("orderbook", "trades", "markprice")
-            if self.health_monitor.messages_per_minute.get(stream_name, 0) == 0
+            if self.stream_counters[stream_name]["received"] == 0
         ]
         if inactive_streams:
             msg = f"Startup stream inactivity after {STREAM_INACTIVE_STARTUP_SECONDS}s: {', '.join(inactive_streams)}"
-            logger.error(msg, stream_counters=self.stream_counters)
+            logger.error(msg, stream_counters=self.stream_counters, validation_fail_reasons=self.validation_fail_reasons)
             send_telegram_alert(msg)
             raise RuntimeError(msg)
-        logger.info("Startup stream verification passed", stream_counters=self.stream_counters)
+        logger.info("Startup stream verification passed", stream_counters=self.stream_counters, validation_fail_reasons=self.validation_fail_reasons)
 
     async def _async_shutdown(self, signum: int):
         logger.info("Received signal, initiating async shutdown", signum=signum)
@@ -236,7 +244,7 @@ class CollectorApp:
         if not self.running:
             return
 
-        logger.info("Shutting down Collector Application...", stream_counters=self.stream_counters)
+        logger.info("Shutting down Collector Application...", stream_counters=self.stream_counters, validation_fail_reasons=self.validation_fail_reasons)
         self.running = False
 
         for ws_client in self.ws_clients:

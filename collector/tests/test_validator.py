@@ -95,3 +95,50 @@ def test_timestamp_regression(validator):
     valid, reason = validator.validate_orderbook(record)
     assert not valid
     assert "Timestamp regression" in reason
+
+
+def test_validate_trade_allows_same_local_millisecond_when_trade_id_increases(validator):
+    ts = int(time.time() * 1000)
+    first = {
+        "timestamp": ts,
+        "exchange_timestamp": ts,
+        "trade_id": 100,
+        "price": 100.0,
+        "quantity": 1.0,
+    }
+    second = {
+        "timestamp": ts,
+        "exchange_timestamp": ts,
+        "trade_id": 101,
+        "price": 100.0,
+        "quantity": 1.0,
+    }
+
+    valid, reason = validator.validate_trade(first)
+    assert valid, reason
+    valid, reason = validator.validate_trade(second)
+    assert valid, reason
+
+
+def test_validate_trade_still_rejects_older_local_timestamp(validator):
+    ts = int(time.time() * 1000)
+    first = {
+        "timestamp": ts,
+        "exchange_timestamp": ts,
+        "trade_id": 100,
+        "price": 100.0,
+        "quantity": 1.0,
+    }
+    older = {
+        "timestamp": ts - 1,
+        "exchange_timestamp": ts,
+        "trade_id": 101,
+        "price": 100.0,
+        "quantity": 1.0,
+    }
+
+    valid, reason = validator.validate_trade(first)
+    assert valid, reason
+    valid, reason = validator.validate_trade(older)
+    assert not valid
+    assert reason == "Timestamp regression"

@@ -33,7 +33,7 @@ class Validator:
                 return True
         return False
 
-    def validate_timestamp(self, stream_name: str, record: Dict[str, Any]) -> Tuple[bool, str]:
+    def validate_timestamp(self, stream_name: str, record: Dict[str, Any], allow_equal: bool = False) -> Tuple[bool, str]:
         ts = record.get("timestamp")
         if ts is None or ts <= 0:
             return False, "Invalid timestamp"
@@ -44,7 +44,7 @@ class Validator:
         if abs(exchange_ts - sys_time) > 5000:
             return False, f"Exchange timestamp out of 5s tolerance: {exchange_ts} vs {sys_time}"
 
-        if ts <= self.last_timestamps[stream_name]:
+        if ts < self.last_timestamps[stream_name] or (ts == self.last_timestamps[stream_name] and not allow_equal):
             return False, "Timestamp regression"
 
         return True, ""
@@ -97,7 +97,7 @@ class Validator:
     def validate_trade(self, record: Dict[str, Any]) -> Tuple[bool, str]:
         self.total_in_window += 1
 
-        valid_ts, reason = self.validate_timestamp("trades", record)
+        valid_ts, reason = self.validate_timestamp("trades", record, allow_equal=True)
         if not valid_ts:
             self._handle_failure("trades", reason, record)
             return False, reason
