@@ -1,10 +1,15 @@
-import os
-import sys
-import time
 import asyncio
 import signal
+from urllib.parse import parse_qs, urlparse
 from collector.utils import logger, send_telegram_alert
-from collector.config import BINANCE_WS_URL, ORDERBOOK_SCHEMA, TRADES_SCHEMA, MARKPRICE_SCHEMA
+from collector.config import (
+    BINANCE_MARKET_WS_URL,
+    BINANCE_PUBLIC_WS_URL,
+    ORDERBOOK_SCHEMA,
+    TRADES_SCHEMA,
+    MARKPRICE_SCHEMA,
+    SYMBOL,
+)
 from collector.feature_computer import compute_orderbook_features, compute_trades_features, compute_markprice_features
 from collector.validator import Validator
 from collector.gap_detector import GapDetector
@@ -13,9 +18,19 @@ from collector.health_monitor import HealthMonitor
 from collector.parquet_writer import ParquetWriter
 from collector.websocket_client import WebSocketClient
 
+STREAM_INACTIVE_STARTUP_SECONDS = 60
+RAW_LOG_LIMIT = 20
+
 class CollectorApp:
     def __init__(self):
         self.running = False
+        self.raw_messages_logged = 0
+        self.stream_counters = {
+            "orderbook": {"received": 0, "computed": 0, "empty_features": 0, "validated": 0, "rejected": 0, "written": 0},
+            "trades": {"received": 0, "computed": 0, "empty_features": 0, "validated": 0, "rejected": 0, "written": 0},
+            "markprice": {"received": 0, "computed": 0, "empty_features": 0, "validated": 0, "rejected": 0, "written": 0},
+            "unrouted": {"received": 0},
+        }
 
         self.disk_monitor = DiskMonitor(shutdown_callback=self.shutdown)
         self.disk_monitor.check_disk_space()
@@ -27,15 +42,52 @@ class CollectorApp:
         self.trades_writer = ParquetWriter("trades", TRADES_SCHEMA)
         self.mark_writer = ParquetWriter("markprice", MARKPRICE_SCHEMA)
 
-        self.ws_client = WebSocketClient(
-            url=BINANCE_WS_URL,
-            on_message=self.handle_message,
-            on_reconnect=self.handle_reconnect
-        )
+        self.ws_clients = [
+            WebSocketClient(
+                url=BINANCE_PUBLIC_WS_URL,
+                on_message=self.handle_message,
+                on_reconnect=self.handle_reconnect
+            ),
+            WebSocketClient(
+                url=BINANCE_MARKET_WS_URL,
+                on_message=self.handle_message,
+                on_reconnect=self.handle_reconnect
+            ),
+        ]
 
-        self.health_monitor = HealthMonitor(self.disk_monitor, self.validator, self.ws_client)
+        self.health_monitor = HealthMonitor(self.disk_monitor, self.validator, self)
 
         self.tasks = []
+
+    @property
+    def connected(self):
+        return all(client.connected for client in self.ws_clients)
+
+    def _requested_streams(self, url: str):
+        parsed = urlparse(url)
+        streams = parse_qs(parsed.query).get("streams", [""])[0]
+        return [stream for stream in streams.split("/") if stream]
+
+    def _route_stream(self, stream: str):
+        normalized_stream = stream.lower()
+        symbol_prefix = f"{SYMBOL.lower()}@"
+
+        if not normalized_stream.startswith(symbol_prefix):
+            return None
+        if "@depth" in normalized_stream:
+            return "orderbook"
+        if "@aggtrade" in normalized_stream:
+            return "trades"
+        if "@markprice" in normalized_stream:
+            return "markprice"
+        return None
+
+    def _log_raw_sample(self, stream: str, msg: dict):
+        if self.raw_messages_logged >= RAW_LOG_LIMIT:
+            return
+        logger.info(f"RAW_STREAM={stream}")
+        logger.info(f"RAW_MESSAGE={msg}")
+        self.raw_messages_logged += 1
 
     async def handle_message(self, msg: dict):
         if "stream" not in msg or "data" not in msg:
@@ -43,37 +95,88 @@ class CollectorApp:
 
         stream = msg["stream"]
         data = msg["data"]
+        self._log_raw_sample(stream, msg)
 
-        if stream == "btcusdt@depth10@100ms":
-            features = compute_orderbook_features(data)
-            if features:
-                valid, _ = self.validator.validate_orderbook(features)
-                if valid:
-                    self.gap_detector.check_gap("orderbook", features["timestamp"])
-                    self.ob_writer.write(features)
-                    self.health_monitor.record_message("orderbook", features["timestamp"])
-
-        elif stream == "btcusdt@aggTrade":
-            features = compute_trades_features(data)
-            if features:
-                valid, _ = self.validator.validate_trade(features)
-                if valid:
-                    self.gap_detector.check_gap("trades", features["timestamp"])
-                    self.trades_writer.write(features)
-                    self.health_monitor.record_message("trades", features["timestamp"])
-
-        elif stream == "btcusdt@markPrice@1s":
-            features = compute_markprice_features(data)
-            if features:
-                valid, _ = self.validator.validate_markprice(features)
-                if valid:
-                    self.gap_detector.check_gap("markprice", features["timestamp"])
-                    self.mark_writer.write(features)
-                    self.health_monitor.record_message("markprice", features["timestamp"])
+        route = self._route_stream(stream)
+        if route is None:
+            self.stream_counters["unrouted"]["received"] += 1
+            logger.warning("Unrouted stream message", stream=stream)
+        elif route == "orderbook":
+            self._handle_orderbook(data, stream)
+        elif route == "trades":
+            self._handle_trades(data, stream)
+        elif route == "markprice":
+            self._handle_markprice(data, stream)
 
         if self.validator.check_failure_rate():
             logger.error("Validation spike detected: >0.1% failures in 60s window")
             send_telegram_alert("Validation spike detected: >0.1% failures in 60s window")
+
+    def _handle_orderbook(self, data: dict, stream: str):
+        self.stream_counters["orderbook"]["received"] += 1
+        features = compute_orderbook_features(data)
+        if not features:
+            self.stream_counters["orderbook"]["empty_features"] += 1
+            logger.warning("Feature extraction returned empty", stream="orderbook", raw_stream=stream, keys=sorted(data.keys()))
+            return
+
+        self.stream_counters["orderbook"]["computed"] += 1
+        valid, reason = self.validator.validate_orderbook(features)
+        if not valid:
+            self.stream_counters["orderbook"]["rejected"] += 1
+            logger.info("Validation result", stream="orderbook", validation_pass=False, validation_fail_reason=reason)
+            return
+
+        self.stream_counters["orderbook"]["validated"] += 1
+        logger.info("Validation result", stream="orderbook", validation_pass=True, validation_fail_reason="")
+        self.gap_detector.check_gap("orderbook", features["timestamp"])
+        self.ob_writer.write(features)
+        self.stream_counters["orderbook"]["written"] += 1
+        self.health_monitor.record_message("orderbook", features["timestamp"])
+
+    def _handle_trades(self, data: dict, stream: str):
+        self.stream_counters["trades"]["received"] += 1
+        features = compute_trades_features(data)
+        if not features:
+            self.stream_counters["trades"]["empty_features"] += 1
+            logger.warning("Feature extraction returned empty", stream="trades", raw_stream=stream, keys=sorted(data.keys()))
+            return
+
+        self.stream_counters["trades"]["computed"] += 1
+        valid, reason = self.validator.validate_trade(features)
+        if not valid:
+            self.stream_counters["trades"]["rejected"] += 1
+            logger.info("Validation result", stream="trades", validation_pass=False, validation_fail_reason=reason)
+            return
+
+        self.stream_counters["trades"]["validated"] += 1
+        logger.info("Validation result", stream="trades", validation_pass=True, validation_fail_reason="")
+        self.gap_detector.check_gap("trades", features["timestamp"])
+        self.trades_writer.write(features)
+        self.stream_counters["trades"]["written"] += 1
+        self.health_monitor.record_message("trades", features["timestamp"])
+
+    def _handle_markprice(self, data: dict, stream: str):
+        self.stream_counters["markprice"]["received"] += 1
+        features = compute_markprice_features(data)
+        if not features:
+            self.stream_counters["markprice"]["empty_features"] += 1
+            logger.warning("Feature extraction returned empty", stream="markprice", raw_stream=stream, keys=sorted(data.keys()))
+            return
+
+        self.stream_counters["markprice"]["computed"] += 1
+        valid, reason = self.validator.validate_markprice(features)
+        if not valid:
+            self.stream_counters["markprice"]["rejected"] += 1
+            logger.info("Validation result", stream="markprice", validation_pass=False, validation_fail_reason=reason)
+            return
+
+        self.stream_counters["markprice"]["validated"] += 1
+        logger.info("Validation result", stream="markprice", validation_pass=True, validation_fail_reason="")
+        self.gap_detector.check_gap("markprice", features["timestamp"])
+        self.mark_writer.write(features)
+        self.stream_counters["markprice"]["written"] += 1
+        self.health_monitor.record_message("markprice", features["timestamp"])
 
     def handle_reconnect(self):
         logger.info("Resetting validation and gap tracking on reconnect")
@@ -82,6 +185,8 @@ class CollectorApp:
 
     async def start(self):
         logger.info("Starting Collector Application")
+        logger.info("Collector WebSocket subscription", url=BINANCE_PUBLIC_WS_URL, requested_streams=self._requested_streams(BINANCE_PUBLIC_WS_URL))
+        logger.info("Collector WebSocket subscription", url=BINANCE_MARKET_WS_URL, requested_streams=self._requested_streams(BINANCE_MARKET_WS_URL))
         send_telegram_alert("Collector Application Started")
 
         self.running = True
@@ -95,7 +200,9 @@ class CollectorApp:
             )
 
         self.tasks.append(asyncio.create_task(self.health_monitor.start()))
-        self.tasks.append(asyncio.create_task(self.ws_client.start()))
+        for ws_client in self.ws_clients:
+            self.tasks.append(asyncio.create_task(ws_client.start()))
+        self.tasks.append(asyncio.create_task(self._verify_startup_streams()))
 
         try:
             await asyncio.gather(*self.tasks)
@@ -103,6 +210,20 @@ class CollectorApp:
             pass
         finally:
             self.shutdown()
+
+    async def _verify_startup_streams(self):
+        await asyncio.sleep(STREAM_INACTIVE_STARTUP_SECONDS)
+        inactive_streams = [
+            stream_name
+            for stream_name in ("orderbook", "trades", "markprice")
+            if self.health_monitor.messages_per_minute.get(stream_name, 0) == 0
+        ]
+        if inactive_streams:
+            msg = f"Startup stream inactivity after {STREAM_INACTIVE_STARTUP_SECONDS}s: {', '.join(inactive_streams)}"
+            logger.error(msg, stream_counters=self.stream_counters)
+            send_telegram_alert(msg)
+            raise RuntimeError(msg)
+        logger.info("Startup stream verification passed", stream_counters=self.stream_counters)
 
     async def _async_shutdown(self, signum: int):
         logger.info("Received signal, initiating async shutdown", signum=signum)
@@ -115,10 +236,11 @@ class CollectorApp:
         if not self.running:
             return
 
-        logger.info("Shutting down Collector Application...")
+        logger.info("Shutting down Collector Application...", stream_counters=self.stream_counters)
         self.running = False
 
-        self.ws_client.stop()
+        for ws_client in self.ws_clients:
+            ws_client.stop()
         self.health_monitor.stop()
 
         for task in self.tasks:
