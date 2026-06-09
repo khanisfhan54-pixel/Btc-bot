@@ -12,7 +12,8 @@ class HealthMonitor:
         self.last_trade_ts = 0
         self.last_book_ts = 0
         self.last_mark_ts = 0
-        self.messages_per_minute: Dict[str, int] = {"orderbook": 0, "trades": 0, "markprice": 0}
+        self.last_oi_ts = 0
+        self.messages_per_minute: Dict[str, int] = {"orderbook": 0, "trades": 0, "markprice": 0, "openinterest": 0}
         self.running = False
 
     def record_message(self, stream_name: str, ts: int):
@@ -23,6 +24,8 @@ class HealthMonitor:
             self.last_trade_ts = max(self.last_trade_ts, ts)
         elif stream_name == "markprice":
             self.last_mark_ts = max(self.last_mark_ts, ts)
+        elif stream_name == "openinterest":
+            self.last_oi_ts = max(self.last_oi_ts, ts)
 
     async def start(self):
         self.running = True
@@ -41,12 +44,14 @@ class HealthMonitor:
         book_stale = (now - self.last_book_ts) > 60000 if self.last_book_ts > 0 else True
         trade_stale = (now - self.last_trade_ts) > 60000 if self.last_trade_ts > 0 else True
         mark_stale = (now - self.last_mark_ts) > 60000 if self.last_mark_ts > 0 else True
+        oi_stale = (now - self.last_oi_ts) > 60000 if self.last_oi_ts > 0 else True
 
-        if book_stale or trade_stale or mark_stale:
+        if book_stale or trade_stale or mark_stale or oi_stale:
             stale_streams = []
             if book_stale: stale_streams.append("orderbook")
             if trade_stale: stale_streams.append("trades")
             if mark_stale: stale_streams.append("markprice")
+            if oi_stale: stale_streams.append("openinterest")
             msg = f"Stream silent > 60s: {', '.join(stale_streams)}"
             logger.error(msg)
             send_telegram_alert(msg)
@@ -57,10 +62,11 @@ class HealthMonitor:
                     last_trade_ts=self.last_trade_ts,
                     last_book_ts=self.last_book_ts,
                     last_mark_ts=self.last_mark_ts,
+                    last_oi_ts=self.last_oi_ts,
                     messages_per_minute=self.messages_per_minute.copy(),
                     validation_failures_in_window=self.validator.failures_in_window,
                     disk_free_gb=disk_free,
                     ws_connected=self.ws_client.connected)
 
         # Reset minute counters
-        self.messages_per_minute = {"orderbook": 0, "trades": 0, "markprice": 0}
+        self.messages_per_minute = {"orderbook": 0, "trades": 0, "markprice": 0, "openinterest": 0}

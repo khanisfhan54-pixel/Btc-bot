@@ -1,5 +1,5 @@
 import pytest
-from collector.collector.feature_computer import compute_orderbook_features, compute_trades_features, compute_markprice_features
+from collector.collector.feature_computer import compute_orderbook_features, compute_trades_features, compute_markprice_features, compute_openinterest_features
 
 def test_compute_orderbook_features():
     msg = {
@@ -122,3 +122,22 @@ def test_compute_markprice_features():
     assert features["funding_rate"] == 0.0001
     assert features["funding_rate_bps"] == 1.0
     assert features["hours_to_funding"] == 1.0
+
+
+def test_compute_openinterest_features_valid_response(monkeypatch):
+    monkeypatch.setattr("collector.collector.feature_computer.time.time", lambda: 1234568.0)
+    msg = {"openInterest": "123.45", "time": "1234567000", "price": "100.0"}
+
+    features = compute_openinterest_features(msg)
+
+    assert features == {
+        "timestamp": 1234568000,
+        "exchange_timestamp": 1234567000,
+        "local_timestamp": 1234568000,
+        "open_interest": 123.45,
+        "open_interest_value": 12345.0,
+    }
+
+
+def test_compute_openinterest_features_missing_openinterest_returns_empty():
+    assert compute_openinterest_features({"time": "1234567000", "price": "100.0"}) == {}

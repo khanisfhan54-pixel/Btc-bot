@@ -6,3 +6,5 @@ numpy==2.4.6
 requests==2.34.2
 pytest==9.0.3
 pytest-asyncio==1.4.0
+
+aiohttp>=3.13.2,<4.0.0
