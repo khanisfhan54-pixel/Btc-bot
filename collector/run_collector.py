@@ -1,7 +1,7 @@
 import asyncio
 import signal
 from urllib.parse import parse_qs, urlparse
-from collector.utils import logger, send_telegram_alert
+from collector.utils import logger, send_telegram_alert, validate_telegram_startup
 from collector.config import (
     BINANCE_MARKET_WS_URL,
     BINANCE_PUBLIC_WS_URL,
@@ -339,6 +339,7 @@ class CollectorApp:
         send_telegram_alert(msg)
 
 if __name__ == "__main__":
+    validate_telegram_startup()
     app = CollectorApp()
     try:
         asyncio.run(app.start())

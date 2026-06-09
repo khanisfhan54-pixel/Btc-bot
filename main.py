@@ -259,13 +259,16 @@ except Exception as _exec_import_err:
     raise RuntimeError(_boot_msg) from _exec_import_err
 
 try:
-    from telegram_bot import send_telegram_message
+    from telegram_bot import send_telegram_message, validate_telegram_startup
 except Exception as _tg_import_err:
     logger.warning("telegram_bot import failed: %s", _tg_import_err)
 
     def send_telegram_message(message: str) -> bool:
         logger.info("TELEGRAM (fallback): %s", message)
         return False
+
+    def validate_telegram_startup():
+        raise RuntimeError(f"telegram_bot import failed: {_tg_import_err}")
 
 ENGINE_IS_FALLBACK: bool = not _EXECUTION_IMPORT_SUCCEEDED
 CREDENTIALS_MISSING: bool = False
@@ -3316,6 +3319,7 @@ def run_live() -> None:
     global CREDENTIALS_MISSING
     import signal as _signal
     print("BTCUSDT Institutional Signal Bot Started")
+    validate_telegram_startup()
     logger.info("Mode: %s", "DRY RUN" if DRY_RUN else "LIVE")
     logger.info(f"[BOOT] LIVE_TRADING resolved to: {LIVE_TRADING}")
     logger.info(f"[BOOT] SIGNAL_ONLY_MODE resolved to: {SIGNAL_ONLY_MODE}")
