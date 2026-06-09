@@ -5615,7 +5615,7 @@ class TelegramAlertSystem:
             )
         from telegram_bot import load_telegram_config, validate_telegram_startup
 
-        config = load_telegram_config(token=token, chat_id=chat_id, validate=True)
+        config = load_telegram_config(validate=True)
         if token is None and chat_id is None:
             validate_telegram_startup()
         self.token = config.token
@@ -5623,18 +5623,12 @@ class TelegramAlertSystem:
         self.enabled = enabled
 
     def send_message(self, text: str, parse_mode: str = "HTML") -> bool:
-        if not self.enabled or requests is None:
+        if not self.enabled:
             return False
         try:
-            url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-            payload = {
-                "chat_id": self.chat_id,
-                "text": str(text),
-                "parse_mode": parse_mode,
-                "disable_web_page_preview": True,
-            }
-            r = requests.post(url, json=payload, timeout=10)
-            return bool(r.ok)
+            from telegram_bot import send_telegram_message
+
+            return send_telegram_message(str(text), parse_mode=parse_mode)
         except Exception:
             return False
 

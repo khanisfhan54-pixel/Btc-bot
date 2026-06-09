@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 try:
@@ -13,20 +13,23 @@ except ImportError as _req_err:
         "requests is required for telegram_bot.py. Install it with: pip install requests"
     ) from _req_err
 
-try:
-    from dotenv import load_dotenv
-except ImportError:
-    def load_dotenv(*args, **kwargs): pass  # type: ignore[misc]
-
-load_dotenv()
-
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TEST_MESSAGE = "✅ BTC Bot Telegram Alert Test"
+BOT_TOKEN = "8719899776:AAHj7Tl-SuUU0CecRYU3sRyssCIRwThv3yY"
+CHAT_ID = "93372553"
+TELEGRAM_TEST_MESSAGE = "✅ BTC Bot Telegram Test Message"
+TELEGRAM_MODULE_FILE_PATH = str(Path(__file__).resolve())
+TELEGRAM_FUNCTION_NAMES = (
+    "load_telegram_config",
+    "validate_telegram_startup",
+    "send_telegram_message",
+    "send_test_telegram_alert",
+    "run_telegram_startup_test",
+)
 
 
 class TelegramConfigError(RuntimeError):
-    """Raised when Telegram alerting is not configured correctly."""
+    """Raised when the hardcoded Telegram alerting configuration is invalid."""
 
 
 @dataclass(frozen=True)
@@ -35,44 +38,16 @@ class TelegramConfig:
     chat_id: str
 
 
-def _clean_env_value(value: Optional[str]) -> str:
-    """Normalize environment/.env values without accepting blank secrets."""
-    return (value or "").strip().strip('"').strip("'").strip()
-
-
 def load_telegram_config(
     *,
     token: Optional[str] = None,
     chat_id: Optional[str] = None,
     validate: bool = True,
 ) -> TelegramConfig:
-    """Load Telegram credentials from explicit overrides or environment/.env."""
-    load_dotenv()
-    resolved_token = _clean_env_value(token if token is not None else os.getenv("TELEGRAM_BOT_TOKEN"))
-    resolved_chat_id = _clean_env_value(chat_id if chat_id is not None else os.getenv("TELEGRAM_CHAT_ID"))
-
-    if validate:
-        missing = []
-        if not resolved_token:
-            missing.append("TELEGRAM_BOT_TOKEN")
-        if not resolved_chat_id:
-            missing.append("TELEGRAM_CHAT_ID")
-        if missing:
-            raise TelegramConfigError(
-                "Missing required Telegram environment variable(s): "
-                + ", ".join(missing)
-                + ". Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in the environment or .env."
-            )
-
-    return TelegramConfig(token=resolved_token, chat_id=resolved_chat_id)
-
-
-def validate_telegram_startup() -> TelegramConfig:
-    """Fail fast on missing Telegram config and emit a clear startup log."""
-    config = load_telegram_config(validate=True)
-    print("Telegram Bot Config Loaded")
-    print(f"Telegram Chat ID: {config.chat_id}")
-    logger.info("[BOOT] Telegram integration configured for chat_id=%s", config.chat_id)
+    """Return the single hardcoded Telegram configuration used by all alerts."""
+    config = TelegramConfig(token=BOT_TOKEN, chat_id=CHAT_ID)
+    if validate and (not config.token.strip() or not config.chat_id.strip()):
+        raise TelegramConfigError("Hardcoded Telegram BOT_TOKEN and CHAT_ID must be non-empty.")
     return config
 
 
@@ -98,9 +73,40 @@ def send_telegram_message(message: str, *, parse_mode: Optional[str] = "Markdown
             extra={"status_code": response.status_code, "response_text": response.text[:500]},
         )
         return False
-    return True
+
+    try:
+        body = response.json()
+    except ValueError:
+        logger.error("Telegram API returned non-JSON response", extra={"response_text": response.text[:500]})
+        return False
+
+    ok = bool(body.get("ok"))
+    if not ok:
+        logger.error("Telegram API response was not successful", extra={"response_json": body})
+    return ok
 
 
 def send_test_telegram_alert() -> bool:
-    """Send a fixed Telegram integration-test alert."""
+    """Send the fixed Telegram integration-test alert."""
     return send_telegram_message(TELEGRAM_TEST_MESSAGE)
+
+
+def run_telegram_startup_test() -> bool:
+    """Send and print the startup Telegram test status."""
+    success = send_test_telegram_alert()
+    status = "success" if success else "failure"
+    print(f"Telegram module file path: {TELEGRAM_MODULE_FILE_PATH}")
+    print("Telegram function names: " + ", ".join(TELEGRAM_FUNCTION_NAMES))
+    print(f"Telegram startup test status: {status}")
+    return success
+
+
+def validate_telegram_startup() -> TelegramConfig:
+    """Validate hardcoded Telegram config and send the startup test message."""
+    config = load_telegram_config(validate=True)
+    print("Telegram Bot Config Loaded")
+    print(f"Telegram Chat ID: {config.chat_id}")
+    logger.info("[BOOT] Telegram integration configured for chat_id=%s", config.chat_id)
+    if not run_telegram_startup_test():
+        raise TelegramConfigError("Telegram startup test failed.")
+    return config
