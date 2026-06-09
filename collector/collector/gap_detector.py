@@ -10,7 +10,7 @@ class GapDetector:
         }
         self.thresholds = {
             "orderbook": 500,
-            "trades": 30000,
+            "trades": 5000,   # was 30000; 19s gaps are definitive WebSocket drops on BTC perp
             "markprice": 5000
         }
 
