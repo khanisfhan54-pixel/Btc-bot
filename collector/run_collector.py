@@ -135,7 +135,7 @@ class CollectorApp:
 
         self.stream_counters["orderbook"]["validated"] += 1
         logger.info("Validation result", stream="orderbook", validation_pass=True, validation_fail_reason="")
-        self.gap_detector.check_gap("orderbook", features["timestamp"])
+        self.gap_detector.check_gap("orderbook", features["exchange_timestamp"])
         self.ob_writer.write(features)
         self.stream_counters["orderbook"]["written"] += 1
         self.health_monitor.record_message("orderbook", features["timestamp"])
@@ -158,7 +158,7 @@ class CollectorApp:
 
         self.stream_counters["trades"]["validated"] += 1
         logger.info("Validation result", stream="trades", validation_pass=True, validation_fail_reason="")
-        self.gap_detector.check_gap("trades", features["timestamp"])
+        self.gap_detector.check_gap("trades", features["exchange_timestamp"])
         self.trades_writer.write(features)
         self.stream_counters["trades"]["written"] += 1
         self.health_monitor.record_message("trades", features["timestamp"])
@@ -181,7 +181,7 @@ class CollectorApp:
 
         self.stream_counters["markprice"]["validated"] += 1
         logger.info("Validation result", stream="markprice", validation_pass=True, validation_fail_reason="")
-        self.gap_detector.check_gap("markprice", features["timestamp"])
+        self.gap_detector.check_gap("markprice", features["exchange_timestamp"])
         self.mark_writer.write(features)
         self.stream_counters["markprice"]["written"] += 1
         self.health_monitor.record_message("markprice", features["timestamp"])

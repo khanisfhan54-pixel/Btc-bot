@@ -121,6 +121,70 @@ def test_trade_validation_rejections_are_grouped_by_reason():
     assert app.validation_fail_reasons["trades"] == {"Timestamp regression": 2}
 
 
+def test_handlers_use_exchange_timestamp_for_gap_detection(monkeypatch):
+    app = _app_without_init()
+
+    trade_features = {
+        "timestamp": 11_000,
+        "exchange_timestamp": 1_200,
+        "trade_id": 123,
+        "price": 100.5,
+        "quantity": 1.0,
+        "is_buyer_maker": False,
+    }
+    orderbook_features = {"timestamp": 11_000, "exchange_timestamp": 1_300}
+    markprice_features = {"timestamp": 11_000, "exchange_timestamp": 1_400}
+    monkeypatch.setattr(_run_collector, "compute_trades_features", lambda _: trade_features)
+    monkeypatch.setattr(_run_collector, "compute_orderbook_features", lambda _: orderbook_features)
+    monkeypatch.setattr(_run_collector, "compute_markprice_features", lambda _: markprice_features)
+
+    app._handle_trades({}, "btcusdt@aggtrade")
+    app._handle_orderbook({}, "btcusdt@depth10@100ms")
+    app._handle_markprice({}, "btcusdt@markprice@1s")
+
+    app.gap_detector.check_gap.assert_any_call("trades", 1_200)
+    app.gap_detector.check_gap.assert_any_call("orderbook", 1_300)
+    app.gap_detector.check_gap.assert_any_call("markprice", 1_400)
+
+
+def test_trade_processing_backlog_local_timestamp_gap_does_not_create_gap(monkeypatch):
+    app = _app_without_init()
+    app.gap_detector = _run_collector.GapDetector()
+    mock_logger = MagicMock()
+    mock_alert = MagicMock()
+    monkeypatch.setattr(_run_collector, "logger", mock_logger)
+    monkeypatch.setattr(_run_collector, "send_telegram_alert", mock_alert)
+    monkeypatch.setitem(_run_collector.GapDetector.check_gap.__globals__, "logger", mock_logger)
+    monkeypatch.setitem(_run_collector.GapDetector.check_gap.__globals__, "send_telegram_alert", mock_alert)
+
+    feature_records = iter([
+        {
+            "timestamp": 1_000,
+            "exchange_timestamp": 1_000,
+            "trade_id": 123,
+            "price": 100.5,
+            "quantity": 1.0,
+            "is_buyer_maker": False,
+        },
+        {
+            "timestamp": 11_000,
+            "exchange_timestamp": 1_200,
+            "trade_id": 124,
+            "price": 100.5,
+            "quantity": 1.0,
+            "is_buyer_maker": False,
+        },
+    ])
+    monkeypatch.setattr(_run_collector, "compute_trades_features", lambda _: next(feature_records))
+
+    app._handle_trades({}, "btcusdt@aggtrade")
+    app._handle_trades({}, "btcusdt@aggtrade")
+
+    assert app.gap_detector.last_seen["trades"] == 1_200
+    mock_logger.warning.assert_not_called()
+    mock_alert.assert_not_called()
+
+
 def test_orderbook_reconnect_preserves_trade_mid_price_validation_context():
     app = CollectorApp.__new__(CollectorApp)
     app.validator = _run_collector.Validator()
