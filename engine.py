@@ -5613,9 +5613,14 @@ class TelegramAlertSystem:
             raise ImportError(
                 "TelegramAlertSystem requires BTCBOT_LIVE_MODE=1."
             )
-        self.token = token or ""
-        self.chat_id = str(chat_id or "")
-        self.enabled = enabled and bool(self.token and self.chat_id)
+        from telegram_bot import load_telegram_config, validate_telegram_startup
+
+        config = load_telegram_config(token=token, chat_id=chat_id, validate=True)
+        if token is None and chat_id is None:
+            validate_telegram_startup()
+        self.token = config.token
+        self.chat_id = config.chat_id
+        self.enabled = enabled
 
     def send_message(self, text: str, parse_mode: str = "HTML") -> bool:
         if not self.enabled or requests is None:

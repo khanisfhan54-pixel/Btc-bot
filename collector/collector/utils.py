@@ -2,8 +2,11 @@ import os
 import structlog
 import logging
 import logging.handlers
-import requests
-import re
+from telegram_bot import (
+    TelegramConfigError,
+    send_telegram_message,
+    validate_telegram_startup,
+)
 
 def setup_logging(log_dir="logs"):
     os.makedirs(log_dir, exist_ok=True)
@@ -45,32 +48,12 @@ def setup_logging(log_dir="logs"):
 
 logger = setup_logging()
 
-def send_telegram_alert(message: str):
-    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-
-    if not bot_token or not chat_id:
-        logger.warning("Telegram credentials missing, skipping alert", message=message)
-        return
-
-    # Validate bot token defensively
-    if not re.match(r"^\d+:[a-zA-Z0-9_-]{30,50}$", bot_token):
-        logger.error("Invalid Telegram bot token format", message=message)
-        return
-
+def send_telegram_alert(message: str) -> bool:
     try:
-        chat_id_int = int(chat_id)
-    except ValueError:
-        logger.error("Invalid Telegram chat ID format", message=message)
-        return
-
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {
-        "chat_id": chat_id_int,
-        "text": message
-    }
-    try:
-        response = requests.post(url, json=payload, timeout=5)
-        response.raise_for_status()
+        return send_telegram_message(message, parse_mode=None)
+    except TelegramConfigError:
+        logger.error("Telegram credentials missing; alert delivery cannot continue", message=message)
+        raise
     except Exception as e:
         logger.error("Failed to send Telegram alert", error=str(e), message=message)
+        return False
