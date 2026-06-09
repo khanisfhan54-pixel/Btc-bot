@@ -68,7 +68,6 @@ OPENINTEREST_SCHEMA = pa.schema([
     ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
     ("local_timestamp", pa.timestamp("ms", tz="UTC")),
     ("open_interest", pa.float64()),
-    ("open_interest_value", pa.float64()),
 ], metadata={"schema_version": "1.0", "stream_name": "openinterest", "symbol": SYMBOL})
 
 LIQUIDATION_SCHEMA = pa.schema([

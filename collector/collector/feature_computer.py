@@ -144,7 +144,6 @@ def compute_openinterest_features(data: dict) -> dict:
     try:
         oi = float(data.get("openInterest", 0.0))
         exchange_ts = int(data.get("time", int(time.time() * 1000)))
-        price = float(data.get("price", 0.0))
     except (ValueError, TypeError):
         return {}
     if oi <= 0:
@@ -155,7 +154,6 @@ def compute_openinterest_features(data: dict) -> dict:
         "exchange_timestamp": exchange_ts,
         "local_timestamp": ts,
         "open_interest": oi,
-        "open_interest_value": oi * price,
     }
 
 
