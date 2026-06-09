@@ -41,7 +41,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = "8719899776:AAHj7Tl-SuUU0CecRYU3sRyssCIRwThv3yY"
-TELEGRAM_CHAT_ID = "93372553"
+TELEGRAM_CHAT_ID = "8578163822"
 BINANCE_API_KEY = os.environ.get("BINANCE_API_KEY", "")
 BINANCE_SECRET = os.environ.get("BINANCE_SECRET", "")
 DRY_RUN = os.environ.get("DRY_RUN", "1") == "1"
