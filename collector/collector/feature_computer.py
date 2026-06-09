@@ -146,3 +146,30 @@ def compute_openinterest_features(data: dict) -> dict:
         "open_interest": oi,
         "open_interest_value": oi * price,
     }
+
+
+def compute_liquidation_features(msg: dict) -> dict:
+    try:
+        o = msg.get("o", {})
+        side_str = o.get("S", "")
+        # BUY side in forceOrder = short position liquidated (forced buy)
+        side = 1 if side_str == "BUY" else -1
+        price = float(o.get("p", 0.0))
+        quantity = float(o.get("q", 0.0))
+        ts = int(time.time() * 1000)
+        exchange_ts = int(o.get("T", ts))
+    except (ValueError, TypeError):
+        return {}
+    if price <= 0 or quantity <= 0:
+        return {}
+    return {
+        "timestamp": ts,
+        "exchange_timestamp": exchange_ts,
+        "local_timestamp": ts,
+        "side": side,
+        "price": price,
+        "quantity": quantity,
+        "signed_qty": quantity * side,
+        "order_status": str(o.get("X", "")),
+        "time_in_force": str(o.get("f", "")),
+    }

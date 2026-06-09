@@ -9,9 +9,11 @@ from collector.config import (
     TRADES_SCHEMA,
     MARKPRICE_SCHEMA,
     OPENINTEREST_SCHEMA,
+    LIQUIDATION_SCHEMA,
     SYMBOL,
 )
 from collector.feature_computer import (
+    compute_liquidation_features,
     compute_markprice_features,
     compute_openinterest_features,
     compute_orderbook_features,
@@ -38,9 +40,10 @@ class CollectorApp:
             "trades": {"received": 0, "computed": 0, "empty_features": 0, "validated": 0, "rejected": 0, "written": 0},
             "markprice": {"received": 0, "computed": 0, "empty_features": 0, "validated": 0, "rejected": 0, "written": 0},
             "openinterest": {"received": 0, "computed": 0, "empty_features": 0, "validated": 0, "rejected": 0, "written": 0},
+            "liquidation": {"received": 0, "computed": 0, "empty_features": 0, "validated": 0, "rejected": 0, "written": 0},
             "unrouted": {"received": 0},
         }
-        self.validation_fail_reasons = {"orderbook": {}, "trades": {}, "markprice": {}, "openinterest": {}}
+        self.validation_fail_reasons = {"orderbook": {}, "trades": {}, "markprice": {}, "openinterest": {}, "liquidation": {}}
 
         self.disk_monitor = DiskMonitor(shutdown_callback=self.shutdown)
         self.disk_monitor.check_disk_space()
@@ -52,6 +55,7 @@ class CollectorApp:
         self.trades_writer = ParquetWriter("trades", TRADES_SCHEMA)
         self.mark_writer = ParquetWriter("markprice", MARKPRICE_SCHEMA)
         self.oi_writer = ParquetWriter("openinterest", OPENINTEREST_SCHEMA)
+        self.liq_writer = ParquetWriter("liquidation", LIQUIDATION_SCHEMA)
 
         self.ws_clients = [
             WebSocketClient(
@@ -91,6 +95,8 @@ class CollectorApp:
             return "trades"
         if "@markprice" in normalized_stream:
             return "markprice"
+        if "@forceorder" in normalized_stream:
+            return "liquidation"
         return None
 
     def _log_raw_sample(self, stream: str, msg: dict):
@@ -122,6 +128,8 @@ class CollectorApp:
             self._handle_trades(data, stream)
         elif route == "markprice":
             self._handle_markprice(data, stream)
+        elif route == "liquidation":
+            self._handle_liquidation(data, stream)
 
         if self.validator.check_failure_rate():
             logger.error("Validation spike detected: >0.1% failures in 60s window")
@@ -172,6 +180,25 @@ class CollectorApp:
         self.trades_writer.write(features)
         self.stream_counters["trades"]["written"] += 1
         self.health_monitor.record_message("trades", features["timestamp"])
+
+    def _handle_liquidation(self, data: dict, stream: str):
+        self.stream_counters["liquidation"]["received"] += 1
+        try:
+            features = compute_liquidation_features(data)
+            if not features:
+                self.stream_counters["liquidation"]["empty_features"] += 1
+                logger.warning("Feature extraction returned empty", stream="liquidation", raw_stream=stream, keys=sorted(data.keys()))
+                return
+
+            self.stream_counters["liquidation"]["computed"] += 1
+            self.stream_counters["liquidation"]["validated"] += 1
+            self.liq_writer.write(features)
+            self.stream_counters["liquidation"]["written"] += 1
+            self.health_monitor.record_message("liquidation", features["timestamp"])
+        except Exception as exc:
+            self.stream_counters["liquidation"]["rejected"] += 1
+            self._record_validation_rejection("liquidation", type(exc).__name__)
+            logger.error("Liquidation handling failed", stream="liquidation", raw_stream=stream, error=str(exc))
 
     def _handle_markprice(self, data: dict, stream: str):
         self.stream_counters["markprice"]["received"] += 1
@@ -305,6 +332,7 @@ class CollectorApp:
         self.trades_writer.close()
         self.mark_writer.close()
         self.oi_writer.close()
+        self.liq_writer.close()
 
         msg = "Collector Application Shutdown"
         logger.info(msg)
