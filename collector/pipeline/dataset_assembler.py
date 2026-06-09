@@ -24,15 +24,39 @@ def assemble_dataset(date_str: str, grid_ms: int = 100, data_dir: str = "data"):
 
         ob_file = os.path.join(ob_dir, f"{file_prefix}.parquet")
         if os.path.exists(ob_file):
-            ob_dfs.append(pd.read_parquet(ob_file))
+            df = pd.read_parquet(ob_file)
+            if pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
+                df["timestamp"] = (
+                    pd.to_datetime(df["timestamp"], utc=True)
+                    .astype("datetime64[ns, UTC]")
+                    .astype("int64")
+                    // 1_000_000
+                )
+            ob_dfs.append(df)
 
         trades_file = os.path.join(trades_dir, f"{file_prefix}.parquet")
         if os.path.exists(trades_file):
-            trades_dfs.append(pd.read_parquet(trades_file))
+            df = pd.read_parquet(trades_file)
+            if pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
+                df["timestamp"] = (
+                    pd.to_datetime(df["timestamp"], utc=True)
+                    .astype("datetime64[ns, UTC]")
+                    .astype("int64")
+                    // 1_000_000
+                )
+            trades_dfs.append(df)
 
         mark_file = os.path.join(mark_dir, f"{file_prefix}.parquet")
         if os.path.exists(mark_file):
-            mark_dfs.append(pd.read_parquet(mark_file))
+            df = pd.read_parquet(mark_file)
+            if pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
+                df["timestamp"] = (
+                    pd.to_datetime(df["timestamp"], utc=True)
+                    .astype("datetime64[ns, UTC]")
+                    .astype("int64")
+                    // 1_000_000
+                )
+            mark_dfs.append(df)
 
     if not ob_dfs or not mark_dfs:
         print(f"Insufficient data for {date_str}")
@@ -41,6 +65,15 @@ def assemble_dataset(date_str: str, grid_ms: int = 100, data_dir: str = "data"):
     df_ob = pd.concat(ob_dfs).sort_values("timestamp").reset_index(drop=True)
     df_trades = pd.concat(trades_dfs).sort_values("timestamp").reset_index(drop=True) if trades_dfs else pd.DataFrame()
     df_mark = pd.concat(mark_dfs).sort_values("timestamp").reset_index(drop=True)
+
+    for df_ref in [df_ob, df_trades, df_mark]:
+        if not df_ref.empty and pd.api.types.is_datetime64_any_dtype(df_ref["timestamp"]):
+            df_ref["timestamp"] = (
+                pd.to_datetime(df_ref["timestamp"], utc=True)
+                .astype("datetime64[ns, UTC]")
+                .astype("int64")
+                // 1_000_000
+            )
 
     # Create common time grid
     start_dt = datetime.strptime(date_str, "%Y-%m-%d")
