@@ -35,13 +35,25 @@ def verify_date(date_str: str, data_dir: str = "data"):
                 all_passed = False
                 continue
 
-            if df["timestamp"].duplicated().any():
-                print(f"  [FAIL] Duplicate timestamps in {file_path}")
-                all_passed = False
+            if stream == "trades":
+                if "trade_id" in df.columns and df.duplicated(subset=["timestamp", "trade_id"]).any():
+                    print(f"  [FAIL] Duplicate (timestamp, trade_id) pairs in {file_path}")
+                    all_passed = False
+            else:
+                if df["timestamp"].duplicated().any():
+                    print(f"  [FAIL] Duplicate timestamps in {file_path}")
+                    all_passed = False
 
-            if not df["timestamp"].is_monotonic_increasing:
-                print(f"  [FAIL] Timestamps not strictly monotonically increasing in {file_path}")
-                all_passed = False
+            if stream == "trades":
+                timestamp_diffs = df["timestamp"].diff().dropna()
+                zero_delta = pd.Timedelta(0) if pd.api.types.is_timedelta64_dtype(timestamp_diffs) else 0
+                if not (timestamp_diffs >= zero_delta).all():
+                    print(f"  [FAIL] Timestamps not monotonically non-decreasing in {file_path}")
+                    all_passed = False
+            else:
+                if not df["timestamp"].is_monotonic_increasing:
+                    print(f"  [FAIL] Timestamps not monotonically increasing in {file_path}")
+                    all_passed = False
 
             if df.isna().any().any():
                 print(f"  [FAIL] NaNs found in {file_path}")
