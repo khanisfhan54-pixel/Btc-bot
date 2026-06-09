@@ -8,9 +8,15 @@ from collector.config import (
     ORDERBOOK_SCHEMA,
     TRADES_SCHEMA,
     MARKPRICE_SCHEMA,
+    OPENINTEREST_SCHEMA,
     SYMBOL,
 )
-from collector.feature_computer import compute_orderbook_features, compute_trades_features, compute_markprice_features
+from collector.feature_computer import (
+    compute_markprice_features,
+    compute_openinterest_features,
+    compute_orderbook_features,
+    compute_trades_features,
+)
 from collector.validator import Validator
 from collector.gap_detector import GapDetector
 from collector.disk_monitor import DiskMonitor
@@ -20,6 +26,8 @@ from collector.websocket_client import WebSocketClient
 
 STREAM_INACTIVE_STARTUP_SECONDS = 60
 RAW_LOG_LIMIT = 20
+OI_POLL_INTERVAL_S = 3.0
+OI_URL = "https://fapi.binance.com/fapi/v1/openInterest?symbol=BTCUSDT"
 
 class CollectorApp:
     def __init__(self):
@@ -29,9 +37,10 @@ class CollectorApp:
             "orderbook": {"received": 0, "computed": 0, "empty_features": 0, "validated": 0, "rejected": 0, "written": 0},
             "trades": {"received": 0, "computed": 0, "empty_features": 0, "validated": 0, "rejected": 0, "written": 0},
             "markprice": {"received": 0, "computed": 0, "empty_features": 0, "validated": 0, "rejected": 0, "written": 0},
+            "openinterest": {"received": 0, "computed": 0, "empty_features": 0, "validated": 0, "rejected": 0, "written": 0},
             "unrouted": {"received": 0},
         }
-        self.validation_fail_reasons = {"orderbook": {}, "trades": {}, "markprice": {}}
+        self.validation_fail_reasons = {"orderbook": {}, "trades": {}, "markprice": {}, "openinterest": {}}
 
         self.disk_monitor = DiskMonitor(shutdown_callback=self.shutdown)
         self.disk_monitor.check_disk_space()
@@ -42,6 +51,7 @@ class CollectorApp:
         self.ob_writer = ParquetWriter("orderbook", ORDERBOOK_SCHEMA)
         self.trades_writer = ParquetWriter("trades", TRADES_SCHEMA)
         self.mark_writer = ParquetWriter("markprice", MARKPRICE_SCHEMA)
+        self.oi_writer = ParquetWriter("openinterest", OPENINTEREST_SCHEMA)
 
         self.ws_clients = [
             WebSocketClient(
@@ -221,6 +231,7 @@ class CollectorApp:
         self.tasks.append(asyncio.create_task(self.health_monitor.start()))
         for ws_client in self.ws_clients:
             self.tasks.append(asyncio.create_task(ws_client.start()))
+        self.tasks.append(asyncio.create_task(self._poll_openinterest()))
         self.tasks.append(asyncio.create_task(self._verify_startup_streams()))
 
         try:
@@ -229,6 +240,31 @@ class CollectorApp:
             pass
         finally:
             self.shutdown()
+
+    async def _poll_openinterest(self):
+        import aiohttp
+
+        timeout = aiohttp.ClientTimeout(total=5)
+        while self.running:
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(OI_URL) as resp:
+                        data = await resp.json()
+                self.stream_counters["openinterest"]["received"] += 1
+                features = compute_openinterest_features(data)
+                if features:
+                    self.stream_counters["openinterest"]["computed"] += 1
+                    self.stream_counters["openinterest"]["validated"] += 1
+                    self.oi_writer.write(features)
+                    self.stream_counters["openinterest"]["written"] += 1
+                    self.health_monitor.record_message("openinterest", features["timestamp"])
+                else:
+                    self.stream_counters["openinterest"]["empty_features"] += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error("OI poll failed", error=str(e))
+            await asyncio.sleep(OI_POLL_INTERVAL_S)
 
     async def _verify_startup_streams(self):
         await asyncio.sleep(STREAM_INACTIVE_STARTUP_SECONDS)
@@ -268,6 +304,7 @@ class CollectorApp:
         self.ob_writer.close()
         self.trades_writer.close()
         self.mark_writer.close()
+        self.oi_writer.close()
 
         msg = "Collector Application Shutdown"
         logger.info(msg)

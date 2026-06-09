@@ -10,6 +10,7 @@ BINANCE_WS_URL = BINANCE_PUBLIC_WS_URL
 ORDERBOOK_STALE_MS = 500
 TRADES_STALE_MS = 5000   # was 30000
 MARKPRICE_STALE_MS = 5000
+OI_STALE_MS = 30000  # OI updates ~every 3s via REST or ~5s via stream
 
 # File Paths
 DATA_DIR = "data"
@@ -61,3 +62,11 @@ MARKPRICE_SCHEMA = pa.schema([
     ("funding_rate_bps", pa.float64()),
     ("hours_to_funding", pa.float64()),
 ], metadata={"schema_version": "1.0", "stream_name": "markprice", "symbol": SYMBOL})
+
+OPENINTEREST_SCHEMA = pa.schema([
+    ("timestamp", pa.int64()),
+    ("exchange_timestamp", pa.int64()),
+    ("local_timestamp", pa.int64()),
+    ("open_interest", pa.float64()),
+    ("open_interest_value", pa.float64()),
+], metadata={"schema_version": "1.0", "stream_name": "openinterest", "symbol": SYMBOL})

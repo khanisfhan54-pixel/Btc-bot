@@ -234,3 +234,52 @@ def test_market_reconnect_resets_trades_and_markprice_without_orderbook_state():
     assert app.gap_detector.last_seen == {"orderbook": 1000, "trades": 0, "markprice": 0}
     assert app.validator.last_trade_id == -1
     assert app.validator.last_mid_price == 100.0
+
+@pytest.mark.asyncio
+async def test_poll_openinterest_writes_valid_rest_response(monkeypatch):
+    app = _app_without_init()
+    app.running = True
+    app.stream_counters["openinterest"] = {"received": 0, "computed": 0, "empty_features": 0, "validated": 0, "rejected": 0, "written": 0}
+    app.oi_writer = MagicMock()
+
+    class FakeResponse:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def json(self):
+            return {"openInterest": "2.5", "time": str(int(time.time() * 1000)), "price": "100.0"}
+
+    class FakeSession:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, url):
+            return FakeResponse()
+
+    class FakeAiohttp:
+        ClientSession = FakeSession
+
+        class ClientTimeout:
+            def __init__(self, total):
+                self.total = total
+
+    async def stop_after_poll(seconds):
+        app.running = False
+
+    monkeypatch.setitem(sys.modules, "aiohttp", FakeAiohttp)
+    monkeypatch.setattr(_run_collector.asyncio, "sleep", stop_after_poll)
+
+    await app._poll_openinterest()
+
+    app.oi_writer.write.assert_called_once()
+    app.health_monitor.record_message.assert_any_call("openinterest", ANY)
+    assert app.stream_counters["openinterest"]["written"] == 1
