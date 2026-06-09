@@ -5608,19 +5608,21 @@ class BinanceFuturesStreamClient:
 
 class TelegramAlertSystem:
     def __init__(self, token: Optional[str] = None, chat_id: Optional[str] = None, enabled: bool = True) -> None:
-        import os as _os  # AUDIT FIX ISSUE-A
-        if _os.environ.get("BTCBOT_LIVE_MODE") != "1":
-            raise ImportError(
-                "TelegramAlertSystem requires BTCBOT_LIVE_MODE=1."
-            )
-        from telegram_bot import load_telegram_config, validate_telegram_startup
+        self.token = token or ""
+        self.chat_id = chat_id or ""
+        self.enabled = False
+        try:
+            from telegram_bot import load_telegram_config
 
-        config = load_telegram_config(validate=True)
-        if token is None and chat_id is None:
-            validate_telegram_startup()
-        self.token = config.token
-        self.chat_id = config.chat_id
-        self.enabled = enabled
+            config = load_telegram_config(token=token, chat_id=chat_id, validate=False)
+            self.token = config.token
+            self.chat_id = config.chat_id
+            self.enabled = bool(enabled and config.enabled)
+            if not self.enabled:
+                logger.warning("TelegramAlertSystem disabled; engine continues without Telegram")
+        except Exception as exc:
+            logger.warning("TelegramAlertSystem failed open during init: %s", exc)
+            self.enabled = False
 
     def send_message(self, text: str, parse_mode: str = "HTML") -> bool:
         if not self.enabled:
