@@ -175,12 +175,11 @@ def test_compute_openinterest_features_valid_response(monkeypatch):
         "exchange_timestamp": 1234567000,
         "local_timestamp": 1234568000,
         "open_interest": 123.45,
-        "open_interest_value": 12345.0,
     }
 
 
 def test_compute_openinterest_features_missing_openinterest_returns_empty():
-    assert compute_openinterest_features({"time": "1234567000", "price": "100.0"}) == {}
+    assert compute_openinterest_features({"time": "1234567000"}) == {}
 
 
 def test_compute_liquidation_features_buy_force_order(monkeypatch):

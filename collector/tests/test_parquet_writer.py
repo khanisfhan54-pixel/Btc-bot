@@ -139,7 +139,6 @@ def _openinterest_record(timestamp_ms=1770000000000):
         "exchange_timestamp": timestamp_ms + 1,
         "local_timestamp": timestamp_ms + 2,
         "open_interest": 123.45,
-        "open_interest_value": 12345.0,
     }
 
 
