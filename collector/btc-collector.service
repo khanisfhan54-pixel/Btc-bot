@@ -7,7 +7,7 @@ Type=simple
 User=ubuntu
 WorkingDirectory=/path/to/collector
 Environment="TELEGRAM_BOT_TOKEN=YOUR_BOT_TOKEN"
-Environment="TELEGRAM_CHAT_ID=YOUR_CHAT_ID"
+Environment="TELEGRAM_CHAT_ID=8578163822"
 ExecStart=/usr/bin/python3 run_collector.py
 Restart=always
 RestartSec=5

@@ -21,7 +21,7 @@ except Exception as _requests_import_error:  # Telegram is optional/fail-open.
     logger.warning("requests unavailable; Telegram disabled: %s", _requests_import_error)
 
 TELEGRAM_BOT_TOKEN = "8719899776:AAHj7Tl-SuUU0CecRYU3sRyssCIRwThv3yY"
-TELEGRAM_CHAT_ID = "93372553"
+TELEGRAM_CHAT_ID = "8578163822"
 BOT_TOKEN = TELEGRAM_BOT_TOKEN
 CHAT_ID = TELEGRAM_CHAT_ID
 TELEGRAM_TEST_MESSAGE = "✅ BTC Bot Telegram Test Message"
