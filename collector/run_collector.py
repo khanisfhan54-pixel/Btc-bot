@@ -1,8 +1,8 @@
 import asyncio
 import signal
 from urllib.parse import parse_qs, urlparse
-from collector.utils import logger, send_telegram_alert, validate_telegram_startup
-from collector.config import (
+from collector.collector.utils import logger, send_telegram_alert, validate_telegram_startup
+from collector.collector.config import (
     BINANCE_MARKET_WS_URL,
     BINANCE_PUBLIC_WS_URL,
     ORDERBOOK_SCHEMA,
@@ -12,19 +12,19 @@ from collector.config import (
     LIQUIDATION_SCHEMA,
     SYMBOL,
 )
-from collector.feature_computer import (
+from collector.collector.feature_computer import (
     compute_liquidation_features,
     compute_markprice_features,
     compute_openinterest_features,
     compute_orderbook_features,
     compute_trades_features,
 )
-from collector.validator import Validator
-from collector.gap_detector import GapDetector
-from collector.disk_monitor import DiskMonitor
-from collector.health_monitor import HealthMonitor
-from collector.parquet_writer import ParquetWriter
-from collector.websocket_client import WebSocketClient
+from collector.collector.validator import Validator
+from collector.collector.gap_detector import GapDetector
+from collector.collector.disk_monitor import DiskMonitor
+from collector.collector.health_monitor import HealthMonitor
+from collector.collector.parquet_writer import ParquetWriter
+from collector.collector.websocket_client import WebSocketClient
 
 STREAM_INACTIVE_STARTUP_SECONDS = 60
 RAW_LOG_LIMIT = 20
