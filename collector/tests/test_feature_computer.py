@@ -21,9 +21,49 @@ def test_compute_orderbook_features():
     assert abs(features["obi"] - (-10.0 / 30.0)) < 1e-5
 
 def test_compute_orderbook_features_invalid():
-    msg = {"b": [["100.0", "1.0"]], "a": [["101.0", "2.0"]]} # Not 10 levels
+    msg = {"b": [], "a": [["101.0", "2.0"]]}
     features = compute_orderbook_features(msg)
     assert not features
+
+
+def test_compute_orderbook_features_pads_five_bid_levels():
+    msg = {
+        "E": 1234567890,
+        "b": [[str(100.0 - i), str(1.0 + i)] for i in range(5)],
+        "a": [[str(101.0 + i), str(2.0)] for i in range(10)],
+    }
+
+    features = compute_orderbook_features(msg)
+
+    assert features
+    assert len(features["bids_price"]) == 10
+    assert len(features["bids_qty"]) == 10
+    assert features["bids_price"][5:] == [96.0] * 5
+    assert features["bids_qty"][5:] == [0.0] * 5
+
+
+def test_compute_orderbook_features_accepts_single_level_and_computes_obi():
+    msg = {
+        "E": 1234567890,
+        "b": [["100.0", "3.0"]],
+        "a": [["101.0", "1.0"]],
+    }
+
+    features = compute_orderbook_features(msg)
+
+    assert features
+    assert len(features["bids_price"]) == 10
+    assert len(features["asks_price"]) == 10
+    assert features["bids_qty"] == [3.0] + [0.0] * 9
+    assert features["asks_qty"] == [1.0] + [0.0] * 9
+    assert features["obi"] == 0.5
+    assert features["obi_level_1"] == 0.5
+
+
+def test_compute_orderbook_features_rejects_zero_bids():
+    msg = {"b": [], "a": [["101.0", "2.0"] for _ in range(10)]}
+    features = compute_orderbook_features(msg)
+    assert features == {}
 
 def test_compute_trades_features():
     msg = {
