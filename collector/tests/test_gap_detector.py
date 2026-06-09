@@ -32,3 +32,11 @@ def test_gap_detector_with_gap(detector, monkeypatch):
 
     assert alerted
     assert detector.last_seen["orderbook"] == 4000
+
+
+def test_reset_stream_resets_only_requested_gap_state(detector):
+    detector.last_seen = {"orderbook": 1000, "trades": 2000, "markprice": 3000}
+
+    detector.reset_stream("trades")
+
+    assert detector.last_seen == {"orderbook": 1000, "trades": 0, "markprice": 3000}

@@ -142,3 +142,29 @@ def test_validate_trade_still_rejects_older_local_timestamp(validator):
     valid, reason = validator.validate_trade(older)
     assert not valid
     assert reason == "Timestamp regression"
+
+
+def test_reset_stream_orderbook_resets_only_orderbook_state(validator):
+    validator.last_timestamps = {"orderbook": 1000, "trades": 2000, "markprice": 3000}
+    validator.last_trade_id = 12345
+    validator.last_mid_price = 100.5
+
+    validator.reset_stream("orderbook")
+
+    assert validator.last_timestamps["orderbook"] == 0
+    assert validator.last_mid_price is None
+    assert validator.last_timestamps["trades"] == 2000
+    assert validator.last_trade_id == 12345
+
+
+def test_reset_stream_trades_resets_only_trades_state(validator):
+    validator.last_timestamps = {"orderbook": 1000, "trades": 2000, "markprice": 3000}
+    validator.last_trade_id = 12345
+    validator.last_mid_price = 100.5
+
+    validator.reset_stream("trades")
+
+    assert validator.last_trade_id == -1
+    assert validator.last_timestamps["trades"] == 0
+    assert validator.last_timestamps["orderbook"] == 1000
+    assert validator.last_mid_price == 100.5
