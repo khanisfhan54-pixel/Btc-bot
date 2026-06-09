@@ -47,12 +47,12 @@ class CollectorApp:
             WebSocketClient(
                 url=BINANCE_PUBLIC_WS_URL,
                 on_message=self.handle_message,
-                on_reconnect=self.handle_reconnect
+                on_reconnect=self._make_reconnect_handler(BINANCE_PUBLIC_WS_URL)
             ),
             WebSocketClient(
                 url=BINANCE_MARKET_WS_URL,
                 on_message=self.handle_message,
-                on_reconnect=self.handle_reconnect
+                on_reconnect=self._make_reconnect_handler(BINANCE_MARKET_WS_URL)
             ),
         ]
 
@@ -186,10 +186,21 @@ class CollectorApp:
         self.stream_counters["markprice"]["written"] += 1
         self.health_monitor.record_message("markprice", features["timestamp"])
 
-    def handle_reconnect(self):
-        logger.info("Resetting validation and gap tracking on reconnect")
-        self.validator.reset()
-        self.gap_detector.reset()
+    def _make_reconnect_handler(self, url: str):
+        streams_for_url = self._requested_streams(url)
+
+        def handler():
+            logger.info("Resetting validation and gap tracking on reconnect", url=url, streams=streams_for_url)
+            for stream_name_fragment in streams_for_url:
+                route = self._route_stream(stream_name_fragment)
+                if route:
+                    preserved_last_mid_price = self.validator.last_mid_price if route == "orderbook" else None
+                    self.validator.reset_stream(route)
+                    if route == "orderbook":
+                        self.validator.last_mid_price = preserved_last_mid_price
+                    self.gap_detector.reset_stream(route)
+
+        return handler
 
     async def start(self):
         logger.info("Starting Collector Application")

@@ -160,6 +160,14 @@ class Validator:
         self.failures_in_window += 1
         logger.error("Validation failed", stream=stream_name, reason=reason, timestamp=record.get("timestamp"), record=record)
 
+    def reset_stream(self, stream_name: str):
+        if stream_name in self.last_timestamps:
+            self.last_timestamps[stream_name] = 0
+        if stream_name == "trades":
+            self.last_trade_id = -1
+        if stream_name == "orderbook":
+            self.last_mid_price = None
+
     def reset(self):
         self.last_timestamps = {"orderbook": 0, "trades": 0, "markprice": 0}
         self.last_trade_id = -1

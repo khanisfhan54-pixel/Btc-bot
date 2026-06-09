@@ -119,3 +119,54 @@ def test_trade_validation_rejections_are_grouped_by_reason():
 
     assert app.stream_counters["trades"]["rejected"] == 2
     assert app.validation_fail_reasons["trades"] == {"Timestamp regression": 2}
+
+
+def test_orderbook_reconnect_preserves_trade_mid_price_validation_context():
+    app = CollectorApp.__new__(CollectorApp)
+    app.validator = _run_collector.Validator()
+    app.gap_detector = _run_collector.GapDetector()
+    app.validator.last_timestamps = {"orderbook": 1000, "trades": 2000, "markprice": 3000}
+    app.gap_detector.last_seen = {"orderbook": 1000, "trades": 2000, "markprice": 3000}
+    app.validator.last_trade_id = 12345
+    app.validator.last_mid_price = 100.0
+
+    reconnect_handler = app._make_reconnect_handler(_run_collector.BINANCE_PUBLIC_WS_URL)
+    reconnect_handler()
+
+    assert app.validator.last_timestamps["orderbook"] == 0
+    assert app.gap_detector.last_seen["orderbook"] == 0
+    assert app.validator.last_timestamps["trades"] == 2000
+    assert app.gap_detector.last_seen["trades"] == 2000
+    assert app.validator.last_trade_id == 12345
+    assert app.validator.last_mid_price == 100.0
+
+    valid, reason = app.validator.validate_trade(
+        {
+            "timestamp": int(time.time() * 1000),
+            "exchange_timestamp": int(time.time() * 1000),
+            "trade_id": 12346,
+            "price": 106.0,
+            "quantity": 1.0,
+        }
+    )
+
+    assert not valid
+    assert reason == "Price > 5% from mid_price"
+
+
+def test_market_reconnect_resets_trades_and_markprice_without_orderbook_state():
+    app = CollectorApp.__new__(CollectorApp)
+    app.validator = _run_collector.Validator()
+    app.gap_detector = _run_collector.GapDetector()
+    app.validator.last_timestamps = {"orderbook": 1000, "trades": 2000, "markprice": 3000}
+    app.gap_detector.last_seen = {"orderbook": 1000, "trades": 2000, "markprice": 3000}
+    app.validator.last_trade_id = 12345
+    app.validator.last_mid_price = 100.0
+
+    reconnect_handler = app._make_reconnect_handler(_run_collector.BINANCE_MARKET_WS_URL)
+    reconnect_handler()
+
+    assert app.validator.last_timestamps == {"orderbook": 1000, "trades": 0, "markprice": 0}
+    assert app.gap_detector.last_seen == {"orderbook": 1000, "trades": 0, "markprice": 0}
+    assert app.validator.last_trade_id == -1
+    assert app.validator.last_mid_price == 100.0

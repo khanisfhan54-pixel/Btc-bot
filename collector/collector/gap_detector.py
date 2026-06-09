@@ -30,5 +30,9 @@ class GapDetector:
 
         self.last_seen[stream_name] = current_ts
 
+    def reset_stream(self, stream_name: str):
+        if stream_name in self.last_seen:
+            self.last_seen[stream_name] = 0
+
     def reset(self):
         self.last_seen = {"orderbook": 0, "trades": 0, "markprice": 0}
