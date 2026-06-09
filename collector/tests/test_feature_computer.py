@@ -42,6 +42,72 @@ def test_compute_trades_features():
     assert features["side_sign"] == -1
     assert features["signed_qty"] == -1.5
 
+
+def test_compute_trades_features_prefers_trade_time_over_event_time():
+    msg = {
+        "T": 1234567000,
+        "E": 1234567890,
+        "a": 123,
+        "p": "100.0",
+        "q": "1.5",
+        "m": True
+    }
+
+    features = compute_trades_features(msg)
+
+    assert features["exchange_timestamp"] == 1234567000
+
+
+def test_compute_trades_features_falls_back_to_event_time_without_trade_time():
+    msg = {
+        "E": 1234567890,
+        "a": 123,
+        "p": "100.0",
+        "q": "1.5",
+        "m": True
+    }
+
+    features = compute_trades_features(msg)
+
+    assert features["exchange_timestamp"] == 1234567890
+
+
+def test_compute_trades_features_falls_back_to_local_timestamp_without_exchange_times(monkeypatch):
+    monkeypatch.setattr("collector.collector.feature_computer.time.time", lambda: 1234567.89)
+    msg = {
+        "a": 123,
+        "p": "100.0",
+        "q": "1.5",
+        "m": True
+    }
+
+    features = compute_trades_features(msg)
+
+    assert features["timestamp"] == 1234567890
+    assert features["local_timestamp"] == 1234567890
+    assert features["exchange_timestamp"] == 1234567890
+
+
+def test_compute_trades_features_trade_time_latency_includes_dispatch_lag(monkeypatch):
+    monkeypatch.setattr("collector.collector.feature_computer.time.time", lambda: 1234568.0)
+    trade_time = 1234567000
+    event_time = 1234567890
+    msg = {
+        "T": trade_time,
+        "E": event_time,
+        "a": 123,
+        "p": "100.0",
+        "q": "1.5",
+        "m": True
+    }
+
+    features = compute_trades_features(msg)
+    trade_latency = features["local_timestamp"] - features["exchange_timestamp"]
+    previous_event_latency = features["local_timestamp"] - event_time
+
+    assert trade_latency > 0
+    assert trade_latency == previous_event_latency + (event_time - trade_time)
+
 def test_compute_markprice_features():
     msg = {
         "E": 1234567890,

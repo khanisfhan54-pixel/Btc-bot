@@ -89,7 +89,7 @@ def compute_trades_features(msg: Dict[str, Any]) -> Dict[str, Any]:
     signed_qty = quantity * side_sign
 
     timestamp = int(time.time() * 1000)
-    exchange_timestamp = msg.get("E", timestamp)
+    exchange_timestamp = int(msg.get("T", msg.get("E", timestamp)))
 
     return {
         "timestamp": timestamp,
