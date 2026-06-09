@@ -8,7 +8,7 @@ def generate_gap_report(start_date: str, end_date: str, data_dir: str = "data"):
     dates = pd.date_range(start_date, end_date).strftime("%Y-%m-%d").tolist()
 
     streams = ["orderbook", "trades", "markprice"]
-    thresholds = {"orderbook": 500, "trades": 30000, "markprice": 5000}
+    thresholds = {"orderbook": 500, "trades": 5000, "markprice": 5000}
 
     print(f"{'Stream':<15} {'Date':<15} {'Gaps':<10} {'Total Gap Time':<15} {'Longest Gap':<15} {'Coverage %':<10}")
     print("-" * 80)
@@ -32,6 +32,13 @@ def generate_gap_report(start_date: str, end_date: str, data_dir: str = "data"):
                 continue
 
             df = pd.concat(dfs).sort_values("timestamp")
+            if pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
+                df["timestamp"] = (
+                    pd.to_datetime(df["timestamp"], utc=True)
+                    .astype("datetime64[ns, UTC]")
+                    .astype("int64")
+                    // 1_000_000
+                )
 
             diffs = df["timestamp"].diff().dropna()
 

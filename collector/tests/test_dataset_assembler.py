@@ -1,8 +1,26 @@
-import pytest
 import os
+
 import pandas as pd
-import numpy as np
-from pipeline.dataset_assembler import assemble_dataset
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
+from collector.pipeline.dataset_assembler import assemble_dataset
+
+
+def _write_timestamp_ms_parquet(df, path):
+    df = df.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    schema = pa.schema(
+        [
+            pa.field(field.name, pa.timestamp("ms", tz="UTC"))
+            if field.name == "timestamp"
+            else field
+            for field in table.schema
+        ]
+    )
+    pq.write_table(table.cast(schema), path)
+
 
 @pytest.fixture
 def test_data(tmp_path):
@@ -25,7 +43,7 @@ def test_data(tmp_path):
         "spread_bps": [10.0, 10.0, 10.0],
         "obi": [0.0, 0.0, 0.0]
     })
-    ob_df.to_parquet(os.path.join(data_dir, "raw", "orderbook", f"{date_str}-00.parquet"))
+    _write_timestamp_ms_parquet(ob_df, os.path.join(data_dir, "raw", "orderbook", f"{date_str}-00.parquet"))
 
     # Trades data
     trades_df = pd.DataFrame({
@@ -36,7 +54,7 @@ def test_data(tmp_path):
         "is_buyer_maker": [False, True, False],
         "signed_qty": [1.0, -2.0, 3.0]
     })
-    trades_df.to_parquet(os.path.join(data_dir, "raw", "trades", f"{date_str}-00.parquet"))
+    _write_timestamp_ms_parquet(trades_df, os.path.join(data_dir, "raw", "trades", f"{date_str}-00.parquet"))
 
     # Markprice data
     mark_df = pd.DataFrame({
@@ -45,9 +63,10 @@ def test_data(tmp_path):
         "funding_rate_bps": [1.0, 1.0],
         "hours_to_funding": [8.0, 7.99]
     })
-    mark_df.to_parquet(os.path.join(data_dir, "raw", "markprice", f"{date_str}-00.parquet"))
+    _write_timestamp_ms_parquet(mark_df, os.path.join(data_dir, "raw", "markprice", f"{date_str}-00.parquet"))
 
     return data_dir, date_str, start_ts
+
 
 def test_dataset_assembler(test_data):
     data_dir, date_str, start_ts = test_data
@@ -61,6 +80,7 @@ def test_dataset_assembler(test_data):
 
     # 24 hours * 60 min * 60 sec * 10 (for 100ms) = 864000 rows
     assert len(df) == 864000
+    assert pd.api.types.is_integer_dtype(df["timestamp"])
 
     # Check first few rows
     # t=0
@@ -77,6 +97,16 @@ def test_dataset_assembler(test_data):
     assert df.loc[1, "sell_volume"] == 0.0
     assert df.loc[1, "net_volume"] == 1.0
     assert df.loc[1, "vwap"] == 100.5
+
+    # t=200 (trade 2 falls here) and t=300 (trade 3 falls here), proving grid_ts binning
+    assert df.loc[2, "trade_count"] == 1
+    assert df.loc[2, "buy_volume"] == 0.0
+    assert df.loc[2, "sell_volume"] == 2.0
+    assert df.loc[2, "net_volume"] == -2.0
+    assert df.loc[3, "trade_count"] == 1
+    assert df.loc[3, "buy_volume"] == 3.0
+    assert df.loc[3, "sell_volume"] == 0.0
+    assert df.loc[3, "net_volume"] == 3.0
 
     # Check gaps
     assert df.loc[0, "orderbook_gap"] == False
