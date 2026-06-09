@@ -17,6 +17,7 @@ class ParquetWriter:
         self.buffer: List[Dict[str, Any]] = []
         self.current_hour = self._get_current_hour_str()
         self.writer: pa_parquet.ParquetWriter = None
+        self._tmp_filepath = None
         self.active_schema = self.schema
         self.record_count = 0
 
@@ -34,7 +35,11 @@ class ParquetWriter:
         # BUG 2 FIX: On same-hour restart, load existing rows back into buffer
         # so they are rewritten when flush() is called, preventing data loss.
         if os.path.exists(filepath):
+            backup_path = filepath + ".bak"
             try:
+                import shutil
+
+                shutil.copy2(filepath, backup_path)
                 existing = pa_parquet.read_table(filepath)
                 existing_dict = existing.to_pydict()
                 n = existing.num_rows
@@ -54,6 +59,7 @@ class ParquetWriter:
                     "Could not reload existing parquet file; data may be incomplete",
                     stream=self.stream_name,
                     file=filepath,
+                    backup_created=os.path.exists(backup_path),
                     error=str(e),
                 )
 
@@ -68,8 +74,9 @@ class ParquetWriter:
             self.active_schema = self.schema.with_metadata(
                 {**existing_metadata, **interval_metadata}
             )
+            self._tmp_filepath = filepath + ".tmp"
             self.writer = pa_parquet.ParquetWriter(
-                filepath,
+                self._tmp_filepath,
                 self.active_schema,
                 compression="snappy",
             )
@@ -124,8 +131,13 @@ class ParquetWriter:
         if self.writer:
             try:
                 filepath = self._get_filename(self.current_hour)
+                tmp = self._tmp_filepath
                 self.writer.close()
                 self.writer = None  # BUG 2 FIX: prevent write to closed writer
+                with open(tmp, "rb") as f:
+                    os.fsync(f.fileno())
+                os.replace(tmp, filepath)
+                self._tmp_filepath = None
                 file_size = os.path.getsize(filepath) if os.path.exists(filepath) else 0
                 logger.info(
                     "Closed parquet file",
