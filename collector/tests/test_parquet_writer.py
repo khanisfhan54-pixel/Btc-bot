@@ -78,3 +78,50 @@ def test_parquet_writer_rotation(temp_dir, monkeypatch):
 
     files = os.listdir(os.path.join(temp_dir, "raw", "test_stream2"))
     assert len(files) == 2
+
+
+def _trade_record(timestamp_ms=1770000000000):
+    return {
+        "timestamp": timestamp_ms,
+        "exchange_timestamp": timestamp_ms + 1,
+        "local_timestamp": timestamp_ms + 2,
+        "trade_id": 123,
+        "price": 50000.0,
+        "quantity": 0.25,
+        "is_buyer_maker": False,
+        "side_sign": 1,
+        "signed_qty": 0.25,
+    }
+
+
+def test_trades_schema_casts_integer_ms_to_utc_timestamps():
+    from collector.collector.config import TRADES_SCHEMA
+
+    table = pa.Table.from_pydict(
+        {key: [value] for key, value in _trade_record().items()},
+        schema=TRADES_SCHEMA,
+    )
+
+    expected_type = pa.timestamp("ms", tz="UTC")
+    assert table.schema.field("timestamp").type == expected_type
+    assert table.schema.field("exchange_timestamp").type == expected_type
+    assert table.schema.field("local_timestamp").type == expected_type
+    assert table.column("timestamp").type == expected_type
+
+
+def test_trades_parquet_reads_timestamps_as_timezone_aware_datetimes(temp_dir):
+    from collector.collector.config import TRADES_SCHEMA
+
+    writer = ParquetWriter("trades", TRADES_SCHEMA, base_dir=temp_dir)
+    writer.write(_trade_record())
+    writer.close()
+
+    file_path = writer._get_filename(writer.current_hour)
+    df = pd.read_parquet(file_path)
+
+    assert str(df["timestamp"].dtype) == "datetime64[ms, UTC]"
+    assert isinstance(df["timestamp"].dtype, pd.DatetimeTZDtype)
+
+    decoded = pd.to_datetime(df["timestamp"])
+    assert decoded.dt.year.iloc[0] == 2026
+    assert decoded.dt.year.iloc[0] != 1970
