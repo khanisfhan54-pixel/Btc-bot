@@ -16,10 +16,11 @@ DATA_DIR = "data"
 LOGS_DIR = "logs"
 
 # Schemas
+# All timestamp columns: Unix epoch, milliseconds, UTC
 ORDERBOOK_SCHEMA = pa.schema([
-    ("timestamp", pa.int64()),
-    ("exchange_timestamp", pa.int64()),
-    ("local_timestamp", pa.int64()),
+    ("timestamp", pa.timestamp("ms", tz="UTC")),
+    ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("local_timestamp", pa.timestamp("ms", tz="UTC")),
     ("bids_price", pa.list_(pa.float64())),
     ("bids_qty", pa.list_(pa.float64())),
     ("asks_price", pa.list_(pa.float64())),
@@ -39,9 +40,9 @@ ORDERBOOK_SCHEMA = pa.schema([
 ], metadata={"schema_version": "1.0", "stream_name": "orderbook", "symbol": SYMBOL})
 
 TRADES_SCHEMA = pa.schema([
-    ("timestamp", pa.int64()),
-    ("exchange_timestamp", pa.int64()),
-    ("local_timestamp", pa.int64()),
+    ("timestamp", pa.timestamp("ms", tz="UTC")),
+    ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("local_timestamp", pa.timestamp("ms", tz="UTC")),
     ("trade_id", pa.int64()),
     ("price", pa.float64()),
     ("quantity", pa.float64()),
@@ -51,9 +52,9 @@ TRADES_SCHEMA = pa.schema([
 ], metadata={"schema_version": "1.0", "stream_name": "trades", "symbol": SYMBOL})
 
 MARKPRICE_SCHEMA = pa.schema([
-    ("timestamp", pa.int64()),
-    ("exchange_timestamp", pa.int64()),
-    ("local_timestamp", pa.int64()),
+    ("timestamp", pa.timestamp("ms", tz="UTC")),
+    ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("local_timestamp", pa.timestamp("ms", tz="UTC")),
     ("mark_price", pa.float64()),
     ("funding_rate", pa.float64()),
     ("next_funding_time", pa.int64()),
