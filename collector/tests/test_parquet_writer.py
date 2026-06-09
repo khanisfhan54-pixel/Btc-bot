@@ -1,7 +1,9 @@
 import pytest
+import json
 import os
 import shutil
 import pyarrow as pa
+import pyarrow.parquet as pa_parquet
 import pandas as pd
 from collector.collector.parquet_writer import ParquetWriter
 
@@ -77,7 +79,10 @@ def test_parquet_writer_rotation(temp_dir, monkeypatch):
     writer.close()
 
     files = os.listdir(os.path.join(temp_dir, "raw", "test_stream2"))
-    assert len(files) == 2
+    parquet_files = [name for name in files if name.endswith(".parquet")]
+    sidecar_files = [name for name in files if name.endswith(".parquet.meta.json")]
+    assert len(parquet_files) == 2
+    assert len(sidecar_files) == 2
 
 
 def _trade_record(timestamp_ms=1770000000000):
@@ -125,3 +130,112 @@ def test_trades_parquet_reads_timestamps_as_timezone_aware_datetimes(temp_dir):
     decoded = pd.to_datetime(df["timestamp"])
     assert decoded.dt.year.iloc[0] == 2026
     assert decoded.dt.year.iloc[0] != 1970
+
+
+def test_parquet_sidecar_uses_first_record_timestamp(temp_dir, monkeypatch):
+    schema = pa.schema([
+        ("timestamp", pa.int64()),
+        ("value", pa.float64())
+    ])
+
+    import datetime
+
+    class MockDatetime:
+        @classmethod
+        def utcnow(cls):
+            return datetime.datetime(2026, 6, 3, 13)
+
+        @classmethod
+        def utcfromtimestamp(cls, timestamp):
+            return datetime.datetime.utcfromtimestamp(timestamp)
+
+    monkeypatch.setattr("collector.collector.parquet_writer.datetime", MockDatetime)
+
+    writer = ParquetWriter("test_stream_sidecar", schema, base_dir=temp_dir)
+    first_timestamp = int(datetime.datetime(2026, 6, 3, 13, 31, 11).timestamp() * 1000)
+    writer.write({"timestamp": first_timestamp, "value": 1.5})
+    writer.write({"timestamp": first_timestamp + 1000, "value": 2.5})
+    writer.close()
+
+    file_path = writer._get_filename(writer.current_hour)
+    sidecar_path = file_path + ".meta.json"
+
+    assert os.path.exists(sidecar_path)
+    with open(sidecar_path, encoding="utf-8") as f:
+        sidecar = json.load(f)
+
+    assert sidecar["interval_start_declared"] == "2026-06-03T13:00:00Z"
+    assert sidecar["interval_start_actual"] == "2026-06-03T13:31:11Z"
+    assert sidecar["interval_end_actual"] == "2026-06-03T13:31:12Z"
+    assert sidecar["record_count"] == 2
+
+    parquet_metadata = pa_parquet.read_metadata(file_path).metadata
+    assert parquet_metadata[b"interval_start"] == b"2026-06-03T13:00:00Z"
+    assert parquet_metadata[b"interval_end"] == b"2026-06-03T14:00:00Z"
+
+
+def test_empty_parquet_sidecar_falls_back_to_declared_start(temp_dir, monkeypatch):
+    schema = pa.schema([
+        ("timestamp", pa.int64()),
+        ("value", pa.float64())
+    ])
+
+    import datetime
+
+    class MockDatetime:
+        @classmethod
+        def utcnow(cls):
+            return datetime.datetime(2026, 6, 3, 13)
+
+        @classmethod
+        def utcfromtimestamp(cls, timestamp):
+            return datetime.datetime.utcfromtimestamp(timestamp)
+
+    monkeypatch.setattr("collector.collector.parquet_writer.datetime", MockDatetime)
+
+    writer = ParquetWriter("test_stream_empty_sidecar", schema, base_dir=temp_dir)
+    writer.close()
+
+    file_path = writer._get_filename(writer.current_hour)
+    sidecar_path = file_path + ".meta.json"
+
+    assert os.path.exists(sidecar_path)
+    with open(sidecar_path, encoding="utf-8") as f:
+        sidecar = json.load(f)
+
+    assert sidecar["interval_start_declared"] == "2026-06-03T13:00:00Z"
+    assert sidecar["interval_start_actual"] == "2026-06-03T13:00:00Z"
+    assert sidecar["interval_end_actual"] == "2026-06-03T14:00:00Z"
+    assert sidecar["record_count"] == 0
+
+
+def test_parquet_sidecar_created_next_to_parquet_file(temp_dir, monkeypatch):
+    schema = pa.schema([
+        ("timestamp", pa.int64()),
+        ("value", pa.float64())
+    ])
+
+    import datetime
+
+    class MockDatetime:
+        @classmethod
+        def utcnow(cls):
+            return datetime.datetime(2026, 6, 3, 13)
+
+        @classmethod
+        def utcfromtimestamp(cls, timestamp):
+            return datetime.datetime.utcfromtimestamp(timestamp)
+
+    monkeypatch.setattr("collector.collector.parquet_writer.datetime", MockDatetime)
+
+    writer = ParquetWriter("test_stream_sidecar_location", schema, base_dir=temp_dir)
+    timestamp = int(datetime.datetime(2026, 6, 3, 13, 31, 11).timestamp() * 1000)
+    writer.write({"timestamp": timestamp, "value": 1.5})
+    writer.close()
+
+    file_path = writer._get_filename(writer.current_hour)
+    sidecar_path = file_path + ".meta.json"
+
+    assert os.path.exists(file_path)
+    assert os.path.exists(sidecar_path)
+    assert os.path.dirname(sidecar_path) == os.path.dirname(file_path)
