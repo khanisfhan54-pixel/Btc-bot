@@ -46,6 +46,19 @@ def _valid_mark_msg():
     }
 
 
+
+def _valid_liquidation_msg():
+    return {
+        "o": {
+            "S": "BUY",
+            "p": "100.5",
+            "q": "1.0",
+            "T": int(time.time() * 1000),
+            "X": "FILLED",
+            "f": "IOC",
+        }
+    }
+
 def _app_without_init():
     app = CollectorApp.__new__(CollectorApp)
     app.raw_messages_logged = 20
@@ -53,9 +66,10 @@ def _app_without_init():
         "orderbook": {"received": 0, "computed": 0, "empty_features": 0, "validated": 0, "rejected": 0, "written": 0},
         "trades": {"received": 0, "computed": 0, "empty_features": 0, "validated": 0, "rejected": 0, "written": 0},
         "markprice": {"received": 0, "computed": 0, "empty_features": 0, "validated": 0, "rejected": 0, "written": 0},
+        "liquidation": {"received": 0, "computed": 0, "empty_features": 0, "validated": 0, "rejected": 0, "written": 0},
         "unrouted": {"received": 0},
     }
-    app.validation_fail_reasons = {"orderbook": {}, "trades": {}, "markprice": {}}
+    app.validation_fail_reasons = {"orderbook": {}, "trades": {}, "markprice": {}, "liquidation": {}}
     app.validator = MagicMock()
     app.validator.validate_orderbook.return_value = (True, "")
     app.validator.validate_trade.return_value = (True, "")
@@ -66,8 +80,9 @@ def _app_without_init():
     app.ob_writer = MagicMock()
     app.trades_writer = MagicMock()
     app.mark_writer = MagicMock()
+    app.liq_writer = MagicMock()
     app.health_monitor = MagicMock()
-    app.health_monitor.messages_per_minute = {"orderbook": 0, "trades": 0, "markprice": 0}
+    app.health_monitor.messages_per_minute = {"orderbook": 0, "trades": 0, "markprice": 0, "liquidation": 0}
     return app
 
 
@@ -79,6 +94,7 @@ def test_route_stream_matches_case_insensitive_required_streams():
     assert app._route_stream("btcusdt@aggtrade") == "trades"
     assert app._route_stream("btcusdt@markPrice@1s") == "markprice"
     assert app._route_stream("btcusdt@markprice@1s") == "markprice"
+    assert app._route_stream("btcusdt@forceOrder") == "liquidation"
     assert app._route_stream("ethusdt@aggtrade") is None
 
 
@@ -103,7 +119,7 @@ async def test_startup_verification_uses_cumulative_received_counters(monkeypatc
     app.stream_counters["orderbook"]["received"] = 533
     app.stream_counters["trades"]["received"] = 651
     app.stream_counters["markprice"]["received"] = 59
-    app.health_monitor.messages_per_minute = {"orderbook": 0, "trades": 0, "markprice": 0}
+    app.health_monitor.messages_per_minute = {"orderbook": 0, "trades": 0, "markprice": 0, "liquidation": 0}
 
     monkeypatch.setattr(_run_collector, "STREAM_INACTIVE_STARTUP_SECONDS", 0)
 
@@ -283,3 +299,17 @@ async def test_poll_openinterest_writes_valid_rest_response(monkeypatch):
     app.oi_writer.write.assert_called_once()
     app.health_monitor.record_message.assert_any_call("openinterest", ANY)
     assert app.stream_counters["openinterest"]["written"] == 1
+
+
+@pytest.mark.asyncio
+async def test_forceorder_message_routes_to_liquidation_writer_not_trades_writer():
+    app = _app_without_init()
+
+    await app.handle_message({"stream": "btcusdt@forceOrder", "data": _valid_liquidation_msg()})
+
+    app.liq_writer.write.assert_called_once()
+    app.trades_writer.write.assert_not_called()
+    app.health_monitor.record_message.assert_any_call("liquidation", ANY)
+    assert app.stream_counters["liquidation"]["written"] == 1
+    assert app.stream_counters["trades"]["received"] == 0
+    assert app.stream_counters["unrouted"]["received"] == 0

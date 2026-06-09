@@ -3,7 +3,7 @@ import pyarrow as pa
 # Constants
 SYMBOL = "BTCUSDT"
 BINANCE_PUBLIC_WS_URL = "wss://fstream.binance.com/public/stream?streams=btcusdt@depth10@100ms"
-BINANCE_MARKET_WS_URL = "wss://fstream.binance.com/market/stream?streams=btcusdt@aggTrade/btcusdt@markPrice@1s"
+BINANCE_MARKET_WS_URL = "wss://fstream.binance.com/market/stream?streams=btcusdt@aggTrade/btcusdt@markPrice@1s/btcusdt@forceOrder"
 BINANCE_WS_URL = BINANCE_PUBLIC_WS_URL
 
 # Intervals and Thresholds
@@ -70,3 +70,15 @@ OPENINTEREST_SCHEMA = pa.schema([
     ("open_interest", pa.float64()),
     ("open_interest_value", pa.float64()),
 ], metadata={"schema_version": "1.0", "stream_name": "openinterest", "symbol": SYMBOL})
+
+LIQUIDATION_SCHEMA = pa.schema([
+    ("timestamp", pa.int64()),
+    ("exchange_timestamp", pa.int64()),
+    ("local_timestamp", pa.int64()),
+    ("side", pa.int8()),
+    ("price", pa.float64()),
+    ("quantity", pa.float64()),
+    ("signed_qty", pa.float64()),
+    ("order_status", pa.string()),
+    ("time_in_force", pa.string()),
+], metadata={"schema_version": "1.0", "stream_name": "liquidation", "symbol": SYMBOL})

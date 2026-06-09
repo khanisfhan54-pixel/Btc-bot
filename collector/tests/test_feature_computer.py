@@ -1,5 +1,5 @@
 import pytest
-from collector.collector.feature_computer import compute_orderbook_features, compute_trades_features, compute_markprice_features, compute_openinterest_features
+from collector.collector.feature_computer import compute_orderbook_features, compute_trades_features, compute_markprice_features, compute_openinterest_features, compute_liquidation_features
 
 def test_compute_orderbook_features():
     msg = {
@@ -141,3 +141,52 @@ def test_compute_openinterest_features_valid_response(monkeypatch):
 
 def test_compute_openinterest_features_missing_openinterest_returns_empty():
     assert compute_openinterest_features({"time": "1234567000", "price": "100.0"}) == {}
+
+
+def test_compute_liquidation_features_buy_force_order(monkeypatch):
+    monkeypatch.setattr("collector.collector.feature_computer.time.time", lambda: 1234568.0)
+    msg = {
+        "o": {
+            "S": "BUY",
+            "p": "100.0",
+            "q": "1.5",
+            "T": "1234567000",
+            "X": "FILLED",
+            "f": "IOC",
+        }
+    }
+
+    features = compute_liquidation_features(msg)
+
+    assert features == {
+        "timestamp": 1234568000,
+        "exchange_timestamp": 1234567000,
+        "local_timestamp": 1234568000,
+        "side": 1,
+        "price": 100.0,
+        "quantity": 1.5,
+        "signed_qty": 1.5,
+        "order_status": "FILLED",
+        "time_in_force": "IOC",
+    }
+
+
+def test_compute_liquidation_features_sell_force_order(monkeypatch):
+    monkeypatch.setattr("collector.collector.feature_computer.time.time", lambda: 1234568.0)
+    msg = {
+        "o": {
+            "S": "SELL",
+            "p": "100.0",
+            "q": "2.0",
+            "T": "1234567000",
+            "X": "FILLED",
+            "f": "IOC",
+        }
+    }
+
+    features = compute_liquidation_features(msg)
+
+    assert features["side"] == -1
+    assert features["signed_qty"] == -2.0
+    assert features["price"] == 100.0
+    assert features["quantity"] == 2.0
