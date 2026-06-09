@@ -5,7 +5,7 @@ def compute_orderbook_features(msg: Dict[str, Any]) -> Dict[str, Any]:
     bids = msg.get("b", [])
     asks = msg.get("a", [])
 
-    if len(bids) != 10 or len(asks) != 10:
+    if len(bids) < 1 or len(asks) < 1:
         return {}
 
     try:
@@ -15,6 +15,17 @@ def compute_orderbook_features(msg: Dict[str, Any]) -> Dict[str, Any]:
         asks_qty = [float(a[1]) for a in asks]
     except (ValueError, TypeError):
         return {}
+
+    while len(bids_price) < 10:
+        bids_price.append(bids_price[-1])
+        bids_qty.append(0.0)
+    while len(asks_price) < 10:
+        asks_price.append(asks_price[-1])
+        asks_qty.append(0.0)
+    bids_price = bids_price[:10]
+    bids_qty = bids_qty[:10]
+    asks_price = asks_price[:10]
+    asks_qty = asks_qty[:10]
 
     best_bid = bids_price[0]
     best_ask = asks_price[0]

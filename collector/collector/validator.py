@@ -57,8 +57,8 @@ class Validator:
             self._handle_failure("orderbook", reason, record)
             return False, reason
 
-        if len(record.get("bids_price", [])) != 10 or len(record.get("asks_price", [])) != 10:
-            reason = "Invalid level count"
+        if len(record.get("bids_price", [])) < 1 or len(record.get("asks_price", [])) < 1:
+            reason = "Empty book"
             self._handle_failure("orderbook", reason, record)
             return False, reason
 

@@ -132,6 +132,78 @@ def test_trades_parquet_reads_timestamps_as_timezone_aware_datetimes(temp_dir):
     assert decoded.dt.year.iloc[0] != 1970
 
 
+
+def _openinterest_record(timestamp_ms=1770000000000):
+    return {
+        "timestamp": timestamp_ms,
+        "exchange_timestamp": timestamp_ms + 1,
+        "local_timestamp": timestamp_ms + 2,
+        "open_interest": 123.45,
+        "open_interest_value": 12345.0,
+    }
+
+
+def _liquidation_record(timestamp_ms=1770000000000):
+    return {
+        "timestamp": timestamp_ms,
+        "exchange_timestamp": timestamp_ms + 1,
+        "local_timestamp": timestamp_ms + 2,
+        "side": 1,
+        "price": 50000.0,
+        "quantity": 0.5,
+        "signed_qty": 0.5,
+        "order_status": "FILLED",
+        "time_in_force": "IOC",
+    }
+
+
+def test_openinterest_schema_casts_integer_ms_to_utc_timestamps():
+    from collector.collector.config import OPENINTEREST_SCHEMA
+
+    table = pa.Table.from_pydict(
+        {key: [value] for key, value in _openinterest_record().items()},
+        schema=OPENINTEREST_SCHEMA,
+    )
+
+    expected_type = pa.timestamp("ms", tz="UTC")
+    assert table.schema.field("timestamp").type == expected_type
+    assert table.schema.field("exchange_timestamp").type == expected_type
+    assert table.schema.field("local_timestamp").type == expected_type
+    assert table.column("timestamp").type == expected_type
+
+
+def test_liquidation_schema_casts_integer_ms_to_utc_timestamps():
+    from collector.collector.config import LIQUIDATION_SCHEMA
+
+    table = pa.Table.from_pydict(
+        {key: [value] for key, value in _liquidation_record().items()},
+        schema=LIQUIDATION_SCHEMA,
+    )
+
+    expected_type = pa.timestamp("ms", tz="UTC")
+    assert table.schema.field("timestamp").type == expected_type
+    assert table.schema.field("exchange_timestamp").type == expected_type
+    assert table.schema.field("local_timestamp").type == expected_type
+    assert table.column("timestamp").type == expected_type
+
+
+def test_openinterest_parquet_reads_timestamps_as_timezone_aware_datetimes(temp_dir):
+    from collector.collector.config import OPENINTEREST_SCHEMA
+
+    writer = ParquetWriter("openinterest", OPENINTEREST_SCHEMA, base_dir=temp_dir)
+    writer.write(_openinterest_record())
+    writer.close()
+
+    file_path = writer._get_filename(writer.current_hour)
+    df = pd.read_parquet(file_path)
+
+    assert str(df["timestamp"].dtype) == "datetime64[ms, UTC]"
+    assert isinstance(df["timestamp"].dtype, pd.DatetimeTZDtype)
+
+    decoded = pd.to_datetime(df["timestamp"])
+    assert decoded.dt.year.iloc[0] == 2026
+    assert decoded.dt.year.iloc[0] != 1970
+
 def test_parquet_sidecar_uses_first_record_timestamp(temp_dir, monkeypatch):
     schema = pa.schema([
         ("timestamp", pa.int64()),

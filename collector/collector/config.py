@@ -64,17 +64,17 @@ MARKPRICE_SCHEMA = pa.schema([
 ], metadata={"schema_version": "1.0", "stream_name": "markprice", "symbol": SYMBOL})
 
 OPENINTEREST_SCHEMA = pa.schema([
-    ("timestamp", pa.int64()),
-    ("exchange_timestamp", pa.int64()),
-    ("local_timestamp", pa.int64()),
+    ("timestamp", pa.timestamp("ms", tz="UTC")),
+    ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("local_timestamp", pa.timestamp("ms", tz="UTC")),
     ("open_interest", pa.float64()),
     ("open_interest_value", pa.float64()),
 ], metadata={"schema_version": "1.0", "stream_name": "openinterest", "symbol": SYMBOL})
 
 LIQUIDATION_SCHEMA = pa.schema([
-    ("timestamp", pa.int64()),
-    ("exchange_timestamp", pa.int64()),
-    ("local_timestamp", pa.int64()),
+    ("timestamp", pa.timestamp("ms", tz="UTC")),
+    ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("local_timestamp", pa.timestamp("ms", tz="UTC")),
     ("side", pa.int8()),
     ("price", pa.float64()),
     ("quantity", pa.float64()),

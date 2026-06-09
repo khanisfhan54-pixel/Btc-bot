@@ -24,6 +24,48 @@ def test_validate_orderbook(validator):
     assert valid
     assert reason == ""
 
+
+def test_validate_orderbook_accepts_partial_padded_book(validator):
+    ts = int(time.time() * 1000)
+    record = {
+        "timestamp": ts,
+        "exchange_timestamp": ts,
+        "bids_price": [100.0],
+        "asks_price": [101.0],
+        "best_bid": 100.0,
+        "best_ask": 101.0,
+        "spread_bps": 10.0,
+        "total_bid_qty": 1.0,
+        "total_ask_qty": 1.0,
+        "obi": 0.0,
+    }
+
+    valid, reason = validator.validate_orderbook(record)
+
+    assert valid, reason
+    assert reason == ""
+
+
+def test_validate_orderbook_rejects_empty_book(validator):
+    ts = int(time.time() * 1000)
+    record = {
+        "timestamp": ts,
+        "exchange_timestamp": ts,
+        "bids_price": [],
+        "asks_price": [101.0],
+        "best_bid": 100.0,
+        "best_ask": 101.0,
+        "spread_bps": 10.0,
+        "total_bid_qty": 1.0,
+        "total_ask_qty": 1.0,
+        "obi": 0.0,
+    }
+
+    valid, reason = validator.validate_orderbook(record)
+
+    assert not valid
+    assert reason == "Empty book"
+
 def test_validate_orderbook_crossed(validator):
     ts = int(time.time() * 1000)
     record = {
