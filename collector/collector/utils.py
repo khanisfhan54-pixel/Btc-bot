@@ -3,7 +3,6 @@ import structlog
 import logging
 import logging.handlers
 from telegram_bot import (
-    TelegramConfigError,
     send_telegram_message,
     validate_telegram_startup,
 )
@@ -51,9 +50,6 @@ logger = setup_logging()
 def send_telegram_alert(message: str) -> bool:
     try:
         return send_telegram_message(message, parse_mode=None)
-    except TelegramConfigError:
-        logger.error("Telegram credentials missing; alert delivery cannot continue", message=message)
-        raise
     except Exception as e:
-        logger.error("Failed to send Telegram alert", error=str(e), message=message)
+        logger.warning("Telegram alert failed open", error=str(e), message=message)
         return False

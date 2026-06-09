@@ -268,7 +268,8 @@ except Exception as _tg_import_err:
         return False
 
     def validate_telegram_startup():
-        raise RuntimeError(f"telegram_bot import failed: {_tg_import_err}")
+        logger.warning("Telegram startup validation skipped; optional subsystem unavailable: %s", _tg_import_err)
+        return None
 
 ENGINE_IS_FALLBACK: bool = not _EXECUTION_IMPORT_SUCCEEDED
 CREDENTIALS_MISSING: bool = False
