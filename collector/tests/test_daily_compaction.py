@@ -167,7 +167,8 @@ def test_tmp_files_skipped(tmp_path):
     assert cd.compact_daily(DATE, "markprice", tmp_path)
     meta = _meta(tmp_path, "markprice")
     assert f"{DATE}-05.parquet.tmp" not in meta["source_hourly_files"]
-    assert meta["missing_hours"] == list(range(1, 24))
+    assert meta["missing_hours"] == [h for h in range(1, 24) if h != 5]
+    assert meta["skipped_hours"] == [5]
 
 
 def test_timestamp_sort_order(tmp_path):
@@ -219,3 +220,118 @@ def test_schema_preserved(tmp_path):
         assert cd.compact_daily(DATE, stream, tmp_path)
         table = pq.read_table(tmp_path / "daily" / stream / f"{DATE}.parquet")
         assert table.schema == schema
+
+
+def test_directory_fsync_execution(tmp_path, monkeypatch):
+    _write_hours(tmp_path, "trades", hours=[0], rows=1)
+    opened_dirs = []
+    fsynced = []
+    closed = []
+
+    def fake_open(path, flags):
+        opened_dirs.append(path)
+        return 12345 + len(opened_dirs)
+
+    def fake_fsync(fd):
+        fsynced.append(fd)
+
+    def fake_close(fd):
+        closed.append(fd)
+
+    monkeypatch.setattr(cd.os, "open", fake_open)
+    monkeypatch.setattr(cd.os, "fsync", fake_fsync)
+    monkeypatch.setattr(cd.os, "close", fake_close)
+    assert cd.compact_daily(DATE, "trades", tmp_path)
+    assert opened_dirs == [str(tmp_path / "daily" / "trades"), str(tmp_path / "daily" / "trades")]
+    assert [12346, 12347] == closed
+    assert 12346 in fsynced and 12347 in fsynced
+
+
+def test_matching_tmp_detection_records_skipped_hour(tmp_path):
+    _write_hour(tmp_path, "markprice", 0, rows=1)
+    _write_hour(tmp_path, "markprice", 1, rows=1)
+    (tmp_path / "raw" / "markprice" / f"{DATE}-01.parquet.tmp").write_text("in progress")
+    assert cd.compact_daily(DATE, "markprice", tmp_path)
+    meta = _meta(tmp_path, "markprice")
+    assert meta["record_count"] == 1
+    assert meta["skipped_hours"] == [1]
+    assert f"{DATE}-01.parquet" not in meta["source_hourly_files"]
+
+
+def test_stale_tmp_cleanup_on_force(tmp_path):
+    _write_hours(tmp_path, "openinterest", hours=[0], rows=1)
+    out_dir = tmp_path / "daily" / "openinterest"
+    out_dir.mkdir(parents=True)
+    parquet_tmp = out_dir / f"{DATE}.parquet.tmp"
+    meta_tmp = out_dir / f"{DATE}.meta.json.tmp"
+    parquet_tmp.write_text("stale")
+    meta_tmp.write_text("stale")
+    assert cd.compact_daily(DATE, "openinterest", tmp_path, force=True)
+    assert not parquet_tmp.exists()
+    assert not meta_tmp.exists()
+
+
+def test_schema_mismatch_rejection(tmp_path):
+    raw_dir = tmp_path / "raw" / "orderbook"
+    raw_dir.mkdir(parents=True)
+    path = raw_dir / f"{DATE}-00.parquet"
+    pq.write_table(pa.table({"timestamp": pa.array([_dt(_base_ms(0))], type=pa.timestamp("ms", tz="UTC"))}), path)
+    old_mtime = time.time() - 3600
+    os.utime(path, (old_mtime, old_mtime))
+    with pytest.raises(cd.CompactionError):
+        cd.compact_daily(DATE, "orderbook", tmp_path)
+
+
+def test_corrupt_parquet_rejection(tmp_path):
+    raw_dir = tmp_path / "raw" / "trades"
+    raw_dir.mkdir(parents=True)
+    path = raw_dir / f"{DATE}-00.parquet"
+    path.write_text("not a parquet file")
+    old_mtime = time.time() - 3600
+    os.utime(path, (old_mtime, old_mtime))
+    assert cd.main(["--date", DATE, "--streams", "trades", "--data-dir", str(tmp_path)]) == 1
+    assert not (tmp_path / "daily" / "trades" / f"{DATE}.parquet").exists()
+
+
+def test_current_hour_guard_behavior(tmp_path):
+    now = datetime.now(UTC)
+    today = now.strftime("%Y-%m-%d")
+    current_hour = now.hour
+    other_hour = 1 if current_hour == 0 else 0
+    old_date = globals()["DATE"]
+    globals()["DATE"] = today
+    try:
+        _write_hour(tmp_path, "trades", other_hour, rows=1)
+        _write_hour(tmp_path, "trades", current_hour, rows=1)
+        guarded = tmp_path / "raw" / "trades" / f"{today}-{current_hour:02d}.parquet"
+        fresh_mtime = time.time()
+        os.utime(guarded, (fresh_mtime, fresh_mtime))
+        assert cd.compact_daily(today, "trades", tmp_path, guard_seconds=3600)
+        meta = json.loads((tmp_path / "daily" / "trades" / f"{today}.meta.json").read_text())
+        assert current_hour in meta["skipped_hours"]
+        assert f"{today}-{current_hour:02d}.parquet" not in meta["source_hourly_files"]
+    finally:
+        globals()["DATE"] = old_date
+
+
+def test_large_multi_hour_compaction_path_without_concat(tmp_path, monkeypatch):
+    for hour in range(6):
+        _write_hour(tmp_path, "trades", hour, rows=50)
+
+    def fail_concat(*args, **kwargs):
+        raise AssertionError("concat_tables should not be used by streaming compaction")
+
+    monkeypatch.setattr(cd.pa, "concat_tables", fail_concat, raising=False)
+    assert cd.compact_daily(DATE, "trades", tmp_path)
+    assert pq.read_table(tmp_path / "daily" / "trades" / f"{DATE}.parquet").num_rows == 300
+
+
+def test_verify_command(tmp_path):
+    _write_hours(tmp_path, "liquidation", hours=[0], rows=1)
+    assert cd.compact_daily(DATE, "liquidation", tmp_path)
+    assert cd.main(["--verify", "--date", DATE, "--streams", "liquidation", "--data-dir", str(tmp_path)]) == 0
+    meta_path = tmp_path / "daily" / "liquidation" / f"{DATE}.meta.json"
+    meta = json.loads(meta_path.read_text())
+    meta["record_count"] = 999
+    meta_path.write_text(json.dumps(meta))
+    assert cd.main(["--verify", "--date", DATE, "--streams", "liquidation", "--data-dir", str(tmp_path)]) == 1
