@@ -42,6 +42,7 @@ class _HourSource:
     rows: int
     min_ts_ms: int
     max_ts_ms: int
+    table: pa.Table
 @dataclass(frozen=True)
 class _DiscoveredFiles:
     present_files: list[Path]
@@ -130,6 +131,21 @@ def verify_daily(
         raise CompactionError("metadata start timestamp does not match parquet")
     if metadata.get("end_timestamp_ms") != stats.end_timestamp_ms:
         raise CompactionError("metadata end timestamp does not match parquet")
+    actual_size = final_path.stat().st_size
+    if metadata.get("file_size_bytes") != actual_size:
+        raise CompactionError(f"file_size_bytes mismatch: {metadata.get('file_size_bytes')} != {actual_size}")
+    if not isinstance(metadata.get("source_hourly_files"), list):
+        raise CompactionError("source_hourly_files must be a list")
+    missing_hours = metadata.get("missing_hours")
+    if not isinstance(missing_hours, list):
+        raise CompactionError("missing_hours must be a list")
+    if not all(isinstance(hour, int) for hour in missing_hours):
+        raise CompactionError("missing_hours must be a list of ints")
+    skipped_hours = metadata.get("skipped_hours")
+    if not isinstance(skipped_hours, list):
+        raise CompactionError("skipped_hours must be a list")
+    if not all(isinstance(hour, int) for hour in skipped_hours):
+        raise CompactionError("skipped_hours must be a list of ints")
     logger.info("compact_daily_verify", stream=stream, date=date, rows=stats.rows)
     return True
 def main(argv: Sequence[str] | None = None) -> int:
@@ -201,19 +217,20 @@ def _discover_hourly_files(raw_dir: Path, date: str, *, guard_seconds: int) -> _
         if path.name.endswith((".tmp", ".bak")):
             skipped.append(hour)
             continue
-        age_seconds = datetime.now(UTC).timestamp() - path.stat().st_mtime
-        if age_seconds < guard_seconds:
-            event = "compact_daily_skip_current_hour" if date == current_date and hour == current_hour else "compact_daily_skip_recent_hour"
-            logger.warning(
-                event,
-                stream=raw_dir.name,
-                date=date,
-                hour=hour,
-                age_seconds=age_seconds,
-                guard_seconds=guard_seconds,
-            )
-            skipped.append(hour)
-            continue
+        is_current_hour = date == current_date and hour == current_hour
+        if is_current_hour:
+            age_seconds = datetime.now(UTC).timestamp() - path.stat().st_mtime
+            if age_seconds < guard_seconds:
+                logger.warning(
+                    "compact_daily_skip_current_hour",
+                    stream=raw_dir.name,
+                    date=date,
+                    hour=hour,
+                    age_seconds=age_seconds,
+                    guard_seconds=guard_seconds,
+                )
+                skipped.append(hour)
+                continue
         present.append(path)
     return _DiscoveredFiles(present, missing, skipped)
 def _discover_all_dates(data_dir: Path, streams: Sequence[str]) -> set[str]:
@@ -240,7 +257,7 @@ def _inspect_sources(paths: Sequence[Path], stream: str, schema: pa.Schema) -> l
         max_ts = pc.max(timestamp_ms).as_py()
         if min_ts is None or max_ts is None:
             raise CompactionError(f"empty or invalid timestamp range in {path.name}")
-        sources.append(_HourSource(path, _hour_from_path(path), table.num_rows, int(min_ts), int(max_ts)))
+        sources.append(_HourSource(path, _hour_from_path(path), table.num_rows, int(min_ts), int(max_ts), table))
     return sources
 def _read_hourly_table(path: Path, schema: pa.Schema) -> pa.Table:
     table = pq.read_table(path)
@@ -284,27 +301,28 @@ def _raise_if_duplicate_groups(table: pa.Table, keys: list[str], message: str) -
     if max_count is not None and max_count > 1:
         raise CompactionError(message)
 def _validate_cross_source_order(sources: Sequence[_HourSource], stream: str, schema: pa.Schema) -> None:
+    del schema
     previous: _HourSource | None = None
-    previous_boundary_ids: set[int] = set()
     for source in sources:
         if previous is not None:
             if stream == "trades":
                 if source.min_ts_ms < previous.max_ts_ms:
                     raise CompactionError("trades source timestamp ranges overlap out of order")
                 if source.min_ts_ms == previous.max_ts_ms:
-                    current_ids = _trade_ids_at_timestamp(source.path, schema, source.min_ts_ms)
-                    if previous_boundary_ids.intersection(current_ids):
-                        raise CompactionError("duplicate (timestamp, trade_id) pairs found across hourly files")
+                    _check_boundary_duplicates(previous, source)
             elif source.min_ts_ms <= previous.max_ts_ms:
                 raise CompactionError(f"duplicate or overlapping timestamp values found across {stream} hourly files")
-        if stream == "trades":
-            previous_boundary_ids = _trade_ids_at_timestamp(source.path, schema, source.max_ts_ms)
         previous = source
-def _trade_ids_at_timestamp(path: Path, schema: pa.Schema, timestamp_ms: int) -> set[int]:
-    table = _read_hourly_table(path, schema)
-    timestamp_col = table.column("timestamp").cast(pa.int64())
-    filtered = table.filter(pc.equal(timestamp_col, pa.scalar(timestamp_ms, type=pa.int64())))
-    return set(filtered.column("trade_id").combine_chunks().to_pylist())
+def _check_boundary_duplicates(prev_source: _HourSource, cur_source: _HourSource) -> None:
+    prev_timestamp = prev_source.table.column("timestamp").cast(pa.int64())
+    cur_timestamp = cur_source.table.column("timestamp").cast(pa.int64())
+    prev_boundary = prev_source.table.filter(pc.equal(prev_timestamp, pa.scalar(prev_source.max_ts_ms, type=pa.int64())))
+    cur_boundary = cur_source.table.filter(pc.equal(cur_timestamp, pa.scalar(cur_source.min_ts_ms, type=pa.int64())))
+    boundary = pa.concat_tables((prev_boundary, cur_boundary), promote_options="none")
+    duplicate_groups = boundary.group_by(["timestamp", "trade_id"]).aggregate([([], "count_all")])
+    max_count = pc.max(duplicate_groups.column("count_all")).as_py()
+    if max_count is not None and max_count > 1:
+        raise CompactionError("duplicate (timestamp, trade_id) pairs found across hourly files")
 def _warn_orderbook_quality(table: pa.Table) -> None:
     bad_spread = pc.greater_equal(table.column("best_bid"), table.column("best_ask"))
     if pc.any(bad_spread).as_py():
@@ -318,13 +336,19 @@ def _stream_write_parquet(sources: Sequence[_HourSource], final_path: Path, sche
     writer = pq.ParquetWriter(str(tmp_path), schema, compression="snappy")
     try:
         for source in sources:
-            table = _read_hourly_table(source.path, schema).sort_by([("timestamp", "ascending")])
-            writer.write_table(table)
+            writer.write_table(source.table)
     finally:
         writer.close()
     with tmp_path.open("rb") as handle:
         os.fsync(handle.fileno())
-    os.replace(tmp_path, final_path)
+    try:
+        os.replace(tmp_path, final_path)
+    except BaseException:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
     _fsync_parent_dir(final_path)
 def _write_json_atomic(metadata: dict[str, Any], final_path: Path) -> None:
     tmp_path = Path(str(final_path) + ".tmp")
@@ -333,22 +357,69 @@ def _write_json_atomic(metadata: dict[str, Any], final_path: Path) -> None:
         handle.write("\n")
         handle.flush()
         os.fsync(handle.fileno())
-    os.replace(tmp_path, final_path)
+    try:
+        os.replace(tmp_path, final_path)
+    except BaseException:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
     _fsync_parent_dir(final_path)
 def _verify_parquet_output(final_path: Path, schema: pa.Schema, expected_rows: int) -> _OutputStats:
     if not final_path.exists():
         raise CompactionError(f"daily parquet was not created: {final_path}")
     actual_schema = pq.read_schema(final_path)
-    if actual_schema != schema:
-        raise CompactionError("daily parquet schema does not match expected stream schema")
+    _validate_schema_compatible(actual_schema, schema)
     parquet_file = pq.ParquetFile(final_path)
-    row_count = parquet_file.metadata.num_rows
+    metadata = parquet_file.metadata
+    row_count = metadata.num_rows
     if row_count != expected_rows:
         raise CompactionError(f"daily parquet row count mismatch: {row_count} != {expected_rows}")
-    timestamps = pq.read_table(final_path, columns=["timestamp"]).column("timestamp").cast(pa.int64())
-    start_ts = pc.min(timestamps).as_py() if row_count else None
-    end_ts = pc.max(timestamps).as_py() if row_count else None
+    start_ts, end_ts = _timestamp_range_from_metadata(parquet_file, schema) if row_count else (None, None)
     return _OutputStats(row_count, final_path.stat().st_size, start_ts, end_ts)
+def _validate_schema_compatible(actual: pa.Schema, expected: pa.Schema) -> None:
+    if len(actual) != len(expected):
+        raise CompactionError("daily parquet schema field count does not match expected stream schema")
+    for index, (actual_field, expected_field) in enumerate(zip(actual, expected, strict=True)):
+        if actual_field.name != expected_field.name:
+            raise CompactionError(
+                f"daily parquet schema field {index} name mismatch: "
+                f"{actual_field.name} != {expected_field.name}"
+            )
+        if actual_field.type != expected_field.type:
+            raise CompactionError(
+                f"daily parquet schema field {actual_field.name} type mismatch: "
+                f"{actual_field.type} != {expected_field.type}"
+            )
+def _timestamp_range_from_metadata(parquet_file: pq.ParquetFile, schema: pa.Schema) -> tuple[int | None, int | None]:
+    metadata = parquet_file.metadata
+    start_ts: int | None = None
+    end_ts: int | None = None
+    ts_col_idx = schema.get_field_index("timestamp")
+    for row_group_index in range(metadata.num_row_groups):
+        row_group = metadata.row_group(row_group_index)
+        column = row_group.column(ts_col_idx)
+        stats = column.statistics
+        if stats is None or not stats.has_min_max:
+            table = parquet_file.read_row_group(row_group_index, columns=["timestamp"])
+            timestamp_col = table.column("timestamp").cast(pa.int64())
+            row_group_min = pc.min(timestamp_col).as_py()
+            row_group_max = pc.max(timestamp_col).as_py()
+        else:
+            row_group_min = _timestamp_stat_to_ms(stats.min)
+            row_group_max = _timestamp_stat_to_ms(stats.max)
+        if row_group_min is not None:
+            start_ts = row_group_min if start_ts is None else min(start_ts, row_group_min)
+        if row_group_max is not None:
+            end_ts = row_group_max if end_ts is None else max(end_ts, row_group_max)
+    return start_ts, end_ts
+def _timestamp_stat_to_ms(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return int(value.timestamp() * 1000)
+    return int(value)
 def _build_metadata(
     *,
     stats: _OutputStats,

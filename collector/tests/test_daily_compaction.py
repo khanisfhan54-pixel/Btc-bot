@@ -2,6 +2,7 @@ import json
 import os
 import time
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -335,3 +336,187 @@ def test_verify_command(tmp_path):
     meta["record_count"] = 999
     meta_path.write_text(json.dumps(meta))
     assert cd.main(["--verify", "--date", DATE, "--streams", "liquidation", "--data-dir", str(tmp_path)]) == 1
+
+
+def _write_hour_for_date(data_dir, stream, date, hour, timestamps=None, rows=2, overrides=None):
+    old_date = globals()["DATE"]
+    globals()["DATE"] = date
+    try:
+        return _write_hour(data_dir, stream, hour, timestamps=timestamps, rows=rows, overrides=overrides)
+    finally:
+        globals()["DATE"] = old_date
+
+
+def test_historical_recent_file_not_skipped(tmp_path):
+    yesterday = "2026-06-09"
+    _write_hour_for_date(tmp_path, "trades", yesterday, 12, rows=1)
+    path = tmp_path / "raw" / "trades" / f"{yesterday}-12.parquet"
+    fresh_mtime = time.time()
+    os.utime(path, (fresh_mtime, fresh_mtime))
+
+    assert cd.compact_daily(yesterday, "trades", tmp_path, guard_seconds=3600)
+
+    meta = json.loads((tmp_path / "daily" / "trades" / f"{yesterday}.meta.json").read_text())
+    assert meta["source_hourly_files"] == [f"{yesterday}-12.parquet"]
+    assert meta["skipped_hours"] == []
+
+
+def test_current_hour_guard_only_applies_today(tmp_path):
+    now = datetime.now(UTC)
+    today = now.strftime("%Y-%m-%d")
+    current_hour = now.hour
+    previous_hour = (current_hour - 1) % 24
+    _write_hour_for_date(tmp_path, "trades", today, previous_hour, rows=1)
+    _write_hour_for_date(tmp_path, "trades", today, current_hour, rows=1)
+    fresh_mtime = time.time()
+    for hour in (previous_hour, current_hour):
+        path = tmp_path / "raw" / "trades" / f"{today}-{hour:02d}.parquet"
+        os.utime(path, (fresh_mtime, fresh_mtime))
+
+    assert cd.compact_daily(today, "trades", tmp_path, guard_seconds=3600)
+
+    meta = json.loads((tmp_path / "daily" / "trades" / f"{today}.meta.json").read_text())
+    assert current_hour in meta["skipped_hours"]
+    assert previous_hour not in meta["skipped_hours"]
+    assert f"{today}-{previous_hour:02d}.parquet" in meta["source_hourly_files"]
+    assert f"{today}-{current_hour:02d}.parquet" not in meta["source_hourly_files"]
+
+
+def test_hourly_file_read_once(tmp_path, monkeypatch):
+    source_hours = [0, 1, 2]
+    _write_hours(tmp_path, "trades", hours=source_hours, rows=2)
+    real_read_table = cd.pq.read_table
+    calls = []
+
+    def tracking_read_table(*args, **kwargs):
+        calls.append(args[0])
+        return real_read_table(*args, **kwargs)
+
+    monkeypatch.setattr(cd.pq, "read_table", tracking_read_table)
+    assert cd.compact_daily(DATE, "trades", tmp_path)
+    source_paths = {tmp_path / "raw" / "trades" / f"{DATE}-{hour:02d}.parquet" for hour in source_hours}
+    assert [path for path in calls if path in source_paths] == [
+        tmp_path / "raw" / "trades" / f"{DATE}-{hour:02d}.parquet" for hour in source_hours
+    ]
+    assert len(calls) == len(source_hours)
+
+
+def test_no_set_or_to_pylist_in_duplicate_detection():
+    source = (Path(__file__).parents[1] / "scripts" / "compact_daily.py").read_text()
+    duplicate_section = source[source.index("def _raise_if_duplicate_groups") : source.index("def _warn_orderbook_quality")]
+    assert "to_pylist" not in duplicate_section
+    assert "set(" not in duplicate_section
+
+
+def test_cross_boundary_arrow_duplicate_detected(tmp_path):
+    boundary_ts = _base_ms(0) + 1000
+    _write_hour(tmp_path, "trades", 0, timestamps=[_base_ms(0), boundary_ts], overrides={"trade_id": [1, 42]})
+    _write_hour(tmp_path, "trades", 1, timestamps=[boundary_ts, _base_ms(1)], overrides={"trade_id": [42, 43]})
+
+    with pytest.raises(cd.CompactionError, match="duplicate"):
+        cd.compact_daily(DATE, "trades", tmp_path)
+
+
+def test_verify_uses_parquet_statistics_not_full_read(tmp_path, monkeypatch):
+    _write_hours(tmp_path, "trades", hours=[0, 1], rows=2)
+    assert cd.compact_daily(DATE, "trades", tmp_path)
+
+    def fail_read_table(*args, **kwargs):
+        raise AssertionError("pq.read_table must not be called during output verification")
+
+    monkeypatch.setattr(cd.pq, "read_table", fail_read_table)
+    stats = cd._verify_parquet_output(tmp_path / "daily" / "trades" / f"{DATE}.parquet", TRADES_SCHEMA, 4)
+    assert stats.rows == 4
+    assert stats.start_timestamp_ms == _base_ms(0)
+    assert stats.end_timestamp_ms == _base_ms(1) + 1000
+
+
+def test_schema_metadata_mismatch_accepted():
+    actual = TRADES_SCHEMA.with_metadata({b"extra": b"metadata"})
+    cd._validate_schema_compatible(actual, TRADES_SCHEMA)
+
+
+def test_schema_column_mismatch_rejected():
+    fields = [pa.field("wrong_name", TRADES_SCHEMA[0].type), *list(TRADES_SCHEMA)[1:]]
+    actual = pa.schema(fields)
+    with pytest.raises(cd.CompactionError, match="name mismatch"):
+        cd._validate_schema_compatible(actual, TRADES_SCHEMA)
+
+
+def test_schema_type_mismatch_rejected():
+    fields = [pa.field(TRADES_SCHEMA[0].name, pa.int64()), *list(TRADES_SCHEMA)[1:]]
+    actual = pa.schema(fields)
+    with pytest.raises(cd.CompactionError, match="type mismatch"):
+        cd._validate_schema_compatible(actual, TRADES_SCHEMA)
+
+
+def test_tmp_removed_after_replace_failure(tmp_path, monkeypatch):
+    final_path = tmp_path / "metadata.json"
+
+    def fail_replace(src, dst):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(cd.os, "replace", fail_replace)
+    with pytest.raises(OSError):
+        cd._write_json_atomic({"ok": True}, final_path)
+    assert not Path(str(final_path) + ".tmp").exists()
+
+
+def test_directory_fsync_called_after_replace(tmp_path, monkeypatch):
+    _write_hours(tmp_path, "trades", hours=[0], rows=1)
+    final_parent = tmp_path / "daily" / "trades"
+    directory_fds = []
+    fsync_fds = []
+    next_fd = 20000
+
+    def fake_open(path, flags):
+        nonlocal next_fd
+        next_fd += 1
+        if Path(path) == final_parent:
+            directory_fds.append(next_fd)
+        return next_fd
+
+    def fake_fsync(fd):
+        fsync_fds.append(fd)
+
+    monkeypatch.setattr(cd.os, "open", fake_open)
+    monkeypatch.setattr(cd.os, "fsync", fake_fsync)
+    monkeypatch.setattr(cd.os, "close", lambda fd: None)
+    assert cd.compact_daily(DATE, "trades", tmp_path)
+    assert directory_fds
+    assert all(fd in fsync_fds for fd in directory_fds)
+
+
+def test_verify_detects_wrong_file_size(tmp_path):
+    _write_hours(tmp_path, "liquidation", hours=[0], rows=1)
+    assert cd.compact_daily(DATE, "liquidation", tmp_path)
+    meta_path = tmp_path / "daily" / "liquidation" / f"{DATE}.meta.json"
+    meta = json.loads(meta_path.read_text())
+    meta["file_size_bytes"] = -1
+    meta_path.write_text(json.dumps(meta))
+
+    with pytest.raises(cd.CompactionError, match="file_size_bytes mismatch"):
+        cd.verify_daily(DATE, "liquidation", tmp_path)
+
+
+def test_verify_detects_bad_metadata(tmp_path):
+    _write_hours(tmp_path, "liquidation", hours=[0], rows=1)
+    assert cd.compact_daily(DATE, "liquidation", tmp_path)
+    meta_path = tmp_path / "daily" / "liquidation" / f"{DATE}.meta.json"
+    meta = json.loads(meta_path.read_text())
+    meta["missing_hours"] = "bad"
+    meta_path.write_text(json.dumps(meta))
+
+    with pytest.raises(cd.CompactionError, match="missing_hours must be a list"):
+        cd.verify_daily(DATE, "liquidation", tmp_path)
+
+
+def test_no_concat_tables_called(tmp_path, monkeypatch):
+    for hour in range(3):
+        _write_hour(tmp_path, "trades", hour, rows=3)
+
+    def fail_concat(*args, **kwargs):
+        raise AssertionError("must not be called")
+
+    monkeypatch.setattr(cd.pa, "concat_tables", fail_concat)
+    assert cd.compact_daily(DATE, "trades", tmp_path)
