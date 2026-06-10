@@ -417,8 +417,27 @@ def _timestamp_range_from_metadata(parquet_file: pq.ParquetFile, schema: pa.Sche
 def _timestamp_stat_to_ms(value: Any) -> int | None:
     if value is None:
         return None
+    # PyArrow scalar — unwrap to Python first.
+    if hasattr(value, "as_py"):
+        value = value.as_py()
+        if value is None:
+            return None
     if isinstance(value, datetime):
         return int(value.timestamp() * 1000)
+    try:
+        import pandas as pd
+
+        if isinstance(value, pd.Timestamp):
+            return int(value.timestamp() * 1000)
+    except Exception:
+        pass
+    try:
+        import numpy as np
+
+        if isinstance(value, np.datetime64):
+            return int(value.astype("datetime64[ms]").astype("int64"))
+    except Exception:
+        pass
     return int(value)
 def _build_metadata(
     *,

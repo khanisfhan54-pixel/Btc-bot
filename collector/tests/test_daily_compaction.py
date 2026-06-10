@@ -105,6 +105,44 @@ def _meta(data_dir, stream):
     return json.loads((data_dir / "daily" / stream / f"{DATE}.meta.json").read_text())
 
 
+def test_timestamp_stat_datetime():
+    from datetime import UTC, datetime as dt
+
+    value = dt(2026, 6, 10, 0, 0, 0, tzinfo=UTC)
+    result = cd._timestamp_stat_to_ms(value)
+    assert result == int(value.timestamp() * 1000)
+    assert isinstance(result, int)
+
+
+def test_timestamp_stat_pyarrow_timestamp_scalar():
+    value = pa.scalar(datetime(2026, 6, 10, 0, 0, 0, tzinfo=UTC), type=cd.TIMESTAMP_TYPE)
+    result = cd._timestamp_stat_to_ms(value)
+    assert isinstance(result, int)
+    assert result == _base_ms(0)
+
+
+def test_timestamp_stat_numpy_datetime64():
+    import numpy as np
+
+    value = np.datetime64("2026-06-10T00:00:00.000", "ms")
+    result = cd._timestamp_stat_to_ms(value)
+    assert isinstance(result, int)
+    assert result == int(value.astype("datetime64[ms]").astype("int64"))
+
+
+def test_timestamp_stat_pandas_timestamp():
+    import pandas as pd
+
+    value = pd.Timestamp("2026-06-10T00:00:00", tz="UTC")
+    result = cd._timestamp_stat_to_ms(value)
+    assert isinstance(result, int)
+    assert result == int(value.timestamp() * 1000)
+
+
+def test_timestamp_stat_none():
+    assert cd._timestamp_stat_to_ms(None) is None
+
+
 def test_single_date_all_streams(tmp_path):
     for stream in SCHEMAS:
         _write_hours(tmp_path, stream, rows=1)
@@ -385,20 +423,28 @@ def test_current_hour_guard_only_applies_today(tmp_path):
 def test_hourly_file_read_once(tmp_path, monkeypatch):
     source_hours = [0, 1, 2]
     _write_hours(tmp_path, "trades", hours=source_hours, rows=2)
-    real_read_table = cd.pq.read_table
-    calls = []
 
-    def tracking_read_table(*args, **kwargs):
-        calls.append(args[0])
-        return real_read_table(*args, **kwargs)
+    real_read_table = cd.pq.read_table
+    # Track reads per source path only; ignore reads of other paths
+    # (e.g. any internal parquet verification reads).
+    source_paths = {
+        tmp_path / "raw" / "trades" / f"{DATE}-{hour:02d}.parquet"
+        for hour in source_hours
+    }
+    raw_source_reads: dict = {p: 0 for p in source_paths}
+
+    def tracking_read_table(path, *args, **kwargs):
+        p = Path(path) if not isinstance(path, Path) else path
+        if p in raw_source_reads:
+            raw_source_reads[p] += 1
+        return real_read_table(path, *args, **kwargs)
 
     monkeypatch.setattr(cd.pq, "read_table", tracking_read_table)
     assert cd.compact_daily(DATE, "trades", tmp_path)
-    source_paths = {tmp_path / "raw" / "trades" / f"{DATE}-{hour:02d}.parquet" for hour in source_hours}
-    assert [path for path in calls if path in source_paths] == [
-        tmp_path / "raw" / "trades" / f"{DATE}-{hour:02d}.parquet" for hour in source_hours
-    ]
-    assert len(calls) == len(source_hours)
+
+    # Every source file must have been read exactly once.
+    for p, count in raw_source_reads.items():
+        assert count == 1, f"{p.name} was read {count} times, expected 1"
 
 
 def test_no_set_or_to_pylist_in_duplicate_detection():
@@ -462,29 +508,64 @@ def test_tmp_removed_after_replace_failure(tmp_path, monkeypatch):
     assert not Path(str(final_path) + ".tmp").exists()
 
 
-def test_directory_fsync_called_after_replace(tmp_path, monkeypatch):
+def test_directory_fsync_after_replace(tmp_path, monkeypatch):
+    # Verify that for both _stream_write_parquet and _write_json_atomic:
+    #   os.replace() fires before the directory os.fsync().
     _write_hours(tmp_path, "trades", hours=[0], rows=1)
     final_parent = tmp_path / "daily" / "trades"
-    directory_fds = []
-    fsync_fds = []
-    next_fd = 20000
+
+    events = []
+    next_fd = [20000]
+    directory_fds = set()
+    real_replace = cd.os.replace
 
     def fake_open(path, flags):
-        nonlocal next_fd
-        next_fd += 1
+        next_fd[0] += 1
+        fd = next_fd[0]
         if Path(path) == final_parent:
-            directory_fds.append(next_fd)
-        return next_fd
+            directory_fds.add(fd)
+        return fd
 
     def fake_fsync(fd):
-        fsync_fds.append(fd)
+        if fd in directory_fds:
+            events.append(("dir_fsync", fd))
+        # File fsyncs use real fds from Python open(); ignore them here.
+
+    def fake_replace(src, dst):
+        events.append(("replace", str(dst)))
+        # Perform the actual replace so the file is really written.
+        real_replace(src, dst)
 
     monkeypatch.setattr(cd.os, "open", fake_open)
-    monkeypatch.setattr(cd.os, "fsync", fake_fsync)
     monkeypatch.setattr(cd.os, "close", lambda fd: None)
+    monkeypatch.setattr(cd.os, "fsync", fake_fsync)
+    monkeypatch.setattr(cd.os, "replace", fake_replace)
+
     assert cd.compact_daily(DATE, "trades", tmp_path)
-    assert directory_fds
-    assert all(fd in fsync_fds for fd in directory_fds)
+
+    # Must have at least one replace and one dir_fsync event.
+    replace_events = [i for i, (kind, _) in enumerate(events) if kind == "replace"]
+    dir_fsync_events = [i for i, (kind, _) in enumerate(events) if kind == "dir_fsync"]
+    assert replace_events, "os.replace never called"
+    assert dir_fsync_events, "directory fsync never called"
+
+    # Every dir_fsync must come after at least one replace; i.e.
+    # min(dir_fsync indices) > min(replace indices).
+    assert min(dir_fsync_events) > min(replace_events), (
+        f"directory fsync at event {min(dir_fsync_events)} "
+        f"occurred before replace at event {min(replace_events)}"
+    )
+
+    # Both parquet and json replace events must precede their dir_fsync
+    # (there are 2 replace+fsync pairs for one compaction run).
+    assert len(replace_events) >= 2, "expected replace for both parquet and metadata"
+    assert len(dir_fsync_events) >= 2, "expected dir_fsync for both parquet and metadata"
+
+    # Verify interleaving: each replace_i < its matching dir_fsync_i.
+    for replace_idx, dir_fsync_idx in zip(
+        sorted(replace_events), sorted(dir_fsync_events), strict=False
+    ):
+        assert replace_idx < dir_fsync_idx
 
 
 def test_verify_detects_wrong_file_size(tmp_path):
@@ -512,11 +593,68 @@ def test_verify_detects_bad_metadata(tmp_path):
 
 
 def test_no_concat_tables_called(tmp_path, monkeypatch):
+    # Normal compaction with non-overlapping hours must never call
+    # concat_tables on the full-day write path.
     for hour in range(3):
         _write_hour(tmp_path, "trades", hour, rows=3)
 
-    def fail_concat(*args, **kwargs):
-        raise AssertionError("must not be called")
+    concat_calls = []
+    real_concat = cd.pa.concat_tables
 
-    monkeypatch.setattr(cd.pa, "concat_tables", fail_concat)
+    def tracking_concat(*args, **kwargs):
+        concat_calls.append(args[0])
+        return real_concat(*args, **kwargs)
+
+    monkeypatch.setattr(cd.pa, "concat_tables", tracking_concat)
     assert cd.compact_daily(DATE, "trades", tmp_path)
+    # Non-overlapping hours produce no boundary timestamp match, so
+    # _check_boundary_duplicates is never called and concat_tables is
+    # never invoked.
+    assert len(concat_calls) == 0
+
+
+def test_boundary_duplicate_detection_uses_small_concat_only(tmp_path):
+    # When two adjacent hours share a boundary timestamp, concat_tables
+    # must be called exactly once (on tiny boundary subsets only) and
+    # must raise CompactionError for actual duplicates.
+    boundary_ts = _base_ms(0) + 3500  # inside hour 0 range
+    _write_hour(
+        tmp_path,
+        "trades",
+        0,
+        timestamps=[_base_ms(0), boundary_ts],
+        overrides={"trade_id": [1, 42]},
+    )
+    _write_hour(
+        tmp_path,
+        "trades",
+        1,
+        timestamps=[boundary_ts, _base_ms(1)],
+        overrides={"trade_id": [42, 43]},
+    )
+
+    concat_calls = []
+    real_concat = cd.pa.concat_tables
+
+    def tracking_concat(*args, **kwargs):
+        concat_calls.append(args[0])
+        return real_concat(*args, **kwargs)
+
+    import collector.scripts.compact_daily as cd_module
+
+    # Patch at module level so _check_boundary_duplicates picks it up.
+    orig = cd_module.pa.concat_tables
+    cd_module.pa.concat_tables = tracking_concat
+    try:
+        with pytest.raises(cd.CompactionError, match="duplicate"):
+            cd.compact_daily(DATE, "trades", tmp_path)
+    finally:
+        cd_module.pa.concat_tables = orig
+
+    # concat_tables called exactly once (the boundary subset only).
+    assert len(concat_calls) == 1
+    # Each boundary subset table must be tiny (boundary rows only, not
+    # full hourly tables).
+    for tables in concat_calls:
+        for table in tables:
+            assert table.num_rows <= 2
