@@ -1,14 +1,6 @@
-# Daily Compaction Pipeline
+# Daily Compaction
 
-## Architecture
-
-Daily compaction is an offline, read-only step over the live collector's hourly raw Parquet outputs. It never imports or changes the live `ParquetWriter`, never writes under `data/raw/`, and never changes the hourly filename contract (`YYYY-MM-DD-HH.parquet`). The compactor reads existing hourly files from `data/raw/{stream}/` and writes additive daily outputs under `data/daily/{stream}/`.
-
-Daily Parquet and metadata files use the same atomic write shape as the collector: write the complete payload to a sibling `.tmp` file, fsync it, publish it with `os.replace`, and fsync the output directory. Because `os.replace` is atomic on the same filesystem and the parent directory is flushed after rename, readers either see the previous complete file or the new complete file; they do not see a partially-written daily output.
-
-The compactor guards the current UTC hour and any recently-modified hourly file. If the current-hour file was modified inside the configurable guard window (90 seconds by default), or if a matching `YYYY-MM-DD-HH.parquet.tmp` exists, the hour is skipped and recorded in the sidecar `skipped_hours` list. This prevents racing the live writer while it may still be flushing or recovering a file.
-
-The implementation streams hourly inputs into the daily Parquet writer one source at a time. It inspects and validates each hourly file independently, orders the sources by timestamp range, then appends row groups directly to the output writer instead of concatenating all 24 hourly tables in memory.
+`collector/scripts/compact_daily.py` compacts raw hourly Parquet files into one daily Parquet file per stream. It is an offline maintenance command: it does not modify raw hourly naming, collector startup, or collector recovery behavior.
 
 ## File Layout
 
@@ -31,26 +23,87 @@ data/
                      YYYY-MM-DD.meta.json
     liquidation/     YYYY-MM-DD.parquet
                      YYYY-MM-DD.meta.json
-  aligned/
-  splits/
-  stats/
 ```
 
-Only `data/daily/{stream}/` is created by this pipeline. The assembler's `data/raw/` inputs remain unchanged.
+Only `data/daily/{stream}/` is created by daily compaction. The raw hourly inputs remain unchanged.
 
-## Recovery Behaviour
+## Guard Behavior
 
-If a run is aborted mid-stream, an unpublished `.tmp` file may remain next to the intended daily output. The next run with `--force` removes stale Parquet and metadata `.tmp` files, logs the cleanup, writes fresh `.tmp` files, fsyncs them, atomically replaces the final files with `os.replace`, and fsyncs the parent directory.
+The mtime guard is intentionally narrow:
 
-Missing hourly files are not fatal. The compactor logs a warning for each absent `HH` file and records those integer hours in the sidecar `missing_hours` field. Hours skipped because a matching `.tmp` exists or because the current-hour guard fired are recorded in `skipped_hours`.
+- Historical hourly files are never skipped due to mtime, regardless of when they were last modified or copied into place.
+- The mtime guard is applied only when the hourly file belongs to the current UTC date and the current UTC hour.
+- When `date == current UTC date` and `hour == current UTC hour`, files modified within `guard_seconds` are skipped and the hour is recorded in `skipped_hours`.
+- The default guard window is 90 seconds.
+- Any hour with a matching `YYYY-MM-DD-HH.parquet.tmp` file is skipped unconditionally and recorded in `skipped_hours`.
 
-If an hourly file is corrupt or unreadable as Parquet, PyArrow raises during the read. The CLI logs the stream/date failure as an error, skips that stream/date output, continues with remaining work, and exits with code `1` after all requested streams and dates have been attempted.
+This allows backfills and historical repairs to compact recently-copied hourly files while still avoiding races with the live writer for the active current-hour file.
 
-After writing a daily Parquet file, the compactor explicitly verifies that the final file exists, is readable, has the expected stream schema, and has the expected row count before collecting `file_size_bytes` for the metadata sidecar.
+## Streaming Architecture
+
+Daily compaction streams inputs by hourly source:
+
+1. `_inspect_sources()` reads each hourly Parquet file exactly once.
+2. The hourly table is aligned to the expected stream schema, sorted by `timestamp`, and validated.
+3. The validated table is stored on `HourSource.table`.
+4. `_stream_write_parquet()` writes each `HourSource.table` directly to the daily output as a row group.
+
+The compactor does not build a full-day in-memory table. It does not use `concat_tables` for the full-day write path.
+
+The only use of Arrow table concatenation is the tiny cross-boundary duplicate check for `trades`, where the final timestamp rows from the previous source and the first timestamp rows from the current source are grouped to detect duplicate `(timestamp, trade_id)` pairs.
+
+## Validation Checks
+
+Before writing a daily file, compaction validates:
+
+- Required columns are present and castable to the configured stream schema.
+- Hourly files are non-empty.
+- The `timestamp` column contains no null values.
+- `trades` timestamps are monotonically non-decreasing within each hourly file and across ordered hourly ranges.
+- `orderbook`, `markprice`, `openinterest`, and `liquidation` timestamps are strictly increasing within each hourly file and across ordered hourly ranges.
+- `trades` has no duplicate `(timestamp, trade_id)` pairs within an hourly file or across adjacent equal-timestamp boundaries.
+- Non-trade streams have no duplicate `timestamp` values.
+- `orderbook` rows where `best_bid >= best_ask` or `obi` is outside `[-1.0, 1.0]` are logged as warnings but do not abort compaction.
+
+Duplicate detection uses Arrow grouping and compute kernels rather than Python trade-id sets or timestamp-list materialization.
+
+## Atomic Writes and Tmp Cleanup
+
+Daily Parquet and metadata sidecar writes use `.tmp` files followed by `os.replace` and a parent-directory fsync. Readers either see the previous complete file or the new complete file; they do not see a partially written final file.
+
+Both `_stream_write_parquet()` and `_write_json_atomic()` wrap `os.replace` in `try`/`except`. If `os.replace` raises, the corresponding `.tmp` file is deleted before the exception is re-raised.
+
+A forced compaction run (`--force`) also removes stale Parquet and metadata `.tmp` files for the requested output before rewriting.
+
+## Schema Compatibility
+
+Daily output verification uses `_validate_schema_compatible()` rather than strict schema object equality. Compatibility checks require:
+
+- The same field count.
+- Matching field names in order.
+- Matching field types in order.
+
+Schema-level metadata differences, such as `interval_start` or `interval_end`, are ignored and do not cause false validation failures.
+
+## Metadata Verification
+
+Each daily file has a sidecar `YYYY-MM-DD.meta.json`. `verify_daily()` checks the Parquet file against that metadata and raises `CompactionError` on any mismatch.
+
+Verification checks:
+
+- `record_count` matches the Parquet row count.
+- `file_size_bytes` matches the actual daily Parquet file size.
+- `start_timestamp_ms` matches the Parquet timestamp minimum.
+- `end_timestamp_ms` matches the Parquet timestamp maximum.
+- `source_hourly_files` is a list.
+- `missing_hours` is a list of integers.
+- `skipped_hours` is a list of integers.
+
+The Parquet timestamp range is read from row-group statistics when available. If a row group lacks timestamp min/max statistics, verification falls back to reading only that row group's `timestamp` column.
 
 ## Usage
 
-Run from the `collector/` repository root or with an environment where the package is importable:
+Run from the repository root or any environment where the package is importable:
 
 ```bash
 python -m collector.scripts.compact_daily --date 2026-06-10
@@ -61,38 +114,27 @@ python -m collector.scripts.compact_daily --date 2026-06-10 --guard-seconds 180
 python -m collector.scripts.compact_daily --verify --date 2026-06-10
 ```
 
-By default, compaction processes all five streams: `orderbook`, `trades`, `markprice`, `openinterest`, and `liquidation`. Without `--force`, existing `data/daily/{stream}/{date}.parquet` files are skipped so repeated runs are idempotent. `--verify` reads existing daily outputs and checks that the Parquet file, schema, metadata row count, and metadata timestamp range are consistent.
-
-## Validation Checks
-
-Before writing a daily file, the compactor validates:
-
-- Concatenated row count expectation equals the sum of per-file row counts for every stream.
-- The `timestamp` column contains no null values.
-- `trades` timestamps are monotonically non-decreasing within each hourly file and across ordered hourly ranges.
-- `orderbook`, `markprice`, `openinterest`, and `liquidation` timestamps are strictly increasing within each hourly file and across ordered hourly ranges.
-- `trades` has no duplicate `(timestamp, trade_id)` pairs within an hourly file or across adjacent equal-timestamp boundaries.
-- The non-trade streams have no duplicate `timestamp` values.
-- `orderbook` rows where `best_bid >= best_ask` are logged as warnings but do not abort compaction.
-- `orderbook` rows where `obi` is outside `[-1.0, 1.0]` are logged as warnings but do not abort compaction.
-
-Validation uses PyArrow compute kernels for column-wide checks and avoids materializing production-sized timestamp columns or trade key sets into Python memory. Daily outputs are written using the imported stream schemas, preserving column types and schema metadata.
+By default, compaction processes all five streams: `orderbook`, `trades`, `markprice`, `openinterest`, and `liquidation`. Without `--force`, an existing `data/daily/{stream}/{date}.parquet` file is skipped so repeated runs are idempotent.
 
 ## Retention Policy Integration
 
-After a daily compacted Parquet file and its `.meta.json` sidecar have been verified, the raw hourly files for that date can be archived or deleted to reclaim disk, consistent with the storage policy discussed in `README.md`. Do not remove raw files before verifying the daily file row count, timestamp range, and sidecar metadata.
+After a daily Parquet file and its `.meta.json` sidecar verify successfully, raw hourly files for that date can be archived or deleted according to the deployment retention policy. Do not remove raw files before verifying the daily row count, timestamp range, file size, and sidecar metadata.
 
-Suggested archive one-liner after verification:
+Example archive flow:
 
 ```bash
-stream=orderbook date=2026-06-10; python -m collector.scripts.compact_daily --verify --date "$date" --streams "$stream" && mkdir -p data/archive/raw/$stream && tar -czf data/archive/raw/$stream/$date-hours.tar.gz data/raw/$stream/$date-*.parquet && rm data/raw/$stream/$date-*.parquet
+stream=orderbook date=2026-06-10
+python -m collector.scripts.compact_daily --verify --date "$date" --streams "$stream" \
+  && mkdir -p data/archive/raw/$stream \
+  && tar -czf data/archive/raw/$stream/$date-hours.tar.gz data/raw/$stream/$date-*.parquet \
+  && rm data/raw/$stream/$date-*.parquet
 ```
 
-Repeat for each stream only after confirming `data/daily/{stream}/{date}.parquet` and `data/daily/{stream}/{date}.meta.json` are present and valid.
-
-## Running the Test Suite
+## Running Tests
 
 ```bash
 pytest collector/tests/test_daily_compaction.py -v
-pytest collector/tests/
+pytest collector/tests/ -v
+ruff check collector/scripts/compact_daily.py
+python -m collector.scripts.compact_daily --help
 ```
