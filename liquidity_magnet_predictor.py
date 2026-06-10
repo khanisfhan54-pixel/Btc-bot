@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import copy
+import inspect
+import json
 import logging
 import math
+import os
 import threading
+import traceback
+from datetime import datetime, timezone
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, TypedDict
 
@@ -16,6 +21,36 @@ _INTERACTION_KEYS = {
     "sweep": "sweeps",
     "breakout": "breakouts",
 }
+
+
+def _magnet_audit_enabled() -> bool:
+    return os.environ.get("BTCBOT_MAGNET_AUDIT", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _json_default(value: Any) -> str:
+    return repr(value)
+
+
+def _emit_predict_audit_event(market_state: Dict[str, Any]) -> None:
+    """Emit call-site proof for LiquidityMagnetPredictor.predict when enabled."""
+    if not _magnet_audit_enabled():
+        return
+    stack = inspect.stack(context=0)
+    caller = stack[2] if len(stack) > 2 else None
+    payload = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "caller_function": caller.function if caller is not None else "unknown",
+        "caller_file": caller.filename if caller is not None else "unknown",
+        "caller_line": caller.lineno if caller is not None else 0,
+        "market_state": copy.deepcopy(market_state),
+        "regime": market_state.get("regime"),
+        "volatility": market_state.get("volatility"),
+        "trend_direction": market_state.get("trend_direction"),
+        "atr": market_state.get("atr"),
+        "missing_fields": validate_market_state(market_state),
+        "stack_trace": "".join(traceback.format_stack()),
+    }
+    logger.warning("[MAGNET_AUDIT] %s", json.dumps(payload, sort_keys=True, default=_json_default))
 
 
 class ZoneCandidate(TypedDict):
@@ -273,6 +308,7 @@ class LiquidityMagnetPredictor:
         """
         safe_candidates = candidates if isinstance(candidates, list) else []
         safe_market_state = market_state if isinstance(market_state, dict) else {}
+        _emit_predict_audit_event(safe_market_state)
         safe_stop_hunt = stop_hunt_data if isinstance(stop_hunt_data, dict) else {}
         safe_vol = volume_intel if isinstance(volume_intel, dict) else {}
 
