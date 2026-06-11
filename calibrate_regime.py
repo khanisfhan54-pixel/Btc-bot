@@ -10,6 +10,7 @@ Rules:
 - Pure numpy only — no sklearn or scipy required
 """
 
+import json
 import os
 import numpy as np
 from collections import deque
@@ -34,6 +35,14 @@ BARRIER_WINDOW = 20
 BARRIER_MULT   = 1.5
 OUTPUT_DIR     = "weights"
 OUTPUT_PATH    = os.path.join(OUTPUT_DIR, "advanced_regime_weights.npz")
+PROVENANCE_PATH = os.path.join(OUTPUT_DIR, "calibration_provenance.json")
+DATA_SOURCE    = os.environ.get("REGIME_DATA_SOURCE", "synthetic").strip().lower()
+
+if DATA_SOURCE not in ("synthetic", "real"):
+    raise ValueError(
+        "calibrate_regime.py: REGIME_DATA_SOURCE must be 'synthetic' or 'real'. "
+        f"Got {DATA_SOURCE!r}."
+    )
 
 # Guard: N_STATES must be 3 or 4. Any other value indicates a misconfiguration.
 if N_STATES not in (3, 4):
@@ -96,7 +105,12 @@ def _kmeans_numpy(X, n_clusters=3, random_state=42,
 
 # ─── STEP 1: GENERATE / LOAD PRICE DATA ──────────────────────
 
-print("\n[1/7] Generating synthetic training data...")
+print(f"\n[1/7] Generating {DATA_SOURCE} training data...")
+if DATA_SOURCE == "real":
+    raise NotImplementedError(
+        "REGIME_DATA_SOURCE=real requested, but this calibration script has no "
+        "real-data loader configured. Refusing to silently fall back to synthetic data."
+    )
 
 prices      = [50000.0]
 returns     = []
@@ -411,6 +425,20 @@ np.savez(
     feature_std         = feature_std.astype(np.float64),
 )
 
+if DATA_SOURCE == "synthetic":
+    with open(PROVENANCE_PATH, "w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "data_source": "synthetic",
+                "production_valid": False,
+                "reason": "trained_on_synthetic_data",
+            },
+            fh,
+            indent=2,
+            sort_keys=True,
+        )
+        fh.write("\n")
+
 saved = np.load(OUTPUT_PATH)
 required_keys = [
     "nhhmm_beta", "nhhmm_mu", "nhhmm_sigma",
@@ -423,6 +451,8 @@ for key in required_keys:
         f"Non-finite in saved key: {key}"
 
 print(f"    Saved:  {OUTPUT_PATH}")
+if DATA_SOURCE == "synthetic":
+    print(f"    Provenance: {PROVENANCE_PATH}")
 print(f"    Keys:   {sorted(saved.files)}")
 print()
 print("=" * 60)
