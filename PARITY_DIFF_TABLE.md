@@ -1,0 +1,14 @@
+# Live vs Backtest Parity Diff Table
+
+| Component | Live | Backtest | Impact | Severity | Fix Required |
+|---|---|---|---|---|---|
+| `main.py::run_all_engines` | Live orchestration path computes regime/signal/risk gates before execution. | Backtest uses `BacktestEngine._run_single_pass` and canonical ARE payload before orchestration. | Backtest can diverge if ARE fail-closed fields are ignored. | P0 | Yes: enforce `signal_valid`, halt modes, degraded engine, and invalid feed status before any backtest entry. |
+| `main.py::determine_signal` | Uses live features and confidence output as execution intent. | Backtest converts orchestrator output into `signal` payload for `ExecutionLogic`. | Parallel raw signal bypass would inflate historical trades. | P0 | Existing orchestrator guard retained; no signal-threshold tuning. |
+| `main.py::get_ai_score` | Live confidence/risk contribution flows into decision gate. | Backtest uses ARE confidence and alpha convictions. | Confidence semantics can diverge if uncalibrated ARE output is accepted. | P0 | Yes: fail closed on uncalibrated/invalid feed statuses. |
+| `main.py::MarketStateDetector` | Live market-state detector participates in regime context. | Backtest feeds ARE-derived regime context. | Regime label mismatch affects alpha weighting and size. | P0 | Documented; only fail-closed parity guard changed. |
+| `engine.py::run_all_engines` | Runtime engine path consumes shared ARE/alpha outputs. | Backtest previously accepted ARE dictionaries unless explicitly uncalibrated. | Feed failures besides `UNCALIBRATED` could still pass. | P0 | Yes: treat feed status outside `OK`/`MTF_PARTIAL_SURVIVAL` as non-actionable. |
+| `engine.py::MarketStateDetector` | Runtime detector class is live-facing. | Backtest does not instantiate this detector directly. | Label drift risk if backtest bypasses canonical ARE. | P1 | No strategy change; covered by ARE gate. |
+| `backtest_engine.py` | N/A live. | Uses candle simulation if real book/trade inputs absent. | Synthetic OFI/trades can masquerade as production-valid. | P0 | Yes: add explicit `production_valid` fail-closed mode. |
+| `AlphaOrchestrator` | Live and backtest both require orchestrator for production path. | Backtest builds alpha sources and uses orchestrator decision only. | Bypass risk if source count too low. | P0 | Existing guard retained. |
+| `AdvancedRegimeEngine` | Loads weights via `ModelWeightManager`, emits `signal_valid`, `engine_status`, `risk_metrics.feed_status`, sizing. | Backtest consumes canonical payload and output. | Ignoring invalid status creates live/backtest execution mismatch. | P0 | Yes: stricter backtest gate. |
+| `LiquiditySweepAlpha` | Requires real microstructure/trade context for production interpretation. | Backtest can build simulated snapshots/trades from candles. | Synthetic OFI/CVD/sweep inputs invalidate production claims. | P0 | Yes: explicit production-valid fail-closed mode and documentation. |
