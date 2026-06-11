@@ -76,14 +76,16 @@ def compact_daily(
     schema = _schema_for_stream(stream)
     raw_dir = data_root / "raw" / stream
     out_dir = data_root / "daily" / stream
-    final_path = out_dir / f"{date}.parquet"
-    meta_path = final_path.with_suffix(".meta.json")
+    final_path = out_dir / f"{date}_{stream}.parquet"
+    meta_path = out_dir / f"{date}_{stream}.meta.json"
     if final_path.exists() and not force:
         logger.info("compact_daily_skip", stream=stream, date=date, reason="exists")
         return True
     if force:
         _remove_stale_tmp(final_path, stream, date)
         _remove_stale_tmp(meta_path, stream, date)
+        for hourly_tmp_path in raw_dir.glob(f"{date}-*.parquet.tmp"):
+            _remove_stale_tmp(hourly_tmp_path.with_suffix(""), stream, date)
     discovered = _discover_hourly_files(raw_dir, date, guard_seconds=guard_seconds)
     if not discovered.present_files:
         logger.warning("compact_daily_no_sources", stream=stream, date=date)
@@ -94,6 +96,18 @@ def compact_daily(
     expected_rows = sum(source.rows for source in sources)
     out_dir.mkdir(parents=True, exist_ok=True)
     _stream_write_parquet(sources, final_path, schema)
+    if discovered.skipped_hours:
+        logger.warning(
+            "compact_daily_skipped_hours_present",
+            stream=stream,
+            date=date,
+            skipped_hours=discovered.skipped_hours,
+            message=(
+                "Hourly files were skipped during compaction. "
+                "Skipped data is recoverable from raw hourly files. "
+                "Re-run with --force after resolving stale .tmp files to include skipped hours."
+            ),
+        )
     stats = _verify_parquet_output(final_path, schema, expected_rows)
     metadata = _build_metadata(
         stats=stats,
@@ -120,8 +134,8 @@ def verify_daily(
         True when the compacted output and metadata are consistent.
     """
     schema = _schema_for_stream(stream)
-    final_path = Path(data_dir) / "daily" / stream / f"{date}.parquet"
-    meta_path = final_path.with_suffix(".meta.json")
+    final_path = Path(data_dir) / "daily" / stream / f"{date}_{stream}.parquet"
+    meta_path = final_path.parent / f"{date}_{stream}.meta.json"
     if not meta_path.exists():
         raise CompactionError(f"missing metadata sidecar: {meta_path}")
     with meta_path.open("r", encoding="utf-8") as handle:
@@ -207,9 +221,22 @@ def _discover_hourly_files(raw_dir: Path, date: str, *, guard_seconds: int) -> _
         path = raw_dir / f"{date}-{hour:02d}.parquet"
         tmp_path = Path(str(path) + ".tmp")
         if tmp_path.exists():
-            logger.warning("compact_daily_skip_matching_tmp", stream=raw_dir.name, date=date, hour=hour)
-            skipped.append(hour)
-            continue
+            is_current_hour = date == current_date and hour == current_hour
+            if is_current_hour:
+                logger.warning("compact_daily_skip_matching_tmp", stream=raw_dir.name, date=date, hour=hour)
+                skipped.append(hour)
+                continue
+            if path.exists():
+                logger.warning(
+                    "compact_daily_stale_tmp_ignored",
+                    stream=raw_dir.name,
+                    date=date,
+                    hour=hour,
+                    message=(
+                        "Stale .tmp found alongside .parquet for historical hour; "
+                        "ignoring .tmp and compacting."
+                    ),
+                )
         if not path.exists():
             logger.warning("compact_daily_missing_hour", stream=raw_dir.name, date=date, hour=hour)
             missing.append(hour)
@@ -240,7 +267,7 @@ def _discover_all_dates(data_dir: Path, streams: Sequence[str]) -> set[str]:
         if not raw_dir.exists():
             continue
         for path in raw_dir.glob("*.parquet"):
-            if path.name.endswith((".tmp", ".bak")) or Path(str(path) + ".tmp").exists():
+            if path.name.endswith((".tmp", ".bak")):
                 continue
             match = DATE_RE.match(path.name)
             if match:
