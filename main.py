@@ -70,6 +70,7 @@ SHPE_ENABLED = os.environ.get("SHPE_ENABLED", "true").strip().lower() not in {"0
 SHPE_HIGH_PROB_THRESHOLD = float(os.environ.get("SHPE_HIGH_PROB_THRESHOLD", "0.70"))
 SHPE_CONFIDENCE_PENALTY = float(os.environ.get("SHPE_CONFIDENCE_PENALTY", "0.20"))
 SHPE_SIZE_PENALTY = float(os.environ.get("SHPE_SIZE_PENALTY", "0.50"))
+SHPE_REQUIRE_TRAINED = os.environ.get("SHPE_REQUIRE_TRAINED", "false").strip().lower() in {"1", "true", "yes", "on"}
 _reconciliation_blocks: Dict[str, float] = {}
 _ORDERBOOK_SNAPSHOTS: Deque[Dict[str, Any]] = deque(maxlen=8)
 _ORDERBOOK_SNAPSHOTS_LOCK = threading.RLock()
@@ -434,8 +435,9 @@ try:
     capital_allocator = CapitalAllocator()
     _shpe_engine: Optional[StopHuntProbabilityEngine] = None
     if _SHPE_IMPORT_OK and SHPE_ENABLED and load_shpe_engine_at_boot is not None:
+        _require_shpe = bool(LIVE_TRADING or SHPE_REQUIRE_TRAINED)
         try:
-            _shpe_engine = load_shpe_engine_at_boot(require_trained=False)
+            _shpe_engine = load_shpe_engine_at_boot(require_trained=_require_shpe)
             if _shpe_engine is not None:
                 logger.info(
                     "SHPE boot: model loaded, version=%s, calibrated=%s",
@@ -444,12 +446,23 @@ try:
                 )
             else:
                 logger.warning(
-                    "SHPE boot: no model loaded — running in degraded mode (p=0.5). "
-                    "calibrator.pkl present=%s. Train a full model and call save().",
+                    "SHPE boot: no model loaded — explicit degraded mode (p=0.5). "
+                    "calibrator.pkl present=%s require_trained=%s. Train a full model and call save().",
                     os.path.exists("calibrator.pkl"),
+                    _require_shpe,
                 )
         except Exception as _shpe_boot_err:
-            logger.warning("[BOOT] SHPE engine construction failed (non-fatal): %s", _shpe_boot_err)
+            _boot_msg = f"[BOOT][SHPE][CRITICAL] artifact validation failed: {_shpe_boot_err}"
+            logger.critical(_boot_msg, exc_info=True)
+            try:
+                _alert_fn = globals().get("send_telegram_message", lambda _m: False)
+                _tg_thread = threading.Thread(target=_alert_fn, args=(_boot_msg,), daemon=True)
+                _tg_thread.start()
+                _tg_thread.join(timeout=10.0)
+            except Exception as _tg_exc:
+                logger.error("[BOOT] Telegram alert failed for SHPE artifact failure: %s", _tg_exc)
+            if _require_shpe:
+                raise RuntimeError(_boot_msg) from _shpe_boot_err
             _shpe_engine = None
     _bootstrap_stage = "VenueBasisNormalizer"
     basis_normalizer = VenueBasisNormalizer(halt_threshold_pct=BASIS_HALT_THRESHOLD_PCT)

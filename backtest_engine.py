@@ -223,6 +223,76 @@ def _snapshot_to_book(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     return {"bids": _conv(snapshot.get("bids")), "asks": _conv(snapshot.get("asks"))}
 
 
+def _extract_funding_rate(features: Dict[str, Any]) -> float:
+    raw = features.get("funding_rate_8h", features.get("funding_rate", 0.0))
+    rate = _safe_float(raw, 0.0)
+    return rate if math.isfinite(rate) else 0.0
+
+
+def calculate_funding_payment(
+    *,
+    side: str,
+    entry_price: float,
+    size: float,
+    funding_rate: float,
+    bar_interval_hours: float,
+    funding_interval_hours: float,
+) -> float:
+    """Return funding cashflow for one bar. Positive means equity credit."""
+    notional = max(0.0, abs(size) * max(entry_price, 0.0))
+    if notional <= 0.0 or funding_rate == 0.0:
+        return 0.0
+    interval_fraction = max(0.0, bar_interval_hours) / max(funding_interval_hours, 1e-12)
+    direction = -1.0 if str(side).upper() == "LONG" else 1.0
+    return float(direction * notional * funding_rate * interval_fraction)
+
+
+def calculate_trade_pnl(
+    *,
+    side: str,
+    entry_price: float,
+    exit_price: float,
+    size: float,
+    fee_pct: float,
+    slippage_pct: float,
+    funding_pnl: float = 0.0,
+) -> Tuple[float, float]:
+    """Return absolute PnL and net return on entry notional for a qty-sized trade."""
+    qty = abs(size)
+    if qty <= 0.0 or entry_price <= 0.0 or exit_price <= 0.0:
+        return 0.0, 0.0
+    gross = (exit_price - entry_price) * qty if str(side).upper() == "LONG" else (entry_price - exit_price) * qty
+    entry_notional = entry_price * qty
+    exit_notional = exit_price * qty
+    fees_abs = max(0.0, fee_pct) * (entry_notional + exit_notional)
+    slippage_abs = max(0.0, slippage_pct) * exit_notional
+    pnl_abs = gross - fees_abs - slippage_abs + funding_pnl
+    return float(pnl_abs), float(pnl_abs / max(entry_notional, 1e-12))
+
+
+def simulate_queue_fill(
+    *,
+    side: str,
+    remaining_qty: float,
+    features: Dict[str, Any],
+) -> Tuple[float, float]:
+    """Queue-aware deterministic fill quantity and fill fraction for one bar."""
+    qty = max(0.0, float(remaining_qty))
+    if qty <= 0.0:
+        return 0.0, 0.0
+    direction = str(side).lower()
+    prob_key = "fill_prob_long" if direction == "buy" else "fill_prob_short"
+    fill_prob = _safe_float(features.get(prob_key, features.get("fill_probability", features.get("fill_prob", 1.0))), 1.0)
+    confidence = _safe_float(features.get("fill_confidence", 1.0), 1.0)
+    fraction = _clamp(fill_prob * confidence, 0.0, 1.0)
+    if direction == "buy":
+        displayed_qty = _safe_float(features.get("top_ask_qty", features.get("ask_depth_n", qty)), qty)
+    else:
+        displayed_qty = _safe_float(features.get("top_bid_qty", features.get("bid_depth_n", qty)), qty)
+    liquidity_cap = max(0.0, displayed_qty)
+    fill_qty = min(qty, qty * fraction, liquidity_cap if liquidity_cap > 0.0 else 0.0)
+    return float(fill_qty), float(0.0 if qty <= 0.0 else fill_qty / qty)
+
 def _ts_seconds(candle: list) -> float:
     ts_raw = _safe_float(candle[0], 0.0)
     # Heuristic: ts > 1e12 is millis; > 1e15 is nanos. Convert to seconds.
@@ -242,6 +312,9 @@ class BacktestConfig:
     slippage_bps: float = 3.0
     max_hold_bars: int = 12
     initial_balance: float = 10_000.0
+    funding_interval_hours: float = 8.0
+    bar_interval_hours: float = 5.0 / 60.0
+    queue_fill_timeout_bars: int = 3
     basis_mode: str = "none"  # none|fixed
     fixed_basis: float = 0.0
     # Phase 4: orchestrator action threshold (lower than production default of
@@ -645,7 +718,7 @@ class BacktestEngine:
                 current_time=ts_seconds,
                 market_state={
                     "regime": regime_label,
-                    "volatility": 1.0,
+                    "volatility": _safe_float(features.get("volatility", features.get("expected_volatility", features.get("atr_pct", 0.0))), 0.0),
                     "trend_direction": "up" if _safe_float(features.get("imbalance", 0.0), 0.0) >= 0.0 else "down",
                     "atr": max(_safe_float(atr, 0.0), 1e-8),
                 },
@@ -1155,6 +1228,7 @@ class BacktestEngine:
         prev_snapshot: Dict[str, Any] = _simulate_snapshot_from_candle(data[0])
 
         position: Optional[Dict[str, Any]] = None
+        pending_order: Optional[Dict[str, Any]] = None
         _bars_with_insufficient_signals: int = 0
 
         for i in range(25, len(data)):
@@ -1255,6 +1329,22 @@ class BacktestEngine:
                 features = self.fill_model.enrich(features)
             if self.tox_filter is not None:
                 features = self.tox_filter.enrich(features)
+
+            if position is not None:
+                funding_pnl = calculate_funding_payment(
+                    side=str(position.get("side", "")),
+                    entry_price=_safe_float(position.get("entry"), 0.0),
+                    size=_safe_float(position.get("size"), 0.0),
+                    funding_rate=_extract_funding_rate(features),
+                    bar_interval_hours=self.cfg.bar_interval_hours,
+                    funding_interval_hours=self.cfg.funding_interval_hours,
+                )
+                if funding_pnl:
+                    balance += funding_pnl
+                    position["funding_pnl"] = _safe_float(position.get("funding_pnl", 0.0), 0.0) + funding_pnl
+                    peak = max(peak, balance)
+                    dd = (peak - balance) / peak if peak > 0 else 0.0
+                    max_dd = max(max_dd, dd)
 
             ts_seconds = _ts_seconds(candle)
 
@@ -1473,8 +1563,53 @@ class BacktestEngine:
                 meta_result=meta,
             )
 
+            if pending_order is not None:
+                pending_order["age_bars"] = int(pending_order.get("age_bars", 0)) + 1
+                fill_qty, fill_fraction = simulate_queue_fill(
+                    side=str(pending_order.get("side", "buy")),
+                    remaining_qty=_safe_float(pending_order.get("remaining_size", 0.0), 0.0),
+                    features=features,
+                )
+                if fill_qty > 0.0:
+                    pending_order["remaining_size"] = max(0.0, _safe_float(pending_order.get("remaining_size", 0.0), 0.0) - fill_qty)
+                    pending_order["filled_size"] = _safe_float(pending_order.get("filled_size", 0.0), 0.0) + fill_qty
+                    if position is None:
+                        position = {
+                            **pending_order["position_template"],
+                            "size": pending_order["filled_size"],
+                            "entry": pending_order["entry"],
+                            "queue_fill_fraction": fill_fraction,
+                            "queue_remaining_size": pending_order["remaining_size"],
+                        }
+
+                        if self.trade_lifecycle is not None:
+                            self.trade_lifecycle.on_entry(
+                                side=position["side"],
+                                entry_price=position["entry"], size=position["size"], features=features,
+                            )
+                        if self.position_manager is not None:
+                            self.position_manager.on_entry(
+                                symbol="BTC/USDT",
+                                side=position["side"],
+                                size=position["size"], entry_price=position["entry"], order_id=position["trade_id"],
+                                sl=position["sl"],
+                                tp=position["tp"],
+                                signal=str(signal.get("signal", "HOLD")),
+                                confidence=float(orch_conviction),
+                                regime=regime_label, fees=0.0, fee_type="pct",
+                                features=features,
+                            )
+                    else:
+                        position["size"] = _safe_float(position.get("size", 0.0), 0.0) + fill_qty
+                        position["queue_fill_fraction"] = fill_fraction
+                        position["queue_remaining_size"] = pending_order["remaining_size"]
+                    if pending_order["remaining_size"] <= 1e-12:
+                        pending_order = None
+                elif int(pending_order.get("age_bars", 0)) >= self.cfg.queue_fill_timeout_bars:
+                    pending_order = None
+
             # ---- Position open ----
-            if position is None and orch_action_str in ("LONG", "SHORT") and decision.get("execute"):
+            if position is None and pending_order is None and orch_action_str in ("LONG", "SHORT") and decision.get("execute"):
                 side = "buy" if orch_action_str == "LONG" else "sell"
                 entry = current_price * (
                     1.0 + (self.cfg.slippage_bps / 10_000.0 if side == "buy"
@@ -1496,37 +1631,68 @@ class BacktestEngine:
                 trade_id = f"bt-{label}-{i}"
                 fees = _safe_float(self.cfg.fee_bps, 0.0) / 10_000.0
                 fee_type = "pct"
-                if self.trade_lifecycle is not None:
-                    self.trade_lifecycle.on_entry(
-                        side="LONG" if side == "buy" else "SHORT",
-                        entry_price=entry, size=size, features=features,
-                    )
-                if self.position_manager is not None:
-                    self.position_manager.on_entry(
-                        symbol="BTC/USDT",
-                        side="LONG" if side == "buy" else "SHORT",
-                        size=size, entry_price=entry, order_id=trade_id,
-                        sl=_safe_float(decision.get("sl", 0.0)),
-                        tp=_safe_float(decision.get("tp", 0.0)),
-                        signal=str(signal.get("signal", "HOLD")),
-                        confidence=float(orch_conviction),
-                        regime=regime_label, fees=0.0, fee_type="pct",
-                        features=features,
-                    )
-                position = {
+                position_template = {
                     "trade_id": trade_id,
                     "side": "LONG" if side == "buy" else "SHORT",
                     "entry": entry,
                     "sl": _safe_float(decision.get("sl", 0.0)),
                     "tp": _safe_float(decision.get("tp", 0.0)),
-                    "size": size,
                     "fees": fees,
                     "fee_type": fee_type,
                     "entry_index": i,
                     "entry_features": features,
                     "signal": signal,
                     "meta": meta,
+                    "funding_pnl": 0.0,
                 }
+                fill_qty, fill_fraction = simulate_queue_fill(
+                    side=side,
+                    remaining_qty=size,
+                    features=features,
+                )
+                if fill_qty <= 0.0:
+                    pending_order = {
+                        "side": side,
+                        "entry": entry,
+                        "remaining_size": size,
+                        "filled_size": 0.0,
+                        "age_bars": 0,
+                        "position_template": position_template,
+                    }
+                    continue
+                remaining_size = max(0.0, size - fill_qty)
+                position = {
+                    **position_template,
+                    "size": fill_qty,
+                    "queue_fill_fraction": fill_fraction,
+                    "queue_remaining_size": remaining_size,
+                }
+                if self.trade_lifecycle is not None:
+                    self.trade_lifecycle.on_entry(
+                        side=position["side"],
+                        entry_price=position["entry"], size=position["size"], features=features,
+                    )
+                if self.position_manager is not None:
+                    self.position_manager.on_entry(
+                        symbol="BTC/USDT",
+                        side=position["side"],
+                        size=position["size"], entry_price=position["entry"], order_id=position["trade_id"],
+                        sl=position["sl"],
+                        tp=position["tp"],
+                        signal=str(signal.get("signal", "HOLD")),
+                        confidence=float(orch_conviction),
+                        regime=regime_label, fees=0.0, fee_type="pct",
+                        features=features,
+                    )
+                if remaining_size > 1e-12:
+                    pending_order = {
+                        "side": side,
+                        "entry": entry,
+                        "remaining_size": remaining_size,
+                        "filled_size": fill_qty,
+                        "age_bars": 0,
+                        "position_template": position_template,
+                    }
                 continue
 
             if position is None:
@@ -1548,12 +1714,17 @@ class BacktestEngine:
             timeout = hold >= self.cfg.max_hold_bars
 
             if hit_sl or hit_tp or flip or timeout:
-                gross_pnl_pct = ((current_price - entry) / entry) if side == "LONG" else ((entry - current_price) / entry)
                 fees = _safe_float(position.get("fees"), 0.0)
                 slippage = self.cfg.slippage_bps / 10_000.0
-                total_fee_pct = fees * 2.0
-                net_pnl_pct = gross_pnl_pct - total_fee_pct - slippage
-                pnl = balance * net_pnl_pct * 0.25
+                pnl, net_pnl_pct = calculate_trade_pnl(
+                    side=side,
+                    entry_price=entry,
+                    exit_price=current_price,
+                    size=_safe_float(position.get("size"), 0.0),
+                    fee_pct=fees,
+                    slippage_pct=slippage,
+                    funding_pnl=0.0,
+                )
                 balance += pnl
                 peak = max(peak, balance)
                 dd = (peak - balance) / peak if peak > 0 else 0.0
@@ -1604,10 +1775,14 @@ class BacktestEngine:
                     "exit": round(current_price, 2),
                     "pnl": round(pnl, 4),
                     "pnl_pct": round(net_pnl_pct * 100.0, 4),
+                    "funding_pnl": round(_safe_float(position.get("funding_pnl", 0.0), 0.0), 6),
+                    "queue_fill_fraction": round(_safe_float(position.get("queue_fill_fraction", 1.0), 1.0), 6),
+                    "queue_remaining_size": round(_safe_float(position.get("queue_remaining_size", 0.0), 0.0), 8),
                     "signal": position["signal"],
                     "meta": position["meta"],
                 })
                 position = None
+                pending_order = None
 
         total_trades = len(trade_log)
         wins = sum(1 for t in trade_log if _safe_float(t.get("pnl", 0.0)) > 0)
