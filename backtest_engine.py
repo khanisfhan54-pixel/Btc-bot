@@ -1,8 +1,10 @@
 # backtest_engine.py
 from __future__ import annotations
 
+import json
 import logging
 import math
+import os
 import time as _time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -426,6 +428,19 @@ class BacktestEngine:
             self._calibration_feature_mean = None
             self._calibration_feature_std = None
 
+    def _calibration_provenance_non_production(self) -> bool:
+        """Return True when calibration sidecar marks weights non-production."""
+        path = os.path.join("weights", "calibration_provenance.json")
+        try:
+            if not os.path.exists(path):
+                return False
+            with open(path, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+            return bool(payload.get("production_valid") is False)
+        except Exception as exc:
+            logger.warning("failed to read calibration provenance sidecar (%s)", exc)
+            return False
+
     # ------------------------------------------------------------------
     # LSA seeding
     # ------------------------------------------------------------------
@@ -475,9 +490,13 @@ class BacktestEngine:
         """
         c = _safe_float(candle[4])
         v = _safe_float(candle[5])
+        _ = (vol_mean, vol_std)
         log_ret = math.log(c / prev_close) if (prev_close > 0 and c > 0) else 0.0
         ofi_z_raw = _safe_float(features.get("ofi_zscore", features.get("ofi_norm", 0.0)))
-        vol_z_raw = _safe_float(features.get("vol_z"), (v - vol_mean) / vol_std if vol_std > 0 else 0.0)
+        # Use the un-normalized replay feature vector here. Calibration-time
+        # feature_mean/feature_std below are the single source of normalization;
+        # applying a rolling volume z-score first double-normalizes replay bars.
+        vol_z_raw = v
         raw = np.array([float(log_ret), float(ofi_z_raw), float(vol_z_raw)], dtype=float)
 
         fm = self._calibration_feature_mean
@@ -517,12 +536,39 @@ class BacktestEngine:
 
         # FIX M-1 APPLIED — replace the synthetic len(trades) volume proxy
         # with the real per-minute aggTrades count. Fall back to len(trades)
-        # only if the bar has no minute bucket in the preloaded map.
+        # only if the bar has no minute bucket in the preloaded map. Track hit
+        # quality so synthetic/non-aligned OHLCV cannot masquerade as LSA parity.
+        trades_count_from_real = False
         try:
             bar_ts_ms = int(_safe_float(candle[0]))
             bar_minute = (bar_ts_ms // 60000) * 60000
-            trades_count = int(self._agg_trades_counts.get(bar_minute, 0)) or len(trades)
+            map_count = int(self._agg_trades_counts.get(bar_minute, 0))
+            self._lsa_trade_count_bars = getattr(self, "_lsa_trade_count_bars", 0) + 1
+            if map_count > 0:
+                self._lsa_trade_count_real_bars = getattr(self, "_lsa_trade_count_real_bars", 0) + 1
+                trades_count = map_count
+                trades_count_from_real = True
+            else:
+                self._lsa_trade_count_zero_map_bars = getattr(self, "_lsa_trade_count_zero_map_bars", 0) + 1
+                trades_count = len(trades)
+            zero_ratio = (
+                getattr(self, "_lsa_trade_count_zero_map_bars", 0)
+                / max(getattr(self, "_lsa_trade_count_bars", 0), 1)
+            )
+            if (
+                not getattr(self, "_lsa_trade_count_warning_logged", False)
+                and getattr(self, "_lsa_trade_count_bars", 0) >= 10
+                and zero_ratio > 0.80
+            ):
+                logger.warning(
+                    "[BACKTEST] aggTrades count map not aligned with replay bars: "
+                    "%.1f%% of checked bars had no real count; using synthetic len(trades) fallback",
+                    zero_ratio * 100.0,
+                )
+                self._lsa_trade_count_warning_logged = True
         except Exception:
+            self._lsa_trade_count_bars = getattr(self, "_lsa_trade_count_bars", 0) + 1
+            self._lsa_trade_count_zero_map_bars = getattr(self, "_lsa_trade_count_zero_map_bars", 0) + 1
             trades_count = len(trades)
 
         market_data: Dict[str, Any] = {
@@ -535,6 +581,7 @@ class BacktestEngine:
             "curr_book": _snapshot_to_book(snapshot),
             "timestamp": _ts_seconds(candle),
             "trades_count": trades_count,
+            "trades_count_from_real": trades_count_from_real,
         }
 
         # FIX H-2 APPLIED — propagate the LSA-tracked liquidity pools into the
@@ -963,6 +1010,9 @@ class BacktestEngine:
             "sharpe": 0.0,
             "expectancy": 0.0,
             "trade_log": [],
+            "bars_skipped_signal_invalid": 0,
+            "bars_skipped_execution_halted": 0,
+            "real_trades_count_pct": 0.0,
         }
 
         if len(data) < 50:
@@ -1047,6 +1097,8 @@ class BacktestEngine:
             "orchestration_bypassed": False,      # enforced by Issue D
             "regime_pipeline_uncalibrated": False, # weights loaded by __init__
             "magnet_inputs_unavailable_or_non_parity": False,
+            "weights_trained_on_synthetic": self._calibration_provenance_non_production(),
+            "synthetic_trade_counts": False,
         }
         _magnet_non_parity_seen = False
         # Backtest boundary: create clean run-local magnet state so zone memory
@@ -1070,6 +1122,15 @@ class BacktestEngine:
         # Per-run alpha telemetry reset
         self._last_alpha_signals = []
         self._all_alpha_convictions = []
+
+        # Per-run LSA aggTrades-count parity telemetry.
+        self._lsa_trade_count_bars = 0
+        self._lsa_trade_count_real_bars = 0
+        self._lsa_trade_count_zero_map_bars = 0
+        self._lsa_trade_count_warning_logged = False
+
+        bars_skipped_signal_invalid = 0
+        bars_skipped_execution_halted = 0
 
         balance = float(initial_balance if initial_balance is not None else self.cfg.initial_balance)
         peak = balance
@@ -1223,10 +1284,28 @@ class BacktestEngine:
                 try:
                     are_out = self.are.update(are_payload)
                     if isinstance(are_out, dict):
+                        if are_out.get("signal_valid") is False:
+                            bars_skipped_signal_invalid += 1
+                            continue
+                        execution_mode = str(are_out.get("execution_mode", "")).lower()
+                        engine_status = str(are_out.get("engine_status", ""))
+                        risk_metrics = are_out.get("risk_metrics", {})
+                        feed_status = risk_metrics.get("feed_status", "") if isinstance(risk_metrics, dict) else ""
+                        if isinstance(feed_status, (list, tuple, set)):
+                            feed_status_text = " ".join(str(x) for x in feed_status)
+                        else:
+                            feed_status_text = str(feed_status)
+                        if (
+                            execution_mode in {"halt", "circuit_breaker", "fail_safe", "halt_igarch"}
+                            or engine_status == "DEGRADED"
+                            or "UNCALIBRATED" in feed_status_text.upper()
+                        ):
+                            bars_skipped_execution_halted += 1
+                            continue
                         regime_label = str(are_out.get("regime_label", "UNKNOWN"))
                         regime_conf = _safe_float(are_out.get("confidence", 0.5), 0.5)
                         volatility_score = _safe_float(
-                            are_out.get("risk_metrics", {}).get("expected_volatility", 0.0)
+                            risk_metrics.get("expected_volatility", 0.0) if isinstance(risk_metrics, dict) else 0.0
                         )
                 except Exception as exc:
                     logger.debug("ARE.update failed at i=%d: %s", i, exc)
@@ -1547,6 +1626,12 @@ class BacktestEngine:
         )
         _non_production_conditions["calibrator_not_fitted"] = not _calibration_fitted
         _non_production_conditions["magnet_inputs_unavailable_or_non_parity"] = bool(_magnet_non_parity_seen)
+        real_trades_count_pct = (
+            getattr(self, "_lsa_trade_count_real_bars", 0)
+            / max(getattr(self, "_lsa_trade_count_bars", 0), 1)
+        )
+        if real_trades_count_pct < 0.1:
+            _non_production_conditions["synthetic_trade_counts"] = True
         _backtest_label = (
             "PRODUCTION-VALID"
             if not any(_non_production_conditions.values())
@@ -1567,4 +1652,7 @@ class BacktestEngine:
             "backtest_label": _backtest_label,                  # AUDIT FIX ISSUE-C / PART-6
             "non_production_conditions": _non_production_conditions,  # AUDIT FIX ISSUE-C / PART-6
             "orch_degraded_fraction": round(_orch_degraded_fraction, 4),
+            "bars_skipped_signal_invalid": int(bars_skipped_signal_invalid),
+            "bars_skipped_execution_halted": int(bars_skipped_execution_halted),
+            "real_trades_count_pct": round(float(real_trades_count_pct), 6),
         }
