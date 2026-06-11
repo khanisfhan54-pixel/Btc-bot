@@ -397,6 +397,11 @@ def _build_output(
     range_ticks: int = 0,
     signal_valid: bool = True,
     include_signal_valid: bool = True,
+    weights_loaded: bool = False,
+    calibration_valid: bool = False,
+    production_valid: bool = False,
+    research_mode: bool = False,
+    calibration_status: str = "uncalibrated",
     engine_id: str = "unknown",
 ) -> Dict[str, Any]:
     """
@@ -468,6 +473,11 @@ def _build_output(
         'execution_side': execution_side,
         'signed_position_size': safe_signed_position,
         'signal_valid': bool(signal_valid),
+        'weights_loaded': bool(weights_loaded),
+        'calibration_valid': bool(calibration_valid),
+        'production_valid': bool(production_valid),
+        'research_mode': bool(research_mode),
+        'calibration_status': str(calibration_status or "uncalibrated"),
         'engine_status': str(engine_status or "UNKNOWN"),
         
         # --- NEW: forward compatibility anchor ---
@@ -1442,7 +1452,11 @@ class AdvancedRegimeEngine:
         self._REGIME_CONFIRMATION_TICKS = 2
         self._lock = threading.RLock()
         self._weights_loaded = False
+        self._calibration_valid = False
+        self._production_valid = False
+        self._research_mode = str(os.environ.get("REGIME_RESEARCH_MODE", "")).strip().lower() in {"1", "true", "yes", "on"}
         self._calibration_status = "uncalibrated"
+        self._calibration_provenance: Dict[str, Any] = {}
         self._weights_checksum = ""
         self._igarch_hard_limit = 1.05
         self._weight_path = os.environ.get("REGIME_WEIGHT_PATH", "weights/advanced_regime_weights.npz")
@@ -2214,10 +2228,35 @@ class AdvancedRegimeEngine:
                 except Exception as _swallowed_exc:
                     LOGGER.debug("[SWALLOWED] %s suppressed: %s", __name__, _swallowed_exc)
 
+    def _resolve_provenance_path(self) -> str:
+        explicit = os.environ.get("REGIME_PROVENANCE_PATH")
+        if explicit:
+            return explicit
+        weight_dir = os.path.dirname(os.path.abspath(self._weight_path)) or "."
+        return os.path.join(weight_dir, "calibration_provenance.json")
+
+    def _load_calibration_provenance(self) -> Dict[str, Any]:
+        provenance_path = self._resolve_provenance_path()
+        with open(provenance_path, "r", encoding="utf-8") as fh:
+            provenance = json.load(fh)
+        if not isinstance(provenance, dict):
+            raise ValueError("provenance_not_object")
+        return provenance
+
+    def _is_signal_permitted(self) -> bool:
+        return bool(
+            getattr(self, "_weights_loaded", False)
+            and getattr(self, "_calibration_valid", False)
+            and (getattr(self, "_production_valid", False) or getattr(self, "_research_mode", False))
+        )
+
     def _load_model_weights(self) -> None:
         weights = ModelWeightManager.load_weights("advanced_regime", self._weight_path)
         if not weights:
             self._weights_loaded = False
+            self._calibration_valid = False
+            self._production_valid = False
+            self._calibration_provenance = {}
             self._calibration_status = "missing"
             self._engine_status = "DEGRADED"
             msg = f"[REGIME] Missing trained weights at {self._weight_path}; blocking regime engine until calibration artifacts are available."
@@ -2280,10 +2319,35 @@ class AdvancedRegimeEngine:
                 self._feature_norm_source = "rolling"
 
             self._weights_loaded = True
-            self._calibration_status = "calibrated"
+            try:
+                provenance = self._load_calibration_provenance()
+                production_valid = bool(provenance.get("production_valid", False))
+                data_source = str(provenance.get("data_source", "")).strip().lower()
+                if data_source == "synthetic":
+                    production_valid = False
+                self._calibration_valid = True
+                self._production_valid = bool(production_valid)
+                self._calibration_provenance = dict(provenance)
+                if self._production_valid:
+                    self._calibration_status = "calibrated"
+                elif self._research_mode:
+                    self._calibration_status = "research"
+                else:
+                    self._calibration_status = "not_production_valid"
+                    self._engine_status = "DEGRADED"
+            except Exception:
+                LOGGER.critical("[REGIME] Failed to load calibration provenance", exc_info=True)
+                self._calibration_valid = False
+                self._production_valid = False
+                self._calibration_provenance = {}
+                self._calibration_status = "invalid_provenance"
+                self._engine_status = "DEGRADED"
         except Exception:
             LOGGER.critical("[REGIME] Failed to load trained weights", exc_info=True)
             self._weights_loaded = False
+            self._calibration_valid = False
+            self._production_valid = False
+            self._calibration_provenance = {}
             self._calibration_status = "invalid"
             self._engine_status = "DEGRADED"
             return
@@ -5428,15 +5492,25 @@ class AdvancedRegimeEngine:
             extended_schema=self._emit_extended_schema,
             range_ticks=rticks,
             include_signal_valid=True,
-            signal_valid=bool(self._weights_loaded),
+            signal_valid=bool(self._is_signal_permitted()),
+            weights_loaded=bool(self._weights_loaded),
+            calibration_valid=bool(getattr(self, "_calibration_valid", False)),
+            production_valid=bool(getattr(self, "_production_valid", False)),
+            research_mode=bool(getattr(self, "_research_mode", False)),
+            calibration_status=str(getattr(self, "_calibration_status", "uncalibrated")),
             engine_id=self._metrics_engine_id,
         )
-        if not self._weights_loaded:
+        if not self._is_signal_permitted():
+            output["signal_valid"] = False
             output["regime_label"] = "UNCALIBRATED"
             output["execution_mode"] = "halt"
             output["position_size"] = 0.0
             output["signed_position_size"] = 0.0
-            output["feed_status"] = "UNCALIBRATED_WEIGHTS"
+            output["feed_status"] = (
+                "UNCALIBRATED_WEIGHTS" if not self._weights_loaded
+                else "RESEARCH_CALIBRATION" if getattr(self, "_research_mode", False)
+                else "INVALID_CALIBRATION_PROVENANCE"
+            )
             self.last_signed_position_size = 0.0
         if str(getattr(self, "_engine_status", "OK")) == "DEGRADED":
             output["signal_valid"] = False
@@ -5662,12 +5736,22 @@ class AdvancedRegimeEngine:
         reason_text = str(reason)
         trigger_value = float(getattr(self, "_drawdown", 0.0))
         self._cb_trigger_history.append((time.time(), reason_text, trigger_value))
-        self._circuit_breaker_reason = reason_text
         if self._circuit_breaker_active:
+            try:
+                LOGGER.warning(
+                    "CIRCUIT_BREAKER_SUPPRESSED reason=%s active_reason=%s trigger_tick=%s current_tick=%s",
+                    reason_text,
+                    self._circuit_breaker_reason,
+                    self._circuit_breaker_trigger_tick,
+                    current_tick,
+                )
+            except Exception:
+                self._warn_rate_limited("circuit_breaker_log_failure", "Circuit breaker logging failed", cooldown_s=30.0)
             return
         if int(getattr(self, "_circuit_breaker_trigger_tick", -1)) == current_tick:
             return
         self._circuit_breaker_active = True
+        self._circuit_breaker_reason = reason_text
         self._circuit_breaker_trigger_tick = current_tick
         self._healing_counter = 0
         if not getattr(self, "_is_replay", False):
@@ -5695,221 +5779,220 @@ class AdvancedRegimeEngine:
         - Called without an error_code: preserves existing circuit-breaker recovery behavior.
         - Called with an error_code: applies category-aware recovery action.
         """
-        _caller_holds_lock = not self._lock.acquire(blocking=False)
-        if not _caller_holds_lock:
+        lock_owned_by_caller = bool(getattr(self._lock, "_is_owned", lambda: False)())
+        acquired_for_call = False
+        if not lock_owned_by_caller:
+            self._lock.acquire()
+            acquired_for_call = True
+
+        def _run_side_effects_unlocked() -> None:
+            # Exactly one lock level is owned here: either by this direct call or
+            # by the synchronized caller. Release that known-owned level while
+            # replay/logging side effects run, then restore it before resuming
+            # stateful work. This avoids release-on-unowned-lock crashes.
             self._lock.release()
-            if not getattr(self, "_is_replay", False):
-                self._warn_rate_limited(
-                    key="self_heal_called_without_lock",
-                    message=(
-                        "_self_heal called without holding self._lock. "
-                        "This is safe in test mode but indicates a concurrency "
-                        "design issue in production callers."
-                    ),
-                    cooldown_s=30.0,
-                )
-        side_effects: List[tuple[str, Any]] = []
-        self._healing_count = int(getattr(self, "_healing_count", 0)) + 1
-        self._last_healing_error = error_code
-        self._last_healing_context = dict(context or {})
-        if getattr(self, "_is_replay", False):
-            context = dict(context or {})
-
-        side_effects.append(("log_warning", "[SELF HEALING INITIATED]"))
-        _preserved_valid_return_count = int(getattr(self, "_valid_return_count", 0))
-        _preserved_first_valid_return_ts = getattr(self, "_first_valid_return_ts", None)
-        _preserved_posterior_update_count = int(getattr(self, "_posterior_update_count", 0))
-        _preserved_first_posterior_ts = getattr(self, "_first_posterior_ts", None)
-
-        # Legacy breaker recovery path: keep existing behavior intact.
-        if error_code is None:
-            # Reset probabilities
-            self.nhhmm_prior = np.ones(self.K) / self.K
-            self.garch_prob = np.ones(2) / 2.0
-            self._smoothed_garch_prob = self.garch_prob.copy()
-            self._regime_state_probs = np.ones(4, dtype=float) / 4.0
-            if getattr(self, "_regime_smoother", None) is not None:
-                self._regime_smoother.reset()
-
-            # Reset volatility
-            self.garch_var = self._stationary_garch_var()
-            self._last_valid_vol = self.garch.target_vol
-
-            # Reset regime state
-            self.current_regime_idx = None
-            self._confirmed_regime = None
-            self._confirmed_regime_idx = None
-            self._prev_regime = None
-            self._prev_raw_regime = None
-            self._regime_persistence = 0
-            self.last_signed_position_size = 0.0
-            self._last_effective_trend_strength = 0.0
-            self._last_edge_score = 0.0
-            self._last_regime_change_ts = None
-            self._range_anchor_size = 0.0
-            self._in_range = False
-            self.range_ticks = 0.0
-            self.range_ticks_int = 0
-
-            # Reset PnL state without erasing cumulative risk memory.
-            self._equity = max(float(getattr(self, "_equity", 1.0)), self._MIN_EQUITY_FLOOR)
-            self._equity_peak = max(float(getattr(self, "_equity_peak", self._equity)), self._equity)
-            self._drawdown = float(np.clip(
-                (self._equity_peak - self._equity) / max(self._equity_peak, self._MIN_EQUITY_FLOOR),
-                0.0,
-                1.0,
-            ))
-            self._cumulative_drawdown = max(float(getattr(self, "_cumulative_drawdown", 0.0)), float(self._drawdown))
-            self._loss_streak = 0
-
-            # Reset memory variables
-            self._shock_memory = 0.0
-            self._return_ema = 0.0
-            self._abs_return_ema = 0.0
-            self._last_timestamp = None
-            self._last_valid_dt = 1.0
-            self._last_valid_sjm_probs = np.ones(self.K) / self.K
-            if reset_price_anchor:
-                self._last_price = None
-                self._last_price_timestamp = None
-                self._last_price_tick_id = None
-                self._pnl_mode = None
-                side_effects.append((
-                    "log_warning",
-                    "[REGIME] Price anchor destroyed by self-heal (reset_price_anchor=True) — PnL tracking will reinitialize on next tick",
-                ))
-            else:
-                side_effects.append(("log_debug", "[REGIME] Self-heal complete — price anchor preserved"))
-            self._valid_return_count = _preserved_valid_return_count
-            self._first_valid_return_ts = _preserved_first_valid_return_ts
-            self._posterior_update_count = _preserved_posterior_update_count
-            self._first_posterior_ts = _preserved_first_posterior_ts
-
-            # Reset breaker
-            self._circuit_breaker_active = False
-            self._circuit_breaker_reason = None
-            self._circuit_breaker_trigger_tick = -1
-            self._healing_counter = 0
-            self._confidence_collapse_streak = 0
-            self._last_healing_action = "RESET_FULL"
-            self._health_status = "HEALING_COMPLETE"
-            self._last_heal_ts = time.time()
-            side_effects.append((
-                "log_info",
-                ("_self_heal: warmup state preserved (valid_returns=%d, posteriors=%d) after recovery.",
-                 _preserved_valid_return_count, _preserved_posterior_update_count),
-            ))
-            if not getattr(self, "_is_replay", False):
-                replay_payload = self._build_self_heal_replay_payload(error=error_code, action="RESET_FULL")
-                side_effects.append(("replay", ("self_heal", replay_payload)))
-            action = self._last_healing_action
-            _lock = self._lock
-            _lock.release()
             try:
                 self._run_self_heal_side_effects(side_effects)
             finally:
-                _lock.acquire()
+                self._lock.acquire()
+
+        side_effects: List[tuple[str, Any]] = []
+        try:
+            self._healing_count = int(getattr(self, "_healing_count", 0)) + 1
+            self._last_healing_error = error_code
+            self._last_healing_context = dict(context or {})
+            if getattr(self, "_is_replay", False):
+                context = dict(context or {})
+
+            side_effects.append(("log_warning", "[SELF HEALING INITIATED]"))
+            _preserved_valid_return_count = int(getattr(self, "_valid_return_count", 0))
+            _preserved_first_valid_return_ts = getattr(self, "_first_valid_return_ts", None)
+            _preserved_posterior_update_count = int(getattr(self, "_posterior_update_count", 0))
+            _preserved_first_posterior_ts = getattr(self, "_first_posterior_ts", None)
+
+            # Legacy breaker recovery path: keep existing behavior intact.
+            if error_code is None:
+                # Reset probabilities
+                self.nhhmm_prior = np.ones(self.K) / self.K
+                self.garch_prob = np.ones(2) / 2.0
+                self._smoothed_garch_prob = self.garch_prob.copy()
+                self._regime_state_probs = np.ones(4, dtype=float) / 4.0
+                if getattr(self, "_regime_smoother", None) is not None:
+                    self._regime_smoother.reset()
+
+                # Reset volatility
+                self.garch_var = self._stationary_garch_var()
+                self._last_valid_vol = self.garch.target_vol
+
+                # Reset regime state
+                self.current_regime_idx = None
+                self._confirmed_regime = None
+                self._confirmed_regime_idx = None
+                self._prev_regime = None
+                self._prev_raw_regime = None
+                self._regime_persistence = 0
+                self.last_signed_position_size = 0.0
+                self._last_effective_trend_strength = 0.0
+                self._last_edge_score = 0.0
+                self._last_regime_change_ts = None
+                self._range_anchor_size = 0.0
+                self._in_range = False
+                self.range_ticks = 0.0
+                self.range_ticks_int = 0
+
+                # Reset PnL state without erasing cumulative risk memory.
+                self._equity = max(float(getattr(self, "_equity", 1.0)), self._MIN_EQUITY_FLOOR)
+                self._equity_peak = max(float(getattr(self, "_equity_peak", self._equity)), self._equity)
+                self._drawdown = float(np.clip(
+                    (self._equity_peak - self._equity) / max(self._equity_peak, self._MIN_EQUITY_FLOOR),
+                    0.0,
+                    1.0,
+                ))
+                self._cumulative_drawdown = max(float(getattr(self, "_cumulative_drawdown", 0.0)), float(self._drawdown))
+                self._loss_streak = 0
+
+                # Reset memory variables
+                self._shock_memory = 0.0
+                self._return_ema = 0.0
+                self._abs_return_ema = 0.0
+                self._last_timestamp = None
+                self._last_valid_dt = 1.0
+                self._last_valid_sjm_probs = np.ones(self.K) / self.K
+                if reset_price_anchor:
+                    self._last_price = None
+                    self._last_price_timestamp = None
+                    self._last_price_tick_id = None
+                    self._pnl_mode = None
+                    side_effects.append((
+                        "log_warning",
+                        "[REGIME] Price anchor destroyed by self-heal (reset_price_anchor=True) — PnL tracking will reinitialize on next tick",
+                    ))
+                else:
+                    side_effects.append(("log_debug", "[REGIME] Self-heal complete — price anchor preserved"))
+                self._valid_return_count = _preserved_valid_return_count
+                self._first_valid_return_ts = _preserved_first_valid_return_ts
+                self._posterior_update_count = _preserved_posterior_update_count
+                self._first_posterior_ts = _preserved_first_posterior_ts
+
+                # Reset breaker
+                self._circuit_breaker_active = False
+                self._circuit_breaker_reason = None
+                self._circuit_breaker_trigger_tick = -1
+                self._healing_counter = 0
+                self._confidence_collapse_streak = 0
+                self._last_healing_action = "RESET_FULL"
+                self._health_status = "HEALING_COMPLETE"
+                self._last_heal_ts = time.time()
+                side_effects.append((
+                    "log_info",
+                    ("_self_heal: warmup state preserved (valid_returns=%d, posteriors=%d) after recovery.",
+                     _preserved_valid_return_count, _preserved_posterior_update_count),
+                ))
+                if not getattr(self, "_is_replay", False):
+                    replay_payload = self._build_self_heal_replay_payload(error=error_code, action="RESET_FULL")
+                    side_effects.append(("replay", ("self_heal", replay_payload)))
+                action = self._last_healing_action
+                _run_side_effects_unlocked()
+                return action
+
+            action = "NO_ACTION"
+            category = ""
+            err_code = error_code
+            resolver = getattr(self, "_error_category_resolver", None)
+            if resolver is not None:
+                try:
+                    err = resolver(error_code)
+                    category = str(getattr(err, "category", "") or "")
+                    err_code = getattr(err, "code", error_code)
+                except Exception:
+                    category = ""
+            if not category:
+                category = self._DEFAULT_ERROR_CATEGORY_BY_CODE.get(str(error_code), "")
+                if (not getattr(self, "_errors_module_available", True)) and (not getattr(self, "_is_replay", False)):
+                    self._warn_rate_limited(
+                        "self_heal_fallback_mapping",
+                        "Self-healing used built-in fallback category mapping.",
+                        cooldown_s=120.0,
+                    )
+
+            if category == "numerical":
+                self.garch_var = self._stationary_garch_var()
+                self.garch_prob = np.ones(2, dtype=float) / 2.0
+                self._smoothed_garch_prob = np.ones(2, dtype=float) / 2.0
+                self._last_valid_sjm_probs = None
+                smooth_len = int(np.size(self._smoothed_garch_prob))
+                if smooth_len <= 0:
+                    self._smoothed_garch_prob = np.ones(2, dtype=float) / 2.0
+                else:
+                    self._smoothed_garch_prob = np.ones(smooth_len, dtype=float) / smooth_len
+                self._shock_memory = 0.0
+                if getattr(self, "_regime_smoother", None) is not None:
+                    self._regime_smoother.reset()
+                self._regime_state_probs = np.ones(4, dtype=float) / 4.0
+                action = "RESET_NUMERICAL"
+
+            elif category == "state":
+                preserved_equity = max(float(getattr(self, "_equity", 1.0)), self._MIN_EQUITY_FLOOR)
+                preserved_equity_peak = max(float(getattr(self, "_equity_peak", preserved_equity)), preserved_equity)
+                preserved_cumulative_drawdown = max(
+                    float(getattr(self, "_cumulative_drawdown", 0.0)),
+                    float(getattr(self, "_drawdown", 0.0)),
+                )
+                self.reset_state()
+                self._equity = preserved_equity
+                self._equity_peak = preserved_equity_peak
+                self._drawdown = float(np.clip(
+                    (self._equity_peak - self._equity) / max(self._equity_peak, self._MIN_EQUITY_FLOOR),
+                    0.0,
+                    1.0,
+                ))
+                self._cumulative_drawdown = max(preserved_cumulative_drawdown, self._drawdown)
+                action = "RESET_STATE"
+
+            elif category == "smoothing":
+                if getattr(self, "_regime_smoother", None) is not None:
+                    self._regime_smoother.reset()
+                self._regime_state_probs = np.ones(4, dtype=float) / 4.0
+                self._confirmed_regime = None
+                self._confirmed_regime_idx = None
+                self._regime_persistence = 0
+                action = "RESET_SMOOTHER"
+
+            elif category == "classification":
+                self._regime_persistence = max(0, int(getattr(self, "_regime_persistence", 0)) - 1)
+                action = "SOFT_REBALANCE"
+
+            elif category == "input":
+                self.nhhmm_prior = np.ones(self.K, dtype=float) / self.K
+                self.last_signed_position_size = 0.0
+                if not np.all(np.isfinite(self.nhhmm_prior)) or self.nhhmm_prior.shape != (self.K,):
+                    self.nhhmm_prior = np.ones(self.K, dtype=float) / self.K
+                action = "RESET_INPUT"
+
+            elif category == "risk":
+                self._trigger_circuit_breaker(str(err_code))
+                action = "CIRCUIT_BREAK"
+            else:
+                # Deterministic fallback: always execute a safe degradation path.
+                self.nhhmm_prior = _normalize_prob_vector(self.nhhmm_prior)
+                self.garch_prob = _safe_prob_vector(self.garch_prob, 2)
+                self._smoothed_garch_prob = _normalize_prob_vector(
+                    _safe_prob_vector(self._smoothed_garch_prob, 2)
+                )
+                self._confidence_collapse_streak = 0
+                action = "SKIP_AND_DEGRADE"
+
+            if not getattr(self, "_is_replay", False):
+                replay_payload = self._build_self_heal_replay_payload(error=error_code, action=action)
+                side_effects.append(("replay", ("self_heal", replay_payload)))
+
+            self._last_healing_action = action
+            _run_side_effects_unlocked()
             return action
 
-        action = "NO_ACTION"
-        category = ""
-        err_code = error_code
-        resolver = getattr(self, "_error_category_resolver", None)
-        if resolver is not None:
-            try:
-                err = resolver(error_code)
-                category = str(getattr(err, "category", "") or "")
-                err_code = getattr(err, "code", error_code)
-            except Exception:
-                category = ""
-        if not category:
-            category = self._DEFAULT_ERROR_CATEGORY_BY_CODE.get(str(error_code), "")
-            if (not getattr(self, "_errors_module_available", True)) and (not getattr(self, "_is_replay", False)):
-                self._warn_rate_limited(
-                    "self_heal_fallback_mapping",
-                    "Self-healing used built-in fallback category mapping.",
-                    cooldown_s=120.0,
-                )
-
-        if category == "numerical":
-            self.garch_var = self._stationary_garch_var()
-            self.garch_prob = np.ones(2, dtype=float) / 2.0
-            self._smoothed_garch_prob = np.ones(2, dtype=float) / 2.0
-            self._last_valid_sjm_probs = None
-            smooth_len = int(np.size(self._smoothed_garch_prob))
-            if smooth_len <= 0:
-                self._smoothed_garch_prob = np.ones(2, dtype=float) / 2.0
-            else:
-                self._smoothed_garch_prob = np.ones(smooth_len, dtype=float) / smooth_len
-            self._shock_memory = 0.0
-            if getattr(self, "_regime_smoother", None) is not None:
-                self._regime_smoother.reset()
-            self._regime_state_probs = np.ones(4, dtype=float) / 4.0
-            action = "RESET_NUMERICAL"
-
-        elif category == "state":
-            preserved_equity = max(float(getattr(self, "_equity", 1.0)), self._MIN_EQUITY_FLOOR)
-            preserved_equity_peak = max(float(getattr(self, "_equity_peak", preserved_equity)), preserved_equity)
-            preserved_cumulative_drawdown = max(
-                float(getattr(self, "_cumulative_drawdown", 0.0)),
-                float(getattr(self, "_drawdown", 0.0)),
-            )
-            self.reset_state()
-            self._equity = preserved_equity
-            self._equity_peak = preserved_equity_peak
-            self._drawdown = float(np.clip(
-                (self._equity_peak - self._equity) / max(self._equity_peak, self._MIN_EQUITY_FLOOR),
-                0.0,
-                1.0,
-            ))
-            self._cumulative_drawdown = max(preserved_cumulative_drawdown, self._drawdown)
-            action = "RESET_STATE"
-
-        elif category == "smoothing":
-            if getattr(self, "_regime_smoother", None) is not None:
-                self._regime_smoother.reset()
-            self._regime_state_probs = np.ones(4, dtype=float) / 4.0
-            self._confirmed_regime = None
-            self._confirmed_regime_idx = None
-            self._regime_persistence = 0
-            action = "RESET_SMOOTHER"
-
-        elif category == "classification":
-            self._regime_persistence = max(0, int(getattr(self, "_regime_persistence", 0)) - 1)
-            action = "SOFT_REBALANCE"
-
-        elif category == "input":
-            self.nhhmm_prior = np.ones(self.K, dtype=float) / self.K
-            self.last_signed_position_size = 0.0
-            if not np.all(np.isfinite(self.nhhmm_prior)) or self.nhhmm_prior.shape != (self.K,):
-                self.nhhmm_prior = np.ones(self.K, dtype=float) / self.K
-            action = "RESET_INPUT"
-
-        elif category == "risk":
-            self._trigger_circuit_breaker(str(err_code))
-            action = "CIRCUIT_BREAK"
-        else:
-            # Deterministic fallback: always execute a safe degradation path.
-            self.nhhmm_prior = _normalize_prob_vector(self.nhhmm_prior)
-            self.garch_prob = _safe_prob_vector(self.garch_prob, 2)
-            self._smoothed_garch_prob = _normalize_prob_vector(
-                _safe_prob_vector(self._smoothed_garch_prob, 2)
-            )
-            self._confidence_collapse_streak = 0
-            action = "SKIP_AND_DEGRADE"
-
-        if not getattr(self, "_is_replay", False):
-            replay_payload = self._build_self_heal_replay_payload(error=error_code, action=action)
-            side_effects.append(("replay", ("self_heal", replay_payload)))
-
-        self._last_healing_action = action
-        _lock = self._lock
-        _lock.release()
-        try:
-            self._run_self_heal_side_effects(side_effects)
         finally:
-            _lock.acquire()
-        return action
+            if acquired_for_call:
+                self._lock.release()
 
     def _build_self_heal_replay_payload(self, error: Any, action: str) -> Dict[str, Any]:
         frozen_payload = {
