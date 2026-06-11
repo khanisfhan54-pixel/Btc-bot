@@ -27,16 +27,18 @@ from collections import deque
 # The .npz produced with N_STATES=4 is INCOMPATIBLE with n_states=3 engines.
 N_STATES       = 3
 N_FEATURES     = 3
-N_BARS         = 8910
+N_BARS         = int(os.environ.get("REGIME_N_BARS", "8910"))
 LOOKBACK       = 200
 RV_WINDOW      = 5
 RANDOM_SEED    = 42
 BARRIER_WINDOW = 20
 BARRIER_MULT   = 1.5
-OUTPUT_DIR     = "weights"
-OUTPUT_PATH    = os.path.join(OUTPUT_DIR, "advanced_regime_weights.npz")
-PROVENANCE_PATH = os.path.join(OUTPUT_DIR, "calibration_provenance.json")
+OUTPUT_DIR     = os.environ.get("REGIME_OUTPUT_DIR", "weights")
+OUTPUT_PATH    = os.environ.get("REGIME_OUTPUT_PATH", os.path.join(OUTPUT_DIR, "advanced_regime_weights.npz"))
+PROVENANCE_PATH = os.environ.get("REGIME_PROVENANCE_PATH", os.path.join(OUTPUT_DIR, "calibration_provenance.json"))
 DATA_SOURCE    = os.environ.get("REGIME_DATA_SOURCE", "synthetic").strip().lower()
+AGGTRADES_PATH = os.environ.get("REGIME_AGGTRADES_PATH", os.path.join("data", "aggTrades.csv"))
+BOOKDEPTH_PATH = os.environ.get("REGIME_BOOKDEPTH_PATH", os.path.join("data", "bookDepth.csv"))
 
 if DATA_SOURCE not in ("synthetic", "real"):
     raise ValueError(
@@ -105,34 +107,172 @@ def _kmeans_numpy(X, n_clusters=3, random_state=42,
 
 # ─── STEP 1: GENERATE / LOAD PRICE DATA ──────────────────────
 
-print(f"\n[1/7] Generating {DATA_SOURCE} training data...")
-if DATA_SOURCE == "real":
-    raise NotImplementedError(
-        "REGIME_DATA_SOURCE=real requested, but this calibration script has no "
-        "real-data loader configured. Refusing to silently fall back to synthetic data."
+def _parse_bool_is_buyer_maker(value):
+    return str(value).strip().lower() in {"true", "1", "t", "yes"}
+
+
+def _floor_minute_ms(ts_ms):
+    return (int(ts_ms) // 60000) * 60000
+
+
+def _load_real_btc_training_data(agg_path, depth_path, max_bars):
+    """Load strictly real BTC calibration inputs from aggTrades + bookDepth.
+
+    No synthetic fallback is permitted on this path.  aggTrades provide real
+    timestamps, prices, trade direction and volume.  bookDepth provides real
+    depth by timestamp/percentage bucket; negative percentages are treated as
+    bid-side depth and positive percentages as ask-side depth.
+    """
+    import csv
+    from datetime import datetime, timezone
+
+    if not os.path.exists(agg_path):
+        raise FileNotFoundError(f"aggTrades file missing: {agg_path}")
+    if not os.path.exists(depth_path):
+        raise FileNotFoundError(f"bookDepth file missing: {depth_path}")
+
+    minute_rows = {}
+    with open(agg_path, "r", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        for row in reader:
+            ts_raw = row.get("transact_time") or row.get("T") or row.get("timestamp")
+            px_raw = row.get("price") or row.get("p")
+            qty_raw = row.get("quantity") or row.get("q") or row.get("qty")
+            if ts_raw is None or px_raw is None or qty_raw is None:
+                raise ValueError("aggTrades row missing timestamp/price/quantity")
+            ts = int(float(ts_raw))
+            price = float(px_raw)
+            qty = float(qty_raw)
+            if not (np.isfinite(price) and np.isfinite(qty) and price > 0.0 and qty >= 0.0):
+                raise ValueError(f"invalid aggTrades row price={px_raw!r} qty={qty_raw!r}")
+            minute = _floor_minute_ms(ts)
+            rec = minute_rows.setdefault(minute, {"close": price, "buy": 0.0, "sell": 0.0, "count": 0})
+            rec["close"] = price
+            # Binance is_buyer_maker=True means buyer was passive, so the
+            # aggressor trade was sell-side.
+            is_buyer_maker = _parse_bool_is_buyer_maker(row.get("is_buyer_maker", row.get("m", "false")))
+            if is_buyer_maker:
+                rec["sell"] += qty
+            else:
+                rec["buy"] += qty
+            rec["count"] += 1
+
+    depth_rows = {}
+    with open(depth_path, "r", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        for row in reader:
+            ts_raw = row.get("timestamp") or row.get("ts") or row.get("T")
+            pct_raw = row.get("percentage")
+            depth_raw = row.get("depth")
+            if ts_raw is None or pct_raw is None or depth_raw is None:
+                raise ValueError("bookDepth row missing timestamp/percentage/depth")
+            try:
+                ts = int(float(ts_raw))
+            except ValueError:
+                dt = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                ts = int(dt.timestamp() * 1000)
+            pct = float(pct_raw)
+            depth = float(depth_raw)
+            if not (np.isfinite(pct) and np.isfinite(depth) and depth >= 0.0):
+                raise ValueError(f"invalid bookDepth row percentage={pct_raw!r} depth={depth_raw!r}")
+            minute = _floor_minute_ms(ts)
+            rec = depth_rows.setdefault(minute, {"bid": 0.0, "ask": 0.0})
+            if pct < 0.0:
+                rec["bid"] += depth
+            elif pct > 0.0:
+                rec["ask"] += depth
+
+    common_minutes = sorted(set(minute_rows).intersection(depth_rows))
+    if max_bars > 0:
+        common_minutes = common_minutes[: int(max_bars)]
+    if len(common_minutes) < max(LOOKBACK + BARRIER_WINDOW + 5, N_STATES * 10):
+        raise ValueError(
+            "real calibration data insufficient after aggTrades/bookDepth alignment: "
+            f"{len(common_minutes)} aligned bars"
+        )
+
+    prices_local = []
+    returns_local = []
+    bid_sizes_local = []
+    ask_sizes_local = []
+    trade_flows_local = []
+    buy_vols_local = []
+    sell_vols_local = []
+    raw_vols_local = []
+    prev_price = None
+    for minute in common_minutes:
+        trade_rec = minute_rows[minute]
+        depth_rec = depth_rows[minute]
+        close = float(trade_rec["close"])
+        if prev_price is None:
+            prices_local.append(close)
+            prev_price = close
+            continue
+        ret = np.log(close / prev_price)
+        buy = float(trade_rec["buy"])
+        sell = float(trade_rec["sell"])
+        prices_local.append(close)
+        returns_local.append(float(ret))
+        bid_sizes_local.append(float(depth_rec["bid"]))
+        ask_sizes_local.append(float(depth_rec["ask"]))
+        trade_flows_local.append(float(buy - sell))
+        buy_vols_local.append(buy)
+        sell_vols_local.append(sell)
+        raw_vols_local.append(float(buy + sell))
+        prev_price = close
+
+    return (
+        np.asarray(prices_local, dtype=float),
+        np.asarray(returns_local, dtype=float),
+        list(bid_sizes_local),
+        list(ask_sizes_local),
+        list(trade_flows_local),
+        list(buy_vols_local),
+        list(sell_vols_local),
+        np.asarray(raw_vols_local, dtype=float),
     )
 
-prices      = [50000.0]
-returns     = []
-bid_sizes   = []
-ask_sizes   = []
-trade_flows = []
-buy_vols    = []
-sell_vols   = []
 
-for i in range(N_BARS):
-    ret = np.random.randn() * 0.002 + 0.00005
-    new_price = prices[-1] * (1 + ret)
-    prices.append(new_price)
-    returns.append(ret)
-    bid_sizes.append(abs(np.random.randn() * 10 + 20))
-    ask_sizes.append(abs(np.random.randn() * 10 + 20))
-    trade_flows.append(np.random.randn() * 5)
-    buy_vols.append(abs(np.random.randn() * 100 + 100))
-    sell_vols.append(abs(np.random.randn() * 100 + 100))
+print(f"\n[1/7] Generating {DATA_SOURCE} training data...")
 
-prices  = np.array(prices)
-returns = np.array(returns)
+if DATA_SOURCE == "real":
+    (
+        prices,
+        returns,
+        bid_sizes,
+        ask_sizes,
+        trade_flows,
+        buy_vols,
+        sell_vols,
+        _raw_vols,
+    ) = _load_real_btc_training_data(AGGTRADES_PATH, BOOKDEPTH_PATH, N_BARS)
+    N_BARS = int(len(returns))
+else:
+    prices      = [50000.0]
+    returns     = []
+    bid_sizes   = []
+    ask_sizes   = []
+    trade_flows = []
+    buy_vols    = []
+    sell_vols   = []
+
+    for i in range(N_BARS):
+        ret = np.random.randn() * 0.002 + 0.00005
+        new_price = prices[-1] * (1 + ret)
+        prices.append(new_price)
+        returns.append(ret)
+        bid_sizes.append(abs(np.random.randn() * 10 + 20))
+        ask_sizes.append(abs(np.random.randn() * 10 + 20))
+        trade_flows.append(np.random.randn() * 5)
+        buy_vols.append(abs(np.random.randn() * 100 + 100))
+        sell_vols.append(abs(np.random.randn() * 100 + 100))
+
+    prices  = np.array(prices)
+    returns = np.array(returns)
+    _raw_vols = np.abs(np.random.randn(N_BARS) * 100 + 100)
+
 print(f"    Bars: {N_BARS} | Price range: "
       f"{prices.min():.0f} - {prices.max():.0f}")
 
@@ -140,7 +280,6 @@ print(f"    Bars: {N_BARS} | Price range: "
 
 print("\n[2/7] Building feature matrix...")
 
-_raw_vols = np.abs(np.random.randn(N_BARS) * 100 + 100)
 _vol_mean = float(_raw_vols.mean())
 _vol_std  = float(_raw_vols.std()) if float(_raw_vols.std()) > 1e-8 else 1.0
 candle_volume_z = (_raw_vols - _vol_mean) / _vol_std  # z-scored, mean≈0, std≈1
@@ -425,19 +564,24 @@ np.savez(
     feature_std         = feature_std.astype(np.float64),
 )
 
-if DATA_SOURCE == "synthetic":
-    with open(PROVENANCE_PATH, "w", encoding="utf-8") as fh:
-        json.dump(
-            {
-                "data_source": "synthetic",
-                "production_valid": False,
-                "reason": "trained_on_synthetic_data",
-            },
-            fh,
-            indent=2,
-            sort_keys=True,
-        )
-        fh.write("\n")
+with open(PROVENANCE_PATH, "w", encoding="utf-8") as fh:
+    if DATA_SOURCE == "synthetic":
+        provenance = {
+            "data_source": "synthetic",
+            "production_valid": False,
+            "reason": "trained_on_synthetic_data",
+        }
+    else:
+        provenance = {
+            "data_source": "real",
+            "production_valid": True,
+            "aggTrades": AGGTRADES_PATH,
+            "bookDepth": BOOKDEPTH_PATH,
+            "bars": int(N_BARS),
+            "reason": "real_aggTrades_bookDepth_aligned",
+        }
+    json.dump(provenance, fh, indent=2, sort_keys=True)
+    fh.write("\n")
 
 saved = np.load(OUTPUT_PATH)
 required_keys = [
@@ -451,11 +595,80 @@ for key in required_keys:
         f"Non-finite in saved key: {key}"
 
 print(f"    Saved:  {OUTPUT_PATH}")
-if DATA_SOURCE == "synthetic":
-    print(f"    Provenance: {PROVENANCE_PATH}")
+print(f"    Provenance: {PROVENANCE_PATH}")
 print(f"    Keys:   {sorted(saved.files)}")
 print()
 print("=" * 60)
 print("  CALIBRATION COMPLETE")
 print("  weights/advanced_regime_weights.npz — READY")
 print("=" * 60)
+
+
+# ─── PUBLIC TESTABLE API ─────────────────────────────────────
+def calibrate(ohlcv_csv_path: str, output_path: str) -> None:
+    """Calibrate ARE-compatible weights from a real OHLCV CSV.
+
+    This function is intentionally small and fail-closed for tests and batch
+    callers.  It does not use synthetic fallback data; invalid input raises a
+    ValueError and no strategy thresholds are tuned here.
+    """
+    data = np.loadtxt(ohlcv_csv_path, delimiter=",", ndmin=2)
+    if data.shape[0] < 8:
+        raise ValueError("calibrate requires at least 8 OHLCV rows")
+    if data.shape[1] < 6:
+        raise ValueError("calibrate requires OHLCV columns: timestamp,open,high,low,close,volume")
+    closes = np.asarray(data[:, 4], dtype=float)
+    volumes = np.asarray(data[:, 5], dtype=float)
+    if not np.all(np.isfinite(closes)):
+        raise ValueError("non-finite close prices")
+    if not np.all(np.isfinite(volumes)):
+        raise ValueError("non-finite volumes")
+    if np.any(closes <= 0.0):
+        raise ValueError("strictly positive close prices required")
+    if np.any(volumes < 0.0):
+        raise ValueError("non-negative volumes required")
+
+    returns_local = np.diff(np.log(closes))
+    vol = volumes[1:]
+    vol_mean_local = float(np.mean(vol))
+    vol_std_local = float(np.std(vol)) if float(np.std(vol)) > 1e-12 else 1.0
+    vol_z = (vol - vol_mean_local) / vol_std_local
+    # OHLCV-only calibration has no real book side; encode the available real
+    # candle range as a neutral microstructure proxy for compatibility only.
+    ranges = np.asarray((data[1:, 2] - data[1:, 3]) / closes[1:], dtype=float)
+    X = np.column_stack([returns_local, ranges, vol_z]).astype(float)
+    if not np.all(np.isfinite(X)):
+        raise ValueError("non-finite calibration features")
+
+    feature_mean_local = X.mean(axis=0)
+    feature_std_local = X.std(axis=0)
+    feature_std_local = np.where(feature_std_local > 1e-12, feature_std_local, 1.0)
+    X_norm_local = (X - feature_mean_local) / feature_std_local
+
+    kmeans_local = _kmeans_numpy(X_norm_local, n_clusters=3, random_state=RANDOM_SEED, n_init=5, max_iter=100)
+    labels_local = np.asarray(kmeans_local.labels_, dtype=int)
+    centroids_local = np.asarray(kmeans_local.cluster_centers_, dtype=float)
+
+    mu_local = np.zeros(3, dtype=float)
+    sigma_local = np.ones(3, dtype=float) * 0.005
+    for k in range(3):
+        state_returns = returns_local[labels_local == k]
+        if len(state_returns) > 1:
+            mu_local[k] = float(np.mean(state_returns))
+            sigma_local[k] = float(max(np.std(state_returns), 1e-4))
+    rng_local = np.random.default_rng(RANDOM_SEED)
+    beta_local = rng_local.normal(0.0, 0.01, size=(3, 3, 3))
+    beta_local[:, 0, :] = 0.0
+    feature_weights_local = np.ones(3, dtype=float) / np.sqrt(3.0)
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    np.savez(
+        output_path,
+        nhhmm_beta=beta_local.astype(np.float64),
+        nhhmm_mu=mu_local.astype(np.float64),
+        nhhmm_sigma=sigma_local.astype(np.float64),
+        sjm_centroids=centroids_local.astype(np.float64),
+        sjm_feature_weights=feature_weights_local.astype(np.float64),
+        feature_mean=feature_mean_local.astype(np.float64),
+        feature_std=feature_std_local.astype(np.float64),
+    )

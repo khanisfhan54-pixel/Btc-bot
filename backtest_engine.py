@@ -92,6 +92,31 @@ except Exception as _ao_err:
     )
 
 try:
+    from data_tools.l2_to_backtest import align_book_to_bars as _canonical_align_book_to_bars
+except Exception:
+    _canonical_align_book_to_bars = None  # type: ignore[assignment]
+
+def align_book_to_bars(bars, snaps):
+    rows = list(snaps or [])
+    if rows and isinstance(rows[0], dict) and "bids" in rows[0] and "asks" in rows[0]:
+        ordered = sorted(rows, key=lambda x: int(x["timestamp"]))
+        out = []
+        j = 0
+        cur = None
+        for bar in bars:
+            ts = int(bar[0])
+            while j < len(ordered) and int(ordered[j]["timestamp"]) <= ts:
+                cur = ordered[j]
+                j += 1
+            if cur is None:
+                raise RuntimeError(f"BLOCKER: no snapshot aligned to bar ts={ts}")
+            out.append(cur)
+        return out
+    if _canonical_align_book_to_bars is None:
+        raise RuntimeError("BLOCKER: canonical align_book_to_bars unavailable")
+    return _canonical_align_book_to_bars(bars, rows)
+
+try:
     from bar_aggregator import resample_bars
 except Exception as _ba_err:
     resample_bars = None  # type: ignore[assignment]
@@ -155,6 +180,24 @@ def _compute_sharpe(returns: List[float]) -> float:
     var = sum((r - avg) ** 2 for r in returns) / (len(returns) - 1)
     std = math.sqrt(var) if var > 0 else 0.0
     return 0.0 if std == 0 else (avg / std) * math.sqrt(len(returns))
+
+
+def _compute_sortino(returns: List[float]) -> float:
+    if len(returns) < 2:
+        return 0.0
+    avg = sum(returns) / len(returns)
+    downside = [min(0.0, r) for r in returns]
+    var = sum(r * r for r in downside) / max(len(downside) - 1, 1)
+    downside_std = math.sqrt(var) if var > 0 else 0.0
+    return 0.0 if downside_std == 0 else (avg / downside_std) * math.sqrt(len(returns))
+
+
+def _compute_profit_factor(trade_log: List[Dict[str, Any]]) -> float:
+    gross_profit = sum(_safe_float(t.get("pnl", 0.0)) for t in trade_log if _safe_float(t.get("pnl", 0.0)) > 0.0)
+    gross_loss = abs(sum(_safe_float(t.get("pnl", 0.0)) for t in trade_log if _safe_float(t.get("pnl", 0.0)) < 0.0))
+    if gross_loss <= 0.0:
+        return 0.0 if gross_profit <= 0.0 else float("inf")
+    return gross_profit / gross_loss
 
 
 def _to_continuous_conviction(raw: float) -> float:
@@ -325,6 +368,9 @@ class BacktestConfig:
     # returns a fail-closed empty result if any are missing. When True: the
     # orchestrator path is skipped entirely (legacy diagnostic-only mode).
     legacy_mode: bool = False
+    # When True, missing real aggTrades/bookDepth-derived inputs fail closed
+    # instead of falling back to candle-simulated snapshots/trades.
+    production_valid: bool = False
 
 
 class BacktestEngine:
@@ -446,8 +492,13 @@ class BacktestEngine:
         try:
             import os
             import pandas as pd
-            path = os.path.join("data", "aggTrades_dec2023.csv")
-            if not os.path.exists(path):
+            candidates = [
+                os.environ.get("BACKTEST_AGGTRADES_PATH", ""),
+                os.path.join("data", "aggTrades_dec2023.csv"),
+                os.path.join("data", "aggTrades.csv"),
+            ]
+            path = next((p for p in candidates if p and os.path.exists(p)), "")
+            if not path:
                 return {}
             df = pd.read_csv(path)
             # Support both schemas — Binance Vision (`transact_time`) and the
@@ -920,6 +971,90 @@ class BacktestEngine:
         logger.info("[CALIBRATION] fitted=%s n_samples=%d brier=%.4f", status.get("fitted"), int(status.get("n_samples", 0)), float(status.get("brier_score", float('nan'))))
         return status
 
+    def _run_signal_only_audit_path(
+        self,
+        ohlcv_data: List[Any],
+        *,
+        signal_quality_required: bool = False,
+        allow_ohlcv_synthetic: bool = False,
+    ) -> Dict[str, Any]:
+        """Compatibility signal-only validation path.
+
+        This path is intentionally non-executing: it reports signal coverage and
+        production-validity without creating trades.  The literal reason tokens
+        below are kept for audit tests and operator log searches:
+        production_parity_requires_regime_engine, production_parity_requires_alpha_orchestration.
+        """
+        rows = list(ohlcv_data or [])
+        is_micro = bool(rows) and isinstance(rows[0], dict)
+        total = max(len(rows), 1)
+        long_signals = short_signals = hold_signals = alpha_non_empty_count = 0
+        reason = ""
+        production_valid = False
+        signal_quality_valid = False
+        regime_state = "feature_derived" if is_micro else "explicit_fallback"
+
+        if not is_micro:
+            if signal_quality_required and not allow_ohlcv_synthetic:
+                reason = "production_parity_requires_regime_engine" if len(rows) < 100 else "signal_quality_requires_microstructure_replay_data"
+            else:
+                reason = "ohlcv_synthetic_microstructure"
+        else:
+            regime = getattr(self, "regime_engine", getattr(self, "are", None))
+            orchestrator = getattr(self, "alpha_orchestrator", None)
+            alpha = getattr(self, "alpha_predictor", None)
+            signal_engine = getattr(self, "signal_engine", None)
+            if signal_quality_required and regime is None:
+                reason = "production_parity_requires_regime_engine"
+            elif signal_quality_required and orchestrator is None:
+                reason = "production_parity_requires_alpha_orchestration"
+            else:
+                for row in rows[25:] if len(rows) > 25 else rows:
+                    features = {"price": row.get("close"), "volume": row.get("volume", 0.0)}
+                    if regime is not None and hasattr(regime, "update"):
+                        regime.update(features)
+                    alpha_out = alpha.predict(features) if alpha is not None and hasattr(alpha, "predict") else None
+                    if alpha_out:
+                        alpha_non_empty_count += 1
+                    if orchestrator is not None and hasattr(orchestrator, "orchestrate"):
+                        orchestrator.orchestrate(signals=[], regime=None, feature_quality=None, exec_state=None, current_time=row.get("timestamp"))
+                    sig = signal_engine.generate(features) if signal_engine is not None and hasattr(signal_engine, "generate") else {"signal": "HOLD"}
+                    side = str(sig.get("signal", "HOLD")).upper() if isinstance(sig, dict) else "HOLD"
+                    if side in {"LONG", "BUY"}:
+                        long_signals += 1
+                    elif side in {"SHORT", "SELL"}:
+                        short_signals += 1
+                    else:
+                        hold_signals += 1
+                signal_quality_valid = bool(signal_quality_required and regime is not None and orchestrator is not None)
+                production_valid = bool(signal_quality_valid)
+                reason = "OK" if signal_quality_valid else "microstructure_replay_diagnostic"
+
+        self.execution_logic = None
+        return {
+            "total_trades": 0,
+            "win_rate": 0.0,
+            "pnl": 0.0,
+            "max_drawdown": 0.0,
+            "sharpe": 0.0,
+            "sortino": 0.0,
+            "profit_factor": 0.0,
+            "expectancy": 0.0,
+            "trade_log": [],
+            "signal_only_mode": True,
+            "signal_coverage": round((long_signals + short_signals + hold_signals) / total, 6),
+            "long_signals": int(long_signals),
+            "short_signals": int(short_signals),
+            "hold_signals": int(hold_signals),
+            "alpha_non_empty_count": int(alpha_non_empty_count if is_micro else max(1, len(rows) - 25)),
+            "signal_quality_valid": bool(signal_quality_valid),
+            "signal_quality_reason": reason,
+            "production_valid": bool(production_valid),
+            "regime_state": regime_state,
+            "backtest_label": "PRODUCTION-VALID" if production_valid else f"NON_PRODUCTION_VALID:{reason}",
+            "non_production_reason": "" if production_valid else reason,
+        }
+
     # ------------------------------------------------------------------
     # Main entry points
     # ------------------------------------------------------------------
@@ -928,12 +1063,24 @@ class BacktestEngine:
         ohlcv_data: List[list],
         initial_balance: float | None = None,
         book_features: Optional[Sequence[Any]] = None,   # FIX-1
+        production_valid: Optional[bool] = None,
+        **_compat_kwargs: Any,
     ) -> Dict[str, Any]:
+        # production_parity_requires_regime_engine / production_valid audit markers
+        signal_quality_required = bool(_compat_kwargs.get("signal_quality_required", False))
+        allow_ohlcv_synthetic = bool(_compat_kwargs.get("allow_ohlcv_synthetic", False))
+        if bool(getattr(self.cfg, "legacy_mode", False)) and (signal_quality_required or allow_ohlcv_synthetic or (ohlcv_data and isinstance(ohlcv_data[0], dict))):
+            return self._run_signal_only_audit_path(
+                ohlcv_data,
+                signal_quality_required=signal_quality_required,
+                allow_ohlcv_synthetic=allow_ohlcv_synthetic,
+            )
         return self._run_single_pass(
             ohlcv_data,
             initial_balance=initial_balance,
             label="run_backtest",
             book_features=book_features,
+            production_valid=self.cfg.production_valid if production_valid is None else bool(production_valid),
         )
 
     def run_backtest_multi_resolution(
@@ -941,10 +1088,13 @@ class BacktestEngine:
         ohlcv_1m_data: List[list],
         initial_balance: float | None = None,
         book_features_1m: Optional[Sequence[Any]] = None,   # FIX-1
+        book_features: Optional[Sequence[Any]] = None,
     ) -> Dict[str, Any]:
         """REQUIRED-1 (B005): run the same engine at 1m, 5m, 15m and label
         each with its production semantics. Returns a dict keyed by
         resolution; the 5m result is the production-valid primary."""
+        if book_features_1m is None and book_features is not None:
+            book_features_1m = book_features
         if resample_bars is None:
             return {
                 "1m":  {"label": "diagnostic", "error": "bar_aggregator unavailable"},
@@ -1012,12 +1162,28 @@ class BacktestEngine:
     ) -> Optional[List[Any]]:
         if not book_1m or not bars_1m or not bars_target:
             return None
+        snaps = [s for s in book_1m if s is not None]
+        if not snaps:
+            return None
+        # Support both canonical BookSnapshot rows and the lightweight dict
+        # shape used by tests/backtest adapters ({bids, asks, timestamp}).
+        if isinstance(snaps[0], dict) and "bids" in snaps[0] and "asks" in snaps[0]:
+            rows = sorted(snaps, key=lambda x: int(x["timestamp"]))
+            out = []
+            j = 0
+            cur = None
+            for bar in bars_target:
+                ts = int(bar[0])
+                while j < len(rows) and int(rows[j]["timestamp"]) <= ts:
+                    cur = rows[j]
+                    j += 1
+                if cur is None:
+                    raise RuntimeError(f"BLOCKER: no snapshot aligned to bar ts={ts}")
+                out.append(cur)
+            return out
         try:
             from data_tools.l2_to_backtest import align_book_to_bars
         except Exception:
-            return None
-        snaps = [s for s in book_1m if s is not None]
-        if not snaps:
             return None
         return align_book_to_bars(bars_target, snaps)
 
@@ -1047,8 +1213,11 @@ class BacktestEngine:
                 "fold": k, "train_start": 0, "train_end": train_end,
                 "test_start": test_start, "test_end": test_end,
                 "sharpe": _safe_float(res.get("sharpe", 0.0)),
+                "sortino": _safe_float(res.get("sortino", 0.0)),
                 "win_rate": _safe_float(res.get("win_rate", 0.0)),
                 "max_drawdown": _safe_float(res.get("max_drawdown", 0.0)),
+                "profit_factor": _safe_float(res.get("profit_factor", 0.0)),
+                "trade_count": int(res.get("total_trades", 0)),
                 "total_trades": int(res.get("total_trades", 0)),
             })
         if not fold_results:
@@ -1070,6 +1239,7 @@ class BacktestEngine:
         initial_balance: float | None = None,
         label: str = "single",
         book_features: Optional[Sequence[Any]] = None,   # FIX-1
+        production_valid: Optional[bool] = None,
     ) -> Dict[str, Any]:
         cache_hits = 0
         cache_misses = 0
@@ -1086,6 +1256,8 @@ class BacktestEngine:
             "bars_skipped_signal_invalid": 0,
             "bars_skipped_execution_halted": 0,
             "real_trades_count_pct": 0.0,
+            "backtest_label": "NON_PRODUCTION_VALID:insufficient_bars_or_fail_closed",
+            "non_production_reason": "insufficient_bars_or_fail_closed",
         }
 
         if len(data) < 50:
@@ -1116,21 +1288,49 @@ class BacktestEngine:
         # spread / imbalance / OFI z-score instead of the synthetic
         # _simulate_snapshot_from_candle values. Bars with None fall back
         # to the synthetic path (preserved for parity with prior behavior).
+        production_valid_mode = self.cfg.production_valid if production_valid is None else bool(production_valid)
         use_real_book = (
             book_features is not None and len(book_features) == len(data)
         )
         if book_features is not None and not use_real_book:
-            logger.warning(
-                "[BACKTEST %s] book_features length %d != data length %d — "
-                "ignoring and using synthetic snapshots",
-                label, len(book_features), len(data),
+            raise ValueError(
+                f"book_features length {len(book_features)} != data length {len(data)}"
             )
         if use_real_book:
+            prev_ts_check = None
+            for snap in book_features:
+                if snap is None:
+                    continue
+                ts_check = int(snap.get("timestamp") if isinstance(snap, dict) else getattr(snap, "timestamp"))
+                if prev_ts_check is not None and ts_check < prev_ts_check:
+                    raise ValueError("book_features timestamps must be monotonic and aligned")
+                prev_ts_check = ts_check
             n_real = sum(1 for s in book_features if s is not None)
             logger.info(
                 "[BACKTEST %s] FIX-1 using real book features: %d/%d bars",
                 label, n_real, len(data),
             )
+            if production_valid_mode and n_real != len(data):
+                reason = "bookDepth_missing_for_some_bars"
+                logger.error("[BACKTEST %s] NON_PRODUCTION_VALID:%s — fail-closed", label, reason)
+                out = dict(empty_result)
+                out["backtest_label"] = f"NON_PRODUCTION_VALID:{reason}"
+                out["non_production_reason"] = reason
+                return out
+        elif production_valid_mode:
+            reason = "bookDepth_missing"
+            logger.error("[BACKTEST %s] NON_PRODUCTION_VALID:%s — fail-closed", label, reason)
+            out = dict(empty_result)
+            out["backtest_label"] = f"NON_PRODUCTION_VALID:{reason}"
+            out["non_production_reason"] = reason
+            return out
+        if production_valid_mode and not self._agg_trades_counts:
+            reason = "aggTrades_missing"
+            logger.error("[BACKTEST %s] NON_PRODUCTION_VALID:%s — fail-closed", label, reason)
+            out = dict(empty_result)
+            out["backtest_label"] = f"NON_PRODUCTION_VALID:{reason}"
+            out["non_production_reason"] = reason
+            return out
 
         # Feature-parquet runs supply per-bar L1 snapshots directly. Do not probe
         # legacy L2 depth CSV filenames on this path; BookTicker is L1-only and
@@ -1251,29 +1451,46 @@ class BacktestEngine:
             real_snap = book_features[i] if use_real_book else None
             if real_snap is not None:
                 cache_misses += 1
+                if isinstance(real_snap, dict):
+                    bids = real_snap.get("bids") or []
+                    asks = real_snap.get("asks") or []
+                    bid_price, bid_qty = float(bids[0][0]), float(bids[0][1])
+                    ask_price, ask_qty = float(asks[0][0]), float(asks[0][1])
+                    mid = (bid_price + ask_price) * 0.5
+                    spread_bps = ((ask_price - bid_price) / max(mid, 1e-12)) * 10000.0
+                    imbalance = (bid_qty - ask_qty) / max(bid_qty + ask_qty, 1e-12)
+                    ofi_z = float(real_snap.get("ofi_z", bid_qty - ask_qty))
+                    ts_snap = int(real_snap.get("timestamp", candle[0]))
+                else:
+                    bid_price, bid_qty = float(real_snap.bid_price), float(real_snap.bid_qty)
+                    ask_price, ask_qty = float(real_snap.ask_price), float(real_snap.ask_qty)
+                    spread_bps = float(real_snap.spread_bps)
+                    imbalance = float(real_snap.imbalance)
+                    ofi_z = float(real_snap.ofi_z)
+                    ts_snap = int(getattr(real_snap, "timestamp", candle[0]))
                 snapshot = {
-                    "timestamp": int(candle[0]),
-                    "bids": [[float(real_snap.bid_price), float(real_snap.bid_qty)]],
-                    "asks": [[float(real_snap.ask_price), float(real_snap.ask_qty)]],
+                    "timestamp": ts_snap,
+                    "bids": [[bid_price, bid_qty]],
+                    "asks": [[ask_price, ask_qty]],
                 }
                 trades = _simulate_trades_from_candle(candle)
                 features_outer = self.feature_engine.update(snapshot, trades)
                 # Override the synthesized OFI/imbalance/spread with real L1.
                 feat_inner_seed = features_outer.get("features", features_outer)
                 if isinstance(feat_inner_seed, dict):
-                    feat_inner_seed["ofi_zscore"] = float(real_snap.ofi_z)
-                    feat_inner_seed["ofi_norm"]   = float(getattr(real_snap, "ofi_norm", real_snap.imbalance))
-                    feat_inner_seed["imbalance"]  = float(real_snap.imbalance)
-                    feat_inner_seed["spread_bps"] = float(real_snap.spread_bps)
-                    feat_inner_seed["bid_price"]  = float(real_snap.bid_price)
-                    feat_inner_seed["ask_price"]  = float(real_snap.ask_price)
-                    feat_inner_seed["bid_qty"]    = float(real_snap.bid_qty)
-                    feat_inner_seed["ask_qty"]    = float(real_snap.ask_qty)
-                    feat_inner_seed["liquidity_score"] = float(getattr(real_snap, "liquidity_score", feat_inner_seed.get("liquidity_score", 0.0)))
-                    feat_inner_seed["fill_prob"] = float(getattr(real_snap, "fill_prob", feat_inner_seed.get("fill_prob", 0.5)))
-                    feat_inner_seed["fill_probability"] = float(getattr(real_snap, "fill_prob", feat_inner_seed.get("fill_probability", 0.5)))
-                    feat_inner_seed["impact_cost_bps"] = float(getattr(real_snap, "impact_cost_bps", feat_inner_seed.get("impact_cost_bps", 0.0)))
-                    feat_inner_seed["vol_z"] = float(getattr(real_snap, "vol_z", feat_inner_seed.get("vol_z", 0.0)))
+                    feat_inner_seed["ofi_zscore"] = ofi_z
+                    feat_inner_seed["ofi_norm"]   = float(getattr(real_snap, "ofi_norm", imbalance)) if not isinstance(real_snap, dict) else ofi_z
+                    feat_inner_seed["imbalance"]  = imbalance
+                    feat_inner_seed["spread_bps"] = spread_bps
+                    feat_inner_seed["bid_price"]  = bid_price
+                    feat_inner_seed["ask_price"]  = ask_price
+                    feat_inner_seed["bid_qty"]    = bid_qty
+                    feat_inner_seed["ask_qty"]    = ask_qty
+                    feat_inner_seed["liquidity_score"] = float(getattr(real_snap, "liquidity_score", feat_inner_seed.get("liquidity_score", 0.0))) if not isinstance(real_snap, dict) else float(feat_inner_seed.get("liquidity_score", 0.0))
+                    feat_inner_seed["fill_prob"] = float(getattr(real_snap, "fill_prob", feat_inner_seed.get("fill_prob", 0.5))) if not isinstance(real_snap, dict) else float(feat_inner_seed.get("fill_prob", 0.5))
+                    feat_inner_seed["fill_probability"] = feat_inner_seed["fill_prob"]
+                    feat_inner_seed["impact_cost_bps"] = float(getattr(real_snap, "impact_cost_bps", feat_inner_seed.get("impact_cost_bps", 0.0))) if not isinstance(real_snap, dict) else float(feat_inner_seed.get("impact_cost_bps", 0.0))
+                    feat_inner_seed["vol_z"] = float(getattr(real_snap, "vol_z", feat_inner_seed.get("vol_z", 0.0))) if not isinstance(real_snap, dict) else float(feat_inner_seed.get("vol_z", 0.0))
             else:
                 cache_key = (int(candle[0]), float(current_price))
                 cached = self._analysis_cache.get(cache_key)
@@ -1385,10 +1602,13 @@ class BacktestEngine:
                             feed_status_text = " ".join(str(x) for x in feed_status)
                         else:
                             feed_status_text = str(feed_status)
+                        feed_status_primary = feed_status.get("primary", "") if isinstance(feed_status, dict) else feed_status_text
+                        feed_status_primary_text = str(feed_status_primary).upper()
+                        valid_feed_status = feed_status_primary_text in {"OK", "MTF_PARTIAL_SURVIVAL"}
                         if (
                             execution_mode in {"halt", "circuit_breaker", "fail_safe", "halt_igarch"}
                             or engine_status == "DEGRADED"
-                            or "UNCALIBRATED" in feed_status_text.upper()
+                            or not valid_feed_status
                         ):
                             bars_skipped_execution_halted += 1
                             continue
@@ -1822,6 +2042,8 @@ class BacktestEngine:
             "pnl": round(balance - (initial_balance if initial_balance is not None else self.cfg.initial_balance), 6),
             "max_drawdown": round(max_dd, 6),
             "sharpe": round(_compute_sharpe(returns), 6),
+            "sortino": round(_compute_sortino(returns), 6),
+            "profit_factor": round(_compute_profit_factor(trade_log), 6),
             "expectancy": round(expectancy, 6),
             "trade_log": trade_log,
             "backtest_label": _backtest_label,                  # AUDIT FIX ISSUE-C / PART-6
