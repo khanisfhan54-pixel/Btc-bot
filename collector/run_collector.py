@@ -255,9 +255,16 @@ class CollectorApp:
                 lambda s=sig: asyncio.create_task(self._async_shutdown(s))
             )
 
-        self.tasks.append(asyncio.create_task(self.health_monitor.start()))
         for ws_client in self.ws_clients:
             self.tasks.append(asyncio.create_task(ws_client.start()))
+
+        # Wait for both WebSocket connections before starting OI polling and health monitor.
+        for ws_client in self.ws_clients:
+            connected = await ws_client.wait_connected(timeout_seconds=30.0)
+            if not connected:
+                logger.warning("ws_client_pre_connect_timeout", url=ws_client.url)
+
+        self.tasks.append(asyncio.create_task(self.health_monitor.start()))
         self.tasks.append(asyncio.create_task(self._poll_openinterest()))
         self.tasks.append(asyncio.create_task(self._verify_startup_streams()))
 

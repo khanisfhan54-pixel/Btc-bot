@@ -13,16 +13,16 @@ data/
     openinterest/    YYYY-MM-DD-HH.parquet
     liquidation/     YYYY-MM-DD-HH.parquet
   daily/
-    orderbook/       YYYY-MM-DD.parquet
-                     YYYY-MM-DD.meta.json
-    trades/          YYYY-MM-DD.parquet
-                     YYYY-MM-DD.meta.json
-    markprice/       YYYY-MM-DD.parquet
-                     YYYY-MM-DD.meta.json
-    openinterest/    YYYY-MM-DD.parquet
-                     YYYY-MM-DD.meta.json
-    liquidation/     YYYY-MM-DD.parquet
-                     YYYY-MM-DD.meta.json
+    orderbook/       YYYY-MM-DD_orderbook.parquet
+                     YYYY-MM-DD_orderbook.meta.json
+    trades/          YYYY-MM-DD_trades.parquet
+                     YYYY-MM-DD_trades.meta.json
+    markprice/       YYYY-MM-DD_markprice.parquet
+                     YYYY-MM-DD_markprice.meta.json
+    openinterest/    YYYY-MM-DD_openinterest.parquet
+                     YYYY-MM-DD_openinterest.meta.json
+    liquidation/     YYYY-MM-DD_liquidation.parquet
+                     YYYY-MM-DD_liquidation.meta.json
 ```
 
 Only `data/daily/{stream}/` is created by daily compaction. The raw hourly inputs remain unchanged.
@@ -35,7 +35,7 @@ The mtime guard is intentionally narrow:
 - The mtime guard is applied only when the hourly file belongs to the current UTC date and the current UTC hour.
 - When `date == current UTC date` and `hour == current UTC hour`, files modified within `guard_seconds` are skipped and the hour is recorded in `skipped_hours`.
 - The default guard window is 90 seconds.
-- Any hour with a matching `YYYY-MM-DD-HH.parquet.tmp` file is skipped unconditionally and recorded in `skipped_hours`.
+- A matching `YYYY-MM-DD-HH.parquet.tmp` file skips only the active current UTC hour. Historical hours with a valid `.parquet` and stale companion `.tmp` are compacted and logged as stale tmp ignored.
 
 This allows backfills and historical repairs to compact recently-copied hourly files while still avoiding races with the live writer for the active current-hour file.
 
@@ -73,7 +73,7 @@ Daily Parquet and metadata sidecar writes use `.tmp` files followed by `os.repla
 
 Both `_stream_write_parquet()` and `_write_json_atomic()` wrap `os.replace` in `try`/`except`. If `os.replace` raises, the corresponding `.tmp` file is deleted before the exception is re-raised.
 
-A forced compaction run (`--force`) also removes stale Parquet and metadata `.tmp` files for the requested output before rewriting.
+A forced compaction run (`--force`) also removes stale Parquet and metadata `.tmp` files for the requested output and stale raw hourly `.parquet.tmp` files for the requested date before rewriting.
 
 ## Schema Compatibility
 
@@ -87,7 +87,7 @@ Schema-level metadata differences, such as `interval_start` or `interval_end`, a
 
 ## Metadata Verification
 
-Each daily file has a sidecar `YYYY-MM-DD.meta.json`. `verify_daily()` checks the Parquet file against that metadata and raises `CompactionError` on any mismatch.
+Each daily file has a sidecar `YYYY-MM-DD_<stream>.meta.json`. `verify_daily()` checks the Parquet file against that metadata and raises `CompactionError` on any mismatch.
 
 Verification checks:
 
@@ -114,7 +114,7 @@ python -m collector.scripts.compact_daily --date 2026-06-10 --guard-seconds 180
 python -m collector.scripts.compact_daily --verify --date 2026-06-10
 ```
 
-By default, compaction processes all five streams: `orderbook`, `trades`, `markprice`, `openinterest`, and `liquidation`. Without `--force`, an existing `data/daily/{stream}/{date}.parquet` file is skipped so repeated runs are idempotent.
+By default, compaction processes all five streams: `orderbook`, `trades`, `markprice`, `openinterest`, and `liquidation`. Without `--force`, an existing `data/daily/{stream}/{date}_{stream}.parquet` file is skipped so repeated runs are idempotent.
 
 ## Retention Policy Integration
 

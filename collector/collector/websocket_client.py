@@ -55,6 +55,14 @@ class WebSocketClient:
                 await asyncio.sleep(self.retry_delay)
                 self.retry_delay = min(self.retry_delay * 2, 60.0)
 
+    async def wait_connected(self, timeout_seconds: float = 30.0) -> bool:
+        deadline = asyncio.get_event_loop().time() + timeout_seconds
+        while asyncio.get_event_loop().time() < deadline:
+            if self.connected:
+                return True
+            await asyncio.sleep(0.1)
+        return False
+
     def stop(self):
         self.running = False
         self.connected = False

@@ -86,7 +86,7 @@ def assemble_dataset(date_str: str, grid_ms: int = 100, data_dir: str = "data"):
     df_grid = pd.DataFrame({"timestamp": grid_ts})
 
     # Forward fill orderbook and mark price using merge_asof
-    df_ob = df_ob.drop(columns=["exchange_timestamp", "local_timestamp", "bids_price", "bids_qty", "asks_price", "asks_qty", "spread"], errors="ignore")
+    df_ob = df_ob.drop(columns=["exchange_timestamp", "local_timestamp", "bids_price", "bids_qty", "asks_price", "asks_qty"], errors="ignore")
     df_mark = df_mark.drop(columns=["exchange_timestamp", "local_timestamp", "next_funding_time", "funding_rate"], errors="ignore")
 
     # Track staleness for gaps
@@ -100,6 +100,30 @@ def assemble_dataset(date_str: str, grid_ms: int = 100, data_dir: str = "data"):
     df_aligned["markprice_gap"] = (df_aligned["timestamp"] - df_aligned["mark_ts"]) > 5000
 
     df_aligned = df_aligned.drop(columns=["ob_ts", "mark_ts"])
+
+    # Mask orderbook spread spikes before trade aggregation so the aligned parquet
+    # carries both the raw spread and model-safe cleaned spread.
+    SPREAD_SPIKE_THRESHOLD = 1.0
+    if "spread" in df_aligned.columns:
+        df_aligned["spread_spike_flag"] = df_aligned["spread"] > SPREAD_SPIKE_THRESHOLD
+        df_aligned["spread_clean"] = df_aligned["spread"].where(
+            ~df_aligned["spread_spike_flag"], other=float("nan")
+        )
+        df_aligned["spread_clean"] = df_aligned["spread_clean"].ffill(limit=10)
+    else:
+        df_aligned["spread_spike_flag"] = False
+        df_aligned["spread_clean"] = float("nan")
+    df_aligned["spread_spike_flag"] = df_aligned["spread_spike_flag"].astype(bool)
+    df_aligned["spread_clean"] = df_aligned["spread_clean"].astype("float64")
+
+    # De-saturate orderbook imbalance features for downstream linear models while
+    # preserving the raw OBI columns.
+    OBI_COLS = ["obi", "obi_level_1", "obi_level_3", "obi_level_5"]
+    CLIP = 0.9999
+    for col in OBI_COLS:
+        if col in df_aligned.columns:
+            clipped = df_aligned[col].clip(-CLIP, CLIP)
+            df_aligned[f"{col}_fisher"] = np.arctanh(clipped).astype("float64")
 
     # Aggregate trades
     if not df_trades.empty:
