@@ -3831,6 +3831,38 @@ class AdvancedRegimeEngine:
             LOGGER.info("load_state: replayed %d staging warnings to live engine.", len(_staging_warnings))
 
     @_synchronized
+    def _set_feed_status(
+        self,
+        output: Dict[str, Any],
+        status: Any,
+        flags: list | None = None,
+    ) -> None:
+        """
+        Single authoritative writer for feed_status.
+        Updates both output["feed_status"] (primary string) and
+        output["risk_metrics"]["feed_status"] (structured dict) atomically
+        so they can never diverge.
+        """
+        if isinstance(status, dict):
+            primary = str(status.get("primary", "UNKNOWN"))
+            raw_flags = status.get("flags", [])
+            if not isinstance(raw_flags, list):
+                raw_flags = []
+            effective_flags = [str(v)[:64] for v in raw_flags[:8]]
+        else:
+            primary = str(status or "UNKNOWN")
+            effective_flags = []
+        if flags is not None:
+            for f in flags:
+                fs = str(f)[:64]
+                if fs not in effective_flags:
+                    effective_flags.append(fs)
+        output["feed_status"] = primary
+        output.setdefault("risk_metrics", {})["feed_status"] = {
+            "primary": primary,
+            "flags": effective_flags,
+        }
+
     def update(self, market_data: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(market_data, dict):
             market_data = {}
@@ -4030,10 +4062,7 @@ class AdvancedRegimeEngine:
             out = _build_halted_output()
             out["execution_mode"] = "halt_igarch"
             out["signal_valid"] = False
-            out["feed_status"] = "HALT_IGARCH_NON_STATIONARY"
-            out.setdefault("risk_metrics", {}).setdefault(
-                "feed_status", {"primary": "HALT_IGARCH_NON_STATIONARY", "flags": []}
-            )["primary"] = "HALT_IGARCH_NON_STATIONARY"
+            self._set_feed_status(out, "HALT_IGARCH_NON_STATIONARY")
             _observe_latency()
             return out
 
@@ -4945,20 +4974,6 @@ class AdvancedRegimeEngine:
             "prev_directional_label_runtime",
         )
         regime = regime_scores["regime"]
-        if regime == "RANGE":
-            return_ema_hint = float(getattr(self, "_return_ema", 0.0))
-            abs_return_ema_hint = float(getattr(self, "_abs_return_ema", 0.0))
-            if (
-                np.isfinite(return_ema_hint)
-                and np.isfinite(abs_return_ema_hint)
-                and abs_return_ema_hint >= 5.0e-4
-            ):
-                if return_ema_hint >= 5.0e-4:
-                    regime = "TREND"
-                    self.current_regime_idx = 0
-                elif return_ema_hint <= -5.0e-4:
-                    regime = "BEAR"
-                    self.current_regime_idx = 2
         directional_recovery_label = None
         if regime == "RANGE":
             directional_recovery = (
@@ -5137,16 +5152,6 @@ class AdvancedRegimeEngine:
             )
             assert confirmed_regime == self._validate_regime_label(confirmed_regime, "confirmed_regime_for_smoother")
 
-        if confirmed_regime == "RANGE":
-            return_hint = float(getattr(self, "_return_ema", 0.0))
-            abs_hint = float(getattr(self, "_abs_return_ema", 0.0))
-            if np.isfinite(return_hint) and np.isfinite(abs_hint) and abs_hint >= 5.0e-4:
-                if return_hint >= 5.0e-4:
-                    confirmed_regime = "TREND"
-                    confirmed_regime_idx = 0
-                elif return_hint <= -5.0e-4:
-                    confirmed_regime = "BEAR"
-                    confirmed_regime_idx = 2
 
         self._prev_raw_regime = regime
         self._confirmed_regime = confirmed_regime
@@ -5566,10 +5571,7 @@ class AdvancedRegimeEngine:
                 else "RESEARCH_CALIBRATION" if getattr(self, "_research_mode", False)
                 else "INVALID_CALIBRATION_PROVENANCE"
             )
-            output["feed_status"] = gated_feed_status
-            output.setdefault("risk_metrics", {}).setdefault(
-                "feed_status", {"primary": gated_feed_status, "flags": []}
-            )["primary"] = gated_feed_status
+            self._set_feed_status(output, gated_feed_status)
             self.last_signed_position_size = 0.0
         if str(getattr(self, "_engine_status", "OK")) == "DEGRADED":
             output["signal_valid"] = False
