@@ -1569,13 +1569,6 @@ class LiquiditySweepAlpha:
                         f"Fake {sweep_side} sweep confirmed via logit ensemble; "
                         f"trend_aligned={trend_aligned}."
                     )
-                    if trend_aligned:
-                        action = "HOLD"
-                        confidence = 0.0
-                        logic_path = (
-                            f"Active {sweep_side} sweep suppressed; "
-                            f"trend_aligned={trend_aligned}."
-                        )
                 else:
                     logic_path = (
                         f"True breakout / lack of reversion edge on {sweep_side} sweep; "
