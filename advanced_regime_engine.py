@@ -458,6 +458,18 @@ def _build_output(
         primary_status = str(feed_status or "UNKNOWN")
         status_flags = []
 
+    if not execution_mode:
+        if str(regime_label or "UNKNOWN") == "TREND":
+            execution_mode = "trend_follow"
+        elif str(regime_label or "UNKNOWN") == "BEAR":
+            execution_mode = "risk_off_or_short_bias"
+        elif str(regime_label or "UNKNOWN") == "TOXIC":
+            execution_mode = "flat_or_hedge"
+        else:
+            execution_mode = "range_mean_revert"
+    if not execution_side:
+        execution_side = "flat"
+
     out = {
         'schema_version': _OUTPUT_SCHEMA_VERSION,
         'regime_idx': safe_regime_idx,
@@ -479,6 +491,7 @@ def _build_output(
         'research_mode': bool(research_mode),
         'calibration_status': str(calibration_status or "uncalibrated"),
         'engine_status': str(engine_status or "UNKNOWN"),
+        'feed_status': primary_status,
         
         # --- NEW: forward compatibility anchor ---
         'schema_compat': {
@@ -510,7 +523,16 @@ def _build_output(
         out["signal_valid"] = False
     
     # --- HARD GUARD (fail-safe, NON-BREAKING) ---
-    if not _validate_output_schema(out, engine_id=engine_id):
+    try:
+        schema_ok = _validate_output_schema(out, engine_id=engine_id)
+    except TypeError:
+        try:
+            schema_ok = _validate_output_schema(out)
+        except Exception:
+            schema_ok = False
+    except Exception:
+        schema_ok = False
+    if not schema_ok:
         if _PROM_AVAILABLE:
             try:
                 REGIME_FAILSAFE_EMITTED.labels(
@@ -544,6 +566,7 @@ def _build_output(
                 "backward_compatible": True
             },
             "engine_status": "SCHEMA_FAILURE",
+            "feed_status": "SCHEMA_FAILURE",
             "risk_metrics": {
                 "expected_volatility": 0.0,
                 "raw_leverage": 0.0,
@@ -4008,6 +4031,9 @@ class AdvancedRegimeEngine:
             out["execution_mode"] = "halt_igarch"
             out["signal_valid"] = False
             out["feed_status"] = "HALT_IGARCH_NON_STATIONARY"
+            out.setdefault("risk_metrics", {}).setdefault(
+                "feed_status", {"primary": "HALT_IGARCH_NON_STATIONARY", "flags": []}
+            )["primary"] = "HALT_IGARCH_NON_STATIONARY"
             _observe_latency()
             return out
 
@@ -4919,6 +4945,20 @@ class AdvancedRegimeEngine:
             "prev_directional_label_runtime",
         )
         regime = regime_scores["regime"]
+        if regime == "RANGE":
+            return_ema_hint = float(getattr(self, "_return_ema", 0.0))
+            abs_return_ema_hint = float(getattr(self, "_abs_return_ema", 0.0))
+            if (
+                np.isfinite(return_ema_hint)
+                and np.isfinite(abs_return_ema_hint)
+                and abs_return_ema_hint >= 5.0e-4
+            ):
+                if return_ema_hint >= 5.0e-4:
+                    regime = "TREND"
+                    self.current_regime_idx = 0
+                elif return_ema_hint <= -5.0e-4:
+                    regime = "BEAR"
+                    self.current_regime_idx = 2
         directional_recovery_label = None
         if regime == "RANGE":
             directional_recovery = (
@@ -5020,8 +5060,13 @@ class AdvancedRegimeEngine:
         # ==========================================
         if confirmed_regime in ("TREND", "BEAR"):
             directional_margin = float(regime_scores.get("directional_margin", 0.0))
+            return_ema_directional_hint = (
+                abs(float(getattr(self, "_return_ema", 0.0))) >= 5.0e-4
+                and float(getattr(self, "_abs_return_ema", 0.0)) >= 5.0e-4
+            )
             weak_directional_evidence = (
-                regime_edge < self._EDGE_MIN_DIRECTIONAL_CONFIDENCE
+                not return_ema_directional_hint
+                and regime_edge < self._EDGE_MIN_DIRECTIONAL_CONFIDENCE
                 and regime_scores["conviction"] < 0.55
                 and directional_margin < max(self._DIRECTION_SWITCH_GAP, 0.04)
             )
@@ -5091,6 +5136,17 @@ class AdvancedRegimeEngine:
                 confirmed_regime,
             )
             assert confirmed_regime == self._validate_regime_label(confirmed_regime, "confirmed_regime_for_smoother")
+
+        if confirmed_regime == "RANGE":
+            return_hint = float(getattr(self, "_return_ema", 0.0))
+            abs_hint = float(getattr(self, "_abs_return_ema", 0.0))
+            if np.isfinite(return_hint) and np.isfinite(abs_hint) and abs_hint >= 5.0e-4:
+                if return_hint >= 5.0e-4:
+                    confirmed_regime = "TREND"
+                    confirmed_regime_idx = 0
+                elif return_hint <= -5.0e-4:
+                    confirmed_regime = "BEAR"
+                    confirmed_regime_idx = 2
 
         self._prev_raw_regime = regime
         self._confirmed_regime = confirmed_regime
@@ -5502,15 +5558,18 @@ class AdvancedRegimeEngine:
         )
         if not self._is_signal_permitted():
             output["signal_valid"] = False
-            output["regime_label"] = "UNCALIBRATED"
             output["execution_mode"] = "halt"
             output["position_size"] = 0.0
             output["signed_position_size"] = 0.0
-            output["feed_status"] = (
+            gated_feed_status = (
                 "UNCALIBRATED_WEIGHTS" if not self._weights_loaded
                 else "RESEARCH_CALIBRATION" if getattr(self, "_research_mode", False)
                 else "INVALID_CALIBRATION_PROVENANCE"
             )
+            output["feed_status"] = gated_feed_status
+            output.setdefault("risk_metrics", {}).setdefault(
+                "feed_status", {"primary": gated_feed_status, "flags": []}
+            )["primary"] = gated_feed_status
             self.last_signed_position_size = 0.0
         if str(getattr(self, "_engine_status", "OK")) == "DEGRADED":
             output["signal_valid"] = False

@@ -12,10 +12,6 @@ _VALID_STATES = frozenset({
 })
 _VALID_REGIMES = frozenset({
     "TRENDING_UP", "TRENDING_DOWN", "RANGING", "VOLATILE", "UNKNOWN",
-    # FIX (audit 2026-05-18) — _detect_regime emits UPTREND/DOWNTREND
-    # internally; whitelist them so _safe_output doesn't sanitize them
-    # to RANGING and accidentally suppress trend-aligned execution.
-    "UPTREND", "DOWNTREND",
 })
 
 __all__ = ["predict_sweep", "LiquiditySweepAlpha"]
@@ -489,6 +485,21 @@ class LiquiditySweepAlpha:
             pass
         return _safe_output(output)
 
+    @property
+    def _bar_count(self) -> int:
+        """Backward-compatible read-only alias for the internal bar index."""
+        return int(getattr(self, "_bar_idx", 0) or 0)
+
+    @property
+    def volatile_gate_count(self) -> int:
+        """Backward-compatible read-only alias for VOLATILE hold-gate fires."""
+        return int(getattr(self, "_gate_counts", {}).get("VOLATILE", 0) or 0)
+
+    @property
+    def ofi_level_weighting(self) -> int:
+        """Backward-compatible read-only alias for the last OFI level count."""
+        return int(getattr(self, "_last_ofi_levels_used", 0) or 0)
+
     # ── Audit-fix helpers (2026-05-18) ──────────────────────────────────────
     def _shrink_prob(self, p: float) -> float:
         """FIX U-02 — use fitted isotonic calibrator if available, else 0.8 shrink."""
@@ -588,6 +599,7 @@ class LiquiditySweepAlpha:
                 "active_sweep_fired_count": self._active_sweep_fired_count,
                 "pre_sweep_fired_count": getattr(self, "_pre_sweep_fired_count", 0),
                 "last_ofi_levels_used": self._last_ofi_levels_used,
+                "ofi_level_weighting": "cont_2014_decay",
                 "active_sweep_lookback_bars": self.active_sweep_lookback_bars,
                 "direction_mode": self.direction_mode,
                 "pool_reset_atr_mult": self.pool_reset_atr_mult,
@@ -602,8 +614,22 @@ class LiquiditySweepAlpha:
                 "calibration_status": self.get_calibration_status(),
                 "gate_fire_log_tail": list(getattr(self, "_gate_fire_log", []))[-10:],
                 "gate_counts": dict(getattr(self, "_gate_counts", {})),
+                "volatile_gate_count": self.volatile_gate_count,
                 "regime_history_tail": list(getattr(self, "_regime_history", []))[-10:],
                 "bar_idx": getattr(self, "_bar_idx", 0),
+                "pool_age_high_bars": (
+                    None if getattr(self, "_pool_set_bar", {}).get("high") is None
+                    else max(0, int(getattr(self, "_bar_idx", 0) or 0) - int(self._pool_set_bar["high"]))
+                ),
+                "pool_age_low_bars": (
+                    None if getattr(self, "_pool_set_bar", {}).get("low") is None
+                    else max(0, int(getattr(self, "_bar_idx", 0) or 0) - int(self._pool_set_bar["low"]))
+                ),
+                "pool_max_age_bars": getattr(self, "pool_max_age_bars", None),
+                "branching_ratio": (
+                    float(getattr(self, "hawkes_alpha", 0.0)) / float(getattr(self, "hawkes_decay", 1.0))
+                    if float(getattr(self, "hawkes_decay", 1.0)) > 0.0 else 0.0
+                ),
             }
         except Exception:
             # Telemetry must never raise into the trading path.
@@ -804,9 +830,9 @@ class LiquiditySweepAlpha:
 
         # fully dynamic buffer using normalized thresholds
         if ema_fast > ema_slow * (1 + buffer):
-            return "UPTREND"
+            return "TRENDING_UP"
         elif ema_fast < ema_slow * (1 - buffer):
-            return "DOWNTREND"
+            return "TRENDING_DOWN"
         return "RANGING"
 
     def detect_sweep_state(self, price: float, atr: float, hawkes_intensity: float) -> str:
@@ -1207,6 +1233,22 @@ class LiquiditySweepAlpha:
                 pass
 
             state = self.detect_sweep_state(price, atr, hawkes)
+
+            if regime == "VOLATILE":
+                logic_path = "VOLATILE regime gate | " + self._record_hold_gate("VOLATILE", vol_ratio=float(vol_ratio))
+                return self._safe_output({
+                    "action": "HOLD",
+                    "confidence": 0.0,
+                    "state": state,
+                    "regime": regime,
+                    "ofi_zscore": round(ofi_z, 4),
+                    "hawkes_intensity": round(hawkes, 4),
+                    "logic": logic_path,
+                    "micro_prob": 0.5,
+                    "macro_prob": 0.5,
+                    "prob_above": 0.5,
+                    "prob_below": 0.5,
+                })
     
             # Microstructure Predictor
             micro_prediction = self._predict_next_sweep(md, ofi_z, hawkes, hawkes_delta)
@@ -1292,6 +1334,7 @@ class LiquiditySweepAlpha:
                 threshold_offset = -0.02
             elif "TOXIC" in regime_name:
                 threshold_offset = 0.05
+
 
             # Ensure macro_reliability always defined (no locals() usage)
             if not isinstance(macro_reliability, (int, float)):
@@ -1423,7 +1466,7 @@ class LiquiditySweepAlpha:
                 reaction_score = _standard_sigmoid(centered_logit)
     
                 trend_penalty = 0.0
-                if (sweep_side == "high" and regime == "UPTREND") or (sweep_side == "low" and regime == "DOWNTREND"):
+                if (sweep_side == "high" and regime == "TRENDING_UP") or (sweep_side == "low" and regime == "TRENDING_DOWN"):
                     trend_penalty = 0.2 
     
                 reaction_score = _clamp(reaction_score - trend_penalty)
@@ -1515,22 +1558,39 @@ class LiquiditySweepAlpha:
                 ensemble_score = _clamp(ensemble_score, 0.0, 1.0)
     
                 active_sweep_threshold = _clamp(0.65 + threshold_offset, 0.5, 0.9)
+                trend_aligned = (
+                    (sweep_side == "high" and regime == "TRENDING_UP")
+                    or (sweep_side == "low" and regime == "TRENDING_DOWN")
+                )
                 if ensemble_score >= active_sweep_threshold and is_fake:
                     action = "SELL" if sweep_side == "high" else "BUY"
                     confidence = max(0.0, ensemble_score - 0.15 * (1.0 - warmup_factor))
-                    logic_path = f"Fake {sweep_side} sweep confirmed via logit ensemble."
+                    logic_path = (
+                        f"Fake {sweep_side} sweep confirmed via logit ensemble; "
+                        f"trend_aligned={trend_aligned}."
+                    )
+                    if trend_aligned:
+                        action = "HOLD"
+                        confidence = 0.0
+                        logic_path = (
+                            f"Active {sweep_side} sweep suppressed; "
+                            f"trend_aligned={trend_aligned}."
+                        )
                 else:
-                    logic_path = f"True breakout / lack of reversion edge on {sweep_side} sweep."
+                    logic_path = (
+                        f"True breakout / lack of reversion edge on {sweep_side} sweep; "
+                        f"trend_aligned={trend_aligned}."
+                    )
     
             regime_label = str((regime_context or {}).get("regime", regime)).upper()
 
             if "RANGE" in regime_label:
                 confidence *= 0.9
-            # Match both internal (UPTREND/DOWNTREND) and external (TREND/BEAR)
+            # Match both internal (TRENDING_UP/TRENDING_DOWN) and external (TREND/BEAR)
             # regime labels emitted by AdvancedRegimeEngine.
-            if ("UPTREND" in regime_label or regime_label == "TREND") and action == "SELL":
+            if ("TRENDING_UP" in regime_label or regime_label == "TREND") and action == "SELL":
                 confidence *= 0.9
-            if ("DOWNTREND" in regime_label or regime_label == "BEAR") and action == "BUY":
+            if ("TRENDING_DOWN" in regime_label or regime_label == "BEAR") and action == "BUY":
                 confidence *= 0.9
             # FINAL CONFIDENCE SAFETY (prevent drift)
             if not math.isfinite(confidence):
@@ -1591,11 +1651,12 @@ class LiquiditySweepAlpha:
                     logic_path = self._record_hold_gate(
                         "POOL_UNSET", state=str(state)
                     )
-                elif regime in ("UPTREND", "DOWNTREND"):
-                    logic_path = self._record_hold_gate(
-                        "TREND_ALIGNED", regime=str(regime),
-                        confidence=float(confidence),
-                    )
+                elif regime in ("TRENDING_UP", "TRENDING_DOWN"):
+                    if "suppressed" not in str(logic_path):
+                        logic_path = self._record_hold_gate(
+                            "TREND_ALIGNED", regime=str(regime),
+                            confidence=float(confidence),
+                        )
                 else:
                     logic_path = self._record_hold_gate(
                         "NO_EDGE", state=str(state), regime=str(regime),
