@@ -826,17 +826,9 @@ def compute_hmm_regime(
     entropy = float(-np.sum(alpha_safe * np.log(np.clip(alpha_safe, 1e-12, None))))
     max_entropy = float(np.log(alpha_safe.size))
     uncertainty = float(np.clip(entropy / max(max_entropy, 1e-12), 0.0, 1.0))
-    # Bounded conviction: directional_strength can only contribute within
-    # the headroom left by information-theoretic certainty (1 - uncertainty).
-    # This prevents synthetic confidence when entropy is high.
-    # Formula: certainty_base + directional_bonus, where
-    #   certainty_base  = 1 - uncertainty                 (info-theoretic ceiling)
-    #   directional_bonus = directional_strength * (1 - uncertainty)
-    #   combined = certainty_base * (1 + 0.5 * directional_strength)
-    #   clamped to [0, 1]
     certainty_base = float(np.clip(1.0 - uncertainty, 0.0, 1.0))
-    directional_bonus = 0.5 * float(directional_strength) * certainty_base
-    conviction = float(np.clip(certainty_base + directional_bonus, 0.0, 1.0))
+    directional_component = float(np.clip(max(edge_score, directional_strength), 0.0, 1.0))
+    conviction = float(np.clip(0.20 * certainty_base + 0.80 * directional_component, 0.0, 1.0))
 
     out = {
         "regime": regime,
