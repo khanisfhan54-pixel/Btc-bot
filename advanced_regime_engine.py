@@ -1215,6 +1215,10 @@ class AdvancedRegimeEngine:
     _RANGE_NEUTRALIZE_VOL: float = 0.018
     _RANGE_DECAY_FLOOR_K: float = 0.05
     _EDGE_MIN_SWITCH_CONFIDENCE: float = 0.58
+    # Conviction threshold constants calibrated from conviction_calibration_report.md.
+    _CONV_THRESHOLD_FLOOR: float = 0.182039
+    _CONV_THRESHOLD_BASE: float = 0.182039
+    _CONV_THRESHOLD_UNCERTAINTY_WEIGHT: float = 0.0
     _EDGE_MIN_DIRECTIONAL_CONFIDENCE: float = 0.64
     _EDGE_VOL_PENALTY: float = 0.18
     _EDGE_LOW_CONF_FRACTION: float = 0.85
@@ -3910,6 +3914,16 @@ class AdvancedRegimeEngine:
             "flags": effective_flags,
         }
 
+    def _compute_shadow_switch_metrics(self, regime_scores, switch_strength, switch_gate, persistence_ok, cooldown_ok, current_threshold, proposed_threshold):
+        current_pass = (cooldown_ok and switch_strength >= switch_gate) or (persistence_ok and regime_scores["conviction"] >= current_threshold)
+        proposed_pass = (cooldown_ok and switch_strength >= switch_gate) or (persistence_ok and regime_scores["conviction"] >= proposed_threshold)
+        return {
+            "current_threshold": float(current_threshold),
+            "proposed_threshold": float(proposed_threshold),
+            "current_pass": bool(current_pass),
+            "proposed_pass": bool(proposed_pass),
+        }
+
     def update(self, market_data: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(market_data, dict):
             market_data = {}
@@ -5231,11 +5245,12 @@ class AdvancedRegimeEngine:
                 cooldown_ok = elapsed_since_change >= self._SWITCH_COOLDOWN_SEC
 
             persistence_ok = self._regime_persistence >= self._SWITCH_MIN_PERSISTENCE
-            # Adaptive conviction gate: scale threshold by uncertainty so that a
-            # genuinely directional signal (high directional_margin) can pass even
-            # when overall entropy is moderate. Floor at 0.52 to prevent trivial bypass.
+            # Adaptive conviction gate calibrated from audit distributions.
             _uncertainty = float(regime_scores.get("uncertainty", 0.5))
-            _adaptive_conv_threshold = max(0.52, 0.65 * (1.0 - 0.25 * _uncertainty))
+            _adaptive_conv_threshold = max(
+                self._CONV_THRESHOLD_FLOOR,
+                self._CONV_THRESHOLD_BASE * (1.0 - self._CONV_THRESHOLD_UNCERTAINTY_WEIGHT * _uncertainty),
+            )
             conviction_ok = regime_scores["conviction"] >= _adaptive_conv_threshold
             toxic_override = confirmed_regime == "TOXIC"
 
@@ -5672,6 +5687,9 @@ class AdvancedRegimeEngine:
                     "confirmed_after_smoother": _want_final,
                     "directional_label": _dbg_directional_label,
                     "conviction": _dbg_conviction,
+                    "uncertainty": float(regime_scores.get("uncertainty", -1.0)),
+                    "edge_score_raw": float(_dbg_regime_edge_raw),
+                    "directional_margin_val": float(_dbg_directional_margin),
                     "adaptive_conv_threshold": _dbg_adaptive_conv_threshold,
                     "directional_margin": _dbg_directional_margin,
                     "trend_score": _dbg_trend_score,
@@ -5699,6 +5717,9 @@ class AdvancedRegimeEngine:
                         "confirmed_regime": _want_final,
                         "directional_label": _dbg_directional_label,
                         "conviction": _dbg_conviction,
+                        "uncertainty": float(regime_scores.get("uncertainty", -1.0)),
+                        "edge_score_raw": float(_dbg_regime_edge_raw),
+                        "directional_margin_val": float(_dbg_directional_margin),
                         "directional_margin": _dbg_directional_margin,
                         "trend_score": _dbg_trend_score,
                         "range_score": _dbg_range_score,
