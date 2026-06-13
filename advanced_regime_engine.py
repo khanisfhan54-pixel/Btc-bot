@@ -710,16 +710,16 @@ def compute_hmm_regime(
 
     directional_strength = float(np.clip(abs(bull - bear), 0.0, 1.0))
     low_directionality = 1.0 - directional_strength
-    directional_confidence = float(np.clip(max(bull, bear), 0.0, 1.0))
+    directional_probability = float(np.clip(max(bull, bear), 0.0, 1.0))
 
     # Soft range evidence (bounded; no hard overrides).
     range_from_balance = low_directionality
     range_from_low_vol = float(np.clip(1.0 - crisis, 0.0, 1.0))
-    range_from_low_drift = float(np.clip(1.0 - directional_confidence, 0.0, 1.0))
+    range_from_low_drift = float(np.clip(1.0 - directional_probability, 0.0, 1.0))
 
     # --- Directional score (bounded, symmetric between TREND and BEAR) ---
     trend_score = float(np.clip(
-        (1.0 - 0.35 * crisis) * (0.70 * directional_confidence + 0.30 * directional_strength),
+        (1.0 - 0.35 * crisis) * (0.70 * directional_probability + 0.30 * directional_strength),
         0.0,
         1.0,
     ))
@@ -738,7 +738,7 @@ def compute_hmm_regime(
         + 0.20 * range_from_low_drift
     )
     trend_pressure = 0.50 * directional_strength + 0.25 * float(
-        np.clip((directional_confidence - 0.5) / 0.5, 0.0, 1.0)
+        np.clip((directional_probability - 0.5) / 0.5, 0.0, 1.0)
     )
 
     range_score = float(np.clip(
@@ -829,6 +829,12 @@ def compute_hmm_regime(
     certainty_base = float(np.clip(1.0 - uncertainty, 0.0, 1.0))
     directional_component = float(np.clip(max(edge_score, directional_strength), 0.0, 1.0))
     conviction = float(np.clip(0.20 * certainty_base + 0.80 * directional_component, 0.0, 1.0))
+    certainty_score = float(np.clip(1.0 - uncertainty, 0.0, 1.0))
+    directional_confidence = float(np.clip(
+        0.5 * directional_strength + 0.5 * edge_score,
+        0.0,
+        1.0,
+    ))
 
     out = {
         "regime": regime,
@@ -839,6 +845,8 @@ def compute_hmm_regime(
         "risk_level": crisis,
         "confidence": max(bull, bear, crisis),
         "conviction": conviction,
+        "certainty_score": certainty_score,
+        "directional_confidence": directional_confidence,
         "uncertainty": uncertainty,
         "directional_margin": abs(effective_direction_gap),
         "directional_label": directional_label,
@@ -5678,7 +5686,11 @@ class AdvancedRegimeEngine:
                     "confirmed_after_switch": str(_dbg_confirmed_after_switch),
                     "confirmed_after_smoother": _want_final,
                     "directional_label": _dbg_directional_label,
+                    "timestamp": float(data.get("timestamp", time.time())) if isinstance(data, dict) else float(time.time()),
+                    "regime": _want_final,
                     "conviction": _dbg_conviction,
+                    "certainty_score": float(regime_scores.get("certainty_score", -1.0)),
+                    "directional_confidence": float(regime_scores.get("directional_confidence", -1.0)),
                     "uncertainty": float(regime_scores.get("uncertainty", -1.0)),
                     "edge_score_raw": float(_dbg_regime_edge_raw),
                     "directional_margin_val": float(_dbg_directional_margin),
