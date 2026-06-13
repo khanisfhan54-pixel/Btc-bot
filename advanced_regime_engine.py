@@ -719,7 +719,7 @@ def compute_hmm_regime(
 
     # --- Directional score (bounded, symmetric between TREND and BEAR) ---
     trend_score = float(np.clip(
-        (1.0 - 0.45 * crisis) * (0.65 * directional_confidence + 0.35 * directional_strength),
+        (1.0 - 0.35 * crisis) * (0.70 * directional_confidence + 0.30 * directional_strength),
         0.0,
         1.0,
     ))
@@ -737,7 +737,7 @@ def compute_hmm_regime(
         + 0.30 * range_from_low_vol
         + 0.20 * range_from_low_drift
     )
-    trend_pressure = 0.40 * directional_strength + 0.20 * float(
+    trend_pressure = 0.50 * directional_strength + 0.25 * float(
         np.clip((directional_confidence - 0.5) / 0.5, 0.0, 1.0)
     )
 
@@ -749,7 +749,7 @@ def compute_hmm_regime(
 
     dominant = max(bull, bear)
     separation = directional_strength
-    edge_score = float(np.clip((dominant - crisis) + 0.25 * separation, 0.0, 1.0))
+    edge_score = float(np.clip((dominant - crisis) + 0.35 * separation, 0.0, 1.0))
 
     direction_gap = float(bull - bear)
     signed_return_hint = float(last_signed_return) if np.isfinite(float(last_signed_return)) else 0.0
@@ -757,14 +757,34 @@ def compute_hmm_regime(
     if abs(signed_return_hint) >= 5.0e-4 and crisis < 0.35:
         return_direction = 1.0 if signed_return_hint > 0.0 else -1.0
     effective_direction_gap = direction_gap
-    if return_direction != 0.0 and directional_strength >= 0.04:
-        effective_direction_gap = directional_strength * return_direction
+    # Return direction may only break ties. Minimum directional_strength
+    # threshold ensures bull/bear probability spread is the primary driver.
+    # A return hint is applied only when:
+    #   (a) the return magnitude exceeds 5e-4
+    #   (b) crisis < 0.35 (not a fear regime)
+    #   (c) directional_strength already exceeds 0.12 (non-trivial prob spread)
+    #   (d) the return hint agrees with direction_gap sign or direction_gap ≈ 0
+    # The hint contribution is capped at min(directional_strength, 0.15) so it
+    # can never flip the label when bull/bear are meaningfully separated.
+    if (
+        return_direction != 0.0
+        and directional_strength >= 0.12
+        and crisis < 0.35
+    ):
+        agree = (return_direction > 0.0 and direction_gap >= 0.0) or \
+                (return_direction < 0.0 and direction_gap <= 0.0)
+        tie = abs(direction_gap) < 0.06
+        if agree or tie:
+            hint_magnitude = min(directional_strength, 0.15) * return_direction
+            effective_direction_gap = direction_gap + 0.25 * hint_magnitude
     directional_label = "TREND" if effective_direction_gap >= 0.0 else "BEAR"
     switch_gap = float(np.clip(direction_switch_gap, 0.0, 0.25))
+    # Hysteresis: require gap to exceed 1.5x switch_gap before flipping direction.
+    # This improves recall by preventing premature directional flips during noise.
     if prev_directional_label in ("TREND", "BEAR"):
-        if prev_directional_label == "TREND" and effective_direction_gap > -switch_gap:
+        if prev_directional_label == "TREND" and effective_direction_gap > -(switch_gap * 1.5):
             directional_label = "TREND"
-        elif prev_directional_label == "BEAR" and effective_direction_gap < switch_gap:
+        elif prev_directional_label == "BEAR" and effective_direction_gap < (switch_gap * 1.5):
             directional_label = "BEAR"
 
     directional_mass = float(np.clip(bull + bear, 1e-12, 2.0))
@@ -806,7 +826,17 @@ def compute_hmm_regime(
     entropy = float(-np.sum(alpha_safe * np.log(np.clip(alpha_safe, 1e-12, None))))
     max_entropy = float(np.log(alpha_safe.size))
     uncertainty = float(np.clip(entropy / max(max_entropy, 1e-12), 0.0, 1.0))
-    conviction = float(np.clip(max(1.0 - uncertainty, directional_strength), 0.0, 1.0))
+    # Bounded conviction: directional_strength can only contribute within
+    # the headroom left by information-theoretic certainty (1 - uncertainty).
+    # This prevents synthetic confidence when entropy is high.
+    # Formula: certainty_base + directional_bonus, where
+    #   certainty_base  = 1 - uncertainty                 (info-theoretic ceiling)
+    #   directional_bonus = directional_strength * (1 - uncertainty)
+    #   combined = certainty_base * (1 + 0.5 * directional_strength)
+    #   clamped to [0, 1]
+    certainty_base = float(np.clip(1.0 - uncertainty, 0.0, 1.0))
+    directional_bonus = 0.5 * float(directional_strength) * certainty_base
+    conviction = float(np.clip(certainty_base + directional_bonus, 0.0, 1.0))
 
     out = {
         "regime": regime,
