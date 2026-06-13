@@ -1569,6 +1569,17 @@ class LiquiditySweepAlpha:
                         f"Fake {sweep_side} sweep confirmed via logit ensemble; "
                         f"trend_aligned={trend_aligned}."
                     )
+                    # EXPLICIT RISK GATE: trend-aligned sweeps carry continuation risk.
+                    # Suppression is isolated here rather than encoded as an inline
+                    # signal-generation shortcut.
+                    if trend_aligned:
+                        action = "HOLD"
+                        confidence = 0.0
+                        self._record_hold_gate("TREND_ALIGNED", regime=str(regime), confidence=0.0)
+                        logic_path = (
+                            f"Active {sweep_side} sweep suppressed by trend_filter gate; "
+                            f"trend_aligned={trend_aligned}."
+                        )
                 else:
                     logic_path = (
                         f"True breakout / lack of reversion edge on {sweep_side} sweep; "

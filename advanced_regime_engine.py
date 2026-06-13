@@ -752,12 +752,19 @@ def compute_hmm_regime(
     edge_score = float(np.clip((dominant - crisis) + 0.25 * separation, 0.0, 1.0))
 
     direction_gap = float(bull - bear)
-    directional_label = "TREND" if direction_gap >= 0.0 else "BEAR"
+    signed_return_hint = float(last_signed_return) if np.isfinite(float(last_signed_return)) else 0.0
+    return_direction = 0.0
+    if abs(signed_return_hint) >= 5.0e-4 and crisis < 0.35:
+        return_direction = 1.0 if signed_return_hint > 0.0 else -1.0
+    effective_direction_gap = direction_gap
+    if return_direction != 0.0 and directional_strength >= 0.04:
+        effective_direction_gap = directional_strength * return_direction
+    directional_label = "TREND" if effective_direction_gap >= 0.0 else "BEAR"
     switch_gap = float(np.clip(direction_switch_gap, 0.0, 0.25))
     if prev_directional_label in ("TREND", "BEAR"):
-        if prev_directional_label == "TREND" and direction_gap > -switch_gap:
+        if prev_directional_label == "TREND" and effective_direction_gap > -switch_gap:
             directional_label = "TREND"
-        elif prev_directional_label == "BEAR" and direction_gap < switch_gap:
+        elif prev_directional_label == "BEAR" and effective_direction_gap < switch_gap:
             directional_label = "BEAR"
 
     directional_mass = float(np.clip(bull + bear, 1e-12, 2.0))
@@ -765,7 +772,11 @@ def compute_hmm_regime(
     bear_share = float(np.clip(bear / directional_mass, 0.0, 1.0))
     trend_score_trend = float(np.clip(trend_score * bull_share, 0.0, 1.0))
     trend_score_bear = float(np.clip(trend_score * bear_share, 0.0, 1.0))
-    if bull_share > bear_share:
+    if return_direction > 0.0 and directional_strength >= 0.04:
+        directional_label_winner = "TREND"
+    elif return_direction < 0.0 and directional_strength >= 0.04:
+        directional_label_winner = "BEAR"
+    elif bull_share > bear_share:
         directional_label_winner = "TREND"
     elif bear_share > bull_share:
         directional_label_winner = "BEAR"
@@ -795,19 +806,19 @@ def compute_hmm_regime(
     entropy = float(-np.sum(alpha_safe * np.log(np.clip(alpha_safe, 1e-12, None))))
     max_entropy = float(np.log(alpha_safe.size))
     uncertainty = float(np.clip(entropy / max(max_entropy, 1e-12), 0.0, 1.0))
-    conviction = float(np.clip(1.0 - uncertainty, 0.0, 1.0))
+    conviction = float(np.clip(max(1.0 - uncertainty, directional_strength), 0.0, 1.0))
 
     out = {
         "regime": regime,
         "bull": bull,
         "bear": bear,
         "crisis": crisis,
-        "trend_strength": bull - bear,
+        "trend_strength": effective_direction_gap,
         "risk_level": crisis,
         "confidence": max(bull, bear, crisis),
         "conviction": conviction,
         "uncertainty": uncertainty,
-        "directional_margin": abs(direction_gap),
+        "directional_margin": abs(effective_direction_gap),
         "directional_label": directional_label,
         "edge_score": edge_score,
         "trend_score": trend_score,
@@ -3830,6 +3841,8 @@ class AdvancedRegimeEngine:
         if _staging_warnings:
             LOGGER.info("load_state: replayed %d staging warnings to live engine.", len(_staging_warnings))
 
+    # update() and load_snapshot() use self._lock, which is an RLock;
+    # reentrant acquisition here cannot deadlock, so the decorator remains safe.
     @_synchronized
     def _set_feed_status(
         self,
@@ -4967,7 +4980,7 @@ class AdvancedRegimeEngine:
             sjm_probs,
             prev_directional_label=getattr(self, "_prev_directional_label", None),
             direction_switch_gap=self._DIRECTION_SWITCH_GAP,
-            last_signed_return=float(getattr(self, "_last_signed_return", 0.0)),
+            last_signed_return=float(y_t),
         )
         self._prev_directional_label = self._validate_directional_label(
             regime_scores.get("directional_label"),
@@ -5146,7 +5159,7 @@ class AdvancedRegimeEngine:
                     regime_changed = False
 
         if getattr(self, "_regime_smoother", None) is not None:
-            regime, self._regime_state_probs = self._regime_smoother.update(
+            _smoothed_regime, self._regime_state_probs = self._regime_smoother.update(
                 regime_scores,
                 confirmed_regime,
             )
