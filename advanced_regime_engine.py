@@ -1708,6 +1708,7 @@ class AdvancedRegimeEngine:
         self._just_restored = False
         self._last_signed_return = 0.0
         self._regime_suppression_log: list = []
+        self._regime_audit_log: list = []
         self._confidence_collapse_streak = 0
         self._strict_replay = True
         self._fsm_error = None
@@ -3297,6 +3298,8 @@ class AdvancedRegimeEngine:
         self._last_timestamp = None
         self._last_valid_dt = 1.0
         self._regime_persistence = 0
+        self._regime_suppression_log = []
+        self._regime_audit_log = []
         self.garch_prob = np.ones(2, dtype=float) / 2.0
         
         # --- NEW: reset SJM fallback memory ---
@@ -5035,7 +5038,9 @@ class AdvancedRegimeEngine:
             _dbg_edge_below_thresh = _dbg_conviction_below_055 = _dbg_margin_below_thresh = False
             _dbg_switch_gate = _dbg_switch_strength = -1.0
             _dbg_cooldown_ok = _dbg_persistence_ok = _dbg_conviction_ok = _dbg_switch_blocked = False
+            _dbg_confirmed_pre_switch = _dbg_confirmed_after_switch = "?"
             _dbg_confirmed_pre_smoother = _dbg_smoother_output = "?"
+            _dbg_adaptive_conv_threshold = -1.0
         except Exception:
             pass
         # --------------------------------------------------
@@ -5171,6 +5176,13 @@ class AdvancedRegimeEngine:
                 _dbg_edge_below_thresh = _dbg_conviction_below_055 = _dbg_margin_below_thresh = False
             # ------------------------------------
 
+        # --- REGIME DEBUG INSTRUMENTATION ---
+        try:
+            _dbg_confirmed_pre_switch = str(confirmed_regime)
+        except Exception:
+            _dbg_confirmed_pre_switch = "ERR"
+        # ------------------------------------
+
         # ==========================================
         # EDGE + VOL + CONFIDENCE COMPOSITE SWITCH FILTER
         # ==========================================
@@ -5234,6 +5246,7 @@ class AdvancedRegimeEngine:
                 _dbg_cooldown_ok = bool(cooldown_ok)
                 _dbg_persistence_ok = bool(persistence_ok)
                 _dbg_conviction_ok = bool(conviction_ok)
+                _dbg_adaptive_conv_threshold = float(_adaptive_conv_threshold)
                 _dbg_switch_blocked = (
                     (not cooldown_ok or switch_strength < switch_gate)
                     and not (persistence_ok and conviction_ok)
@@ -5248,6 +5261,13 @@ class AdvancedRegimeEngine:
                     confirmed_regime = prev_regime_snapshot
                     confirmed_regime_idx = self._confirmed_regime_idx
                     regime_changed = False
+
+        # --- REGIME DEBUG INSTRUMENTATION ---
+        try:
+            _dbg_confirmed_after_switch = str(confirmed_regime)
+        except Exception:
+            _dbg_confirmed_after_switch = "ERR"
+        # ------------------------------------
 
         if getattr(self, "_regime_smoother", None) is not None:
             _smoothed_regime, self._regime_state_probs = self._regime_smoother.update(
@@ -5644,6 +5664,34 @@ class AdvancedRegimeEngine:
                     _want_raw in ("TREND", "BEAR")
                     and _want_final not in ("TREND", "BEAR")
                 )
+                _audit_record = {
+                    "tick": int(self._tick_id),
+                    "raw_regime": _want_raw,
+                    "confirmed_before_switch": str(_dbg_confirmed_pre_switch),
+                    "confirmed_after_switch": str(_dbg_confirmed_after_switch),
+                    "confirmed_after_smoother": _want_final,
+                    "directional_label": _dbg_directional_label,
+                    "conviction": _dbg_conviction,
+                    "adaptive_conv_threshold": _dbg_adaptive_conv_threshold,
+                    "directional_margin": _dbg_directional_margin,
+                    "trend_score": _dbg_trend_score,
+                    "range_score": _dbg_range_score,
+                    "regime_edge_raw": _dbg_regime_edge_raw,
+                    "regime_edge_smoothed": _dbg_regime_edge_smoothed,
+                    "regime_persistence": int(getattr(self, "_regime_persistence", 0)),
+                    "switch_min_persistence": int(self._SWITCH_MIN_PERSISTENCE),
+                    "switch_gate": _dbg_switch_gate,
+                    "switch_strength": _dbg_switch_strength,
+                    "cooldown_ok": _dbg_cooldown_ok,
+                    "persistence_ok": _dbg_persistence_ok,
+                    "conviction_ok": _dbg_conviction_ok,
+                    "switch_blocked": _dbg_switch_blocked,
+                }
+                if not hasattr(self, "_regime_audit_log"):
+                    self._regime_audit_log = []
+                self._regime_audit_log.append(_audit_record)
+                if len(self._regime_audit_log) > 5000:
+                    self._regime_audit_log = self._regime_audit_log[-5000:]
                 if _is_suppressed:
                     _dbg_record = {
                         "tick": int(self._tick_id),
@@ -5674,6 +5722,12 @@ class AdvancedRegimeEngine:
                         "last_edge_score_before": float(getattr(self, "_last_edge_score", -1.0)),
                         "edge_min_directional": float(self._EDGE_MIN_DIRECTIONAL_CONFIDENCE),
                         "direction_switch_gap": float(self._DIRECTION_SWITCH_GAP),
+                        "regime_persistence": int(getattr(self, "_regime_persistence", 0)),
+                        "switch_min_persistence": int(self._SWITCH_MIN_PERSISTENCE),
+                        "adaptive_conv_threshold": _dbg_adaptive_conv_threshold,
+                        "confirmed_before_switch": str(_dbg_confirmed_pre_switch),
+                        "confirmed_after_switch": str(_dbg_confirmed_after_switch),
+                        "confirmed_after_smoother": _want_final,
                     }
                     # Accumulate suppression records into engine attribute for test inspection
                     if not hasattr(self, "_regime_suppression_log"):
