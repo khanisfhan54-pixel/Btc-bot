@@ -7,7 +7,8 @@ class Validator:
         self.last_timestamps: Dict[str, int] = {
             "orderbook": 0,
             "trades": 0,
-            "markprice": 0
+            "markprice": 0,
+            "liquidation": 0,
         }
         self.last_trade_id = -1
         self.last_mid_price: Optional[float] = None
@@ -129,6 +130,27 @@ class Validator:
         self.last_trade_id = trade_id
         return True, ""
 
+    def validate_liquidation(self, record: Dict[str, Any]) -> Tuple[bool, str]:
+        self.total_in_window += 1
+
+        valid_ts, reason = self.validate_timestamp("liquidation", record, allow_equal=True)
+        if not valid_ts:
+            self._handle_failure("liquidation", reason, record)
+            return False, reason
+
+        if record.get("price", 0) <= 0:
+            reason = "Invalid price"
+            self._handle_failure("liquidation", reason, record)
+            return False, reason
+
+        if record.get("quantity", 0) <= 0:
+            reason = "Invalid quantity"
+            self._handle_failure("liquidation", reason, record)
+            return False, reason
+
+        self.last_timestamps["liquidation"] = record["timestamp"]
+        return True, ""
+
     def validate_markprice(self, record: Dict[str, Any]) -> Tuple[bool, str]:
         self.total_in_window += 1
 
@@ -169,7 +191,7 @@ class Validator:
             self.last_mid_price = None
 
     def reset(self):
-        self.last_timestamps = {"orderbook": 0, "trades": 0, "markprice": 0}
+        self.last_timestamps = {"orderbook": 0, "trades": 0, "markprice": 0, "liquidation": 0}
         self.last_trade_id = -1
         self.last_mid_price = None
         self.failures_in_window = 0

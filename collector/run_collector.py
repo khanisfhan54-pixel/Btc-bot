@@ -191,7 +191,15 @@ class CollectorApp:
                 return
 
             self.stream_counters["liquidation"]["computed"] += 1
+            valid, reason = self.validator.validate_liquidation(features)
+            if not valid:
+                self.stream_counters["liquidation"]["rejected"] += 1
+                self._record_validation_rejection("liquidation", reason)
+                logger.info("Validation result", stream="liquidation", validation_pass=False, validation_fail_reason=reason)
+                return
+
             self.stream_counters["liquidation"]["validated"] += 1
+            logger.info("Validation result", stream="liquidation", validation_pass=True, validation_fail_reason="")
             self.liq_writer.write(features)
             self.stream_counters["liquidation"]["written"] += 1
             self.health_monitor.record_message("liquidation", features["timestamp"])

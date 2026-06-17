@@ -1,21 +1,13 @@
-import importlib.util
 import sys
 import time
-from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock
 
 import pytest
 
-_outer_collector = sys.modules.get("collector")
-_collector_dir = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(_collector_dir))
-sys.modules.pop("collector", None)
-_spec = importlib.util.spec_from_file_location("_run_collector_under_test", _collector_dir / "run_collector.py")
-_run_collector = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_run_collector)
+from collector import run_collector as _run_collector
+
 CollectorApp = _run_collector.CollectorApp
-if _outer_collector is not None:
-    sys.modules["collector"] = _outer_collector
 
 
 def _valid_depth_msg():
@@ -66,6 +58,7 @@ def _app_without_init():
         "orderbook": {"received": 0, "computed": 0, "empty_features": 0, "validated": 0, "rejected": 0, "written": 0},
         "trades": {"received": 0, "computed": 0, "empty_features": 0, "validated": 0, "rejected": 0, "written": 0},
         "markprice": {"received": 0, "computed": 0, "empty_features": 0, "validated": 0, "rejected": 0, "written": 0},
+        "openinterest": {"received": 0, "computed": 0, "empty_features": 0, "validated": 0, "rejected": 0, "written": 0},
         "liquidation": {"received": 0, "computed": 0, "empty_features": 0, "validated": 0, "rejected": 0, "written": 0},
         "unrouted": {"received": 0},
     }
@@ -74,6 +67,7 @@ def _app_without_init():
     app.validator.validate_orderbook.return_value = (True, "")
     app.validator.validate_trade.return_value = (True, "")
     app.validator.validate_markprice.return_value = (True, "")
+    app.validator.validate_liquidation.return_value = (True, "")
     app.validator.check_failure_rate.return_value = False
     app.validator.failures_in_window = 0
     app.gap_detector = MagicMock()
@@ -313,3 +307,25 @@ async def test_forceorder_message_routes_to_liquidation_writer_not_trades_writer
     assert app.stream_counters["liquidation"]["written"] == 1
     assert app.stream_counters["trades"]["received"] == 0
     assert app.stream_counters["unrouted"]["received"] == 0
+
+
+@pytest.mark.asyncio
+async def test_forceorder_message_with_real_health_monitor_writes_without_rejection():
+    from collector.collector.disk_monitor import DiskMonitor
+    from collector.collector.gap_detector import GapDetector
+    from collector.collector.health_monitor import HealthMonitor
+    from collector.collector.validator import Validator
+
+    app = _app_without_init()
+    app.validator = Validator()
+    app.gap_detector = GapDetector()
+    app.liq_writer = MagicMock()
+    ws_ref = SimpleNamespace(connected=True)
+    app.health_monitor = HealthMonitor(DiskMonitor(), app.validator, ws_ref)
+
+    await app.handle_message({"stream": "btcusdt@forceOrder", "data": _valid_liquidation_msg()})
+
+    app.liq_writer.write.assert_called_once()
+    assert app.stream_counters["liquidation"]["written"] == 1
+    assert app.stream_counters["liquidation"]["rejected"] == 0
+    assert app.health_monitor.messages_per_minute["liquidation"] == 1

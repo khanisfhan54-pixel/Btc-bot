@@ -117,6 +117,16 @@ def compact_daily(
         missing_hours=discovered.missing_hours,
         skipped_hours=discovered.skipped_hours,
     )
+    if (
+        stream == "liquidation"
+        and metadata["coverage_hours"] is not None
+        and metadata["coverage_hours"] < 23.75
+    ):
+        logger.warning(
+            "compact_daily_low_liquidation_coverage",
+            date=date,
+            coverage_hours=metadata["coverage_hours"],
+        )
     _write_json_atomic(metadata, meta_path)
     logger.info("compact_daily", stream=stream, date=date, rows=stats.rows)
     return True
@@ -475,6 +485,10 @@ def _build_metadata(
     missing_hours: Sequence[int],
     skipped_hours: Sequence[int],
 ) -> dict[str, Any]:
+    coverage_hours = None
+    if stats.start_timestamp_ms is not None and stats.end_timestamp_ms is not None:
+        coverage_hours = (stats.end_timestamp_ms - stats.start_timestamp_ms) / 3600000.0
+
     return {
         "date": date,
         "stream": stream,
@@ -485,6 +499,7 @@ def _build_metadata(
         "skipped_hours": list(skipped_hours),
         "start_timestamp_ms": stats.start_timestamp_ms,
         "end_timestamp_ms": stats.end_timestamp_ms,
+        "coverage_hours": coverage_hours,
         "start_timestamp_iso": _format_ms_iso(stats.start_timestamp_ms),
         "end_timestamp_iso": _format_ms_iso(stats.end_timestamp_ms),
         "compacted_at_utc": datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),

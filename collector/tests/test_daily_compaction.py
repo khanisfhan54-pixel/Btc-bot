@@ -3,6 +3,7 @@ import os
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -669,3 +670,41 @@ def test_boundary_duplicate_detection_uses_small_concat_only(tmp_path):
     for tables in concat_calls:
         for table in tables:
             assert table.num_rows <= 2
+
+
+def test_compact_daily_metadata_includes_coverage_hours(tmp_path):
+    start = _base_ms(0)
+    end = start + 2 * 3600000
+    _write_hour(tmp_path, "liquidation", 0, timestamps=[start, end])
+
+    assert cd.compact_daily(DATE, "liquidation", tmp_path)
+    meta = _meta(tmp_path, "liquidation")
+
+    assert meta["coverage_hours"] == 2.0
+
+
+def test_compact_daily_warns_on_low_liquidation_coverage_without_aborting(tmp_path, monkeypatch):
+    mock_logger = MagicMock()
+    monkeypatch.setattr(cd, "logger", mock_logger)
+    _write_hours(tmp_path, "liquidation", hours=[0], rows=1)
+
+    assert cd.compact_daily(DATE, "liquidation", tmp_path)
+
+    mock_logger.warning.assert_any_call(
+        "compact_daily_low_liquidation_coverage",
+        date=DATE,
+        coverage_hours=0.0,
+    )
+
+
+def test_compact_daily_does_not_warn_on_full_liquidation_coverage(tmp_path, monkeypatch):
+    mock_logger = MagicMock()
+    monkeypatch.setattr(cd, "logger", mock_logger)
+    start = _base_ms(0)
+    end = start + int(23.75 * 3600000)
+    _write_hour(tmp_path, "liquidation", 0, timestamps=[start, end])
+
+    assert cd.compact_daily(DATE, "liquidation", tmp_path)
+
+    warning_events = [call.args[0] for call in mock_logger.warning.call_args_list]
+    assert "compact_daily_low_liquidation_coverage" not in warning_events

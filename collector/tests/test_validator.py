@@ -210,3 +210,56 @@ def test_reset_stream_trades_resets_only_trades_state(validator):
     assert validator.last_timestamps["trades"] == 0
     assert validator.last_timestamps["orderbook"] == 1000
     assert validator.last_mid_price == 100.5
+
+
+def _valid_liquidation_record(ts=None):
+    ts = ts or int(time.time() * 1000)
+    return {
+        "timestamp": ts,
+        "exchange_timestamp": ts,
+        "price": 100.0,
+        "quantity": 1.0,
+    }
+
+
+def test_validate_liquidation_accepts_valid_record(validator):
+    record = _valid_liquidation_record()
+
+    valid, reason = validator.validate_liquidation(record)
+
+    assert valid, reason
+    assert reason == ""
+    assert validator.last_timestamps["liquidation"] == record["timestamp"]
+
+
+def test_validate_liquidation_rejects_invalid_price(validator):
+    record = _valid_liquidation_record()
+    record["price"] = 0
+
+    valid, reason = validator.validate_liquidation(record)
+
+    assert not valid
+    assert reason == "Invalid price"
+    assert validator.failures_in_window == 1
+
+
+def test_validate_liquidation_rejects_invalid_quantity(validator):
+    record = _valid_liquidation_record()
+    record["quantity"] = 0
+
+    valid, reason = validator.validate_liquidation(record)
+
+    assert not valid
+    assert reason == "Invalid quantity"
+    assert validator.failures_in_window == 1
+
+
+def test_validate_liquidation_allows_same_millisecond(validator):
+    ts = int(time.time() * 1000)
+    first = _valid_liquidation_record(ts)
+    second = _valid_liquidation_record(ts)
+
+    valid, reason = validator.validate_liquidation(first)
+    assert valid, reason
+    valid, reason = validator.validate_liquidation(second)
+    assert valid, reason

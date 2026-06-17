@@ -4,13 +4,12 @@ import pyarrow as pa
 SYMBOL = "BTCUSDT"
 BINANCE_PUBLIC_WS_URL = "wss://fstream.binance.com/public/stream?streams=btcusdt@depth10@100ms"
 BINANCE_MARKET_WS_URL = "wss://fstream.binance.com/market/stream?streams=btcusdt@aggTrade/btcusdt@markPrice@1s/btcusdt@forceOrder"
-BINANCE_WS_URL = BINANCE_PUBLIC_WS_URL
-
 # Intervals and Thresholds
 ORDERBOOK_STALE_MS = 500
 TRADES_STALE_MS = 5000   # was 30000
 MARKPRICE_STALE_MS = 5000
 OI_STALE_MS = 30000  # OI updates ~every 3s via REST or ~5s via stream
+LIQUIDATION_STALE_MS = 1800000  # Liquidations are event-sparse; alert after 30 minutes silent.
 
 # File Paths
 DATA_DIR = "data"
