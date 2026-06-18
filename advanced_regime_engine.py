@@ -24,6 +24,12 @@ import os
 import queue
 import threading
 from model_weights import ModelWeightManager
+from regime_vol_calibration import (
+    DEFAULT_TARGET_VOL_ARTIFACT_PATH,
+    calibrate_target_vol,
+    load_target_vol_artifact,
+    write_target_vol_artifact,
+)
 try:
     from traceback_engine import TracebackEngine
 except Exception:
@@ -1392,7 +1398,7 @@ class AdvancedRegimeEngine:
         self,
         n_states=3,
         n_features=3,
-        target_vol=0.02,
+        target_vol: float | None = None,
         allow_igarch=False,
         regime_prob_floor: float = None,
         emit_extended_schema: bool = False,
@@ -1409,6 +1415,8 @@ class AdvancedRegimeEngine:
         engine_id: str | None = None,
         enable_background_workers: bool = True,
         load_model_weights_on_init: bool = True,
+        target_vol_artifact_path: str | None = None,
+        use_calibrated_target_vol_default: bool = False,
     ):
         if n_states != 3:
             raise ValueError(
@@ -1438,8 +1446,50 @@ class AdvancedRegimeEngine:
 
         self.nhhmm = NHHMM_Engine(n_states=n_states, n_features=n_features)
         self.sjm = SparseJumpModel(n_states=n_states)
+        self._target_vol_provenance: Dict[str, Any] = {}
+        self._target_vol_calibrated = False
+        self._target_vol_missing_artifact = False
+        self._target_vol_artifact_path = (
+            target_vol_artifact_path
+            or os.environ.get("REGIME_TARGET_VOL_PATH")
+            or DEFAULT_TARGET_VOL_ARTIFACT_PATH
+        )
+        env_use_calibrated_target_vol = str(
+            os.environ.get("REGIME_USE_CALIBRATED_TARGET_VOL", "")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._use_calibrated_target_vol_default = bool(
+            use_calibrated_target_vol_default or env_use_calibrated_target_vol
+        )
+        if target_vol is not None:
+            effective_target_vol = float(target_vol)
+            self._target_vol_calibrated = True
+            self._target_vol_provenance = {"source": "explicit_override", "target_vol": effective_target_vol}
+        elif not self._use_calibrated_target_vol_default:
+            effective_target_vol = 0.02
+            self._target_vol_calibrated = False
+            self._target_vol_provenance = {
+                "source": "literal_default",
+                "target_vol": effective_target_vol,
+                "artifact_resolution_enabled": False,
+            }
+        else:
+            artifact = load_target_vol_artifact(self._target_vol_artifact_path)
+            if artifact is not None:
+                effective_target_vol = float(artifact["calibrated_target_vol"])
+                self._target_vol_calibrated = True
+                self._target_vol_provenance = copy.deepcopy(artifact)
+            else:
+                effective_target_vol = 0.02
+                self._target_vol_missing_artifact = True
+                self._target_vol_calibrated = False
+                self._target_vol_provenance = {
+                    "source": "literal_fallback",
+                    "path": self._target_vol_artifact_path,
+                    "target_vol": effective_target_vol,
+                    "artifact_resolution_enabled": True,
+                }
         self.garch = MSGARCH_RiskEngine(
-            target_volatility=target_vol,
+            target_volatility=effective_target_vol,
             regime_prob_floor=regime_prob_floor,
         )
         # FIX-3: back-reference enables runtime IGARCH telemetry from _garch_update
@@ -1447,7 +1497,7 @@ class AdvancedRegimeEngine:
         self._init_params: Dict[str, Any] = {
             'n_states': n_states,
             'n_features': n_features,
-            'target_vol': target_vol,
+            'target_vol': effective_target_vol,
             'allow_igarch': allow_igarch,
             'regime_prob_floor': self.garch._REGIME_PROB_FLOOR,
             'schema_version': _OUTPUT_SCHEMA_VERSION,
@@ -1458,6 +1508,8 @@ class AdvancedRegimeEngine:
             'shock_warmup_seconds': float(shock_warmup_seconds),
             'shock_startup_multiplier': float(shock_startup_multiplier),
             'shock_startup_vol_floor_mult': float(shock_startup_vol_floor_mult),
+            'target_vol_artifact_path': self._target_vol_artifact_path,
+            'use_calibrated_target_vol_default': bool(self._use_calibrated_target_vol_default),
         }
 
         for k in range(len(self.garch.alpha)):
@@ -1492,7 +1544,7 @@ class AdvancedRegimeEngine:
         self._last_effective_trend_strength = 0.0
         self._last_edge_score = 0.0
         self._last_regime_change_ts = None
-        self._last_valid_vol = float(target_vol)
+        self._last_valid_vol = float(effective_target_vol)
         self._switch_stability_ema = 1.0
         self.range_ticks = 0.0
         self.range_ticks_int = 0
@@ -1585,7 +1637,10 @@ class AdvancedRegimeEngine:
                 {
                     "n_states": int(n_states),
                     "n_features": int(n_features),
-                    "target_vol": float(target_vol),
+                    "target_vol_key": (
+                        float(target_vol) if target_vol is not None else "target_vol:default"
+                    ),
+                    "use_calibrated_target_vol_default": bool(self._use_calibrated_target_vol_default),
                     "allow_igarch": bool(allow_igarch),
                     "regime_prob_floor": float(self.garch._REGIME_PROB_FLOOR),
                     "seed": self._rng_seed,
@@ -1706,7 +1761,12 @@ class AdvancedRegimeEngine:
         self._obs_counter = 0
         self._OBS_SAMPLE_RATE = 5  # update metrics every N ticks
         self._tick_id = 0
-        self._engine_status = "OK"
+        self._engine_status = "DEGRADED" if getattr(self, "_target_vol_missing_artifact", False) else "OK"
+        if getattr(self, "_target_vol_missing_artifact", False):
+            LOGGER.critical(
+                "[REGIME] Missing valid target-vol calibration artifact at %s; using literal fallback target_vol=0.02.",
+                getattr(self, "_target_vol_artifact_path", DEFAULT_TARGET_VOL_ARTIFACT_PATH),
+            )
         self._health_status = "OK"
         self._last_heal_ts = None
         self._just_restored = False
@@ -2977,6 +3037,7 @@ class AdvancedRegimeEngine:
             "last_effective_trend_strength": float(self._last_effective_trend_strength),
             "last_edge_score": float(self._last_edge_score),
             "last_valid_vol": float(self._last_valid_vol),
+            "target_vol": float(self.garch.target_vol),
             "switch_stability_ema": float(self._switch_stability_ema),
             "last_regime_change_ts": None if self._last_regime_change_ts is None else float(self._last_regime_change_ts),
             "range_ticks": float(self.range_ticks),
@@ -3051,6 +3112,9 @@ class AdvancedRegimeEngine:
             "determinism_status": str(getattr(self, "_determinism_status", "OK")),
             "determinism_had_failure": bool(getattr(self, "_determinism_had_failure", False)),
             "engine_status": str(getattr(self, "_engine_status", "OK")),
+            "target_vol_calibrated": bool(getattr(self, "_target_vol_calibrated", False)),
+            "target_vol_provenance": copy.deepcopy(getattr(self, "_target_vol_provenance", {})),
+            "use_calibrated_target_vol_default": bool(getattr(self, "_use_calibrated_target_vol_default", False)),
             "tick_id": int(getattr(self, "_tick_id", 0)),
             # Explicitly mark deprecated field as False to avoid confusion in external systems
             "emit_extended_schema": False,
@@ -3183,6 +3247,10 @@ class AdvancedRegimeEngine:
             # operators can verify at a glance whether a deployed engine is
             # using calibrated or rolling-stats feature normalisation.
             "feature_norm_source": str(getattr(self, "_feature_norm_source", "rolling")),
+            "target_vol": float(getattr(getattr(self, "garch", None), "target_vol", 0.02)),
+            "target_vol_calibrated": bool(getattr(self, "_target_vol_calibrated", False)),
+            "target_vol_provenance": copy.deepcopy(getattr(self, "_target_vol_provenance", {})),
+            "use_calibrated_target_vol_default": bool(getattr(self, "_use_calibrated_target_vol_default", False)),
         }
 
     @staticmethod
@@ -3211,6 +3279,34 @@ class AdvancedRegimeEngine:
     @_synchronized
     def get_state(self) -> Dict[str, Any]:
         return self._get_state_unlocked()
+
+    @_synchronized
+    def recalibrate_target_vol(self, returns, timestamps, **kwargs) -> Dict[str, Any]:
+        """Calibrate, persist, and hot-swap target volatility for future ticks only."""
+        path = kwargs.pop(
+            "path",
+            getattr(self, "_target_vol_artifact_path", DEFAULT_TARGET_VOL_ARTIFACT_PATH),
+        )
+        before = float(self.garch.target_vol)
+        result = calibrate_target_vol(returns, timestamps, **kwargs)
+        write_target_vol_artifact(result, path=path)
+        after = float(result["calibrated_target_vol"])
+        self.garch.target_vol = after
+        self._init_params["target_vol"] = after
+        self._init_params["target_vol_artifact_path"] = path
+        self._init_params["use_calibrated_target_vol_default"] = True
+        self._target_vol_calibrated = True
+        artifact = load_target_vol_artifact(path, min_samples=int(kwargs.get("min_samples", 5000)))
+        self._target_vol_provenance = copy.deepcopy(artifact if artifact is not None else result)
+        self._target_vol_artifact_path = path
+        self._target_vol_missing_artifact = False
+        LOGGER.info(
+            "[REGIME] target_vol recalibrated and hot-swapped for future ticks only: %.12g -> %.12g provenance=%s",
+            before,
+            after,
+            self._target_vol_provenance,
+        )
+        return copy.deepcopy(self._target_vol_provenance)
 
     def report_realized_pnl(self, realized_pnl: float, equity: float) -> None:
         """FIX-7 (REGIME_ENGINE_AUDIT 2026-04-23): the executor (live or
@@ -3563,6 +3659,22 @@ class AdvancedRegimeEngine:
             self._regime_smoother.prev_probs = authoritative_probs.copy()
 
         self._engine_status = str(state.get("engine_status", "OK"))
+        restored_target_vol = self._state_scalar(
+            state,
+            "target_vol",
+            default=float(self.garch.target_vol),
+            min_value=1e-12,
+        )
+        if np.isfinite(restored_target_vol) and restored_target_vol > 0.0:
+            self.garch.target_vol = float(restored_target_vol)
+            self._init_params["target_vol"] = float(restored_target_vol)
+        else:
+            self._log_state_load_issue("target_vol", ValueError("invalid target_vol"), state.get("target_vol"))
+        self._target_vol_calibrated = bool(state.get("target_vol_calibrated", getattr(self, "_target_vol_calibrated", False)))
+        self._use_calibrated_target_vol_default = bool(state.get("use_calibrated_target_vol_default", getattr(self, "_use_calibrated_target_vol_default", False)))
+        self._init_params["use_calibrated_target_vol_default"] = bool(self._use_calibrated_target_vol_default)
+        incoming_target_vol_provenance = state.get("target_vol_provenance", getattr(self, "_target_vol_provenance", {}))
+        self._target_vol_provenance = copy.deepcopy(incoming_target_vol_provenance) if isinstance(incoming_target_vol_provenance, dict) else {}
         # ── Restore NHHMM model parameters ──────────────────────────────────────
         # Track per-parameter success with a set.
         # "Fully restored" requires ALL THREE keys to succeed.

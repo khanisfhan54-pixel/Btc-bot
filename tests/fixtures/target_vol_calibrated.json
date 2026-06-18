@@ -1,0 +1,25 @@
+{
+  "calibrated_target_vol": 0.0005088801523676887,
+  "calibration_window": {
+    "end_ts": "1970-01-07T05:59:00Z",
+    "start_ts": "1970-01-03T06:00:00Z",
+    "window_days": 4
+  },
+  "fixture_note": "test-only deterministic BTCUSDT-like extended 1m series; generated via calibrate_target_vol(window_days=4,min_samples=5000), not production config",
+  "percentile_used": 75.0,
+  "sample_size": 5760,
+  "schema_version": "1.0.0",
+  "timestamp": "2026-06-18T01:33:06.321069Z",
+  "validation_metrics": {
+    "low_vol_gate_activation_rate_at_calibrated_value": 0.75,
+    "mean": 0.0005067770450012563,
+    "median": 0.0005073334138836894,
+    "p10": 0.0005030273034579936,
+    "p25": 0.0005038085226774528,
+    "p50": 0.0005073334138836894,
+    "p75": 0.0005088801523676887,
+    "p90": 0.0005103243984997635,
+    "p95": 0.000510709794476491,
+    "p99": 0.0005110213384387003
+  }
+}
