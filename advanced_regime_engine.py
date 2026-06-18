@@ -5473,8 +5473,8 @@ class AdvancedRegimeEngine:
             0.0,
             1.0,
         ))
-        self._last_edge_score = edge_score
-        
+        self._last_edge_score = regime_edge
+
         if _PROM_AVAILABLE and obs_sample and not getattr(self, "_is_replay", False):
             ENGINE_VOL.labels(self._metrics_engine_id).set(expected_vol)
             ENGINE_CONFIDENCE.labels(self._metrics_engine_id).set(regime_scores["conviction"])

@@ -194,3 +194,156 @@ def test_halted_zeros_position(engine):
     assert out["regime_label"] == "HALTED"
     assert out["signed_position_size"] == 0.0
     assert engine.last_signed_position_size == 0.0
+
+
+class TestEdgeEMATrap:
+    @staticmethod
+    def _regime_scores(edge_score=0.73):
+        return {
+            "regime": "TREND",
+            "directional_label": "TREND",
+            "conviction": max(edge_score, 0.73),
+            "directional_margin": 0.30,
+            "trend_score": 0.90,
+            "range_score": 0.10,
+            "edge_score": edge_score,
+            "risk_level": 0.10,
+            "trend_strength": 0.80,
+            "confidence": 0.80,
+            "bull": 0.80,
+            "bear": 0.10,
+            "crisis": 0.10,
+            "uncertainty": 0.10,
+            "certainty_score": 0.80,
+            "directional_confidence": 0.80,
+        }
+
+    @staticmethod
+    def _engine():
+        eng = AdvancedRegimeEngine(
+            target_vol=0.02,
+            load_model_weights_on_init=False,
+            enable_background_workers=False,
+        )
+        eng._weights_loaded = True
+        eng._calibration_valid = True
+        eng._production_valid = True
+        eng._calibration_status = "production_valid"
+        eng.garch_var = np.array([2.5e-7, 2.5e-7], dtype=float)
+        eng.garch_prob = np.array([0.5, 0.5], dtype=float)
+        eng._smoothed_garch_prob = np.array([0.5, 0.5], dtype=float)
+        eng._last_valid_vol = 0.0005
+        return eng
+
+    @staticmethod
+    def _feed(eng, n, ret=0.0001):
+        price = 100.0
+        outputs = []
+        for i in range(n):
+            price *= 1.0 + ret
+            outputs.append(
+                eng.update(
+                    {
+                        "timestamp": float(i),
+                        "return": ret,
+                        "features": np.array([0.2, 0.1, 0.05]),
+                        "price": price,
+                    }
+                )
+            )
+        return outputs
+
+    def test_ema_does_not_collapse_under_persistent_low_vol_penalty(self, monkeypatch):
+        monkeypatch.setattr(
+            "advanced_regime_engine.compute_hmm_regime",
+            lambda *args, **kwargs: self._regime_scores(edge_score=0.73),
+        )
+        eng = self._engine()
+        try:
+            self._feed(eng, 50)
+            assert eng._last_edge_score > 0.30
+        finally:
+            eng._shutdown_warning_worker()
+
+    def test_edge_score_escapes_zero_after_warmup(self, monkeypatch):
+        monkeypatch.setattr(
+            "advanced_regime_engine.compute_hmm_regime",
+            lambda *args, **kwargs: self._regime_scores(edge_score=0.73),
+        )
+        eng = self._engine()
+        try:
+            outputs = self._feed(eng, 16)
+            assert outputs[15]["alpha"]["edge_score"] > 0.0
+        finally:
+            eng._shutdown_warning_worker()
+
+    def test_ema_ceiling_convergence_without_penalty_feedback(self, monkeypatch):
+        monkeypatch.setattr(
+            "advanced_regime_engine.compute_hmm_regime",
+            lambda *args, **kwargs: self._regime_scores(edge_score=0.73),
+        )
+        eng = self._engine()
+        eng._EDGE_VOL_PENALTY = 0.0
+        try:
+            self._feed(eng, 100, ret=0.01)
+            assert eng._last_edge_score == pytest.approx(0.73, rel=0.05)
+        finally:
+            eng._shutdown_warning_worker()
+
+    def test_position_sizing_activates_after_edge_warmup(self, monkeypatch):
+        monkeypatch.setattr(
+            "advanced_regime_engine.compute_hmm_regime",
+            lambda *args, **kwargs: self._regime_scores(edge_score=0.90),
+        )
+        eng = self._engine()
+        try:
+            outputs = self._feed(eng, 30)
+            assert outputs[25]["position_size"] > 0.0
+        finally:
+            eng._shutdown_warning_worker()
+
+    def test_execution_gate_becomes_reachable(self, monkeypatch):
+        monkeypatch.setattr(
+            "advanced_regime_engine.compute_hmm_regime",
+            lambda *args, **kwargs: self._regime_scores(edge_score=0.90),
+        )
+        eng = self._engine()
+        try:
+            outputs = self._feed(eng, 60)
+            assert outputs[50]["execution_side"] in ("long", "short")
+        finally:
+            eng._shutdown_warning_worker()
+
+    def test_penalty_still_applies_to_edge_score_output(self, monkeypatch):
+        monkeypatch.setattr(
+            "advanced_regime_engine.compute_hmm_regime",
+            lambda *args, **kwargs: self._regime_scores(edge_score=0.50),
+        )
+        eng = self._engine()
+        eng.garch_var = np.array([(0.03) ** 2, (0.03) ** 2], dtype=float)
+        eng._smoothed_garch_prob = np.array([0.5, 0.5], dtype=float)
+        eng.garch_prob = np.array([0.5, 0.5], dtype=float)
+        eng._last_valid_vol = 0.03
+        try:
+            output = self._feed(eng, 1, ret=0.0005)[0]
+            assert output["alpha"]["edge_score"] < eng._last_edge_score
+        finally:
+            eng._shutdown_warning_worker()
+
+    def test_last_edge_score_state_survives_round_trip(self, monkeypatch):
+        monkeypatch.setattr(
+            "advanced_regime_engine.compute_hmm_regime",
+            lambda *args, **kwargs: self._regime_scores(edge_score=0.73),
+        )
+        eng = self._engine()
+        reloaded = self._engine()
+        try:
+            self._feed(eng, 20)
+            before = eng._last_edge_score
+            reloaded.load_state(eng.get_state())
+            assert reloaded._last_edge_score == pytest.approx(before)
+            self._feed(reloaded, 5)
+            assert reloaded._last_edge_score >= before
+        finally:
+            eng._shutdown_warning_worker()
+            reloaded._shutdown_warning_worker()
