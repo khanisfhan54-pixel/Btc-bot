@@ -1,0 +1,24 @@
+{
+  "calibrated_target_vol": 0.0005,
+  "calibration_window": {
+    "end_ts": "2026-06-18T00:00:00Z",
+    "start_ts": "2026-05-19T00:00:00Z",
+    "window_days": 30
+  },
+  "percentile_used": 75.0,
+  "sample_size": 43200,
+  "schema_version": "1.0.0",
+  "timestamp": "2026-06-18T00:00:00Z",
+  "validation_metrics": {
+    "low_vol_gate_activation_rate_at_calibrated_value": 0.75,
+    "mean": 0.00045,
+    "median": 0.00043,
+    "p10": 0.00025,
+    "p25": 0.00032,
+    "p50": 0.00043,
+    "p75": 0.0005,
+    "p90": 0.00068,
+    "p95": 0.00081,
+    "p99": 0.0011
+  }
+}
