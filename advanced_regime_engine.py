@@ -1267,7 +1267,7 @@ class AdvancedRegimeEngine:
     _EDGE_POWER: float = 1.5
     _EDGE_MIN_ACTIVE: float = 0.35
     _SWITCH_MIN_PERSISTENCE: int = 2
-    _SWITCH_COOLDOWN_SEC: float = 2.0
+    _SWITCH_COOLDOWN_SEC: float = 60.0  # 1 bar at 1-min resolution
     _SWITCH_EDGE_BUFFER: float = 0.03
     _SWITCH_VOL_WEIGHT: float = 0.18
     _SWITCH_CONF_WEIGHT: float = 0.34
@@ -2491,6 +2491,23 @@ class AdvancedRegimeEngine:
                 self._calibration_valid = True
                 self._production_valid = bool(production_valid)
                 self._calibration_provenance = dict(provenance)
+                try:
+                    thresh_path = os.environ.get(
+                        "REGIME_THRESHOLD_PATH",
+                        os.path.join(os.path.dirname(os.path.abspath(self._weight_path)),
+                                     "threshold_params.json"),
+                    )
+                    with open(thresh_path, "r", encoding="utf-8") as fh:
+                        thresh = json.load(fh)
+                    ctf = float(thresh.get("conv_threshold_floor", self._CONV_THRESHOLD_FLOOR))
+                    if 0.0 < ctf <= 1.0 and np.isfinite(ctf):
+                        self._CONV_THRESHOLD_FLOOR = ctf
+                        self._CONV_THRESHOLD_BASE = ctf
+                        LOGGER.info("[REGIME] conv_threshold_floor loaded from artifact: %.6f", ctf)
+                    else:
+                        LOGGER.warning("[REGIME] conv_threshold_floor out of bounds (%r); keeping class default.", ctf)
+                except Exception as _thresh_exc:
+                    LOGGER.warning("[REGIME] threshold_params.json not loaded (%s); keeping class default.", _thresh_exc)
                 if self._production_valid:
                     self._calibration_status = "calibrated"
                 elif self._research_mode:
@@ -4625,6 +4642,7 @@ class AdvancedRegimeEngine:
                         expected_size=self.n_features,
                         name=f"mtf[{tf}] features",
                     )
+                    x_t_tf = self._normalize_features(x_t_tf)
                 except (ValueError, TypeError):
                     continue
 
@@ -4689,6 +4707,7 @@ class AdvancedRegimeEngine:
                         expected_size=self.n_features,
                         name="base x_t",
                     )
+                    x_safe = self._normalize_features(x_safe)
                     nhhmm_posterior, _ = self.nhhmm.forward_pass_step(
                         float(y_t), x_safe, self.nhhmm_prior
                     )
@@ -4719,6 +4738,7 @@ class AdvancedRegimeEngine:
                         expected_size=self.n_features,
                         name="fallback x_t"
                     )
+                    x_safe = self._normalize_features(x_safe)
 
                     nhhmm_posterior, _ = self.nhhmm.forward_pass_step(
                         y_safe, x_safe, self.nhhmm_prior
@@ -5028,6 +5048,12 @@ class AdvancedRegimeEngine:
         # OBS: feed tracking
         if _PROM_AVAILABLE and obs_sample and not getattr(self, "_is_replay", False):
             ENGINE_FEED_STATUS.labels(self._metrics_engine_id, str(feed_status)).inc()
+
+        # FIX-A: apply calibration-time feature normalization at inference.
+        # Without this, loaded feature_mean/feature_std (FIX-6 artifact) never
+        # reach NHHMM/SJM, so trained centroids/beta operate on the wrong scale.
+        if not use_fused_macro_only:
+            x_t = self._normalize_features(x_t)
 
         # Only compute if not already from MTF
         if mtf_data is None:
