@@ -1,0 +1,49 @@
+{
+  "beta_val_cross_entropy": {
+    "0": 0.02509896635032871,
+    "1": 0.019397626524721434,
+    "2": 0.32547340995287105
+  },
+  "code_hash": "bc23f63921326c58e41436874c32baee64f74c49cd3e1d28fbb13fcb67d085fe",
+  "conv_threshold_floor": 0.5764945002995783,
+  "data_source": "synthetic",
+  "dates": [],
+  "derivation_window": {
+    "embargo_bars": 10,
+    "test_bars": 26,
+    "train_bars": 108,
+    "val_bars": 26
+  },
+  "garch_artifact_path": "weights/garch_params.json",
+  "garch_persistence": [
+    0.9,
+    0.8
+  ],
+  "gate_results": {
+    "data_source_ok": false,
+    "garch_converged": true,
+    "garch_stationary": true,
+    "nhhmm_beta_nontrivial": true,
+    "regime_balance_ok": true,
+    "sjm_cluster_valid": true,
+    "target_vol_ok": true,
+    "val_f1_ok": false
+  },
+  "nhhmm_beta_fit": "multinomial_logistic_l2",
+  "nhhmm_beta_std": 1.0362358315636573,
+  "parquet_dates": [],
+  "production_valid": false,
+  "schema_version": "1.0.0",
+  "sjm_fit": "kmeans_numpy_20init",
+  "target_vol": 0.0012608985520440453,
+  "target_vol_artifact_path": "weights/target_vol.json",
+  "threshold_artifact_path": "weights/threshold_params.json",
+  "timestamp": "2026-06-19T02:00:21.982898Z",
+  "val_macro_f1": 0.3000696621386276,
+  "val_regime_balance": {
+    "BEAR": 0.8076923076923077,
+    "CRISIS": 0.0,
+    "RANGE": 0.07692307692307693,
+    "TREND": 0.11538461538461539
+  }
+}

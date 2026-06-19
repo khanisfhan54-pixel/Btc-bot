@@ -1,0 +1,37 @@
+{
+  "conv_threshold_floor": 0.5764945002995783,
+  "data_source": "synthetic",
+  "dates": [],
+  "derivation_window": {
+    "embargo_bars": 10,
+    "test_bars": 26,
+    "train_bars": 108,
+    "val_bars": 26
+  },
+  "garch_persistence": [
+    0.9,
+    0.8
+  ],
+  "gate_results": {
+    "data_source_ok": false,
+    "garch_converged": true,
+    "garch_stationary": true,
+    "nhhmm_beta_nontrivial": true,
+    "regime_balance_ok": true,
+    "sjm_cluster_valid": true,
+    "target_vol_ok": true,
+    "val_f1_ok": false
+  },
+  "nhhmm_beta_std": 1.0362358315636573,
+  "production_valid": false,
+  "schema_version": "1.0.0",
+  "target_vol": 0.0012608985520440453,
+  "timestamp": "2026-06-19T02:00:21.982898Z",
+  "val_macro_f1": 0.3000696621386276,
+  "val_regime_balance": {
+    "BEAR": 0.8076923076923077,
+    "CRISIS": 0.0,
+    "RANGE": 0.07692307692307693,
+    "TREND": 0.11538461538461539
+  }
+}

@@ -1193,6 +1193,42 @@ class MSGARCH_RiskEngine:
         updated /= updated.sum()
         return updated
 
+    def load_fitted_params(
+        self,
+        omega: "np.ndarray",
+        alpha: "np.ndarray",
+        beta_garch: "np.ndarray",
+        P: "np.ndarray",
+    ) -> None:
+        """
+        CONNECTIVE CHANGE: Load MLE-fitted MS-GARCH parameters from calibration artifact.
+        Called by AdvancedRegimeEngine._load_model_weights() when garch_params.json exists.
+        Validates stationarity before applying. No changes to any other method.
+        """
+        omega_arr = np.asarray(omega, dtype=float)
+        alpha_arr = np.asarray(alpha, dtype=float)
+        beta_arr = np.asarray(beta_garch, dtype=float)
+        P_arr = np.asarray(P, dtype=float)
+        for name, arr, shape in [("omega", omega_arr, (2,)), ("alpha", alpha_arr, (2,)),
+                                 ("beta_garch", beta_arr, (2,)), ("P", P_arr, (2, 2))]:
+            if arr.shape != shape:
+                raise ValueError(f"GARCH {name}: expected {shape}, got {arr.shape}")
+            if not np.all(np.isfinite(arr)):
+                raise ValueError(f"GARCH {name} contains non-finite values")
+        persistence = alpha_arr + beta_arr
+        if np.any(persistence >= 1.0) and not getattr(self, "_allow_igarch_load", False):
+            raise ValueError(
+                f"Fitted GARCH is non-stationary: alpha+beta={persistence.tolist()} >= 1.0. "
+                "Reject artifact and refit with tighter bounds."
+            )
+        row_sums = P_arr.sum(axis=1)
+        if not np.allclose(row_sums, 1.0, atol=1e-6):
+            raise ValueError(f"GARCH transition matrix rows do not sum to 1: {row_sums}")
+        self.omega = omega_arr
+        self.alpha = alpha_arr
+        self.beta_garch = beta_arr
+        self.P = P_arr
+
 
 class AdvancedRegimeEngine:
     # ==========================================
@@ -2409,6 +2445,24 @@ class AdvancedRegimeEngine:
             if not np.all(np.isfinite(w)) or float(np.sum(np.abs(w))) <= 0.0:
                 raise ValueError("sjm_feature_weights must be finite and non-zero")
             self.sjm.load_weights(means, w)
+
+            # CONNECTIVE CHANGE: load GARCH artifact if present
+            from calibrate_garch import load_garch_artifact as _load_garch_artifact
+            _garch_path = os.path.join(os.path.dirname(self._weight_path), "garch_params.json")
+            _garch_artifact = _load_garch_artifact(_garch_path)
+            if _garch_artifact is not None:
+                try:
+                    self.garch.load_fitted_params(
+                        np.asarray(_garch_artifact["omega"]),
+                        np.asarray(_garch_artifact["alpha"]),
+                        np.asarray(_garch_artifact["beta_garch"]),
+                        np.asarray(_garch_artifact["P"]),
+                    )
+                    LOGGER.info("[REGIME] MS-GARCH params loaded from %s", _garch_path)
+                except Exception as _garch_exc:
+                    LOGGER.warning("[REGIME] GARCH artifact load failed (%s); using defaults.", _garch_exc)
+            else:
+                LOGGER.warning("[REGIME] GARCH calibration artifact not found at %s; using hardcoded defaults.", _garch_path)
 
             # FIX-6 (consumer): consume calibration-time normalisation moments
             # if the .npz includes them (saver in calibrate_regime.py writes
