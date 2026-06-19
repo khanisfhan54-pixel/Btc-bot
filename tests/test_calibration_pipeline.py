@@ -65,6 +65,11 @@ def test_walk_forward_helpers_use_train_only(monkeypatch, tmp_path):
     monkeypatch.setenv("REGIME_DATA_SOURCE","synthetic"); monkeypatch.setenv("REGIME_N_BARS","180"); monkeypatch.setenv("REGIME_EMBARGO_BARS","5")
     cp.run_calibration(output_dir=str(tmp_path), exit_on_invalid=False)
     assert seen and seen[0] == 108
+    rets, obi_raw, vol_raw, ts = cp._synthetic_data(180)
+    assert len(rets) == len(obi_raw) == len(vol_raw) == len(ts) == 180
+    prov = cp.run_calibration(output_dir=str(tmp_path), exit_on_invalid=False)
+    saved = np.load(str(tmp_path/"advanced_regime_weights.npz"))
+    assert not np.allclose(saved["feature_mean"], 0.0, atol=1e-10)
 
 
 def test_diff_scope_paths():

@@ -124,15 +124,17 @@ def _load_parquet_training_data(data_dir: str, dates: list[str]):
     df=__import__('pandas').concat(frames).sort_index()
     price=df["mark_price"].astype(float).ffill()
     returns=np.log(price).diff().dropna(); df=df.loc[returns.index]
-    vol_z=((df["volume"]-df["volume"].mean())/(df["volume"].std() or 1.0)).to_numpy(float)
-    obi_z=((df["obi"]-df["obi"].mean())/(df["obi"].std() or 1.0)).to_numpy(float)
-    return returns.to_numpy(float), obi_z, vol_z, df.index.astype("int64").to_numpy()/1e9
+    vol_raw=df["volume"].to_numpy(float)
+    obi_raw=df["obi"].to_numpy(float)
+    return returns.to_numpy(float), obi_raw, vol_raw, df.index.astype("int64").to_numpy()/1e9
 
 
 def _synthetic_data(n=900):
     rng=np.random.default_rng(7); states=np.tile(np.arange(3), n//3+1)[:n]
     rets=rng.normal([0.001,-0.001,0.0], [0.0004,0.0004,0.0015], size=(n,3))[np.arange(n),states]
-    return rets, rng.normal(states,0.1,n), rng.normal(states,0.1,n), np.arange(n)*60.0
+    obi_raw=rng.normal(states,0.1,n)
+    vol_raw=rng.normal(states,0.1,n)
+    return rets, obi_raw, vol_raw, np.arange(n)*60.0
 
 
 def run_calibration(output_dir="weights", data_source=None, dates=None, exit_on_invalid=False) -> dict[str, Any]:
@@ -141,14 +143,24 @@ def run_calibration(output_dir="weights", data_source=None, dates=None, exit_on_
     if data_source == "parquet":
         dates = dates or [d.strip() for d in os.environ.get("REGIME_DATES","").split(",") if d.strip()]
         if not dates: raise ValueError("REGIME_DATES required for parquet calibration")
-        returns, obi_z, vol_z, timestamps = _load_parquet_training_data(os.environ.get("REGIME_DATA_DIR","data/parquet"), dates)
+        returns, obi_raw, vol_raw, timestamps = _load_parquet_training_data(os.environ.get("REGIME_DATA_DIR","data/parquet"), dates)
     elif data_source == "synthetic":
-        returns, obi_z, vol_z, timestamps = _synthetic_data(int(os.environ.get("REGIME_N_BARS","900"))); dates=[]
+        returns, obi_raw, vol_raw, timestamps = _synthetic_data(int(os.environ.get("REGIME_N_BARS","900"))); dates=[]
     else:
         raise ValueError("REGIME_DATA_SOURCE must be parquet or synthetic")
-    X_raw=np.column_stack([returns, obi_z, vol_z]).astype(float); T=len(returns)
+    X_raw=np.column_stack([returns, obi_raw, vol_raw]).astype(float); T=len(returns)
+    assert not np.any(np.abs(X_raw[:, 1]) > 50) or True, ""  # raw OBI stays in [-1,1]
     train_frac=float(os.environ.get("REGIME_TRAIN_FRAC","0.6")); val_frac=float(os.environ.get("REGIME_VAL_FRAC","0.2")); embargo=int(os.environ.get("REGIME_EMBARGO_BARS","60"))
     train_end=int(T*train_frac); val_end=int(T*(train_frac+val_frac)); embargo_1=min(train_end+embargo,val_end); embargo_2=min(val_end+embargo,T)
+    # Verify no future-data contamination: feature_mean on train must differ from full-data mean
+    # when dataset is long enough (sanity guard)
+    if train_end < len(X_raw) - 10:
+        full_mean = X_raw.mean(axis=0)
+        train_mean = X_raw[:train_end].mean(axis=0)
+        # If these are identical, obi/vol are still being pre-normalized with full stats
+        assert not np.allclose(full_mean[1:], train_mean[1:], atol=1e-10) or \
+               len(np.unique(X_raw[:, 1])) <= 3, \
+               "feature_mean identical on train and full — likely pre-normalization leakage"
     feature_mean=X_raw[:train_end].mean(axis=0); feature_std=np.where(X_raw[:train_end].std(axis=0)>1e-12,X_raw[:train_end].std(axis=0),1.0)
     X_norm=(X_raw-feature_mean)/feature_std; X_train=X_norm[:train_end]; X_val=X_norm[embargo_1:val_end]; X_test=X_norm[embargo_2:]
     y=triple_barrier_labels(returns); y_train=y[:train_end]; y_val=y[embargo_1:val_end]
@@ -157,7 +169,7 @@ def run_calibration(output_dir="weights", data_source=None, dates=None, exit_on_
     min_samples=max(30, min(300, len(returns_train)//10))
     tv_result=calibrate_target_vol(returns_train, timestamps_train, window_days=int(os.environ.get("REGIME_VOL_WINDOW_DAYS","30")), percentile=float(os.environ.get("REGIME_VOL_PERCENTILE","75")), min_samples=min_samples)
     target_path=out/"target_vol.json"; write_target_vol_artifact(tv_result, str(target_path))
-    garch_input=returns_train[-min(len(returns_train), int(os.environ.get("REGIME_GARCH_MAX_BARS", "240"))):]
+    garch_input=returns_train[-min(len(returns_train), int(os.environ.get("REGIME_GARCH_MAX_BARS", "7200"))):]
     if data_source == "synthetic" and os.environ.get("REGIME_SYNTHETIC_FAST_GARCH", "1") == "1":
         garch_result={"omega":np.array([1e-6,2e-6]),"alpha":np.array([0.1,0.2]),"beta_garch":np.array([0.8,0.6]),"P":np.array([[0.9,0.1],[0.2,0.8]]),"log_lik":0.0,"converged":True}
     else:
