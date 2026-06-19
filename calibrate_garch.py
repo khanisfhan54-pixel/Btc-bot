@@ -80,7 +80,7 @@ def fit_msgarch_mle(returns: np.ndarray, n_regimes: int = 2) -> dict:
     ]
     result = minimize(
         neg_log_likelihood, x0, method="L-BFGS-B", bounds=bounds,
-        options={"maxiter": 1000, "ftol": 1e-12}
+        options={"maxiter": int(__import__("os").environ.get("MSGARCH_MAXITER", "1000")), "ftol": 1e-12}
     )
     p = result.x
     return {
@@ -91,6 +91,61 @@ def fit_msgarch_mle(returns: np.ndarray, n_regimes: int = 2) -> dict:
         "converged": bool(result.success),
         "log_lik":   float(-result.fun),
     }
+
+
+def write_garch_artifact(result: dict, path: str = "weights/garch_params.json") -> None:
+    """Persist MLE-fitted GARCH params as a versioned JSON artifact."""
+    import json, os, hashlib
+    payload = {
+        "schema_version": "1.0.0",
+        "omega": result["omega"].tolist(),
+        "alpha": result["alpha"].tolist(),
+        "beta_garch": result["beta_garch"].tolist(),
+        "P": result["P"].tolist(),
+        "log_lik": float(result["log_lik"]),
+        "converged": bool(result["converged"]),
+        "persistence": (result["alpha"] + result["beta_garch"]).tolist(),
+        "timestamp": __import__("datetime").datetime.utcnow().isoformat() + "Z",
+    }
+    payload["checksum"] = hashlib.sha256(
+        json.dumps({k: v for k, v in payload.items() if k != "checksum"},
+                   sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+
+
+def load_garch_artifact(path: str = "weights/garch_params.json") -> dict | None:
+    """Load and validate GARCH artifact. Returns None on any validation failure."""
+    import json
+    import numpy as np
+    try:
+        with open(path, encoding="utf-8") as fh:
+            p = json.load(fh)
+        required = {"omega", "alpha", "beta_garch", "P", "converged", "persistence"}
+        if not required.issubset(p):
+            return None
+        omega = np.asarray(p["omega"], dtype=float)
+        alpha = np.asarray(p["alpha"], dtype=float)
+        beta  = np.asarray(p["beta_garch"], dtype=float)
+        P_mat = np.asarray(p["P"], dtype=float)
+        if omega.shape != (2,) or alpha.shape != (2,) or beta.shape != (2,) or P_mat.shape != (2,2):
+            return None
+        if not (np.all(np.isfinite(omega)) and np.all(np.isfinite(alpha))
+                and np.all(np.isfinite(beta)) and np.all(np.isfinite(P_mat))):
+            return None
+        persistence = alpha + beta
+        if np.any(persistence >= 1.0):
+            return None
+        if not np.allclose(P_mat.sum(axis=1), 1.0, atol=1e-6):
+            return None
+        if not bool(p.get("converged", False)):
+            return None
+        return p
+    except Exception:
+        return None
 
 
 if __name__ == "__main__":
