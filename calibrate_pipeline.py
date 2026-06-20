@@ -6,7 +6,7 @@ Usage:
 """
 from __future__ import annotations
 
-import hashlib, json, os, sys
+import hashlib, importlib.util, json, os, sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -98,6 +98,41 @@ def _timestamp_series(df):
     return __import__('pandas').to_datetime(s, utc=True)
 
 
+
+def _read_parquet_all(path: Path):
+    """Read every row group from a parquet file using pyarrow, or DuckDB fallback."""
+    if importlib.util.find_spec("pyarrow") is not None:
+        import pyarrow.parquet as pq
+
+        return pq.read_table(path).to_pandas()
+    if importlib.util.find_spec("duckdb") is not None:
+        import duckdb
+
+        return duckdb.sql(f"SELECT * FROM '{path}'").df()
+    raise ImportError("pyarrow or duckdb is required to read parquet calibration data")
+
+
+def _as_top_book_size(value):
+    """Best-effort extraction of the size from a nested top-of-book cell."""
+    if value is None:
+        return np.nan
+    if isinstance(value, dict):
+        for key in ("size", "qty", "quantity", "amount"):
+            if key in value:
+                return value[key]
+        vals = list(value.values())
+        return vals[1] if len(vals) > 1 else (vals[0] if vals else np.nan)
+    if isinstance(value, (list, tuple, np.ndarray)):
+        if len(value) == 0:
+            return np.nan
+        first = value[0]
+        if isinstance(first, dict):
+            return _as_top_book_size(first)
+        if isinstance(first, (list, tuple, np.ndarray)):
+            return first[1] if len(first) > 1 else (first[0] if len(first) else np.nan)
+        return value[1] if len(value) > 1 else value[0]
+    return value
+
 def _load_parquet_training_data(data_dir: str, dates: list[str]):
     import pandas as pd
     frames=[]
@@ -105,19 +140,41 @@ def _load_parquet_training_data(data_dir: str, dates: list[str]):
         paths={kind: Path(data_dir)/f"{date}_{kind}.parquet" for kind in ["trades","markprice","orderbook","openinterest"]}
         missing=[str(p) for p in paths.values() if not p.exists()]
         if missing: raise FileNotFoundError("missing parquet files: "+", ".join(missing))
-        tr=pd.read_parquet(paths["trades"]); mp=pd.read_parquet(paths["markprice"]); ob=pd.read_parquet(paths["orderbook"]); oi=pd.read_parquet(paths["openinterest"])
+        tr=_read_parquet_all(paths["trades"]); mp=_read_parquet_all(paths["markprice"]); ob=_read_parquet_all(paths["orderbook"]); oi=_read_parquet_all(paths["openinterest"])
         tr["ts_floor"]=_timestamp_series(tr).dt.floor("min")
         pc=_find_col(tr,["price","p"]); qc=_find_col(tr,["quantity","qty","q","volume"]); mc=_find_col(tr,["is_buyer_maker","m"])
         tr["price"] = tr[pc].astype(float); tr["qty"] = tr[qc].astype(float)
         maker = tr[mc].astype(str).str.lower().isin(["true","1","t","yes"]) if mc else False
         tr["buy_vol"] = np.where(maker, 0.0, tr["qty"]); tr["sell_vol"] = np.where(maker, tr["qty"], 0.0)
         t1=tr.groupby("ts_floor").agg(close=("price","last"), volume=("qty","sum"), buy_vol=("buy_vol","sum"), sell_vol=("sell_vol","sum"))
+        if os.environ.get("REGIME_REQUIRE_FULL_DAY", "1") == "1" and len(t1) < 1400:
+            raise AssertionError(f"Only {len(t1)} rows for {date} - truncated parquet day")
+
         ob["ts_floor"]=_timestamp_series(ob).dt.floor("min")
         obi=_find_col(ob,["obi"])
-        if obi: o1=ob.groupby("ts_floor")[obi].mean().to_frame("obi")
+        if obi:
+            o1=ob.groupby("ts_floor")[obi].mean().to_frame("obi")
         else:
-            bid=_find_col(ob,["bid","bid_size","bid_qty"]); ask=_find_col(ob,["ask","ask_size","ask_qty"])
-            ob["obi"]=(ob[bid].astype(float)-ob[ask].astype(float))/(ob[bid].astype(float)+ob[ask].astype(float)+1e-12); o1=ob.groupby("ts_floor")["obi"].mean().to_frame()
+            bid=next((c for c in ob.columns if 'bid' in c.lower() and 'size' in c.lower()), None)
+            ask=next((c for c in ob.columns if 'ask' in c.lower() and 'size' in c.lower()), None)
+            if not (bid and ask):
+                bid=_find_col(ob,["bid_qty","bid_quantity","bids"]); ask=_find_col(ob,["ask_qty","ask_quantity","asks"])
+            if bid and ask:
+                ob["bid_sz"]=ob[bid].map(_as_top_book_size).astype(float)
+                ob["ask_sz"]=ob[ask].map(_as_top_book_size).astype(float)
+                ob["obi"]=(ob["bid_sz"]-ob["ask_sz"])/(ob["bid_sz"]+ob["ask_sz"]+1e-12)
+            else:
+                ob["obi"]=0.0
+            o1=ob.groupby("ts_floor")["obi"].mean().to_frame("obi")
+
+        signed_col=_find_col(tr,["signed_qty","side_sign"])
+        if signed_col and o1["obi"].abs().mean() < 1e-6:
+            signed = tr[signed_col].astype(float)
+            if signed_col.lower() == "side_sign":
+                signed = signed * tr["qty"]
+            cvd = signed.groupby(tr["ts_floor"]).sum()
+            cvd_norm = cvd / (cvd.abs().rolling(60, min_periods=1).mean() + 1e-12)
+            o1 = cvd_norm.clip(-1, 1).rename("obi").to_frame()
         mp["ts_floor"]=_timestamp_series(mp).dt.floor("min"); mark=_find_col(mp,["mark_price","markPrice","price"]); fund=_find_col(mp,["funding_rate_bps","fundingRate","funding_rate"])
         m1=mp.groupby("ts_floor").agg(mark_price=(mark,"last")); m1["funding_rate_bps"]=mp.groupby("ts_floor")[fund].last() if fund else 0.0
         oi["ts_floor"]=_timestamp_series(oi).dt.floor("min"); oic=_find_col(oi,["open_interest","openInterest","oi"]); oi1=oi.groupby("ts_floor")[oic].last().to_frame("open_interest")
@@ -127,7 +184,11 @@ def _load_parquet_training_data(data_dir: str, dates: list[str]):
     returns=np.log(price).diff().dropna(); df=df.loc[returns.index]
     vol_raw=df["volume"].to_numpy(float)
     obi_raw=df["obi"].to_numpy(float)
-    return returns.to_numpy(float), obi_raw, vol_raw, df.index.astype("int64").to_numpy()/1e9
+    returns_raw=returns.to_numpy(float)
+    assert np.nanmean(np.abs(obi_raw)) > 1e-4, "OBI is still zero/near-zero - column not decoded"
+    if len(obi_raw) > 2 and np.nanstd(obi_raw) > 1e-12 and np.nanstd(returns_raw) > 1e-12:
+        assert abs(float(np.corrcoef(obi_raw, returns_raw)[0,1])) < 0.95, "OBI too correlated with returns - still proxy"
+    return returns_raw, obi_raw, vol_raw, df.index.astype("int64").to_numpy()/1e9
 
 
 def _synthetic_data(n=900):
@@ -179,7 +240,10 @@ def run_calibration(output_dir="weights", data_source=None, dates=None, exit_on_
     tv_result=calibrate_target_vol(returns_train, timestamps_train, window_days=int(os.environ.get("REGIME_VOL_WINDOW_DAYS","30")), percentile=float(os.environ.get("REGIME_VOL_PERCENTILE","75")), min_samples=min_samples)
     target_path=out/"target_vol.json"; write_target_vol_artifact(tv_result, str(target_path))
     garch_input=returns_train[-min(len(returns_train), int(os.environ.get("REGIME_GARCH_MAX_BARS", "7200"))):]
-    if data_source == "synthetic" and os.environ.get("REGIME_SYNTHETIC_FAST_GARCH", "1") == "1":
+    if data_source == "parquet":
+        garch_result=fit_msgarch_mle(garch_input)
+        assert float(garch_result["log_lik"]) != 0.0, "GARCH MLE did not run"
+    elif data_source == "synthetic" and os.environ.get("REGIME_SYNTHETIC_FAST_GARCH", "1") == "1":
         garch_result={"omega":np.array([1e-6,2e-6]),"alpha":np.array([0.1,0.2]),"beta_garch":np.array([0.8,0.6]),"P":np.array([[0.9,0.1],[0.2,0.8]]),"log_lik":0.0,"converged":True}
     else:
         garch_result=fit_msgarch_mle(garch_input)
