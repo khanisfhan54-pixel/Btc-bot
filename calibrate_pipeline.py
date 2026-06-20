@@ -303,10 +303,17 @@ def run_calibration(output_dir="weights", data_source=None, dates=None, exit_on_
     cluster_counts_arr = np.bincount(train_labels, minlength=N_STATES)
     cluster_pct_arr = cluster_counts_arr / max(1, len(train_labels))
     centroid_norms_arr = np.linalg.norm(centroids, axis=1)
+    train_dists = np.linalg.norm(X_train[:, None, :] - centroids[None, :, :], axis=2) if len(X_train) else np.empty((0, N_STATES))
+    intra_cluster_distance = float(np.mean(np.min(train_dists, axis=1))) if len(train_dists) else float("inf")
+    inter_cluster_distance = float(np.mean([np.linalg.norm(centroids[i] - centroids[j]) for i in range(N_STATES) for j in range(i + 1, N_STATES)]))
+    separation_ratio = inter_cluster_distance / intra_cluster_distance if intra_cluster_distance > 0 else float("inf")
     sjm_health = {
         "cluster_counts": cluster_counts_arr.astype(int).tolist(),
         "cluster_pct": cluster_pct_arr.astype(float).tolist(),
         "centroid_norms": centroid_norms_arr.astype(float).tolist(),
+        "inter_cluster_distance": inter_cluster_distance,
+        "intra_cluster_distance": intra_cluster_distance,
+        "separation_ratio": separation_ratio,
         "underrepresented_states": np.where(cluster_pct_arr < 0.05)[0].astype(int).tolist(),
     }
     mu=np.array([returns_train[train_labels==k].mean() if np.any(train_labels==k) else 0.0 for k in range(N_STATES)],float)
@@ -346,13 +353,15 @@ def run_calibration(output_dir="weights", data_source=None, dates=None, exit_on_
       "garch_fit_ok": garch_fit_ok,
       "sample_size_ok": T >= min_bars and supplied_dates >= min_dates,
       "sjm_balance_ok": bool(np.all(cluster_pct_arr >= 0.05)),
+      "sjm_separation_ok": bool(separation_ratio > 1.5),
+      "sjm_cluster_balance_ok": bool(np.all(cluster_pct_arr >= 0.05)),
       "obi_quality_ok": float(np.nanmean(np.abs(obi_raw))) > 1e-4,
     }
     production_valid=all(gates.values())
     threshold={"schema_version":"1.0.0","conv_threshold_floor":conv_thr,"target_vol":float(tv_result["calibrated_target_vol"]),"val_macro_f1":val_macro_f1,"val_f1_threshold_used":_adaptive_min_f1,"val_f1_scale_factor":_f1_scale,"val_regime_balance":balance,"derivation_window":{"train_bars":train_end,"val_bars":len(y_val),"test_bars":len(X_test),"embargo_bars":embargo},"nhhmm_beta_std":float(np.std(beta)),"garch_persistence":(garch_result["alpha"]+garch_result["beta_garch"]).tolist(),"timestamp":_utc(),"data_source":data_source,"dates":dates,"production_valid":production_valid,"gate_results":gates}
     (out/"threshold_params.json").write_text(json.dumps(threshold, indent=2, sort_keys=True)+"\n")
     code_hash=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-    prov={**threshold,"partial_day_stats":partial_day_stats,"feature_diagnostics":feature_diagnostics,"sjm_health":sjm_health,"obi_return_corr":data_metadata.get("obi_return_corr", return_vs_obi_corr),"parquet_dates":dates,"garch_artifact_path":str(garch_path),"target_vol_artifact_path":str(target_path),"threshold_artifact_path":str(out/"threshold_params.json"),"nhhmm_beta_fit":"multinomial_logistic_l2","sjm_fit":"kmeans_numpy_20init","code_hash":code_hash,"beta_val_cross_entropy":transition_cross_entropy(X_val, pred_val, beta) if len(X_val)>1 else {}}
+    prov={**threshold,"partial_day_stats":partial_day_stats,"feature_diagnostics":feature_diagnostics,"sjm_health":sjm_health,"cluster_counts":sjm_health["cluster_counts"],"cluster_pct":sjm_health["cluster_pct"],"centroid_norms":sjm_health["centroid_norms"],"inter_cluster_distance":inter_cluster_distance,"intra_cluster_distance":intra_cluster_distance,"separation_ratio":separation_ratio,"sjm_separation_ok":gates["sjm_separation_ok"],"sjm_cluster_balance_ok":gates["sjm_cluster_balance_ok"],"obi_return_corr":data_metadata.get("obi_return_corr", return_vs_obi_corr),"parquet_dates":dates,"garch_artifact_path":str(garch_path),"target_vol_artifact_path":str(target_path),"threshold_artifact_path":str(out/"threshold_params.json"),"nhhmm_beta_fit":"multinomial_logistic_l2","sjm_fit":"kmeans_numpy_20init","code_hash":code_hash,"beta_val_cross_entropy":transition_cross_entropy(X_val, pred_val, beta) if len(X_val)>1 else {}}
     (out/"calibration_provenance.json").write_text(json.dumps(prov, indent=2, sort_keys=True)+"\n")
     if exit_on_invalid and not production_valid:
         raise SystemExit("production_valid=False: "+json.dumps(gates, sort_keys=True))
