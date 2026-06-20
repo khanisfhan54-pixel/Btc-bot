@@ -53,6 +53,10 @@ def test_synthetic_pipeline_production_invalid(tmp_path, monkeypatch):
     assert (tmp_path/"target_vol.json").exists()
     assert (tmp_path/"threshold_params.json").exists()
     assert (tmp_path/"calibration_provenance.json").exists()
+    prov = json.loads((tmp_path/"calibration_provenance.json").read_text())
+    assert prov["conv_threshold_floor"] >= 0.182039, f"conv_threshold_floor {prov['conv_threshold_floor']} below engine minimum 0.182039"
+    thresh = json.loads((tmp_path/"threshold_params.json").read_text())
+    assert thresh["conv_threshold_floor"] >= 0.182039
     assert load_garch_artifact(str(tmp_path/"garch_params.json")) is not None
 
 
@@ -70,6 +74,19 @@ def test_walk_forward_helpers_use_train_only(monkeypatch, tmp_path):
     prov = cp.run_calibration(output_dir=str(tmp_path), exit_on_invalid=False)
     saved = np.load(str(tmp_path/"advanced_regime_weights.npz"))
     assert not np.allclose(saved["feature_mean"], 0.0, atol=1e-10)
+    w = saved["sjm_feature_weights"]
+    max_allowed = 2.0 / np.sqrt(3)
+    assert np.all(w <= max_allowed + 1e-9), f"SJM weight dominance: max={w.max():.4f} exceeds {max_allowed:.4f}"
+    assert (w / (np.linalg.norm(w) + 1e-12)).max() <= 0.60, f"OBI dominance: {(w/np.linalg.norm(w)).max():.2f}"
+
+
+def test_parquet_missing_dir_raises(monkeypatch, tmp_path):
+    import calibrate_pipeline as cp
+    monkeypatch.setenv("REGIME_DATA_SOURCE", "parquet")
+    monkeypatch.setenv("REGIME_DATES", "2026-06-12")
+    monkeypatch.setenv("REGIME_DATA_DIR", str(tmp_path / "nonexistent"))
+    with pytest.raises(FileNotFoundError, match="REGIME_DATA_DIR"):
+        cp.run_calibration(output_dir=str(tmp_path))
 
 
 def test_diff_scope_paths():

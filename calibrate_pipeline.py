@@ -21,6 +21,7 @@ from regime_vol_calibration import calibrate_target_vol, write_target_vol_artifa
 N_STATES = 3
 N_FEATURES = 3
 RANDOM_SEED = 42
+_ENGINE_CTF_MINIMUM = 0.182039
 
 
 def _utc() -> str:
@@ -141,9 +142,17 @@ def run_calibration(output_dir="weights", data_source=None, dates=None, exit_on_
     out=Path(output_dir); out.mkdir(parents=True, exist_ok=True)
     data_source=(data_source or os.environ.get("REGIME_DATA_SOURCE","synthetic")).strip().lower()
     if data_source == "parquet":
-        dates = dates or [d.strip() for d in os.environ.get("REGIME_DATES","").split(",") if d.strip()]
-        if not dates: raise ValueError("REGIME_DATES required for parquet calibration")
-        returns, obi_raw, vol_raw, timestamps = _load_parquet_training_data(os.environ.get("REGIME_DATA_DIR","data/parquet"), dates)
+        dates = dates or [d.strip() for d in os.environ.get("REGIME_DATES", "").split(",") if d.strip()]
+        if not dates:
+            raise ValueError("REGIME_DATES required for parquet calibration — set to comma-separated YYYY-MM-DD list")
+        _data_dir = os.environ.get("REGIME_DATA_DIR", "data/parquet")
+        if not os.path.isdir(_data_dir):
+            raise FileNotFoundError(
+                f"REGIME_DATA_DIR='{_data_dir}' does not exist. "
+                f"Set REGIME_DATA_DIR to the directory containing {{date}}_trades.parquet etc. "
+                f"For the uploaded audit data: REGIME_DATA_DIR=/mnt/user-data/uploads"
+            )
+        returns, obi_raw, vol_raw, timestamps = _load_parquet_training_data(_data_dir, dates)
     elif data_source == "synthetic":
         returns, obi_raw, vol_raw, timestamps = _synthetic_data(int(os.environ.get("REGIME_N_BARS","900"))); dates=[]
     else:
@@ -179,13 +188,26 @@ def run_calibration(output_dir="weights", data_source=None, dates=None, exit_on_
     within=np.zeros(N_FEATURES)
     for k in range(N_STATES):
         if np.sum(train_labels==k)>1: within += X_train[train_labels==k].var(axis=0)
-    weights=1.0/(np.where(within/N_STATES>1e-12, within/N_STATES, 1.0)+1e-8)
-    # FIX-D2: Clip before normalization to prevent any single feature from
-    # dominating via near-zero within-cluster variance (e.g. OBI 81% weight).
-    # Cap: no feature may exceed 3× the geometric mean of all feature weights.
+    weights = 1.0 / (np.where(within / N_STATES > 1e-12, within / N_STATES, 1.0) + 1e-8)
     _w_gmean = float(np.exp(np.mean(np.log(np.clip(weights, 1e-30, None)))))
     weights = np.clip(weights, 0.0, 3.0 * _w_gmean)
-    weights/=np.linalg.norm(weights)+1e-12
+    # Per-feature dominance cap: no feature may exceed 2x the uniform-weight contribution,
+    # and no feature may hold more than 60% of the normalized total.
+    _uniform_norm = 2.0 / np.sqrt(max(N_FEATURES, 1))
+    _feature_cap = min(float(_uniform_norm), 0.60)
+    weights = np.clip(weights / (np.linalg.norm(weights) + 1e-12), 0.0, _uniform_norm)
+    weights /= np.linalg.norm(weights) + 1e-12
+    for _ in range(N_FEATURES):
+        over = weights > _feature_cap
+        if not np.any(over):
+            break
+        weights[over] = _feature_cap
+        rem = ~over
+        rem_norm = np.linalg.norm(weights[rem])
+        rem_target = np.sqrt(max(1.0 - float(np.sum(weights[over] ** 2)), 0.0))
+        if rem_norm > 1e-12:
+            weights[rem] *= rem_target / rem_norm
+    weights /= np.linalg.norm(weights) + 1e-12
     mu=np.array([returns_train[train_labels==k].mean() if np.any(train_labels==k) else 0.0 for k in range(N_STATES)],float)
     sigma=np.array([max(returns_train[train_labels==k].std(),1e-4) if np.any(train_labels==k) else 0.005 for k in range(N_STATES)],float)
     beta=fit_nhhmm_beta(X_train, train_labels, N_STATES, N_FEATURES, max_iter=int(os.environ.get("REGIME_BETA_MAX_ITER", "80")), random_seed=RANDOM_SEED)
@@ -196,7 +218,10 @@ def run_calibration(output_dir="weights", data_source=None, dates=None, exit_on_
     val_macro_f1=_macro_f1(y_val, pred_val) if len(y_val) else 0.0
     correct=(pred_val==y_val) if len(y_val) else np.array([], bool)
     conviction=np.max(probs,axis=1)-np.partition(probs, -2, axis=1)[:,-2] if len(probs) else np.array([0.0])
-    conv_thr=float(np.percentile(conviction[correct],5)) if np.any(correct) else float(np.percentile(conviction,5))
+    conv_thr = max(
+        float(np.percentile(conviction[correct], 5)) if np.any(correct) else float(np.percentile(conviction, 5)),
+        _ENGINE_CTF_MINIMUM,
+    )
     balance_vals=np.bincount(y_val, minlength=3)/max(1,len(y_val)); balance={"TREND":float(balance_vals[0]),"BEAR":float(balance_vals[1]),"RANGE":float(balance_vals[2]),"CRISIS":0.0}
     dists=np.linalg.norm(X_val[:,None,:]-centroids[None,:,:],axis=2) if len(X_val) else np.empty((0,3))
     intra=float(np.mean(np.min(dists,axis=1))) if len(dists) else float('inf')
