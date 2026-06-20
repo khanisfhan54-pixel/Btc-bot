@@ -55,6 +55,9 @@ def test_synthetic_pipeline_production_invalid(tmp_path, monkeypatch):
     assert (tmp_path/"calibration_provenance.json").exists()
     prov = json.loads((tmp_path/"calibration_provenance.json").read_text())
     assert prov["conv_threshold_floor"] >= 0.182039, f"conv_threshold_floor {prov['conv_threshold_floor']} below engine minimum 0.182039"
+    assert set(["cluster_counts", "cluster_pct", "centroid_norms", "inter_cluster_distance", "intra_cluster_distance", "separation_ratio", "sjm_separation_ok", "sjm_cluster_balance_ok"]).issubset(prov)
+    assert prov["sjm_separation_ok"] is True
+    assert prov["sjm_cluster_balance_ok"] is True
     thresh = json.loads((tmp_path/"threshold_params.json").read_text())
     assert thresh["conv_threshold_floor"] >= 0.182039
     assert load_garch_artifact(str(tmp_path/"garch_params.json")) is not None
