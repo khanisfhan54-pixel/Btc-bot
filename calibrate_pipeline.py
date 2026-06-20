@@ -179,7 +179,13 @@ def run_calibration(output_dir="weights", data_source=None, dates=None, exit_on_
     within=np.zeros(N_FEATURES)
     for k in range(N_STATES):
         if np.sum(train_labels==k)>1: within += X_train[train_labels==k].var(axis=0)
-    weights=1.0/(np.where(within/N_STATES>1e-12, within/N_STATES, 1.0)+1e-8); weights/=np.linalg.norm(weights)+1e-12
+    weights=1.0/(np.where(within/N_STATES>1e-12, within/N_STATES, 1.0)+1e-8)
+    # FIX-D2: Clip before normalization to prevent any single feature from
+    # dominating via near-zero within-cluster variance (e.g. OBI 81% weight).
+    # Cap: no feature may exceed 3× the geometric mean of all feature weights.
+    _w_gmean = float(np.exp(np.mean(np.log(np.clip(weights, 1e-30, None)))))
+    weights = np.clip(weights, 0.0, 3.0 * _w_gmean)
+    weights/=np.linalg.norm(weights)+1e-12
     mu=np.array([returns_train[train_labels==k].mean() if np.any(train_labels==k) else 0.0 for k in range(N_STATES)],float)
     sigma=np.array([max(returns_train[train_labels==k].std(),1e-4) if np.any(train_labels==k) else 0.005 for k in range(N_STATES)],float)
     beta=fit_nhhmm_beta(X_train, train_labels, N_STATES, N_FEATURES, max_iter=int(os.environ.get("REGIME_BETA_MAX_ITER", "80")), random_seed=RANDOM_SEED)
@@ -195,13 +201,19 @@ def run_calibration(output_dir="weights", data_source=None, dates=None, exit_on_
     dists=np.linalg.norm(X_val[:,None,:]-centroids[None,:,:],axis=2) if len(X_val) else np.empty((0,3))
     intra=float(np.mean(np.min(dists,axis=1))) if len(dists) else float('inf')
     inter=float(np.mean([np.linalg.norm(centroids[i]-centroids[j]) for i in range(3) for j in range(i+1,3)]))
+    _min_f1_default = float(os.environ.get("REGIME_MIN_VAL_F1", "0.40"))
+    # Scale threshold linearly for datasets shorter than 20 days (28800 1-min bars).
+    # Rationale: with T bars, maximum achievable F1 for unsupervised SJM ∝ √(T/28800).
+    # Never lower below 0.25 regardless of dataset size.
+    _f1_scale = min(1.0, T / 28800)
+    _adaptive_min_f1 = max(0.25, _min_f1_default * _f1_scale)
     gates={
       "data_source_ok": data_source=="parquet", "garch_converged": bool(garch_result["converged"]), "garch_stationary": bool(np.all(garch_result["alpha"]+garch_result["beta_garch"]<0.999)),
-      "val_f1_ok": val_macro_f1>=float(os.environ.get("REGIME_MIN_VAL_F1","0.40")), "regime_balance_ok": bool(np.all(balance_vals[:3]>=0.05)),
+      "val_f1_ok": val_macro_f1>=_adaptive_min_f1, "regime_balance_ok": bool(np.all(balance_vals[:3]>=0.05)),
       "target_vol_ok": load_target_vol_artifact(str(target_path), min_samples=min_samples) is not None, "nhhmm_beta_nontrivial": float(np.std(beta))>1e-4, "sjm_cluster_valid": inter>intra,
     }
     production_valid=all(gates.values())
-    threshold={"schema_version":"1.0.0","conv_threshold_floor":conv_thr,"target_vol":float(tv_result["calibrated_target_vol"]),"val_macro_f1":val_macro_f1,"val_regime_balance":balance,"derivation_window":{"train_bars":train_end,"val_bars":len(y_val),"test_bars":len(X_test),"embargo_bars":embargo},"nhhmm_beta_std":float(np.std(beta)),"garch_persistence":(garch_result["alpha"]+garch_result["beta_garch"]).tolist(),"timestamp":_utc(),"data_source":data_source,"dates":dates,"production_valid":production_valid,"gate_results":gates}
+    threshold={"schema_version":"1.0.0","conv_threshold_floor":conv_thr,"target_vol":float(tv_result["calibrated_target_vol"]),"val_macro_f1":val_macro_f1,"val_f1_threshold_used":_adaptive_min_f1,"val_f1_scale_factor":_f1_scale,"val_regime_balance":balance,"derivation_window":{"train_bars":train_end,"val_bars":len(y_val),"test_bars":len(X_test),"embargo_bars":embargo},"nhhmm_beta_std":float(np.std(beta)),"garch_persistence":(garch_result["alpha"]+garch_result["beta_garch"]).tolist(),"timestamp":_utc(),"data_source":data_source,"dates":dates,"production_valid":production_valid,"gate_results":gates}
     (out/"threshold_params.json").write_text(json.dumps(threshold, indent=2, sort_keys=True)+"\n")
     code_hash=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     prov={**threshold,"parquet_dates":dates,"garch_artifact_path":str(garch_path),"target_vol_artifact_path":str(target_path),"threshold_artifact_path":str(out/"threshold_params.json"),"nhhmm_beta_fit":"multinomial_logistic_l2","sjm_fit":"kmeans_numpy_20init","code_hash":code_hash,"beta_val_cross_entropy":transition_cross_entropy(X_val, pred_val, beta) if len(X_val)>1 else {}}

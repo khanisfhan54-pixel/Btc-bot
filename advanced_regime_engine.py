@@ -1267,7 +1267,7 @@ class AdvancedRegimeEngine:
     _EDGE_POWER: float = 1.5
     _EDGE_MIN_ACTIVE: float = 0.35
     _SWITCH_MIN_PERSISTENCE: int = 2
-    _SWITCH_COOLDOWN_SEC: float = 60.0  # 1 bar at 1-min resolution
+    _SWITCH_COOLDOWN_SEC: float = 300.0  # 5 bars minimum at 1-min resolution
     _SWITCH_EDGE_BUFFER: float = 0.03
     _SWITCH_VOL_WEIGHT: float = 0.18
     _SWITCH_CONF_WEIGHT: float = 0.34
@@ -2500,10 +2500,15 @@ class AdvancedRegimeEngine:
                     with open(thresh_path, "r", encoding="utf-8") as fh:
                         thresh = json.load(fh)
                     ctf = float(thresh.get("conv_threshold_floor", self._CONV_THRESHOLD_FLOOR))
+                    # FIX-D4: Never lower threshold below class default (0.182039).
+                    # Artifact-derived value is a dataset-specific calibration; the class
+                    # default is the production safety floor. On 5-day calibration, the
+                    # artifact returns 0.043 (5th pct of conviction) which removes all gating.
+                    _CTF_MINIMUM = 0.182039  # production safety floor; do not lower
                     if 0.0 < ctf <= 1.0 and np.isfinite(ctf):
-                        self._CONV_THRESHOLD_FLOOR = ctf
-                        self._CONV_THRESHOLD_BASE = ctf
-                        LOGGER.info("[REGIME] conv_threshold_floor loaded from artifact: %.6f", ctf)
+                        self._CONV_THRESHOLD_FLOOR = max(ctf, _CTF_MINIMUM)
+                        self._CONV_THRESHOLD_BASE = max(ctf, _CTF_MINIMUM)
+                        LOGGER.info("[REGIME] conv_threshold_floor loaded: artifact=%.6f applied=%.6f", ctf, self._CONV_THRESHOLD_FLOOR)
                     else:
                         LOGGER.warning("[REGIME] conv_threshold_floor out of bounds (%r); keeping class default.", ctf)
                 except Exception as _thresh_exc:
