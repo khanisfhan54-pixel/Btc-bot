@@ -74,8 +74,8 @@ def fit_msgarch_mle(returns: np.ndarray, n_regimes: int = 2) -> dict:
     x0 = [5e-7, 3e-5, 0.12, 0.25, 0.85, 0.65, 0.97, 0.93]
     bounds = [
         (1e-10, 1e-3), (1e-8, 1e-2),   # omega
-        (0.01,  0.45), (0.05, 0.45),   # alpha
-        (0.50,  0.97), (0.45, 0.94),   # beta
+        (0.01,  0.40), (0.05, 0.40),   # alpha
+        (0.50,  0.88), (0.45, 0.88),   # beta
         (0.80,  0.999),(0.80, 0.999),  # transition probs
     ]
     result = minimize(
