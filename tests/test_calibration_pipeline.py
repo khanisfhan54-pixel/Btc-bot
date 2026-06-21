@@ -8,6 +8,7 @@ import pytest
 from calibrate_garch import write_garch_artifact, load_garch_artifact
 from calibrate_nhhmm_beta import fit_nhhmm_beta, transition_cross_entropy
 from advanced_regime_engine import MSGARCH_RiskEngine
+import calibrate_pipeline
 
 
 def _garch_result(converged=True, persistence=0.9):
@@ -97,3 +98,56 @@ def test_diff_scope_paths():
     allowed={"calibrate_regime.py","calibrate_garch.py","calibrate_nhhmm_beta.py","calibrate_pipeline.py","advanced_regime_engine.py","weights/garch_params.json","weights/threshold_params.json","weights/target_vol.json","weights/calibration_provenance.json","weights/advanced_regime_weights.npz","tests/test_calibration_pipeline.py"}
     out=subprocess.check_output(["git","diff","--name-only"], text=True).splitlines()
     assert set(out).issubset(allowed)
+
+
+def test_sjm_weight_dominance_cap(tmp_path, monkeypatch):
+    # Uses synthetic mode (fast)
+    monkeypatch.setenv("REGIME_DATA_SOURCE", "synthetic")
+    monkeypatch.setenv("REGIME_N_BARS", "500")
+    prov = calibrate_pipeline.run_calibration(output_dir=str(tmp_path))
+    w = np.load(str(tmp_path / "advanced_regime_weights.npz"))["sjm_feature_weights"]
+    w_norm = w / (np.linalg.norm(w) + 1e-12)
+    assert w_norm.max() <= 0.60 + 1e-9, f"Feature dominance: {w_norm.max():.4f}"
+    assert w_norm.max() / w_norm.min() < 10.0, "Weight ratio too extreme"
+
+
+def test_conv_threshold_floor_minimum(tmp_path, monkeypatch):
+    monkeypatch.setenv("REGIME_DATA_SOURCE", "synthetic")
+    monkeypatch.setenv("REGIME_N_BARS", "500")
+    prov = calibrate_pipeline.run_calibration(output_dir=str(tmp_path))
+    assert prov["conv_threshold_floor"] >= 0.182039
+    thr = json.loads((tmp_path / "threshold_params.json").read_text())
+    assert thr["conv_threshold_floor"] >= 0.182039
+
+
+def test_crisis_state_gate_present(tmp_path, monkeypatch):
+    monkeypatch.setenv("REGIME_DATA_SOURCE", "synthetic")
+    monkeypatch.setenv("REGIME_N_BARS", "500")
+    prov = calibrate_pipeline.run_calibration(output_dir=str(tmp_path))
+    assert "crisis_state_ok" in prov["gate_results"]
+    assert "crisis_state_fraction" in prov
+
+
+def test_audit_mode_bypasses_sample_size_gate(tmp_path, monkeypatch):
+    monkeypatch.setenv("REGIME_DATA_SOURCE", "synthetic")
+    monkeypatch.setenv("REGIME_N_BARS", "500")
+    monkeypatch.setenv("REGIME_AUDIT_MODE", "1")
+    prov = calibrate_pipeline.run_calibration(output_dir=str(tmp_path))
+    assert prov["gate_results"]["sample_size_ok"] == True
+    assert prov.get("audit_mode") == True
+
+
+def test_deployed_artifacts_not_synthetic():
+    """Fails if weights/ still contains synthetic artifacts when real artifacts are available."""
+    import json, os
+    if not os.path.exists("weights/calibration_provenance.json"):
+        pytest.skip("weights/ not deployed")
+    prov = json.load(open("weights/calibration_provenance.json"))
+    real_artifacts_available = os.path.exists("/home/claude/weights_real/calibration_provenance.json")
+    parquet_uploads_available = os.path.isdir("/mnt/user-data/uploads")
+    if prov["data_source"] == "synthetic" and not (real_artifacts_available or parquet_uploads_available):
+        pytest.skip("parquet deployment artifacts are not available in this environment")
+    assert prov["data_source"] != "synthetic", \
+        "weights/ contains synthetic artifacts — run parquet calibration and deploy"
+    gr = json.load(open("weights/garch_params.json"))
+    assert float(gr["log_lik"]) > 0, "GARCH fast-path detected in deployed artifacts"
