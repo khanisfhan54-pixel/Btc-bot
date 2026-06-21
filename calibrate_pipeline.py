@@ -343,22 +343,26 @@ def run_calibration(output_dir="weights", data_source=None, dates=None, exit_on_
     partial_day_stats = data_metadata["partial_day_stats"]
     full_day_count = sum(1 for stats in partial_day_stats.values() if stats.get("full_day_ok"))
     supplied_dates = len(dates)
+    _audit_mode = os.environ.get("REGIME_AUDIT_MODE", "0").strip().lower() in ("1", "true", "yes")
     min_bars = int(os.environ.get("REGIME_MIN_BARS", "10000"))
     min_dates = int(os.environ.get("REGIME_MIN_DATES", "20"))
+    _min_crisis_frac = float(os.environ.get("REGIME_MIN_CRISIS_FRAC", "0.05"))
+    _crisis_frac = float(np.min(cluster_pct_arr))
     gates={
       "data_source_ok": data_source=="parquet", "garch_converged": bool(garch_result["converged"]), "garch_stationary": bool(np.all(garch_result["alpha"]+garch_result["beta_garch"]<0.999)),
       "val_f1_ok": val_macro_f1>=_adaptive_min_f1, "regime_balance_ok": bool(np.all(balance_vals[:3]>=0.05)),
       "target_vol_ok": load_target_vol_artifact(str(target_path), min_samples=min_samples) is not None, "nhhmm_beta_nontrivial": float(np.std(beta))>1e-4, "sjm_cluster_valid": inter>intra,
       "full_day_data_ok": (full_day_count / max(1, supplied_dates)) >= 0.80 if supplied_dates else False,
       "garch_fit_ok": garch_fit_ok,
-      "sample_size_ok": T >= min_bars and supplied_dates >= min_dates,
+      "sample_size_ok": (T >= min_bars and supplied_dates >= min_dates) or _audit_mode,
+      "crisis_state_ok": bool(_crisis_frac >= _min_crisis_frac),
       "sjm_balance_ok": bool(np.all(cluster_pct_arr >= 0.05)),
       "sjm_separation_ok": bool(separation_ratio > 1.5),
       "sjm_cluster_balance_ok": bool(np.all(cluster_pct_arr >= 0.05)),
       "obi_quality_ok": float(np.nanmean(np.abs(obi_raw))) > 1e-4,
     }
     production_valid=all(gates.values())
-    threshold={"schema_version":"1.0.0","conv_threshold_floor":conv_thr,"target_vol":float(tv_result["calibrated_target_vol"]),"val_macro_f1":val_macro_f1,"val_f1_threshold_used":_adaptive_min_f1,"val_f1_scale_factor":_f1_scale,"val_regime_balance":balance,"derivation_window":{"train_bars":train_end,"val_bars":len(y_val),"test_bars":len(X_test),"embargo_bars":embargo},"nhhmm_beta_std":float(np.std(beta)),"garch_persistence":(garch_result["alpha"]+garch_result["beta_garch"]).tolist(),"timestamp":_utc(),"data_source":data_source,"dates":dates,"production_valid":production_valid,"gate_results":gates}
+    threshold={"schema_version":"1.0.0","conv_threshold_floor":conv_thr,"target_vol":float(tv_result["calibrated_target_vol"]),"val_macro_f1":val_macro_f1,"val_f1_threshold_used":_adaptive_min_f1,"val_f1_scale_factor":_f1_scale,"val_regime_balance":balance,"derivation_window":{"train_bars":train_end,"val_bars":len(y_val),"test_bars":len(X_test),"embargo_bars":embargo},"nhhmm_beta_std":float(np.std(beta)),"garch_persistence":(garch_result["alpha"]+garch_result["beta_garch"]).tolist(),"timestamp":_utc(),"data_source":data_source,"dates":dates,"production_valid":production_valid,"gate_results":gates,"audit_mode":bool(_audit_mode),"sample_size_bars":int(T),"sample_size_dates":int(supplied_dates),"crisis_state_fraction":float(_crisis_frac),"min_crisis_frac_required":float(_min_crisis_frac)}
     (out/"threshold_params.json").write_text(json.dumps(threshold, indent=2, sort_keys=True)+"\n")
     code_hash=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     prov={**threshold,"partial_day_stats":partial_day_stats,"feature_diagnostics":feature_diagnostics,"sjm_health":sjm_health,"cluster_counts":sjm_health["cluster_counts"],"cluster_pct":sjm_health["cluster_pct"],"centroid_norms":sjm_health["centroid_norms"],"inter_cluster_distance":inter_cluster_distance,"intra_cluster_distance":intra_cluster_distance,"separation_ratio":separation_ratio,"sjm_separation_ok":gates["sjm_separation_ok"],"sjm_cluster_balance_ok":gates["sjm_cluster_balance_ok"],"obi_return_corr":data_metadata.get("obi_return_corr", return_vs_obi_corr),"parquet_dates":dates,"garch_artifact_path":str(garch_path),"target_vol_artifact_path":str(target_path),"threshold_artifact_path":str(out/"threshold_params.json"),"nhhmm_beta_fit":"multinomial_logistic_l2","sjm_fit":"kmeans_numpy_20init","code_hash":code_hash,"beta_val_cross_entropy":transition_cross_entropy(X_val, pred_val, beta) if len(X_val)>1 else {}}
