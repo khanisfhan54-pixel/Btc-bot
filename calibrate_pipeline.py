@@ -183,7 +183,10 @@ def _load_parquet_training_data(data_dir: str, dates: list[str]):
         mp["ts_floor"]=_timestamp_series(mp).dt.floor("min"); mark=_find_col(mp,["mark_price","markPrice","price"]); fund=_find_col(mp,["funding_rate_bps","fundingRate","funding_rate"])
         m1=mp.groupby("ts_floor").agg(mark_price=(mark,"last")); m1["funding_rate_bps"]=mp.groupby("ts_floor")[fund].last() if fund else 0.0
         oi["ts_floor"]=_timestamp_series(oi).dt.floor("min"); oic=_find_col(oi,["open_interest","openInterest","oi"]); oi1=oi.groupby("ts_floor")[oic].last().to_frame("open_interest")
-        frames.append(t1.join([o1,m1,oi1], how="inner"))
+        # LEFT join OI so trade-bar count is preserved; forward-fill sparse OI values.
+        merged = t1.join([o1, m1], how="inner")
+        oi1_ffill = oi1.reindex(merged.index, method="ffill")
+        frames.append(merged.join(oi1_ffill, how="left"))
     df=__import__('pandas').concat(frames).sort_index()
     price=df["mark_price"].astype(float).ffill()
     returns=np.log(price).diff().dropna(); df=df.loc[returns.index]
@@ -250,7 +253,16 @@ def run_calibration(output_dir="weights", data_source=None, dates=None, exit_on_
                len(np.unique(X_raw[:, 1])) <= 3, \
                "feature_mean identical on train and full — likely pre-normalization leakage"
     feature_mean=X_raw[:train_end].mean(axis=0); feature_std=np.where(X_raw[:train_end].std(axis=0)>1e-12,X_raw[:train_end].std(axis=0),1.0)
-    X_norm=(X_raw-feature_mean)/feature_std; X_train=X_norm[:train_end]; X_val=X_norm[embargo_1:val_end]; X_test=X_norm[embargo_2:]
+    X_norm=(X_raw-feature_mean)/feature_std
+    # Sanity guard: after z-scoring each non-constant feature should have unit std
+    # on the training set.
+    _actual_std = X_norm[:train_end].std(axis=0)
+    _expected_std = np.where(X_raw[:train_end].std(axis=0)>1e-12, 1.0, 0.0)
+    assert np.allclose(_actual_std, _expected_std, atol=0.01), (
+        f"Post-normalization std check failed: {_actual_std}. "
+        "Feature scaling is inconsistent."
+    )
+    X_train=X_norm[:train_end]; X_val=X_norm[embargo_1:val_end]; X_test=X_norm[embargo_2:]
     y=triple_barrier_labels(returns); y_train=y[:train_end]; y_val=y[embargo_1:val_end]
     returns_train=returns[:train_end]; timestamps_train=timestamps[:train_end]
 
@@ -318,6 +330,19 @@ def run_calibration(output_dir="weights", data_source=None, dates=None, exit_on_
     }
     mu=np.array([returns_train[train_labels==k].mean() if np.any(train_labels==k) else 0.0 for k in range(N_STATES)],float)
     sigma=np.array([max(returns_train[train_labels==k].std(),1e-4) if np.any(train_labels==k) else 0.005 for k in range(N_STATES)],float)
+    # Guard: reject collapsed emission distributions before saving weights.
+    # Bhattacharyya coefficient > 0.70 between any state pair is a calibration failure.
+    def _bc_gaussian(m1, s1, m2, s2):
+        va, vb = s1**2, s2**2; v_avg = (va+vb)/2
+        return float(np.exp(-(0.25*(m1-m2)**2/v_avg + 0.5*np.log(v_avg/np.sqrt(va*vb)))))
+    for _i in range(N_STATES):
+        for _j in range(_i+1, N_STATES):
+            _bc = _bc_gaussian(mu[_i], sigma[_i], mu[_j], sigma[_j])
+            if _bc > 0.70:
+                raise ValueError(
+                    f"NHHMM emission collapse: states {_i}/{_j} BC={_bc:.4f}>0.70. "
+                    "Increase training data or adjust triple_barrier_labels window."
+                )
     beta=fit_nhhmm_beta(X_train, train_labels, N_STATES, N_FEATURES, max_iter=int(os.environ.get("REGIME_BETA_MAX_ITER", "80")), random_seed=RANDOM_SEED)
     np.savez(out/"advanced_regime_weights.npz", nhhmm_beta=beta, nhhmm_mu=mu, nhhmm_sigma=sigma, sjm_centroids=centroids, sjm_feature_weights=weights, feature_mean=feature_mean, feature_std=feature_std)
 
@@ -354,7 +379,9 @@ def run_calibration(output_dir="weights", data_source=None, dates=None, exit_on_
       "target_vol_ok": load_target_vol_artifact(str(target_path), min_samples=min_samples) is not None, "nhhmm_beta_nontrivial": float(np.std(beta))>1e-4, "sjm_cluster_valid": inter>intra,
       "full_day_data_ok": (full_day_count / max(1, supplied_dates)) >= 0.80 if supplied_dates else False,
       "garch_fit_ok": garch_fit_ok,
-      "sample_size_ok": (T >= min_bars and supplied_dates >= min_dates) or _audit_mode,
+      # Count effective bars after join (not raw T) to avoid false-pass on OI-decimated data.
+      # This gate should reference the actual training set size used by the model.
+      "sample_size_ok": (len(returns) >= min_bars and supplied_dates >= min_dates) or _audit_mode,
       "crisis_state_ok": bool(_crisis_frac >= _min_crisis_frac),
       "sjm_balance_ok": bool(np.all(cluster_pct_arr >= 0.05)),
       "sjm_separation_ok": bool(separation_ratio > 1.5),
