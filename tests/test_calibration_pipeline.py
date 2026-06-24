@@ -151,3 +151,46 @@ def test_deployed_artifacts_not_synthetic():
         "weights/ contains synthetic artifacts — run parquet calibration and deploy"
     gr = json.load(open("weights/garch_params.json"))
     assert float(gr["log_lik"]) > 0, "GARCH fast-path detected in deployed artifacts"
+
+def test_parquet_loader_forward_fills_sparse_oi(monkeypatch, tmp_path):
+    import pandas as pd
+    import calibrate_pipeline as cp
+
+    date = "2026-06-12"
+    for kind in ["trades", "markprice", "orderbook", "openinterest"]:
+        (tmp_path / f"{date}_{kind}.parquet").touch()
+
+    minutes = pd.date_range("2026-06-12", periods=20, freq="min", tz="UTC")
+    oi_minutes = minutes[::5]
+    frames = {
+        "trades": pd.DataFrame({
+            "timestamp": minutes.view("int64") // 1_000_000,
+            "price": np.linspace(100.0, 119.0, len(minutes)),
+            "quantity": 1.0,
+            "is_buyer_maker": False,
+        }),
+        "markprice": pd.DataFrame({
+            "timestamp": minutes.view("int64") // 1_000_000,
+            "mark_price": np.linspace(100.0, 119.0, len(minutes)),
+            "funding_rate_bps": 0.0,
+        }),
+        "orderbook": pd.DataFrame({
+            "timestamp": minutes.view("int64") // 1_000_000,
+            "obi": np.linspace(-0.5, 0.5, len(minutes)),
+        }),
+        "openinterest": pd.DataFrame({
+            "timestamp": oi_minutes.view("int64") // 1_000_000,
+            "open_interest": np.linspace(1000.0, 1003.0, len(oi_minutes)),
+        }),
+    }
+
+    def fake_read(path):
+        return frames[path.stem.split("_", 1)[1]].copy()
+
+    monkeypatch.setattr(cp, "_read_parquet_all", fake_read)
+    returns, obi_raw, vol_raw, timestamps, metadata = cp._load_parquet_training_data(str(tmp_path), [date])
+
+    assert len(returns) == len(minutes) - 1
+    assert len(returns) > len(oi_minutes)
+    assert len(obi_raw) == len(vol_raw) == len(timestamps) == len(returns)
+    assert metadata["partial_day_stats"][date]["bars"] == len(minutes)

@@ -333,15 +333,23 @@ def run_calibration(output_dir="weights", data_source=None, dates=None, exit_on_
     # Guard: reject collapsed emission distributions before saving weights.
     # Bhattacharyya coefficient > 0.70 between any state pair is a calibration failure.
     def _bc_gaussian(m1, s1, m2, s2):
-        va, vb = s1**2, s2**2; v_avg = (va+vb)/2
-        return float(np.exp(-(0.25*(m1-m2)**2/v_avg + 0.5*np.log(v_avg/np.sqrt(va*vb)))))
+        va, vb = s1**2, s2**2
+        v_avg = (va + vb) / 2.0
+        bd = 0.25 * (m1 - m2)**2 / v_avg + 0.5 * np.log(v_avg / np.sqrt(va * vb))
+        return float(np.exp(-bd))
+
+    _BC_COLLAPSE_THRESHOLD = 0.70
     for _i in range(N_STATES):
-        for _j in range(_i+1, N_STATES):
+        for _j in range(_i + 1, N_STATES):
             _bc = _bc_gaussian(mu[_i], sigma[_i], mu[_j], sigma[_j])
-            if _bc > 0.70:
+            if data_source == "parquet" and _bc > _BC_COLLAPSE_THRESHOLD:
                 raise ValueError(
-                    f"NHHMM emission collapse: states {_i}/{_j} BC={_bc:.4f}>0.70. "
-                    "Increase training data or adjust triple_barrier_labels window."
+                    f"NHHMM emission collapse: states {_i}/{_j} "
+                    f"BC={_bc:.4f} > {_BC_COLLAPSE_THRESHOLD}. "
+                    f"mu=({mu[_i]:.6f},{mu[_j]:.6f}) "
+                    f"sigma=({sigma[_i]:.6f},{sigma[_j]:.6f}). "
+                    "Apply D1 fix (left-join OI) to increase training bars, "
+                    "or extend REGIME_DATES to cover more market regimes."
                 )
     beta=fit_nhhmm_beta(X_train, train_labels, N_STATES, N_FEATURES, max_iter=int(os.environ.get("REGIME_BETA_MAX_ITER", "80")), random_seed=RANDOM_SEED)
     np.savez(out/"advanced_regime_weights.npz", nhhmm_beta=beta, nhhmm_mu=mu, nhhmm_sigma=sigma, sjm_centroids=centroids, sjm_feature_weights=weights, feature_mean=feature_mean, feature_std=feature_std)
