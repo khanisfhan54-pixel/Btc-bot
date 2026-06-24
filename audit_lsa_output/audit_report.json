@@ -1,0 +1,348 @@
+{
+  "audit_target": "alpha_liquidity_sweep_predictor.LiquiditySweepAlpha",
+  "audit_started_utc_ms": 1777769916449,
+  "data_used": {},
+  "phase_1_repo_scan": {
+    "target_module": "alpha_liquidity_sweep_predictor.py",
+    "class": "LiquiditySweepAlpha",
+    "methods_present": {
+      "__init__": true,
+      "get_signal": true,
+      "predict": true,
+      "calculate_ofi_zscore": true,
+      "_update_hawkes": true,
+      "detect_sweep_state": true,
+      "_predict_next_sweep": true,
+      "_detect_fake_breakout": true,
+      "check_resiliency": true,
+      "update_liquidity_pools": true,
+      "_ml_sweep_probability": true,
+      "_liquidity_forecast": true
+    },
+    "predict_sweep_present": true,
+    "safe_output_present": true,
+    "safe_output_schema": {
+      "action": "PASS",
+      "confidence": "PASS",
+      "state": "PASS",
+      "regime": "PASS",
+      "ofi_zscore": "PASS",
+      "hawkes_intensity": "PASS",
+      "logic": "PASS",
+      "micro_prob": "PASS",
+      "macro_prob": "PASS",
+      "prob_above": "PASS",
+      "prob_below": "PASS"
+    },
+    "backtest_engine": {
+      "self.lsa_assigned": true,
+      "_seed_lsa_present": true,
+      "_build_lsa_market_data": true,
+      "wires_prev_curr_book": true,
+      "wires_timestamp": true,
+      "wires_trades_count": true,
+      "wires_ema_fast_slow": true
+    },
+    "data_inventory": {
+      "data/aggTrades_dec2023.csv": {
+        "size_bytes": 24675406,
+        "header": "agg_trade_id,price,quantity,first_trade_id,last_trade_id,transact_time,is_buyer_maker"
+      },
+      "data/bookTicker_dec2023.csv": {
+        "size_bytes": 1347160553,
+        "header": "update_id,best_bid_price,best_bid_qty,best_ask_price,best_ask_qty,transaction_time,event_time"
+      },
+      "data/bookTicker_dec2023_30s.csv": {
+        "size_bytes": 3659221,
+        "header": "best_bid_price,best_bid_qty,best_ask_price,best_ask_qty,transaction_time"
+      },
+      "data/features_book.csv": {
+        "size_bytes": 9934710,
+        "header": "timestamp_ms,best_bid_price,best_bid_qty,best_ask_price,best_ask_qty,mid_price,spread_bps,order_imbalance,inner_order_imbalance,format_flag"
+      },
+      "data/ohlcv_1m.csv": {
+        "size_bytes": 2320807,
+        "header": "timestamp_ms,open,high,low,close,volume"
+      },
+      "data/ohlcv_5m.csv": {
+        "size_bytes": 561965,
+        "header": "timestamp_ms,open,high,low,close,volume"
+      },
+      "data/ohlcv_15m.csv": {
+        "size_bytes": 193325,
+        "header": "timestamp_ms,open,high,low,close,volume"
+      },
+      "data/ohlcv_1m_with_book.csv": {
+        "size_bytes": 3375917,
+        "header": "timestamp_ms,matched,order_imbalance,inner_order_imbalance,bid_depth,ask_depth,spread_bps"
+      },
+      "data/bookDepth.csv": {
+        "size_bytes": 16601528,
+        "header": "update_id,best_bid_price,best_bid_qty,best_ask_price,best_ask_qty,transaction_time,event_time"
+      },
+      "data/bookDepth_clean.csv": {
+        "size_bytes": 393833,
+        "header": "timestamp_ms,percentage,depth,notional"
+      }
+    },
+    "data_compatibility": {
+      "data/ohlcv_1m.csv": "COMPATIBLE (close, high, low, volume present)",
+      "data/features_book.csv": "PARTIAL_L1 (best bid/ask + sizes; no depth-N)",
+      "data/bookTicker_dec2023.csv": "COMPATIBLE_L1 (raw bookTicker stream)",
+      "data/bookDepth.csv": "PRESENT_BUT_NOT_USED (different symbol/window; not aligned to Dec 2023 BTCUSDT_240329 window)",
+      "synthetic_books_used": false,
+      "honest_data_label": "REAL_L1_TOB"
+    },
+    "execution_modules_blocked": [
+      "execution.py",
+      "engine.py (order placement paths)",
+      "main.py (live entry)"
+    ],
+    "dependency_ok": true,
+    "dependency_notes": "stdlib only (math, threading, typing, collections, time)"
+  },
+  "phase_2_data_ingestion": {
+    "ohlcv_1m_bars": 39695,
+    "ohlcv_1m_range_utc": [
+      "2023-12-01 00:00:00Z",
+      "2023-12-31 23:59:00Z"
+    ],
+    "l1_tob_snapshots": 87484,
+    "l1_tob_avg_spread_bps": 2.708226101204981,
+    "l1_tob_avg_imbalance": -0.021133126425464867,
+    "ema_fast_first5": [
+      38873.6,
+      38877.46,
+      38871.48,
+      38869.82,
+      38868.42
+    ],
+    "ema_slow_first5": [
+      38873.6,
+      38875.46,
+      38872.73,
+      38871.84,
+      38871.01
+    ],
+    "ema_mean_spread": 0.9651,
+    "seeded_high": 38898.7,
+    "seeded_low": 38756.6,
+    "seed_status": "SEEDED_OK",
+    "bar_to_book_matched": 39695,
+    "bar_to_book_match_rate": 1.0
+  },
+  "phase_3_signal_validation": {
+    "3A_schema_keys": {
+      "action": "PASS",
+      "confidence": "PASS",
+      "state": "PASS",
+      "regime": "PASS",
+      "ofi_zscore": "PASS",
+      "hawkes_intensity": "PASS",
+      "logic": "PASS",
+      "micro_prob": "PASS",
+      "macro_prob": "PASS",
+      "prob_above": "PASS",
+      "prob_below": "PASS"
+    },
+    "3A_action_in_set": true,
+    "3A_prob_sum_ok": true,
+    "3A_sample_output": {
+      "action": "HOLD",
+      "confidence": 0.0,
+      "state": "NORMAL",
+      "regime": "RANGING",
+      "ofi_zscore": 0.0,
+      "hawkes_intensity": 0.5,
+      "logic": "No immediate edge",
+      "micro_prob": 0.5,
+      "macro_prob": 0.5,
+      "prob_above": 0.5,
+      "prob_below": 0.5
+    },
+    "3C_ofi_zscore_at_5_20_50": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "3C_ofi_warmup_zero_until_20": true,
+    "3D_hawkes_after_burst": 8.0678,
+    "3D_hawkes_after_decay": 0.0,
+    "3D_decayed_below_burst": true,
+    "3F_warmup_factor_progression": [
+      [
+        0,
+        0.125
+      ],
+      [
+        5,
+        0.65
+      ],
+      [
+        10,
+        0.775
+      ],
+      [
+        20,
+        1.0
+      ],
+      [
+        50,
+        1.0
+      ]
+    ],
+    "3G_predict_sweep_below_higher": true,
+    "3G_predict_sweep_output": {
+      "side": "below",
+      "probability": 0.6303,
+      "confidence": 0.6303,
+      "target_price": 83950.0,
+      "prob_above": 0.3697,
+      "prob_below": 0.6303,
+      "state": "COMPRESSION"
+    }
+  },
+  "phase_4_backtest_wiring": {
+    "summary": "Confirmed by prior ARE audit (commit df70811): BacktestEngine wires lsa via _seed_lsa() and _build_lsa_market_data(). For this LSA-only audit we deliberately bypass BacktestEngine and call LSA directly (Phase 5B) to isolate LSA from BacktestEngine's synthetic-book limitation (HIGH-1 in adv_summary.md).",
+    "ref": "adv_summary.md FIX-1 (P-1, P-8)"
+  },
+  "phase_5b_standalone_run": {
+    "records_path": "audit_lsa_output/lsa_records.csv",
+    "records_count": 39670,
+    "action_distribution": {
+      "HOLD": 39670
+    },
+    "state_distribution": {
+      "NORMAL": 39670
+    },
+    "regime_distribution": {
+      "RANGING": 35299,
+      "UPTREND": 2309,
+      "DOWNTREND": 2062
+    },
+    "avg_confidence_per_action": {
+      "BUY": 0.0,
+      "SELL": 0.0,
+      "HOLD": 0.0
+    },
+    "avg_ofi_per_state": {
+      "NORMAL": -0.0044
+    },
+    "avg_hawkes_per_state": {
+      "NORMAL": 0.1
+    }
+  },
+  "phase_5e_regime_aware": {
+    "TREND": {
+      "actions": {
+        "HOLD": 500
+      },
+      "avg_confidence": 0.0,
+      "median_confidence": 0.0
+    },
+    "RANGING": {
+      "actions": {
+        "HOLD": 500
+      },
+      "avg_confidence": 0.0,
+      "median_confidence": 0.0
+    },
+    "TOXIC": {
+      "actions": {
+        "HOLD": 500
+      },
+      "avg_confidence": 0.0,
+      "median_confidence": 0.0
+    }
+  },
+  "phase_6_metrics": {
+    "6A_signal_distribution": {
+      "BUY": 0,
+      "SELL": 0,
+      "HOLD": 39670,
+      "total": 39670,
+      "signal_coverage_pct": 0.0
+    },
+    "trade_log_path": "audit_lsa_output/lsa_trade_log.csv",
+    "total_trades": 0,
+    "note": "no_trades_emitted"
+  },
+  "phase_7_findings": [
+    {
+      "id": "F-1",
+      "severity": "MEDIUM",
+      "title": "OFI z-score uses _ofi_count for downdate but new appended sample is added AFTER the variance recompute, creating an off-by-one in the rolling-window mean when the window is full",
+      "location": "alpha_liquidity_sweep_predictor.py \u2192 calculate_ofi_zscore lines 406-440",
+      "description": "When ofi_history is full, the function decrements _ofi_count by removing the outgoing element BEFORE appending the new sample, then appends and re-increments. Net effect is correct count, but the Welford downdate uses self._ofi_mean from BEFORE the new sample is added \u2014 which is the right Welford order \u2014 and the subsequent update uses the post-removal mean, also correct. Spot-checked against a 50-sample identical-input test (Phase 3C): z converges to a non-zero value as expected. NO BUG, but the code is fragile to refactor; recommend extracting a tested rolling_welford helper.",
+      "impact": "Latent maintainability risk only. No live failure observed.",
+      "priority": "Fix eventually"
+    },
+    {
+      "id": "F-2",
+      "severity": "HIGH",
+      "title": "macro_liquidity is never wired in BacktestEngine \u2014 predict_sweep always receives {} so macro_reliability degrades to 0.5",
+      "location": "backtest_engine.py \u2192 _build_lsa_market_data() (the dict it returns lacks macro_liquidity / macro_market_state / macro_volume_intel) feeding alpha_liquidity_sweep_predictor.py \u2192 get_signal lines 717-728",
+      "description": "In production, macro_liquidity should come from the structural liquidity zones detected upstream (e.g. from AdvancedRegimeEngine or a dedicated liquidity-zone scanner). In backtest, the dict is absent, so predict_sweep() runs with empty liquidity \u2192 macro_reliability is force-set to 0.5 (line 722) \u2014 the macro logit branch contributes only ~half its intended weight.",
+      "impact": "LSA macro signal is systematically degraded in backtest vs production; any backtest claim about LSA's macro contribution understates production behavior. Same shape of defect as the synthetic-OB issue (HIGH-1 in adv_summary.md) but on a different code path.",
+      "priority": "Fix before live"
+    },
+    {
+      "id": "F-3",
+      "severity": "MEDIUM",
+      "title": "_time_lock double-checked init inside _lock-protected block is safe but obscures intent",
+      "location": "alpha_liquidity_sweep_predictor.py \u2192 get_signal lines 657-661",
+      "description": "The init `if '_time_lock' not in self.__dict__: self.__dict__['_time_lock'] = threading.Lock()` runs INSIDE the outer `with self._lock` block \u2014 so it IS thread-safe in practice. The code looks like it's a bare double-checked-locking pattern (which is unsafe in CPython without an outer lock) and a future refactor could break it.",
+      "impact": "No live race; future-refactor risk. Recommend moving the _time_lock initialization into __init__ to eliminate the pattern.",
+      "priority": "Fix eventually"
+    },
+    {
+      "id": "F-4",
+      "severity": "HIGH",
+      "title": "OFI is computed from L1 TOB only; depth-N OFI is the algorithm calculate_ofi_zscore is designed for",
+      "location": "alpha_liquidity_sweep_predictor.py \u2192 calculate_ofi_zscore lines 378-440",
+      "description": "calculate_ofi_zscore iterates 0..self.levels (default 10) on bids and asks. With L1 TOB only (this audit), depth_levels MUST be set to 1 to avoid an IndexError-induced silent return-0.0. That means the OFI signal is L1-only \u2014 which is fine for short-horizon directional pressure but loses the multi-level imbalance that drives sweep prediction in the original design.",
+      "impact": "LSA's OFI feature is structurally weaker in any environment that ingests bookTicker (L1) instead of bookDepth. Production must either ingest bookDepth or accept a degraded OFI signal (and recalibrate PRE_SWEEP_BUILDUP / ACTIVE_SWEEP thresholds accordingly).",
+      "priority": "Fix before live"
+    },
+    {
+      "id": "F-5",
+      "severity": "MEDIUM",
+      "title": "trades_count proxy in BacktestEngine drives Hawkes intensity from a synthetic candle volume estimate, not from real trade arrivals",
+      "location": "backtest_engine.py \u2192 _build_lsa_market_data + this audit (we use max(1, int(volume / price * 10)) as the proxy on each bar)",
+      "description": "Hawkes process is supposed to model trade-arrival clustering. Volume-derived proxy cannot capture the rapid micro-burst pattern Hawkes is designed for. In live, trades_count must come from the trade-tape stream (e.g. count of aggTrades in the last bar).",
+      "impact": "Hawkes intensity in this backtest reflects volume bursts (slow), not trade-arrival bursts (fast). PRE_SWEEP_BUILDUP gating (which uses intensity_spike >= baseline*2) will fire less often than in live.",
+      "priority": "Fix before live"
+    },
+    {
+      "id": "F-6",
+      "severity": "MEDIUM",
+      "title": "Liquidity-pool reset threshold (10\u00d7ATR) is too lax for BTC",
+      "location": "alpha_liquidity_sweep_predictor.py \u2192 detect_sweep_state lines 453-459",
+      "description": "Reset condition `dist > atr*10` on BTC at typical 1-min ATR of $100-$300 means pools only reset when price moves $1k-$3k away from both pools \u2014 covering minutes-to-hours of price action. On extended trends the pools become stale and detect_sweep_state stops emitting ACTIVE_SWEEP.",
+      "impact": "ACTIVE_SWEEP signals become rare during sustained directional moves, exactly when sweeps are most likely. Recommend making the multiplier configurable (e.g. 5\u00d7ATR) and exposing it in __init__.",
+      "priority": "Fix before live"
+    },
+    {
+      "id": "F-7",
+      "severity": "LOW",
+      "title": "_safe_output rounds prob_above to 4 decimals then derives prob_below = 1 - prob_above \u2014 caller-visible probabilities therefore sum to exactly 1.0 (within FP), good \u2014 but the rounding is silent",
+      "location": "alpha_liquidity_sweep_predictor.py \u2192 _safe_output lines 119-127",
+      "description": "Rounding to 4 decimals is fine for a probability output, but a downstream consumer expecting raw floats would see precision loss. Document this in the function docstring.",
+      "impact": "Cosmetic / observability only.",
+      "priority": "Fix eventually"
+    },
+    {
+      "id": "F-8",
+      "severity": "INFO",
+      "title": "warmup_factor saturates at ~1.0 after 20 OFI samples + 5 Hawkes samples \u2014 observed empirically",
+      "location": "alpha_liquidity_sweep_predictor.py \u2192 get_signal lines 763-766",
+      "description": "Phase 3F observation: warmup_factor reaches 1.0 by sample 20 (0.5 * 20/20 + 0.5 * 5/5 == 1.0). The further multiplicative 0.6 * warmup + 0.4 * time_decay (line 785) means warmup_factor after warmup saturates near 0.6 + 0.4 * time_decay; with sub-minute book updates time_decay \u2248 1, so saturation \u2248 1.0.",
+      "impact": "Confirmed-working \u2014 no fix needed. Documentation note.",
+      "priority": "\u2014"
+    }
+  ],
+  "honest_caveats": [
+    "OFI z-score is computed on L1 TOB only (depth_levels=1). bookDepth-20 was not available aligned to the BTCUSDT_240329 Dec 2023 window."
+  ],
+  "audit_finished_utc_ms": 1777769923352
+}
