@@ -1,0 +1,172 @@
+{
+  "audit_version": "v1",
+  "data_source": "REAL: data/ohlcv_1m.csv (Dec 2023 BTCUSDT 1m)",
+  "warmup_bars": 30,
+  "horizon_bars": 12,
+  "fee_bps_per_side": 8,
+  "slippage_bps_per_side": 3,
+  "starting_equity": 10000.0,
+  "elapsed_seconds": 3.81,
+  "signal_metrics": {
+    "total_bars_processed": 39665,
+    "total_orchestrate_calls": 39665,
+    "exceptions_during_loop": 0,
+    "BUY_count": 68,
+    "SELL_count": 77,
+    "HOLD_count": 39520,
+    "BUY_pct": 0.1714,
+    "SELL_pct": 0.1941,
+    "HOLD_pct": 99.6344,
+    "stale_rejections": 0,
+    "invalid_rejections": 0,
+    "future_timestamp_rejections": 0,
+    "duplicates_removed": 0,
+    "negative_edge_normalized": 0,
+    "avg_net_conviction": 0.002022,
+    "std_net_conviction": 0.036312,
+    "conviction_distribution": {
+      "0.0-0.2": 39520,
+      "0.2-0.4": 5,
+      "0.4-0.6": 90,
+      "0.6-0.8": 19,
+      "0.8-1.0": 31
+    },
+    "avg_urgency": 0.001877,
+    "std_urgency": 0.033724,
+    "avg_expected_edge_bps": -0.001404,
+    "std_expected_edge_bps": 0.516729,
+    "action_threshold_hit_rate": 0.3656,
+    "rationale_breakdown": {
+      "insufficient_liquidity": 33632,
+      "neg_bias": 77,
+      "pos_bias": 68,
+      "weak_score": 270,
+      "dd_breach": 5618
+    }
+  },
+  "trade_metrics": {
+    "total_trades": 67,
+    "win_rate": 0.119403,
+    "avg_win_bps": 20.0087,
+    "avg_loss_bps": -30.5265,
+    "best_trade_bps": 52.3494,
+    "worst_trade_bps": -62.4106,
+    "max_consec_wins": 3,
+    "max_consec_losses": 19,
+    "expectancy_bps_per_trade": -24.4925,
+    "sharpe_annualized_synthetic": -280.4283,
+    "sortino_annualized_synthetic": -466.3053,
+    "calmar_synthetic": -1.0,
+    "max_drawdown_pct": 15.1643,
+    "profit_factor": 0.088875,
+    "total_return_pct": -15.1643,
+    "final_equity": 8483.57,
+    "round_trip_cost_drag_bps_total": 1072
+  },
+  "fusion_metrics": {
+    "avg_agreement_ratio": 0.014143,
+    "avg_conflict_ratio": 2.5e-05,
+    "dominant_timeframe_distribution": {},
+    "alignment_bonus_triggered_bars": 561,
+    "conflict_penalty_triggered_bars": 1
+  },
+  "regime_summary": {
+    "range": {
+      "count": 36307,
+      "avg_conviction": 0.001289,
+      "actions": {
+        "HOLD": 36217,
+        "SELL": 48,
+        "BUY": 42
+      }
+    },
+    "trend": {
+      "count": 2729,
+      "avg_conviction": 0.007622,
+      "actions": {
+        "HOLD": 2692,
+        "SELL": 20,
+        "BUY": 17
+      }
+    },
+    "toxic": {
+      "count": 629,
+      "avg_conviction": 0.020011,
+      "actions": {
+        "BUY": 9,
+        "HOLD": 611,
+        "SELL": 9
+      }
+    }
+  },
+  "feedback_metrics": {
+    "update_performance_calls": 67,
+    "tracked_sources": [
+      "signal_engine"
+    ],
+    "performance_multipliers": {
+      "signal_engine": 0.5
+    },
+    "trade_counts": {
+      "signal_engine": 67
+    },
+    "win_rates": {
+      "signal_engine": 0.11940298507462686
+    }
+  },
+  "schema_audit": {
+    "bars_audited": 39665,
+    "violations_per_required_key": {
+      "final_conviction": 33632,
+      "risk_metrics": 33632,
+      "quality_metrics": 33632
+    },
+    "rationale_paths_with_violations": {
+      "final_conviction": [
+        "insufficient_liquidity",
+        "insufficient_liquidity",
+        "insufficient_liquidity",
+        "insufficient_liquidity",
+        "insufficient_liquidity"
+      ],
+      "risk_metrics": [
+        "insufficient_liquidity",
+        "insufficient_liquidity",
+        "insufficient_liquidity",
+        "insufficient_liquidity",
+        "insufficient_liquidity"
+      ],
+      "quality_metrics": [
+        "insufficient_liquidity",
+        "insufficient_liquidity",
+        "insufficient_liquidity",
+        "insufficient_liquidity",
+        "insufficient_liquidity"
+      ]
+    },
+    "fully_clean_keys": [
+      "orchestration_ts",
+      "metrics",
+      "rejection_details",
+      "fusion_stats",
+      "alpha_performance",
+      "rejection_telemetry",
+      "environmental_context",
+      "decision_telemetry",
+      "source_policy_summary",
+      "signal_metrics",
+      "per_signal_breakdown",
+      "timeframe_breakdown",
+      "agreement_ratio",
+      "conflict_ratio",
+      "dominant_timeframe"
+    ]
+  },
+  "rationale_distribution": {
+    "insufficient_liquidity": 33632,
+    "neg_bias": 77,
+    "pos_bias": 68,
+    "weak_score": 270,
+    "dd_breach": 5618
+  }
+}
