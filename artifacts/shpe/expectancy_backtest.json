@@ -1,0 +1,1903 @@
+{
+  "cost_assumptions": {
+    "latency_adverse_selection_bps": 0.5,
+    "latency_ms": 250,
+    "slippage_bps_round_trip": 2.0,
+    "spread_bps_round_trip": 1.0,
+    "taker_fee_bps_per_side": 4.0
+  },
+  "summary": {
+    "0.55": {
+      "average_loss": 0.002116584946289973,
+      "average_win": 0.0010672672445625187,
+      "expectancy": -0.0007838096105842786,
+      "max_drawdown": -0.033703813255123984,
+      "negative_expectancy": true,
+      "profit_factor": 0.3630529535003779,
+      "sharpe": -2.1018673530688643,
+      "trade_count": 43,
+      "trades": [
+        {
+          "entry": 68335.7,
+          "exit": 68544.1,
+          "gross_return": 0.003049650475520244,
+          "net_return": -0.004199650475520244,
+          "probability": 0.00860253617910687,
+          "row_index": 49,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68414.1,
+          "exit": 68556.6,
+          "gross_return": 0.0020829039627796022,
+          "net_return": -0.003232903962779602,
+          "probability": 0.3900700355359974,
+          "row_index": 50,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68527.5,
+          "exit": 68616.6,
+          "gross_return": 0.0013002079457153089,
+          "net_return": 0.00015020794571530887,
+          "probability": 0.9903650573553348,
+          "row_index": 51,
+          "side": "LONG"
+        },
+        {
+          "entry": 68544.1,
+          "exit": 68632.3,
+          "gross_return": 0.0012867628286022733,
+          "net_return": 0.0001367628286022733,
+          "probability": 0.9034843466550535,
+          "row_index": 52,
+          "side": "LONG"
+        },
+        {
+          "entry": 68556.6,
+          "exit": 68602.0,
+          "gross_return": 0.000662226539822485,
+          "net_return": -0.00048777346017751496,
+          "probability": 0.9509694346445398,
+          "row_index": 53,
+          "side": "LONG"
+        },
+        {
+          "entry": 68616.6,
+          "exit": 68641.7,
+          "gross_return": 0.0003658006954584061,
+          "net_return": -0.000784199304541594,
+          "probability": 0.5828125357330391,
+          "row_index": 54,
+          "side": "LONG"
+        },
+        {
+          "entry": 68632.3,
+          "exit": 68645.5,
+          "gross_return": 0.0001923292677062708,
+          "net_return": -0.0009576707322937292,
+          "probability": 0.9813577085851646,
+          "row_index": 55,
+          "side": "LONG"
+        },
+        {
+          "entry": 68602.0,
+          "exit": 68608.4,
+          "gross_return": 9.32917407654905e-05,
+          "net_return": -0.0010567082592345095,
+          "probability": 0.9956482518268727,
+          "row_index": 56,
+          "side": "LONG"
+        },
+        {
+          "entry": 68641.7,
+          "exit": 68608.6,
+          "gross_return": -0.0004822141642761072,
+          "net_return": -0.0016322141642761071,
+          "probability": 0.9720713297839209,
+          "row_index": 57,
+          "side": "LONG"
+        },
+        {
+          "entry": 68645.5,
+          "exit": 68756.9,
+          "gross_return": 0.0016228303384780384,
+          "net_return": 0.0004728303384780384,
+          "probability": 0.9623653591364331,
+          "row_index": 58,
+          "side": "LONG"
+        },
+        {
+          "entry": 68608.4,
+          "exit": 68833.9,
+          "gross_return": 0.0032867695500842465,
+          "net_return": 0.0021367695500842466,
+          "probability": 0.9999507381477064,
+          "row_index": 59,
+          "side": "LONG"
+        },
+        {
+          "entry": 68608.6,
+          "exit": 68813.8,
+          "gross_return": 0.002990878694507643,
+          "net_return": 0.001840878694507643,
+          "probability": 0.9999586240816629,
+          "row_index": 60,
+          "side": "LONG"
+        },
+        {
+          "entry": 68833.9,
+          "exit": 68608.1,
+          "gross_return": -0.0032803604038124873,
+          "net_return": 0.0021303604038124873,
+          "probability": 0.006502462773582677,
+          "row_index": 62,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68813.8,
+          "exit": 68590.0,
+          "gross_return": -0.003252254634971516,
+          "net_return": 0.002102254634971516,
+          "probability": 0.042051267471316385,
+          "row_index": 63,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68738.9,
+          "exit": 68583.6,
+          "gross_return": -0.002259273860943198,
+          "net_return": -0.003409273860943198,
+          "probability": 0.9329399171613041,
+          "row_index": 64,
+          "side": "LONG"
+        },
+        {
+          "entry": 68608.1,
+          "exit": 68645.4,
+          "gross_return": 0.0005436675844395684,
+          "net_return": -0.0006063324155604316,
+          "probability": 0.9999999850109966,
+          "row_index": 65,
+          "side": "LONG"
+        },
+        {
+          "entry": 68590.0,
+          "exit": 68612.3,
+          "gross_return": 0.0003251202799242296,
+          "net_return": -0.0008248797200757704,
+          "probability": 0.9999999963974142,
+          "row_index": 66,
+          "side": "LONG"
+        },
+        {
+          "entry": 68583.6,
+          "exit": 68598.5,
+          "gross_return": 0.00021725310424057905,
+          "net_return": -0.000932746895759421,
+          "probability": 0.9999999976724807,
+          "row_index": 67,
+          "side": "LONG"
+        },
+        {
+          "entry": 68645.4,
+          "exit": 68635.0,
+          "gross_return": -0.00015150323255446366,
+          "net_return": -0.0013015032325544636,
+          "probability": 0.9999999521770463,
+          "row_index": 68,
+          "side": "LONG"
+        },
+        {
+          "entry": 68612.3,
+          "exit": 68619.5,
+          "gross_return": 0.00010493745290563193,
+          "net_return": -0.001045062547094368,
+          "probability": 0.8021038634565217,
+          "row_index": 69,
+          "side": "LONG"
+        },
+        {
+          "entry": 68598.5,
+          "exit": 68698.2,
+          "gross_return": 0.0014533845492247948,
+          "net_return": 0.00030338454922479484,
+          "probability": 0.8452114085724439,
+          "row_index": 70,
+          "side": "LONG"
+        },
+        {
+          "entry": 68635.0,
+          "exit": 68750.3,
+          "gross_return": 0.0016799009251839865,
+          "net_return": 0.0005299009251839865,
+          "probability": 0.6558719639625172,
+          "row_index": 71,
+          "side": "LONG"
+        },
+        {
+          "entry": 68619.5,
+          "exit": 68768.6,
+          "gross_return": 0.002172851740394579,
+          "net_return": 0.001022851740394579,
+          "probability": 0.7054136548705396,
+          "row_index": 72,
+          "side": "LONG"
+        },
+        {
+          "entry": 68698.2,
+          "exit": 68787.4,
+          "gross_return": 0.0012984328555915162,
+          "net_return": -0.0024484328555915164,
+          "probability": 0.10888865515611935,
+          "row_index": 73,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68750.3,
+          "exit": 68813.2,
+          "gross_return": 0.0009149050985958486,
+          "net_return": -0.0020649050985958486,
+          "probability": 0.11363802934313323,
+          "row_index": 74,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68768.6,
+          "exit": 68799.1,
+          "gross_return": 0.00044351637229782194,
+          "net_return": -0.001593516372297822,
+          "probability": 0.00014036114812763644,
+          "row_index": 75,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68787.4,
+          "exit": 68765.0,
+          "gross_return": -0.0003256410330960929,
+          "net_return": -0.0008243589669039071,
+          "probability": 0.006084304653990757,
+          "row_index": 76,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68813.2,
+          "exit": 68765.1,
+          "gross_return": -0.0006989937977014769,
+          "net_return": -0.0004510062022985231,
+          "probability": 0.004748739085660092,
+          "row_index": 77,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68799.1,
+          "exit": 68691.7,
+          "gross_return": -0.0015610669325617447,
+          "net_return": 0.0004110669325617447,
+          "probability": 0.0033820228626092698,
+          "row_index": 78,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68765.0,
+          "exit": 68710.4,
+          "gross_return": -0.0007940085799462782,
+          "net_return": -0.0003559914200537218,
+          "probability": 0.0034671925453614375,
+          "row_index": 79,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68765.1,
+          "exit": 68668.4,
+          "gross_return": -0.0014062365938537374,
+          "net_return": 0.0002562365938537374,
+          "probability": 0.0014167845447348275,
+          "row_index": 80,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68691.7,
+          "exit": 68674.8,
+          "gross_return": -0.00024602681255514393,
+          "net_return": -0.000903973187444856,
+          "probability": 0.023966099397139333,
+          "row_index": 81,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68710.4,
+          "exit": 68634.8,
+          "gross_return": -0.0011002701192249103,
+          "net_return": -4.9729880775089674e-05,
+          "probability": 0.001774010383923158,
+          "row_index": 82,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68668.4,
+          "exit": 68845.7,
+          "gross_return": 0.0025819736589173903,
+          "net_return": 0.0014319736589173903,
+          "probability": 0.8075998977696596,
+          "row_index": 83,
+          "side": "LONG"
+        },
+        {
+          "entry": 68674.8,
+          "exit": 68925.6,
+          "gross_return": 0.003651994618113237,
+          "net_return": -0.004801994618113236,
+          "probability": 0.30652691553028594,
+          "row_index": 84,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68845.7,
+          "exit": 68934.6,
+          "gross_return": 0.0012912934286383715,
+          "net_return": 0.00014129342863837156,
+          "probability": 0.76012086768472,
+          "row_index": 86,
+          "side": "LONG"
+        },
+        {
+          "entry": 68925.6,
+          "exit": 68792.6,
+          "gross_return": -0.0019296168622398642,
+          "net_return": 0.0007796168622398643,
+          "probability": 0.11891832560570878,
+          "row_index": 87,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68917.4,
+          "exit": 68706.9,
+          "gross_return": -0.003054381041652761,
+          "net_return": 0.0019043810416527612,
+          "probability": 0.1737138553369827,
+          "row_index": 88,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68934.6,
+          "exit": 68666.7,
+          "gross_return": -0.003886292224804506,
+          "net_return": 0.002736292224804506,
+          "probability": 0.23072643442475246,
+          "row_index": 89,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68792.6,
+          "exit": 68663.7,
+          "gross_return": -0.0018737480484820855,
+          "net_return": 0.0007237480484820855,
+          "probability": 0.23171169969466027,
+          "row_index": 90,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68706.9,
+          "exit": 69185.2,
+          "gross_return": 0.006961455108584479,
+          "net_return": -0.008111455108584478,
+          "probability": 0.23668354176621467,
+          "row_index": 91,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68666.7,
+          "exit": 69260.0,
+          "gross_return": 0.008640287067821854,
+          "net_return": -0.009790287067821854,
+          "probability": 0.24103855648780176,
+          "row_index": 92,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68663.7,
+          "exit": 68656.7,
+          "gross_return": -0.00010194615204249116,
+          "net_return": -0.0010480538479575089,
+          "probability": 0.2329858161019606,
+          "row_index": 93,
+          "side": "SHORT"
+        }
+      ],
+      "win_rate": 0.4186046511627907
+    },
+    "0.60": {
+      "average_loss": 0.002172101014696155,
+      "average_win": 0.0010672672445625187,
+      "expectancy": -0.0007838003321567234,
+      "max_drawdown": -0.03291961395058239,
+      "negative_expectancy": true,
+      "profit_factor": 0.36851436834942053,
+      "sharpe": -2.0529624151284875,
+      "trade_count": 42,
+      "trades": [
+        {
+          "entry": 68335.7,
+          "exit": 68544.1,
+          "gross_return": 0.003049650475520244,
+          "net_return": -0.004199650475520244,
+          "probability": 0.00860253617910687,
+          "row_index": 49,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68414.1,
+          "exit": 68556.6,
+          "gross_return": 0.0020829039627796022,
+          "net_return": -0.003232903962779602,
+          "probability": 0.3900700355359974,
+          "row_index": 50,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68527.5,
+          "exit": 68616.6,
+          "gross_return": 0.0013002079457153089,
+          "net_return": 0.00015020794571530887,
+          "probability": 0.9903650573553348,
+          "row_index": 51,
+          "side": "LONG"
+        },
+        {
+          "entry": 68544.1,
+          "exit": 68632.3,
+          "gross_return": 0.0012867628286022733,
+          "net_return": 0.0001367628286022733,
+          "probability": 0.9034843466550535,
+          "row_index": 52,
+          "side": "LONG"
+        },
+        {
+          "entry": 68556.6,
+          "exit": 68602.0,
+          "gross_return": 0.000662226539822485,
+          "net_return": -0.00048777346017751496,
+          "probability": 0.9509694346445398,
+          "row_index": 53,
+          "side": "LONG"
+        },
+        {
+          "entry": 68632.3,
+          "exit": 68645.5,
+          "gross_return": 0.0001923292677062708,
+          "net_return": -0.0009576707322937292,
+          "probability": 0.9813577085851646,
+          "row_index": 55,
+          "side": "LONG"
+        },
+        {
+          "entry": 68602.0,
+          "exit": 68608.4,
+          "gross_return": 9.32917407654905e-05,
+          "net_return": -0.0010567082592345095,
+          "probability": 0.9956482518268727,
+          "row_index": 56,
+          "side": "LONG"
+        },
+        {
+          "entry": 68641.7,
+          "exit": 68608.6,
+          "gross_return": -0.0004822141642761072,
+          "net_return": -0.0016322141642761071,
+          "probability": 0.9720713297839209,
+          "row_index": 57,
+          "side": "LONG"
+        },
+        {
+          "entry": 68645.5,
+          "exit": 68756.9,
+          "gross_return": 0.0016228303384780384,
+          "net_return": 0.0004728303384780384,
+          "probability": 0.9623653591364331,
+          "row_index": 58,
+          "side": "LONG"
+        },
+        {
+          "entry": 68608.4,
+          "exit": 68833.9,
+          "gross_return": 0.0032867695500842465,
+          "net_return": 0.0021367695500842466,
+          "probability": 0.9999507381477064,
+          "row_index": 59,
+          "side": "LONG"
+        },
+        {
+          "entry": 68608.6,
+          "exit": 68813.8,
+          "gross_return": 0.002990878694507643,
+          "net_return": 0.001840878694507643,
+          "probability": 0.9999586240816629,
+          "row_index": 60,
+          "side": "LONG"
+        },
+        {
+          "entry": 68833.9,
+          "exit": 68608.1,
+          "gross_return": -0.0032803604038124873,
+          "net_return": 0.0021303604038124873,
+          "probability": 0.006502462773582677,
+          "row_index": 62,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68813.8,
+          "exit": 68590.0,
+          "gross_return": -0.003252254634971516,
+          "net_return": 0.002102254634971516,
+          "probability": 0.042051267471316385,
+          "row_index": 63,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68738.9,
+          "exit": 68583.6,
+          "gross_return": -0.002259273860943198,
+          "net_return": -0.003409273860943198,
+          "probability": 0.9329399171613041,
+          "row_index": 64,
+          "side": "LONG"
+        },
+        {
+          "entry": 68608.1,
+          "exit": 68645.4,
+          "gross_return": 0.0005436675844395684,
+          "net_return": -0.0006063324155604316,
+          "probability": 0.9999999850109966,
+          "row_index": 65,
+          "side": "LONG"
+        },
+        {
+          "entry": 68590.0,
+          "exit": 68612.3,
+          "gross_return": 0.0003251202799242296,
+          "net_return": -0.0008248797200757704,
+          "probability": 0.9999999963974142,
+          "row_index": 66,
+          "side": "LONG"
+        },
+        {
+          "entry": 68583.6,
+          "exit": 68598.5,
+          "gross_return": 0.00021725310424057905,
+          "net_return": -0.000932746895759421,
+          "probability": 0.9999999976724807,
+          "row_index": 67,
+          "side": "LONG"
+        },
+        {
+          "entry": 68645.4,
+          "exit": 68635.0,
+          "gross_return": -0.00015150323255446366,
+          "net_return": -0.0013015032325544636,
+          "probability": 0.9999999521770463,
+          "row_index": 68,
+          "side": "LONG"
+        },
+        {
+          "entry": 68612.3,
+          "exit": 68619.5,
+          "gross_return": 0.00010493745290563193,
+          "net_return": -0.001045062547094368,
+          "probability": 0.8021038634565217,
+          "row_index": 69,
+          "side": "LONG"
+        },
+        {
+          "entry": 68598.5,
+          "exit": 68698.2,
+          "gross_return": 0.0014533845492247948,
+          "net_return": 0.00030338454922479484,
+          "probability": 0.8452114085724439,
+          "row_index": 70,
+          "side": "LONG"
+        },
+        {
+          "entry": 68635.0,
+          "exit": 68750.3,
+          "gross_return": 0.0016799009251839865,
+          "net_return": 0.0005299009251839865,
+          "probability": 0.6558719639625172,
+          "row_index": 71,
+          "side": "LONG"
+        },
+        {
+          "entry": 68619.5,
+          "exit": 68768.6,
+          "gross_return": 0.002172851740394579,
+          "net_return": 0.001022851740394579,
+          "probability": 0.7054136548705396,
+          "row_index": 72,
+          "side": "LONG"
+        },
+        {
+          "entry": 68698.2,
+          "exit": 68787.4,
+          "gross_return": 0.0012984328555915162,
+          "net_return": -0.0024484328555915164,
+          "probability": 0.10888865515611935,
+          "row_index": 73,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68750.3,
+          "exit": 68813.2,
+          "gross_return": 0.0009149050985958486,
+          "net_return": -0.0020649050985958486,
+          "probability": 0.11363802934313323,
+          "row_index": 74,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68768.6,
+          "exit": 68799.1,
+          "gross_return": 0.00044351637229782194,
+          "net_return": -0.001593516372297822,
+          "probability": 0.00014036114812763644,
+          "row_index": 75,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68787.4,
+          "exit": 68765.0,
+          "gross_return": -0.0003256410330960929,
+          "net_return": -0.0008243589669039071,
+          "probability": 0.006084304653990757,
+          "row_index": 76,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68813.2,
+          "exit": 68765.1,
+          "gross_return": -0.0006989937977014769,
+          "net_return": -0.0004510062022985231,
+          "probability": 0.004748739085660092,
+          "row_index": 77,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68799.1,
+          "exit": 68691.7,
+          "gross_return": -0.0015610669325617447,
+          "net_return": 0.0004110669325617447,
+          "probability": 0.0033820228626092698,
+          "row_index": 78,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68765.0,
+          "exit": 68710.4,
+          "gross_return": -0.0007940085799462782,
+          "net_return": -0.0003559914200537218,
+          "probability": 0.0034671925453614375,
+          "row_index": 79,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68765.1,
+          "exit": 68668.4,
+          "gross_return": -0.0014062365938537374,
+          "net_return": 0.0002562365938537374,
+          "probability": 0.0014167845447348275,
+          "row_index": 80,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68691.7,
+          "exit": 68674.8,
+          "gross_return": -0.00024602681255514393,
+          "net_return": -0.000903973187444856,
+          "probability": 0.023966099397139333,
+          "row_index": 81,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68710.4,
+          "exit": 68634.8,
+          "gross_return": -0.0011002701192249103,
+          "net_return": -4.9729880775089674e-05,
+          "probability": 0.001774010383923158,
+          "row_index": 82,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68668.4,
+          "exit": 68845.7,
+          "gross_return": 0.0025819736589173903,
+          "net_return": 0.0014319736589173903,
+          "probability": 0.8075998977696596,
+          "row_index": 83,
+          "side": "LONG"
+        },
+        {
+          "entry": 68674.8,
+          "exit": 68925.6,
+          "gross_return": 0.003651994618113237,
+          "net_return": -0.004801994618113236,
+          "probability": 0.30652691553028594,
+          "row_index": 84,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68845.7,
+          "exit": 68934.6,
+          "gross_return": 0.0012912934286383715,
+          "net_return": 0.00014129342863837156,
+          "probability": 0.76012086768472,
+          "row_index": 86,
+          "side": "LONG"
+        },
+        {
+          "entry": 68925.6,
+          "exit": 68792.6,
+          "gross_return": -0.0019296168622398642,
+          "net_return": 0.0007796168622398643,
+          "probability": 0.11891832560570878,
+          "row_index": 87,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68917.4,
+          "exit": 68706.9,
+          "gross_return": -0.003054381041652761,
+          "net_return": 0.0019043810416527612,
+          "probability": 0.1737138553369827,
+          "row_index": 88,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68934.6,
+          "exit": 68666.7,
+          "gross_return": -0.003886292224804506,
+          "net_return": 0.002736292224804506,
+          "probability": 0.23072643442475246,
+          "row_index": 89,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68792.6,
+          "exit": 68663.7,
+          "gross_return": -0.0018737480484820855,
+          "net_return": 0.0007237480484820855,
+          "probability": 0.23171169969466027,
+          "row_index": 90,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68706.9,
+          "exit": 69185.2,
+          "gross_return": 0.006961455108584479,
+          "net_return": -0.008111455108584478,
+          "probability": 0.23668354176621467,
+          "row_index": 91,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68666.7,
+          "exit": 69260.0,
+          "gross_return": 0.008640287067821854,
+          "net_return": -0.009790287067821854,
+          "probability": 0.24103855648780176,
+          "row_index": 92,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68663.7,
+          "exit": 68656.7,
+          "gross_return": -0.00010194615204249116,
+          "net_return": -0.0010480538479575089,
+          "probability": 0.2329858161019606,
+          "row_index": 93,
+          "side": "SHORT"
+        }
+      ],
+      "win_rate": 0.42857142857142855
+    },
+    "0.65": {
+      "average_loss": 0.002125979147388179,
+      "average_win": 0.0010672672445625187,
+      "expectancy": -0.0007240660972634826,
+      "max_drawdown": -0.030322757292472198,
+      "negative_expectancy": true,
+      "profit_factor": 0.3928790304483899,
+      "sharpe": -1.8738739559155344,
+      "trade_count": 41,
+      "trades": [
+        {
+          "entry": 68335.7,
+          "exit": 68544.1,
+          "gross_return": 0.003049650475520244,
+          "net_return": -0.004199650475520244,
+          "probability": 0.00860253617910687,
+          "row_index": 49,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68527.5,
+          "exit": 68616.6,
+          "gross_return": 0.0013002079457153089,
+          "net_return": 0.00015020794571530887,
+          "probability": 0.9903650573553348,
+          "row_index": 51,
+          "side": "LONG"
+        },
+        {
+          "entry": 68544.1,
+          "exit": 68632.3,
+          "gross_return": 0.0012867628286022733,
+          "net_return": 0.0001367628286022733,
+          "probability": 0.9034843466550535,
+          "row_index": 52,
+          "side": "LONG"
+        },
+        {
+          "entry": 68556.6,
+          "exit": 68602.0,
+          "gross_return": 0.000662226539822485,
+          "net_return": -0.00048777346017751496,
+          "probability": 0.9509694346445398,
+          "row_index": 53,
+          "side": "LONG"
+        },
+        {
+          "entry": 68632.3,
+          "exit": 68645.5,
+          "gross_return": 0.0001923292677062708,
+          "net_return": -0.0009576707322937292,
+          "probability": 0.9813577085851646,
+          "row_index": 55,
+          "side": "LONG"
+        },
+        {
+          "entry": 68602.0,
+          "exit": 68608.4,
+          "gross_return": 9.32917407654905e-05,
+          "net_return": -0.0010567082592345095,
+          "probability": 0.9956482518268727,
+          "row_index": 56,
+          "side": "LONG"
+        },
+        {
+          "entry": 68641.7,
+          "exit": 68608.6,
+          "gross_return": -0.0004822141642761072,
+          "net_return": -0.0016322141642761071,
+          "probability": 0.9720713297839209,
+          "row_index": 57,
+          "side": "LONG"
+        },
+        {
+          "entry": 68645.5,
+          "exit": 68756.9,
+          "gross_return": 0.0016228303384780384,
+          "net_return": 0.0004728303384780384,
+          "probability": 0.9623653591364331,
+          "row_index": 58,
+          "side": "LONG"
+        },
+        {
+          "entry": 68608.4,
+          "exit": 68833.9,
+          "gross_return": 0.0032867695500842465,
+          "net_return": 0.0021367695500842466,
+          "probability": 0.9999507381477064,
+          "row_index": 59,
+          "side": "LONG"
+        },
+        {
+          "entry": 68608.6,
+          "exit": 68813.8,
+          "gross_return": 0.002990878694507643,
+          "net_return": 0.001840878694507643,
+          "probability": 0.9999586240816629,
+          "row_index": 60,
+          "side": "LONG"
+        },
+        {
+          "entry": 68833.9,
+          "exit": 68608.1,
+          "gross_return": -0.0032803604038124873,
+          "net_return": 0.0021303604038124873,
+          "probability": 0.006502462773582677,
+          "row_index": 62,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68813.8,
+          "exit": 68590.0,
+          "gross_return": -0.003252254634971516,
+          "net_return": 0.002102254634971516,
+          "probability": 0.042051267471316385,
+          "row_index": 63,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68738.9,
+          "exit": 68583.6,
+          "gross_return": -0.002259273860943198,
+          "net_return": -0.003409273860943198,
+          "probability": 0.9329399171613041,
+          "row_index": 64,
+          "side": "LONG"
+        },
+        {
+          "entry": 68608.1,
+          "exit": 68645.4,
+          "gross_return": 0.0005436675844395684,
+          "net_return": -0.0006063324155604316,
+          "probability": 0.9999999850109966,
+          "row_index": 65,
+          "side": "LONG"
+        },
+        {
+          "entry": 68590.0,
+          "exit": 68612.3,
+          "gross_return": 0.0003251202799242296,
+          "net_return": -0.0008248797200757704,
+          "probability": 0.9999999963974142,
+          "row_index": 66,
+          "side": "LONG"
+        },
+        {
+          "entry": 68583.6,
+          "exit": 68598.5,
+          "gross_return": 0.00021725310424057905,
+          "net_return": -0.000932746895759421,
+          "probability": 0.9999999976724807,
+          "row_index": 67,
+          "side": "LONG"
+        },
+        {
+          "entry": 68645.4,
+          "exit": 68635.0,
+          "gross_return": -0.00015150323255446366,
+          "net_return": -0.0013015032325544636,
+          "probability": 0.9999999521770463,
+          "row_index": 68,
+          "side": "LONG"
+        },
+        {
+          "entry": 68612.3,
+          "exit": 68619.5,
+          "gross_return": 0.00010493745290563193,
+          "net_return": -0.001045062547094368,
+          "probability": 0.8021038634565217,
+          "row_index": 69,
+          "side": "LONG"
+        },
+        {
+          "entry": 68598.5,
+          "exit": 68698.2,
+          "gross_return": 0.0014533845492247948,
+          "net_return": 0.00030338454922479484,
+          "probability": 0.8452114085724439,
+          "row_index": 70,
+          "side": "LONG"
+        },
+        {
+          "entry": 68635.0,
+          "exit": 68750.3,
+          "gross_return": 0.0016799009251839865,
+          "net_return": 0.0005299009251839865,
+          "probability": 0.6558719639625172,
+          "row_index": 71,
+          "side": "LONG"
+        },
+        {
+          "entry": 68619.5,
+          "exit": 68768.6,
+          "gross_return": 0.002172851740394579,
+          "net_return": 0.001022851740394579,
+          "probability": 0.7054136548705396,
+          "row_index": 72,
+          "side": "LONG"
+        },
+        {
+          "entry": 68698.2,
+          "exit": 68787.4,
+          "gross_return": 0.0012984328555915162,
+          "net_return": -0.0024484328555915164,
+          "probability": 0.10888865515611935,
+          "row_index": 73,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68750.3,
+          "exit": 68813.2,
+          "gross_return": 0.0009149050985958486,
+          "net_return": -0.0020649050985958486,
+          "probability": 0.11363802934313323,
+          "row_index": 74,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68768.6,
+          "exit": 68799.1,
+          "gross_return": 0.00044351637229782194,
+          "net_return": -0.001593516372297822,
+          "probability": 0.00014036114812763644,
+          "row_index": 75,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68787.4,
+          "exit": 68765.0,
+          "gross_return": -0.0003256410330960929,
+          "net_return": -0.0008243589669039071,
+          "probability": 0.006084304653990757,
+          "row_index": 76,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68813.2,
+          "exit": 68765.1,
+          "gross_return": -0.0006989937977014769,
+          "net_return": -0.0004510062022985231,
+          "probability": 0.004748739085660092,
+          "row_index": 77,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68799.1,
+          "exit": 68691.7,
+          "gross_return": -0.0015610669325617447,
+          "net_return": 0.0004110669325617447,
+          "probability": 0.0033820228626092698,
+          "row_index": 78,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68765.0,
+          "exit": 68710.4,
+          "gross_return": -0.0007940085799462782,
+          "net_return": -0.0003559914200537218,
+          "probability": 0.0034671925453614375,
+          "row_index": 79,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68765.1,
+          "exit": 68668.4,
+          "gross_return": -0.0014062365938537374,
+          "net_return": 0.0002562365938537374,
+          "probability": 0.0014167845447348275,
+          "row_index": 80,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68691.7,
+          "exit": 68674.8,
+          "gross_return": -0.00024602681255514393,
+          "net_return": -0.000903973187444856,
+          "probability": 0.023966099397139333,
+          "row_index": 81,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68710.4,
+          "exit": 68634.8,
+          "gross_return": -0.0011002701192249103,
+          "net_return": -4.9729880775089674e-05,
+          "probability": 0.001774010383923158,
+          "row_index": 82,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68668.4,
+          "exit": 68845.7,
+          "gross_return": 0.0025819736589173903,
+          "net_return": 0.0014319736589173903,
+          "probability": 0.8075998977696596,
+          "row_index": 83,
+          "side": "LONG"
+        },
+        {
+          "entry": 68674.8,
+          "exit": 68925.6,
+          "gross_return": 0.003651994618113237,
+          "net_return": -0.004801994618113236,
+          "probability": 0.30652691553028594,
+          "row_index": 84,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68845.7,
+          "exit": 68934.6,
+          "gross_return": 0.0012912934286383715,
+          "net_return": 0.00014129342863837156,
+          "probability": 0.76012086768472,
+          "row_index": 86,
+          "side": "LONG"
+        },
+        {
+          "entry": 68925.6,
+          "exit": 68792.6,
+          "gross_return": -0.0019296168622398642,
+          "net_return": 0.0007796168622398643,
+          "probability": 0.11891832560570878,
+          "row_index": 87,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68917.4,
+          "exit": 68706.9,
+          "gross_return": -0.003054381041652761,
+          "net_return": 0.0019043810416527612,
+          "probability": 0.1737138553369827,
+          "row_index": 88,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68934.6,
+          "exit": 68666.7,
+          "gross_return": -0.003886292224804506,
+          "net_return": 0.002736292224804506,
+          "probability": 0.23072643442475246,
+          "row_index": 89,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68792.6,
+          "exit": 68663.7,
+          "gross_return": -0.0018737480484820855,
+          "net_return": 0.0007237480484820855,
+          "probability": 0.23171169969466027,
+          "row_index": 90,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68706.9,
+          "exit": 69185.2,
+          "gross_return": 0.006961455108584479,
+          "net_return": -0.008111455108584478,
+          "probability": 0.23668354176621467,
+          "row_index": 91,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68666.7,
+          "exit": 69260.0,
+          "gross_return": 0.008640287067821854,
+          "net_return": -0.009790287067821854,
+          "probability": 0.24103855648780176,
+          "row_index": 92,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68663.7,
+          "exit": 68656.7,
+          "gross_return": -0.00010194615204249116,
+          "net_return": -0.0010480538479575089,
+          "probability": 0.2329858161019606,
+          "row_index": 93,
+          "side": "SHORT"
+        }
+      ],
+      "win_rate": 0.43902439024390244
+    },
+    "0.70": {
+      "average_loss": 0.0020043420805370402,
+      "average_win": 0.0010988770280553736,
+      "expectancy": -0.0006516568280736803,
+      "max_drawdown": -0.026050663599542945,
+      "negative_expectancy": true,
+      "profit_factor": 0.4236463711445725,
+      "sharpe": -1.666483651462258,
+      "trade_count": 39,
+      "trades": [
+        {
+          "entry": 68335.7,
+          "exit": 68544.1,
+          "gross_return": 0.003049650475520244,
+          "net_return": -0.004199650475520244,
+          "probability": 0.00860253617910687,
+          "row_index": 49,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68527.5,
+          "exit": 68616.6,
+          "gross_return": 0.0013002079457153089,
+          "net_return": 0.00015020794571530887,
+          "probability": 0.9903650573553348,
+          "row_index": 51,
+          "side": "LONG"
+        },
+        {
+          "entry": 68544.1,
+          "exit": 68632.3,
+          "gross_return": 0.0012867628286022733,
+          "net_return": 0.0001367628286022733,
+          "probability": 0.9034843466550535,
+          "row_index": 52,
+          "side": "LONG"
+        },
+        {
+          "entry": 68556.6,
+          "exit": 68602.0,
+          "gross_return": 0.000662226539822485,
+          "net_return": -0.00048777346017751496,
+          "probability": 0.9509694346445398,
+          "row_index": 53,
+          "side": "LONG"
+        },
+        {
+          "entry": 68632.3,
+          "exit": 68645.5,
+          "gross_return": 0.0001923292677062708,
+          "net_return": -0.0009576707322937292,
+          "probability": 0.9813577085851646,
+          "row_index": 55,
+          "side": "LONG"
+        },
+        {
+          "entry": 68602.0,
+          "exit": 68608.4,
+          "gross_return": 9.32917407654905e-05,
+          "net_return": -0.0010567082592345095,
+          "probability": 0.9956482518268727,
+          "row_index": 56,
+          "side": "LONG"
+        },
+        {
+          "entry": 68641.7,
+          "exit": 68608.6,
+          "gross_return": -0.0004822141642761072,
+          "net_return": -0.0016322141642761071,
+          "probability": 0.9720713297839209,
+          "row_index": 57,
+          "side": "LONG"
+        },
+        {
+          "entry": 68645.5,
+          "exit": 68756.9,
+          "gross_return": 0.0016228303384780384,
+          "net_return": 0.0004728303384780384,
+          "probability": 0.9623653591364331,
+          "row_index": 58,
+          "side": "LONG"
+        },
+        {
+          "entry": 68608.4,
+          "exit": 68833.9,
+          "gross_return": 0.0032867695500842465,
+          "net_return": 0.0021367695500842466,
+          "probability": 0.9999507381477064,
+          "row_index": 59,
+          "side": "LONG"
+        },
+        {
+          "entry": 68608.6,
+          "exit": 68813.8,
+          "gross_return": 0.002990878694507643,
+          "net_return": 0.001840878694507643,
+          "probability": 0.9999586240816629,
+          "row_index": 60,
+          "side": "LONG"
+        },
+        {
+          "entry": 68833.9,
+          "exit": 68608.1,
+          "gross_return": -0.0032803604038124873,
+          "net_return": 0.0021303604038124873,
+          "probability": 0.006502462773582677,
+          "row_index": 62,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68813.8,
+          "exit": 68590.0,
+          "gross_return": -0.003252254634971516,
+          "net_return": 0.002102254634971516,
+          "probability": 0.042051267471316385,
+          "row_index": 63,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68738.9,
+          "exit": 68583.6,
+          "gross_return": -0.002259273860943198,
+          "net_return": -0.003409273860943198,
+          "probability": 0.9329399171613041,
+          "row_index": 64,
+          "side": "LONG"
+        },
+        {
+          "entry": 68608.1,
+          "exit": 68645.4,
+          "gross_return": 0.0005436675844395684,
+          "net_return": -0.0006063324155604316,
+          "probability": 0.9999999850109966,
+          "row_index": 65,
+          "side": "LONG"
+        },
+        {
+          "entry": 68590.0,
+          "exit": 68612.3,
+          "gross_return": 0.0003251202799242296,
+          "net_return": -0.0008248797200757704,
+          "probability": 0.9999999963974142,
+          "row_index": 66,
+          "side": "LONG"
+        },
+        {
+          "entry": 68583.6,
+          "exit": 68598.5,
+          "gross_return": 0.00021725310424057905,
+          "net_return": -0.000932746895759421,
+          "probability": 0.9999999976724807,
+          "row_index": 67,
+          "side": "LONG"
+        },
+        {
+          "entry": 68645.4,
+          "exit": 68635.0,
+          "gross_return": -0.00015150323255446366,
+          "net_return": -0.0013015032325544636,
+          "probability": 0.9999999521770463,
+          "row_index": 68,
+          "side": "LONG"
+        },
+        {
+          "entry": 68612.3,
+          "exit": 68619.5,
+          "gross_return": 0.00010493745290563193,
+          "net_return": -0.001045062547094368,
+          "probability": 0.8021038634565217,
+          "row_index": 69,
+          "side": "LONG"
+        },
+        {
+          "entry": 68598.5,
+          "exit": 68698.2,
+          "gross_return": 0.0014533845492247948,
+          "net_return": 0.00030338454922479484,
+          "probability": 0.8452114085724439,
+          "row_index": 70,
+          "side": "LONG"
+        },
+        {
+          "entry": 68619.5,
+          "exit": 68768.6,
+          "gross_return": 0.002172851740394579,
+          "net_return": 0.001022851740394579,
+          "probability": 0.7054136548705396,
+          "row_index": 72,
+          "side": "LONG"
+        },
+        {
+          "entry": 68698.2,
+          "exit": 68787.4,
+          "gross_return": 0.0012984328555915162,
+          "net_return": -0.0024484328555915164,
+          "probability": 0.10888865515611935,
+          "row_index": 73,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68750.3,
+          "exit": 68813.2,
+          "gross_return": 0.0009149050985958486,
+          "net_return": -0.0020649050985958486,
+          "probability": 0.11363802934313323,
+          "row_index": 74,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68768.6,
+          "exit": 68799.1,
+          "gross_return": 0.00044351637229782194,
+          "net_return": -0.001593516372297822,
+          "probability": 0.00014036114812763644,
+          "row_index": 75,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68787.4,
+          "exit": 68765.0,
+          "gross_return": -0.0003256410330960929,
+          "net_return": -0.0008243589669039071,
+          "probability": 0.006084304653990757,
+          "row_index": 76,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68813.2,
+          "exit": 68765.1,
+          "gross_return": -0.0006989937977014769,
+          "net_return": -0.0004510062022985231,
+          "probability": 0.004748739085660092,
+          "row_index": 77,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68799.1,
+          "exit": 68691.7,
+          "gross_return": -0.0015610669325617447,
+          "net_return": 0.0004110669325617447,
+          "probability": 0.0033820228626092698,
+          "row_index": 78,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68765.0,
+          "exit": 68710.4,
+          "gross_return": -0.0007940085799462782,
+          "net_return": -0.0003559914200537218,
+          "probability": 0.0034671925453614375,
+          "row_index": 79,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68765.1,
+          "exit": 68668.4,
+          "gross_return": -0.0014062365938537374,
+          "net_return": 0.0002562365938537374,
+          "probability": 0.0014167845447348275,
+          "row_index": 80,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68691.7,
+          "exit": 68674.8,
+          "gross_return": -0.00024602681255514393,
+          "net_return": -0.000903973187444856,
+          "probability": 0.023966099397139333,
+          "row_index": 81,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68710.4,
+          "exit": 68634.8,
+          "gross_return": -0.0011002701192249103,
+          "net_return": -4.9729880775089674e-05,
+          "probability": 0.001774010383923158,
+          "row_index": 82,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68668.4,
+          "exit": 68845.7,
+          "gross_return": 0.0025819736589173903,
+          "net_return": 0.0014319736589173903,
+          "probability": 0.8075998977696596,
+          "row_index": 83,
+          "side": "LONG"
+        },
+        {
+          "entry": 68845.7,
+          "exit": 68934.6,
+          "gross_return": 0.0012912934286383715,
+          "net_return": 0.00014129342863837156,
+          "probability": 0.76012086768472,
+          "row_index": 86,
+          "side": "LONG"
+        },
+        {
+          "entry": 68925.6,
+          "exit": 68792.6,
+          "gross_return": -0.0019296168622398642,
+          "net_return": 0.0007796168622398643,
+          "probability": 0.11891832560570878,
+          "row_index": 87,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68917.4,
+          "exit": 68706.9,
+          "gross_return": -0.003054381041652761,
+          "net_return": 0.0019043810416527612,
+          "probability": 0.1737138553369827,
+          "row_index": 88,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68934.6,
+          "exit": 68666.7,
+          "gross_return": -0.003886292224804506,
+          "net_return": 0.002736292224804506,
+          "probability": 0.23072643442475246,
+          "row_index": 89,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68792.6,
+          "exit": 68663.7,
+          "gross_return": -0.0018737480484820855,
+          "net_return": 0.0007237480484820855,
+          "probability": 0.23171169969466027,
+          "row_index": 90,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68706.9,
+          "exit": 69185.2,
+          "gross_return": 0.006961455108584479,
+          "net_return": -0.008111455108584478,
+          "probability": 0.23668354176621467,
+          "row_index": 91,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68666.7,
+          "exit": 69260.0,
+          "gross_return": 0.008640287067821854,
+          "net_return": -0.009790287067821854,
+          "probability": 0.24103855648780176,
+          "row_index": 92,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68663.7,
+          "exit": 68656.7,
+          "gross_return": -0.00010194615204249116,
+          "net_return": -0.0010480538479575089,
+          "probability": 0.2329858161019606,
+          "row_index": 93,
+          "side": "SHORT"
+        }
+      ],
+      "win_rate": 0.4358974358974359
+    },
+    "0.75": {
+      "average_loss": 0.0020043420805370402,
+      "average_win": 0.001103628608534173,
+      "expectancy": -0.0006957228430333715,
+      "max_drawdown": -0.027073515339937525,
+      "negative_expectancy": true,
+      "profit_factor": 0.40045010071823434,
+      "sharpe": -1.7443795291109154,
+      "trade_count": 38,
+      "trades": [
+        {
+          "entry": 68335.7,
+          "exit": 68544.1,
+          "gross_return": 0.003049650475520244,
+          "net_return": -0.004199650475520244,
+          "probability": 0.00860253617910687,
+          "row_index": 49,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68527.5,
+          "exit": 68616.6,
+          "gross_return": 0.0013002079457153089,
+          "net_return": 0.00015020794571530887,
+          "probability": 0.9903650573553348,
+          "row_index": 51,
+          "side": "LONG"
+        },
+        {
+          "entry": 68544.1,
+          "exit": 68632.3,
+          "gross_return": 0.0012867628286022733,
+          "net_return": 0.0001367628286022733,
+          "probability": 0.9034843466550535,
+          "row_index": 52,
+          "side": "LONG"
+        },
+        {
+          "entry": 68556.6,
+          "exit": 68602.0,
+          "gross_return": 0.000662226539822485,
+          "net_return": -0.00048777346017751496,
+          "probability": 0.9509694346445398,
+          "row_index": 53,
+          "side": "LONG"
+        },
+        {
+          "entry": 68632.3,
+          "exit": 68645.5,
+          "gross_return": 0.0001923292677062708,
+          "net_return": -0.0009576707322937292,
+          "probability": 0.9813577085851646,
+          "row_index": 55,
+          "side": "LONG"
+        },
+        {
+          "entry": 68602.0,
+          "exit": 68608.4,
+          "gross_return": 9.32917407654905e-05,
+          "net_return": -0.0010567082592345095,
+          "probability": 0.9956482518268727,
+          "row_index": 56,
+          "side": "LONG"
+        },
+        {
+          "entry": 68641.7,
+          "exit": 68608.6,
+          "gross_return": -0.0004822141642761072,
+          "net_return": -0.0016322141642761071,
+          "probability": 0.9720713297839209,
+          "row_index": 57,
+          "side": "LONG"
+        },
+        {
+          "entry": 68645.5,
+          "exit": 68756.9,
+          "gross_return": 0.0016228303384780384,
+          "net_return": 0.0004728303384780384,
+          "probability": 0.9623653591364331,
+          "row_index": 58,
+          "side": "LONG"
+        },
+        {
+          "entry": 68608.4,
+          "exit": 68833.9,
+          "gross_return": 0.0032867695500842465,
+          "net_return": 0.0021367695500842466,
+          "probability": 0.9999507381477064,
+          "row_index": 59,
+          "side": "LONG"
+        },
+        {
+          "entry": 68608.6,
+          "exit": 68813.8,
+          "gross_return": 0.002990878694507643,
+          "net_return": 0.001840878694507643,
+          "probability": 0.9999586240816629,
+          "row_index": 60,
+          "side": "LONG"
+        },
+        {
+          "entry": 68833.9,
+          "exit": 68608.1,
+          "gross_return": -0.0032803604038124873,
+          "net_return": 0.0021303604038124873,
+          "probability": 0.006502462773582677,
+          "row_index": 62,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68813.8,
+          "exit": 68590.0,
+          "gross_return": -0.003252254634971516,
+          "net_return": 0.002102254634971516,
+          "probability": 0.042051267471316385,
+          "row_index": 63,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68738.9,
+          "exit": 68583.6,
+          "gross_return": -0.002259273860943198,
+          "net_return": -0.003409273860943198,
+          "probability": 0.9329399171613041,
+          "row_index": 64,
+          "side": "LONG"
+        },
+        {
+          "entry": 68608.1,
+          "exit": 68645.4,
+          "gross_return": 0.0005436675844395684,
+          "net_return": -0.0006063324155604316,
+          "probability": 0.9999999850109966,
+          "row_index": 65,
+          "side": "LONG"
+        },
+        {
+          "entry": 68590.0,
+          "exit": 68612.3,
+          "gross_return": 0.0003251202799242296,
+          "net_return": -0.0008248797200757704,
+          "probability": 0.9999999963974142,
+          "row_index": 66,
+          "side": "LONG"
+        },
+        {
+          "entry": 68583.6,
+          "exit": 68598.5,
+          "gross_return": 0.00021725310424057905,
+          "net_return": -0.000932746895759421,
+          "probability": 0.9999999976724807,
+          "row_index": 67,
+          "side": "LONG"
+        },
+        {
+          "entry": 68645.4,
+          "exit": 68635.0,
+          "gross_return": -0.00015150323255446366,
+          "net_return": -0.0013015032325544636,
+          "probability": 0.9999999521770463,
+          "row_index": 68,
+          "side": "LONG"
+        },
+        {
+          "entry": 68612.3,
+          "exit": 68619.5,
+          "gross_return": 0.00010493745290563193,
+          "net_return": -0.001045062547094368,
+          "probability": 0.8021038634565217,
+          "row_index": 69,
+          "side": "LONG"
+        },
+        {
+          "entry": 68598.5,
+          "exit": 68698.2,
+          "gross_return": 0.0014533845492247948,
+          "net_return": 0.00030338454922479484,
+          "probability": 0.8452114085724439,
+          "row_index": 70,
+          "side": "LONG"
+        },
+        {
+          "entry": 68698.2,
+          "exit": 68787.4,
+          "gross_return": 0.0012984328555915162,
+          "net_return": -0.0024484328555915164,
+          "probability": 0.10888865515611935,
+          "row_index": 73,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68750.3,
+          "exit": 68813.2,
+          "gross_return": 0.0009149050985958486,
+          "net_return": -0.0020649050985958486,
+          "probability": 0.11363802934313323,
+          "row_index": 74,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68768.6,
+          "exit": 68799.1,
+          "gross_return": 0.00044351637229782194,
+          "net_return": -0.001593516372297822,
+          "probability": 0.00014036114812763644,
+          "row_index": 75,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68787.4,
+          "exit": 68765.0,
+          "gross_return": -0.0003256410330960929,
+          "net_return": -0.0008243589669039071,
+          "probability": 0.006084304653990757,
+          "row_index": 76,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68813.2,
+          "exit": 68765.1,
+          "gross_return": -0.0006989937977014769,
+          "net_return": -0.0004510062022985231,
+          "probability": 0.004748739085660092,
+          "row_index": 77,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68799.1,
+          "exit": 68691.7,
+          "gross_return": -0.0015610669325617447,
+          "net_return": 0.0004110669325617447,
+          "probability": 0.0033820228626092698,
+          "row_index": 78,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68765.0,
+          "exit": 68710.4,
+          "gross_return": -0.0007940085799462782,
+          "net_return": -0.0003559914200537218,
+          "probability": 0.0034671925453614375,
+          "row_index": 79,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68765.1,
+          "exit": 68668.4,
+          "gross_return": -0.0014062365938537374,
+          "net_return": 0.0002562365938537374,
+          "probability": 0.0014167845447348275,
+          "row_index": 80,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68691.7,
+          "exit": 68674.8,
+          "gross_return": -0.00024602681255514393,
+          "net_return": -0.000903973187444856,
+          "probability": 0.023966099397139333,
+          "row_index": 81,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68710.4,
+          "exit": 68634.8,
+          "gross_return": -0.0011002701192249103,
+          "net_return": -4.9729880775089674e-05,
+          "probability": 0.001774010383923158,
+          "row_index": 82,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68668.4,
+          "exit": 68845.7,
+          "gross_return": 0.0025819736589173903,
+          "net_return": 0.0014319736589173903,
+          "probability": 0.8075998977696596,
+          "row_index": 83,
+          "side": "LONG"
+        },
+        {
+          "entry": 68845.7,
+          "exit": 68934.6,
+          "gross_return": 0.0012912934286383715,
+          "net_return": 0.00014129342863837156,
+          "probability": 0.76012086768472,
+          "row_index": 86,
+          "side": "LONG"
+        },
+        {
+          "entry": 68925.6,
+          "exit": 68792.6,
+          "gross_return": -0.0019296168622398642,
+          "net_return": 0.0007796168622398643,
+          "probability": 0.11891832560570878,
+          "row_index": 87,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68917.4,
+          "exit": 68706.9,
+          "gross_return": -0.003054381041652761,
+          "net_return": 0.0019043810416527612,
+          "probability": 0.1737138553369827,
+          "row_index": 88,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68934.6,
+          "exit": 68666.7,
+          "gross_return": -0.003886292224804506,
+          "net_return": 0.002736292224804506,
+          "probability": 0.23072643442475246,
+          "row_index": 89,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68792.6,
+          "exit": 68663.7,
+          "gross_return": -0.0018737480484820855,
+          "net_return": 0.0007237480484820855,
+          "probability": 0.23171169969466027,
+          "row_index": 90,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68706.9,
+          "exit": 69185.2,
+          "gross_return": 0.006961455108584479,
+          "net_return": -0.008111455108584478,
+          "probability": 0.23668354176621467,
+          "row_index": 91,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68666.7,
+          "exit": 69260.0,
+          "gross_return": 0.008640287067821854,
+          "net_return": -0.009790287067821854,
+          "probability": 0.24103855648780176,
+          "row_index": 92,
+          "side": "SHORT"
+        },
+        {
+          "entry": 68663.7,
+          "exit": 68656.7,
+          "gross_return": -0.00010194615204249116,
+          "net_return": -0.0010480538479575089,
+          "probability": 0.2329858161019606,
+          "row_index": 93,
+          "side": "SHORT"
+        }
+      ],
+      "win_rate": 0.42105263157894735
+    }
+  }
+}

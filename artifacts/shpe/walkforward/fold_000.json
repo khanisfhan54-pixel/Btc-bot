@@ -1,0 +1,143 @@
+{
+  "class_balance": {
+    "test": {
+      "0": 10
+    },
+    "train": {
+      "0": 25,
+      "1": 2
+    }
+  },
+  "first_test_row_index": 49,
+  "fold": 0,
+  "last_train_label_horizon_end_index": 48,
+  "metrics": {
+    "brier": 0.701879701338775,
+    "ece": 0.7737746595435462,
+    "precision": 0.0,
+    "raw_brier": 0.701879701338775,
+    "recall": 0.0,
+    "win_rate": 0.2
+  },
+  "predictions": [
+    {
+      "degraded": false,
+      "fold": 0,
+      "label": 0,
+      "probability": 0.00860253617910687,
+      "raw_probability": 0.00860253617910687,
+      "regime_used": "<global>",
+      "row_index": 49,
+      "timestamp_ms": 1774584300000
+    },
+    {
+      "degraded": false,
+      "fold": 0,
+      "label": 0,
+      "probability": 0.3900700355359974,
+      "raw_probability": 0.3900700355359974,
+      "regime_used": "<global>",
+      "row_index": 50,
+      "timestamp_ms": 1774584600000
+    },
+    {
+      "degraded": false,
+      "fold": 0,
+      "label": 0,
+      "probability": 0.9903650573553348,
+      "raw_probability": 0.9903650573553348,
+      "regime_used": "<global>",
+      "row_index": 51,
+      "timestamp_ms": 1774584900000
+    },
+    {
+      "degraded": false,
+      "fold": 0,
+      "label": 0,
+      "probability": 0.9034843466550535,
+      "raw_probability": 0.9034843466550535,
+      "regime_used": "<global>",
+      "row_index": 52,
+      "timestamp_ms": 1774585200000
+    },
+    {
+      "degraded": false,
+      "fold": 0,
+      "label": 0,
+      "probability": 0.9509694346445398,
+      "raw_probability": 0.9509694346445398,
+      "regime_used": "<global>",
+      "row_index": 53,
+      "timestamp_ms": 1774585500000
+    },
+    {
+      "degraded": false,
+      "fold": 0,
+      "label": 0,
+      "probability": 0.5828125357330391,
+      "raw_probability": 0.5828125357330391,
+      "regime_used": "<global>",
+      "row_index": 54,
+      "timestamp_ms": 1774585800000
+    },
+    {
+      "degraded": false,
+      "fold": 0,
+      "label": 0,
+      "probability": 0.9813577085851646,
+      "raw_probability": 0.9813577085851646,
+      "regime_used": "<global>",
+      "row_index": 55,
+      "timestamp_ms": 1774586100000
+    },
+    {
+      "degraded": false,
+      "fold": 0,
+      "label": 0,
+      "probability": 0.9956482518268727,
+      "raw_probability": 0.9956482518268727,
+      "regime_used": "<global>",
+      "row_index": 56,
+      "timestamp_ms": 1774586400000
+    },
+    {
+      "degraded": false,
+      "fold": 0,
+      "label": 0,
+      "probability": 0.9720713297839209,
+      "raw_probability": 0.9720713297839209,
+      "regime_used": "<global>",
+      "row_index": 57,
+      "timestamp_ms": 1774586700000
+    },
+    {
+      "degraded": false,
+      "fold": 0,
+      "label": 0,
+      "probability": 0.9623653591364331,
+      "raw_probability": 0.9623653591364331,
+      "regime_used": "<global>",
+      "row_index": 58,
+      "timestamp_ms": 1774587000000
+    }
+  ],
+  "purge_bars": 3,
+  "purged_rows": 3,
+  "regime_balance": {
+    "high_vol": 10
+  },
+  "samples": {
+    "test": 10,
+    "train": 27
+  },
+  "test_range": [
+    "2026-03-27T04:05:00+00:00",
+    "2026-03-27T04:50:00+00:00"
+  ],
+  "test_rows": 10,
+  "train_range": [
+    "2026-03-27T01:35:00+00:00",
+    "2026-03-27T03:45:00+00:00"
+  ],
+  "train_rows": 27
+}

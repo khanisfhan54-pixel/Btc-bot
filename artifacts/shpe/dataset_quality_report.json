@@ -1,0 +1,41 @@
+{
+  "missing_sources": [
+    "funding",
+    "open_interest",
+    "liquidations",
+    "regime_history"
+  ],
+  "quality_failed": false,
+  "sources": [
+    {
+      "duplicates": 692,
+      "end": "2026-03-27T08:01:58.026000+00:00",
+      "future_timestamps": 0,
+      "gaps": [],
+      "name": "data/aggTrades.csv transact_time",
+      "rows": 2386,
+      "start": "2026-03-27T00:00:03.838000+00:00",
+      "timestamp_disorder": 0
+    },
+    {
+      "duplicates": 9559,
+      "end": "2026-03-27T08:01:30+00:00",
+      "future_timestamps": 0,
+      "gaps": [],
+      "name": "data/bookDepth.csv timestamp",
+      "rows": 10428,
+      "start": "2026-03-27T00:00:08+00:00",
+      "timestamp_disorder": 0
+    },
+    {
+      "duplicates": 0,
+      "end": "2026-03-27T08:00:00+00:00",
+      "future_timestamps": 0,
+      "gaps": [],
+      "name": "derived 5m OHLCV bars",
+      "rows": 97,
+      "start": "2026-03-27T00:00:00+00:00",
+      "timestamp_disorder": 0
+    }
+  ]
+}
