@@ -44,7 +44,9 @@ def _snapshot(update):
 def test_binance_local_book_snapshot_bridges_and_discards_stale_diffs():
     from collector.collector.book_engine import LocalBook
     book = LocalBook("BINANCE")
-    book.buffer = [_diff(9, 9), _diff(10, 9), _diff(11, 11, 10)]
+    # u == lastUpdateId is stale under the USD-M algorithm.  The next first
+    # eligible update itself must bridge the REST snapshot.
+    book.buffer = [_diff(9, 9), _diff(10, 9), _diff(11, 10, 10)]
     assert book.binance_snapshot(10, _snapshot(10))
     assert book.previous.update_id == 11
     assert book.state.state.value == "VALID"
@@ -56,7 +58,9 @@ def test_binance_local_book_bridge_range_and_gap_retains_unproven_diffs():
     book.buffer = [_diff(12, 8), _diff(13, 13, 99)]
     assert not book.binance_snapshot(10, _snapshot(10))
     assert book.last_reason == "pu_mismatch"
-    assert [event.update_id for event in book.buffer] == [13]
+    # The temporary chain never committed, therefore neither event is applied
+    # and both remain available to the next recovery transaction.
+    assert [event.update_id for event in book.buffer] == [12, 13]
     assert book.state.state.value == "SEQUENCE_GAP"
 
 

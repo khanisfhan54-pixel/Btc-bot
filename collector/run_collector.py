@@ -1,6 +1,8 @@
 import asyncio
 import signal
 import time
+import json
+import os
 from decimal import Decimal
 from urllib.parse import parse_qs, urlparse
 from dataclasses import replace
@@ -71,6 +73,13 @@ class CollectorApp:
         self._quality_overflow = 0
 
         self.quality_writer = ParquetWriter("quality_events", QUALITY_EVENTS_SCHEMA, segment_rows=1, segment_seconds=1)
+        self._quality_journal_path = self.quality_writer.stream_dir / "quality_queue.pending.json"
+        # A SIGKILL cannot drain RAM.  A durable pending marker makes that
+        # uncertainty visible on the next process rather than claiming zero loss.
+        if self._quality_journal_path.exists():
+            self._persist_quality_event({"stream":"quality_events", "event_type":QualityEventType.DATA_DROP,
+                "reason":"quality_queue_unfinished_on_previous_process", "rows_lost":None})
+            self._quality_journal_path.unlink(missing_ok=True)
         self.ob_writer = ParquetWriter("orderbook", ORDERBOOK_SCHEMA, quality_event_sink=self._persist_quality_event)
         # Raw reconstructed state is independently durable; legacy feature stream remains compatible.
         self.raw_book_writer = ParquetWriter("binance_orderbook_raw", BINANCE_ORDERBOOK_RAW_SCHEMA, quality_event_sink=self._persist_quality_event)
@@ -174,10 +183,19 @@ class CollectorApp:
             return
         try:
             self._quality_queue.put_nowait(event)
+            self._write_quality_pending_marker()
         except asyncio.QueueFull:
             # The drop is observable in logs/counters and a later persistence task writes one aggregate marker.
             self._quality_overflow += 1
             logger.error("quality_event_queue_overflow", dropped=self._quality_overflow)
+
+    def _write_quality_pending_marker(self):
+        path = self._quality_journal_path
+        temporary = path.with_suffix(".tmp")
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump({"pending": self._quality_queue.qsize(), "updated_ms": int(time.time() * 1000)}, handle)
+            handle.flush(); os.fsync(handle.fileno())
+        os.replace(temporary, path)
 
     async def _quality_persistence_loop(self):
         while self.running or not self._quality_queue.empty():
@@ -187,6 +205,8 @@ class CollectorApp:
                 continue
             self._persist_quality_event(event)
             self._quality_queue.task_done()
+            if self._quality_queue.empty():
+                self._quality_journal_path.unlink(missing_ok=True)
         if self._quality_overflow:
             self._persist_quality_event({"stream":"quality_events", "event_type":QualityEventType.DATA_DROP,
                 "reason":"quality_queue_overflow", "rows_lost":self._quality_overflow})
@@ -241,6 +261,8 @@ class CollectorApp:
                 if not self.binance_book.binance_snapshot(snapshot_event.update_id,snapshot_event):
                     self._record_book_quality(QualityEventType.ERROR, self.binance_book.last_reason)
                     return False
+                self._persist_reconstructed_books(self.binance_book.committed_recovery_events)
+                self.binance_book.committed_recovery_events=[]
                 self._record_book_quality(QualityEventType.RECOVERY,"snapshot_bridge_completed")
                 return True
         except asyncio.TimeoutError:
@@ -275,17 +297,24 @@ class CollectorApp:
                 if self._recovery_task is None or self._recovery_task.done(): self._recovery_task=asyncio.create_task(self._recover_binance_book("sequence_gap_or_initial_snapshot"))
                 return
             if applied is None: return
-            raw_writer=getattr(self, "raw_book_writer", None)
-            if raw_writer is not None: raw_writer.write({"timestamp":applied.local_process_ts,"exchange_timestamp":applied.exchange_event_ts,
-                "local_receive_ts":applied.local_receive_ts,"local_process_ts":applied.local_process_ts,
-                "bids":[[float(p),float(q)] for p,q in applied.bids],"asks":[[float(p),float(q)] for p,q in applied.asks],"update_id":applied.update_id,
-                "first_update_id":applied.first_update_id,"previous_update_id":applied.previous_update_id,
-                "book_source":applied.book_source,"event_kind":"incremental_update","recovery_generation":self.binance_book.recovery_generation,"quality_state":applied.quality_state})
+            self._persist_reconstructed_books([(applied, "NORMAL_INCREMENTAL", self.binance_book.recovery_generation)])
             data={"E":applied.exchange_event_ts,"b":[[str(p),str(q)] for p,q in applied.bids],"a":[[str(p),str(q)] for p,q in applied.asks]}
             features=compute_orderbook_features(data)
             if not features: self.stream_counters["orderbook"]["empty_features"] += 1; return
             features["timestamp"]=applied.local_process_ts; features["local_timestamp"]=applied.local_receive_ts; features["exchange_timestamp"]=applied.exchange_event_ts
             self._write_orderbook_features(features)
+
+    def _persist_reconstructed_books(self, rows):
+        """Raw reconstructed book is exact and independent of lossy features."""
+        raw_writer=getattr(self, "raw_book_writer", None)
+        if raw_writer is None:
+            return
+        for applied, event_kind, generation in rows:
+            raw_writer.write({"timestamp":applied.local_process_ts,"exchange_timestamp":applied.exchange_event_ts,
+                "local_receive_ts":applied.local_receive_ts,"local_process_ts":applied.local_process_ts,
+                "bids":[[str(p),str(q)] for p,q in applied.bids],"asks":[[str(p),str(q)] for p,q in applied.asks],"update_id":applied.update_id,
+                "first_update_id":applied.first_update_id,"previous_update_id":applied.previous_update_id,
+                "book_source":applied.book_source,"event_kind":event_kind,"recovery_generation":generation,"quality_state":applied.quality_state})
 
     def _write_orderbook_features(self, features: dict):
         self.stream_counters["orderbook"]["computed"] += 1
@@ -318,19 +347,21 @@ class CollectorApp:
         for event in events:
             # Legacy parquet schema is int64. Preserve canonical IDs only when
             # conversion is exact; otherwise reject visibly instead of truncating.
-            try:
-                trade_id = self._lossless_legacy_trade_id(event.trade_id)
-            except (TypeError, ValueError):
-                self.stream_counters["trades"]["rejected"] += 1
-                self._record_validation_rejection("trades", "legacy_trade_id_not_lossless")
-                self._persist_quality_event({"stream":"trades", "event_type":QualityEventType.ERROR, "reason":"legacy_trade_id_not_lossless"})
-                return
+            try: trade_id = self._lossless_legacy_trade_id(event.trade_id)
+            except (TypeError, ValueError): trade_id = None
             process_ts = int(time.time() * 1000)
             raw_trade_writer=getattr(self, "raw_trades_writer", None)
             if raw_trade_writer is not None:
                 raw_trade_writer.write({"timestamp":process_ts, "local_receive_ts":event.local_receive_ts,
                     "exchange_timestamp":event.exchange_transaction_ts or event.exchange_event_ts, "trade_id":trade_id,
                     "native_trade_id":event.trade_id, "price":event.price, "quantity":event.quantity})
+            if trade_id is None:
+                # Raw native record is durable first; old int64 feature stream
+                # cannot faithfully represent this identifier.
+                self.stream_counters["trades"]["rejected"] += 1
+                self._record_validation_rejection("trades", "legacy_trade_id_not_lossless")
+                self._persist_quality_event({"stream":"trades", "event_type":QualityEventType.ERROR, "reason":"legacy_trade_id_not_lossless"})
+                continue
             features = {
                 "timestamp": process_ts, "local_timestamp": event.local_receive_ts,
                 "exchange_timestamp": event.exchange_transaction_ts or event.exchange_event_ts,
@@ -464,7 +495,8 @@ class CollectorApp:
                         self.validator.last_mid_price = preserved_last_mid_price
                     self.gap_detector.reset_stream(route)
                     if route == "orderbook":
-                        (getattr(self, "binance_book", None) or setattr(self, "binance_book", LocalBook("BINANCE")))
+                        if getattr(self, "binance_book", None) is None:
+                            self.binance_book = LocalBook("BINANCE")
                         self.binance_book.invalidate("websocket_reconnect")
 
         return handler
