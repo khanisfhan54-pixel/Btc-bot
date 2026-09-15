@@ -2,7 +2,7 @@ import pyarrow as pa
 
 # Constants
 SYMBOL = "BTCUSDT"
-BINANCE_PUBLIC_WS_URL = "wss://fstream.binance.com/public/stream?streams=btcusdt@depth10@100ms"
+BINANCE_PUBLIC_WS_URL = "wss://fstream.binance.com/public/stream?streams=btcusdt@depth@100ms"
 BINANCE_MARKET_WS_URL = "wss://fstream.binance.com/market/stream?streams=btcusdt@aggTrade/btcusdt@markPrice@1s/btcusdt@forceOrder"
 # Intervals and Thresholds
 ORDERBOOK_STALE_MS = 500
@@ -80,3 +80,15 @@ LIQUIDATION_SCHEMA = pa.schema([
     ("order_status", pa.string()),
     ("time_in_force", pa.string()),
 ], metadata={"schema_version": "1.0", "stream_name": "liquidation", "symbol": SYMBOL})
+
+QUALITY_EVENTS_SCHEMA = pa.schema([
+    ("timestamp", pa.timestamp("ms", tz="UTC")),
+    ("exchange", pa.string()),
+    ("stream", pa.string()),
+    ("event_type", pa.string()),
+    ("reason", pa.string()),
+    ("gap_size_ms", pa.int64()),
+    ("rows_lost", pa.string()),
+    ("quality_state", pa.string()),
+    ("connection_id", pa.string()),
+], metadata={"schema_version": "1.0", "stream_name": "quality_events", "symbol": SYMBOL})

@@ -1,6 +1,8 @@
 import asyncio
 import signal
+import time
 from urllib.parse import parse_qs, urlparse
+from dataclasses import replace
 from collector.collector.utils import logger, send_telegram_alert, validate_telegram_startup
 from collector.collector.config import (
     BINANCE_MARKET_WS_URL,
@@ -10,8 +12,13 @@ from collector.collector.config import (
     MARKPRICE_SCHEMA,
     OPENINTEREST_SCHEMA,
     LIQUIDATION_SCHEMA,
+    QUALITY_EVENTS_SCHEMA,
     SYMBOL,
 )
+from collector.collector.adapters.binance import BinanceAdapter
+from collector.collector.book_engine import LocalBook
+from collector.collector.canonical import CanonicalOrderBookEvent
+from collector.collector.quality_events import BookQuality, QualityEvent, QualityEventType
 from collector.collector.feature_computer import (
     compute_liquidation_features,
     compute_markprice_features,
@@ -30,6 +37,7 @@ STREAM_INACTIVE_STARTUP_SECONDS = 60
 RAW_LOG_LIMIT = 20
 OI_POLL_INTERVAL_S = 3.0
 OI_URL = "https://fapi.binance.com/fapi/v1/openInterest?symbol=BTCUSDT"
+BINANCE_DEPTH_SNAPSHOT_URL = "https://fapi.binance.com/fapi/v1/depth?symbol=BTCUSDT&limit=1000"
 
 class CollectorApp:
     def __init__(self):
@@ -50,8 +58,12 @@ class CollectorApp:
 
         self.validator = Validator()
         self.gap_detector = GapDetector()
+        self.binance_adapter = BinanceAdapter()
+        self.binance_book = LocalBook("BINANCE")
+        self._book_snapshot_lock = asyncio.Lock()
 
-        self.ob_writer = ParquetWriter("orderbook", ORDERBOOK_SCHEMA)
+        self.quality_writer = ParquetWriter("quality_events", QUALITY_EVENTS_SCHEMA)
+        self.ob_writer = ParquetWriter("orderbook", ORDERBOOK_SCHEMA, quality_event_sink=self._persist_quality_event)
         self.trades_writer = ParquetWriter("trades", TRADES_SCHEMA)
         self.mark_writer = ParquetWriter("markprice", MARKPRICE_SCHEMA)
         self.oi_writer = ParquetWriter("openinterest", OPENINTEREST_SCHEMA)
@@ -110,7 +122,11 @@ class CollectorApp:
         reasons = self.validation_fail_reasons.setdefault(stream_name, {})
         reasons[reason] = reasons.get(reason, 0) + 1
 
-    async def handle_message(self, msg: dict):
+    async def handle_message(self, msg: dict, local_receive_ts: int | None = None):
+        # Tests and offline callers may supply decoded events directly.  The
+        # WebSocket client supplies the authoritative pre-decode timestamp.
+        if local_receive_ts is None:
+            local_receive_ts = int(time.time() * 1000)
         if "stream" not in msg or "data" not in msg:
             return
 
@@ -123,9 +139,9 @@ class CollectorApp:
             self.stream_counters["unrouted"]["received"] += 1
             logger.warning("Unrouted stream message", stream=stream)
         elif route == "orderbook":
-            self._handle_orderbook(data, stream)
+            await self._handle_binance_orderbook(msg, local_receive_ts)
         elif route == "trades":
-            self._handle_trades(data, stream)
+            self._handle_binance_trade(msg, stream, local_receive_ts)
         elif route == "markprice":
             self._handle_markprice(data, stream)
         elif route == "liquidation":
@@ -134,6 +150,144 @@ class CollectorApp:
         if self.validator.check_failure_rate():
             logger.error("Validation spike detected: >0.1% failures in 60s window")
             send_telegram_alert("Validation spike detected: >0.1% failures in 60s window")
+
+    def _persist_quality_event(self, event: dict):
+        """Persist only stable, schema-compatible quality-event values."""
+        rows_lost = event.get("rows_lost")
+        event_type = event.get("event_type", QualityEventType.ERROR.value)
+        if isinstance(event_type, QualityEventType):
+            event_type = event_type.value
+        self.quality_writer.write({
+            "timestamp": event.get("local_ts", int(time.time() * 1000)),
+            "exchange": event.get("exchange", "BINANCE"),
+            "stream": event.get("stream", "orderbook"),
+            "event_type": event_type,
+            "reason": event.get("reason", ""),
+            "gap_size_ms": event.get("gap_size_ms"),
+            "rows_lost": None if rows_lost is None else str(rows_lost),
+            "quality_state": event.get("quality_state", self.binance_book.state.state.value),
+            "connection_id": event.get("connection_id"),
+        })
+
+    def _record_book_quality(self, kind: QualityEventType, reason: str):
+        event = QualityEvent(
+            exchange="BINANCE", stream="orderbook", event_type=kind, reason=reason,
+            local_ts=int(time.time() * 1000), quality_state=self.binance_book.state.state.value,
+        )
+        self._persist_quality_event(event.record())
+
+    async def _recover_binance_book(self, reason: str):
+        """Fetch a fresh REST snapshot and bridge the buffered diff stream."""
+        async with self._book_snapshot_lock:
+            if self.binance_book.previous is not None and self.binance_book.state.state == BookQuality.VALID:
+                return
+            self.binance_book.state.resync()
+            self._record_book_quality(QualityEventType.RESYNC, reason)
+            try:
+                import aiohttp
+                timeout = aiohttp.ClientTimeout(total=5)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(BINANCE_DEPTH_SNAPSHOT_URL) as response:
+                        response.raise_for_status()
+                        snapshot = await response.json()
+                local_receive_ts = int(time.time() * 1000)
+                snapshot_event = CanonicalOrderBookEvent(
+                    "BINANCE", "orderbook", None, None, local_receive_ts,
+                    local_process_ts=int(time.time() * 1000),
+                    bids=tuple((float(price), float(quantity)) for price, quantity in snapshot["bids"]),
+                    asks=tuple((float(price), float(quantity)) for price, quantity in snapshot["asks"]),
+                    update_id=int(snapshot["lastUpdateId"]), is_snapshot=True,
+                    book_source="DIFF_DEPTH_RECONSTRUCTED",
+                )
+                if not self.binance_book.binance_snapshot(snapshot_event.update_id, snapshot_event):
+                    self._record_book_quality(QualityEventType.ERROR, "snapshot_bridge_not_found")
+                    return
+                self._record_book_quality(QualityEventType.RECOVERY, "snapshot_bridge_completed")
+            except Exception as exc:
+                logger.error("binance_book_snapshot_failed", error=str(exc))
+                self._record_book_quality(QualityEventType.ERROR, "snapshot_fetch_failed")
+
+    async def _handle_binance_orderbook(self, raw: dict, local_receive_ts: int):
+        self.stream_counters["orderbook"]["received"] += 1
+        events = self.binance_adapter.normalize(raw, local_receive_ts=local_receive_ts)
+        for event in events:
+            if event.book_source != "DIFF_DEPTH_RECONSTRUCTED":
+                logger.error("partial_depth_rejected_from_authoritative_path")
+                self._record_book_quality(QualityEventType.BOOK_INVALID, "partial_depth_not_authoritative")
+                return
+            event = replace(event, local_process_ts=int(time.time() * 1000))
+            previous_state = self.binance_book.state.state
+            applied = self.binance_book.apply(event)
+            if self.binance_book.state.state == BookQuality.SEQUENCE_GAP:
+                if previous_state != BookQuality.SEQUENCE_GAP:
+                    self._record_book_quality(QualityEventType.SEQUENCE_GAP, "binance_update_gap")
+                await self._recover_binance_book("sequence_gap")
+                return
+            if applied is None:
+                await self._recover_binance_book("initial_snapshot")
+                return
+            data = {
+                "E": applied.exchange_event_ts,
+                "b": [[str(price), str(quantity)] for price, quantity in applied.bids],
+                "a": [[str(price), str(quantity)] for price, quantity in applied.asks],
+            }
+            features = compute_orderbook_features(data)
+            if not features:
+                self.stream_counters["orderbook"]["empty_features"] += 1
+                return
+            # Preserve the true receive time; timestamp represents when the
+            # collector finished processing this reconstructed state.
+            features["timestamp"] = applied.local_process_ts
+            features["local_timestamp"] = applied.local_receive_ts
+            features["exchange_timestamp"] = applied.exchange_event_ts
+            self._write_orderbook_features(features)
+
+    def _write_orderbook_features(self, features: dict):
+        self.stream_counters["orderbook"]["computed"] += 1
+        valid, reason = self.validator.validate_orderbook(features)
+        if not valid:
+            self.stream_counters["orderbook"]["rejected"] += 1
+            self._record_validation_rejection("orderbook", reason)
+            return
+        self.stream_counters["orderbook"]["validated"] += 1
+        self.gap_detector.check_gap("orderbook", features["exchange_timestamp"])
+        self.ob_writer.write(features)
+        self.stream_counters["orderbook"]["written"] += 1
+        self.health_monitor.record_message("orderbook", features["local_timestamp"])
+
+    def _handle_binance_trade(self, raw: dict, stream: str, local_receive_ts: int):
+        self.stream_counters["trades"]["received"] += 1
+        events = self.binance_adapter.normalize(raw, local_receive_ts=local_receive_ts)
+        for event in events:
+            try:
+                trade_id = int(event.trade_id) if event.trade_id is not None else -1
+            except ValueError:
+                self.stream_counters["trades"]["rejected"] += 1
+                self._record_validation_rejection("trades", "non_numeric_binance_aggregate_trade_id")
+                return
+            process_ts = int(time.time() * 1000)
+            features = {
+                "timestamp": process_ts, "local_timestamp": event.local_receive_ts,
+                "exchange_timestamp": event.exchange_transaction_ts or event.exchange_event_ts,
+                "trade_id": trade_id, "price": event.price, "quantity": event.quantity,
+                "is_buyer_maker": event.side == "SELL",
+                "side_sign": -1 if event.side == "SELL" else 1,
+                "signed_qty": -event.quantity if event.side == "SELL" else event.quantity,
+            }
+            self._handle_trade_features(features)
+
+    def _handle_trade_features(self, features: dict):
+        self.stream_counters["trades"]["computed"] += 1
+        valid, reason = self.validator.validate_trade(features)
+        if not valid:
+            self.stream_counters["trades"]["rejected"] += 1
+            self._record_validation_rejection("trades", reason)
+            return
+        self.stream_counters["trades"]["validated"] += 1
+        self.gap_detector.check_gap("trades", features["exchange_timestamp"])
+        self.trades_writer.write(features)
+        self.stream_counters["trades"]["written"] += 1
+        self.health_monitor.record_message("trades", features["local_timestamp"])
 
     def _handle_orderbook(self, data: dict, stream: str):
         self.stream_counters["orderbook"]["received"] += 1
@@ -244,6 +398,8 @@ class CollectorApp:
                     if route == "orderbook":
                         self.validator.last_mid_price = preserved_last_mid_price
                     self.gap_detector.reset_stream(route)
+                    if route == "orderbook":
+                        self.binance_book = LocalBook("BINANCE")
 
         return handler
 
@@ -272,6 +428,7 @@ class CollectorApp:
             if not connected:
                 logger.warning("ws_client_pre_connect_timeout", url=ws_client.url)
 
+        await self._recover_binance_book("startup")
         self.tasks.append(asyncio.create_task(self.health_monitor.start()))
         self.tasks.append(asyncio.create_task(self._poll_openinterest()))
         self.tasks.append(asyncio.create_task(self._verify_startup_streams()))
@@ -299,6 +456,7 @@ class CollectorApp:
                     self.stream_counters["openinterest"]["validated"] += 1
                     self.oi_writer.write(features)
                     self.stream_counters["openinterest"]["written"] += 1
+                    self.gap_detector.check_gap("openinterest", features["exchange_timestamp"])
                     self.health_monitor.record_message("openinterest", features["timestamp"])
                 else:
                     self.stream_counters["openinterest"]["empty_features"] += 1
@@ -348,6 +506,7 @@ class CollectorApp:
         self.mark_writer.close()
         self.oi_writer.close()
         self.liq_writer.close()
+        self.quality_writer.close()
 
         msg = "Collector Application Shutdown"
         logger.info(msg)

@@ -6,6 +6,8 @@ from unittest.mock import ANY, MagicMock
 import pytest
 
 from collector import run_collector as _run_collector
+from collector.collector.book_engine import LocalBook
+from collector.collector.canonical import CanonicalOrderBookEvent
 
 CollectorApp = _run_collector.CollectorApp
 
@@ -13,6 +15,9 @@ CollectorApp = _run_collector.CollectorApp
 def _valid_depth_msg():
     return {
         "E": int(time.time() * 1000),
+        "U": 11,
+        "u": 11,
+        "pu": 10,
         "b": [[str(100.0 - i * 0.1), "1.0"] for i in range(10)],
         "a": [[str(101.0 + i * 0.1), "1.0"] for i in range(10)],
     }
@@ -71,7 +76,15 @@ def _app_without_init():
     app.validator.check_failure_rate.return_value = False
     app.validator.failures_in_window = 0
     app.gap_detector = MagicMock()
+    app.binance_adapter = _run_collector.BinanceAdapter()
+    app.binance_book = LocalBook("BINANCE")
+    app.binance_book.snapshot(CanonicalOrderBookEvent(
+        "BINANCE", "orderbook", 1, None, 1,
+        bids=((100.0, 1.0),), asks=((101.0, 1.0),), update_id=10, is_snapshot=True,
+    ))
+    app._book_snapshot_lock = None
     app.ob_writer = MagicMock()
+    app.quality_writer = MagicMock()
     app.trades_writer = MagicMock()
     app.mark_writer = MagicMock()
     app.liq_writer = MagicMock()
@@ -96,7 +109,7 @@ def test_route_stream_matches_case_insensitive_required_streams():
 async def test_handle_message_routes_lowercase_trade_and_markprice_to_health_monitor():
     app = _app_without_init()
 
-    await app.handle_message({"stream": "btcusdt@depth10@100ms", "data": _valid_depth_msg()})
+    await app.handle_message({"stream": "btcusdt@depth@100ms", "data": _valid_depth_msg()})
     await app.handle_message({"stream": "btcusdt@aggtrade", "data": _valid_trade_msg()})
     await app.handle_message({"stream": "btcusdt@markprice@1s", "data": _valid_mark_msg()})
 
@@ -106,6 +119,23 @@ async def test_handle_message_routes_lowercase_trade_and_markprice_to_health_mon
     assert app.stream_counters["trades"]["validated"] == 1
     assert app.stream_counters["markprice"]["validated"] == 1
     assert app.stream_counters["unrouted"]["received"] == 0
+
+
+@pytest.mark.asyncio
+async def test_diff_depth_is_processed_from_local_book_with_received_timestamp():
+    app = _app_without_init()
+    receive_ts = 123_456
+
+    await app.handle_message(
+        {"stream": "btcusdt@depth@100ms", "data": _valid_depth_msg()},
+        local_receive_ts=receive_ts,
+    )
+
+    record = app.ob_writer.write.call_args.args[0]
+    assert record["local_timestamp"] == receive_ts
+    assert record["bids_price"][0] == 100.0
+    assert record["asks_price"][0] == 101.0
+    assert app.binance_book.previous.update_id == 11
 
 @pytest.mark.asyncio
 async def test_startup_verification_uses_cumulative_received_counters(monkeypatch):

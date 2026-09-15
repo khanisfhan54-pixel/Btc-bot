@@ -79,8 +79,8 @@ def test_parquet_writer_rotation(temp_dir, monkeypatch):
     writer.close()
 
     files = os.listdir(os.path.join(temp_dir, "raw", "test_stream2"))
-    parquet_files = [name for name in files if name.endswith(".parquet")]
-    sidecar_files = [name for name in files if name.endswith(".parquet.meta.json")]
+    parquet_files = [name for name in files if name.endswith(".seg")]
+    sidecar_files = [name for name in files if name.endswith(".seg.meta.json")]
     assert len(parquet_files) == 2
     assert len(sidecar_files) == 2
 
@@ -235,14 +235,9 @@ def test_parquet_sidecar_uses_first_record_timestamp(temp_dir, monkeypatch):
     with open(sidecar_path, encoding="utf-8") as f:
         sidecar = json.load(f)
 
-    assert sidecar["interval_start_declared"] == "2026-06-03T13:00:00Z"
-    assert sidecar["interval_start_actual"] == "2026-06-03T13:31:11Z"
-    assert sidecar["interval_end_actual"] == "2026-06-03T13:31:12Z"
+    assert sidecar["first_record_ts"] == first_timestamp
+    assert sidecar["last_record_ts"] == first_timestamp + 1000
     assert sidecar["record_count"] == 2
-
-    parquet_metadata = pa_parquet.read_metadata(file_path).metadata
-    assert parquet_metadata[b"interval_start"] == b"2026-06-03T13:00:00Z"
-    assert parquet_metadata[b"interval_end"] == b"2026-06-03T14:00:00Z"
 
 
 def test_empty_parquet_sidecar_falls_back_to_declared_start(temp_dir, monkeypatch):
@@ -267,17 +262,9 @@ def test_empty_parquet_sidecar_falls_back_to_declared_start(temp_dir, monkeypatc
     writer = ParquetWriter("test_stream_empty_sidecar", schema, base_dir=temp_dir)
     writer.close()
 
-    file_path = writer._get_filename(writer.current_hour)
-    sidecar_path = file_path + ".meta.json"
-
-    assert os.path.exists(sidecar_path)
-    with open(sidecar_path, encoding="utf-8") as f:
-        sidecar = json.load(f)
-
-    assert sidecar["interval_start_declared"] == "2026-06-03T13:00:00Z"
-    assert sidecar["interval_start_actual"] == "2026-06-03T13:00:00Z"
-    assert sidecar["interval_end_actual"] == "2026-06-03T14:00:00Z"
-    assert sidecar["record_count"] == 0
+    # Empty segments are intentionally never published: an empty .seg would
+    # be indistinguishable from a real but useless collection interval.
+    assert not os.listdir(os.path.join(temp_dir, "raw", "test_stream_empty_sidecar"))
 
 
 def test_parquet_sidecar_created_next_to_parquet_file(temp_dir, monkeypatch):

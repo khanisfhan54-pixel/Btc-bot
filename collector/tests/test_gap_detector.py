@@ -83,3 +83,16 @@ def test_reset_stream_resets_only_requested_gap_state(detector):
     detector.reset_stream("trades")
 
     assert detector.last_seen == {"orderbook": 1000, "trades": 0, "markprice": 3000}
+
+
+def test_openinterest_uses_its_configured_staleness_threshold(detector, monkeypatch):
+    from collector.collector.config import OI_STALE_MS
+
+    mock_logger = MagicMock()
+    monkeypatch.setattr("collector.collector.gap_detector.logger", mock_logger)
+    monkeypatch.setattr("collector.collector.gap_detector.send_telegram_alert", MagicMock())
+    detector.check_gap("openinterest", 1_000)
+    detector.check_gap("openinterest", 1_000 + OI_STALE_MS)
+    mock_logger.warning.assert_not_called()
+    detector.check_gap("openinterest", 1_001 + 2 * OI_STALE_MS)
+    mock_logger.warning.assert_called_once()
