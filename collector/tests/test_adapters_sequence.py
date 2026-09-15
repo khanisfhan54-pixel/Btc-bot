@@ -28,3 +28,45 @@ def test_bybit_ticker_fans_out_and_uses_all_liquidations():
 def test_okx_does_not_fabricate_transaction_timestamp():
     event = OKXAdapter().normalize({"arg":{"channel":"books"}, "data":[{"ts":"1", "seqId":20, "prevSeqId":-1, "bids":[["1","2"]], "asks":[["3","4"]]}]}, local_receive_ts=2)[0]
     assert event.exchange_transaction_ts is None
+
+
+def _diff(u, U=None, pu=None):
+    return CanonicalOrderBookEvent("BINANCE", "orderbook", 1, None, 1,
+        bids=((100.0, 1.0),), asks=((101.0, 1.0),), update_id=u,
+        first_update_id=u if U is None else U, previous_update_id=pu)
+
+
+def _snapshot(update):
+    return CanonicalOrderBookEvent("BINANCE", "orderbook", None, None, 10,
+        bids=((100.0, 1.0),), asks=((101.0, 1.0),), update_id=update, is_snapshot=True)
+
+
+def test_binance_local_book_snapshot_bridges_and_discards_stale_diffs():
+    from collector.collector.book_engine import LocalBook
+    book = LocalBook("BINANCE")
+    book.buffer = [_diff(9, 9), _diff(10, 9), _diff(11, 11, 10)]
+    assert book.binance_snapshot(10, _snapshot(10))
+    assert book.previous.update_id == 11
+    assert book.state.state.value == "VALID"
+
+
+def test_binance_local_book_bridge_range_and_gap_retains_unproven_diffs():
+    from collector.collector.book_engine import LocalBook
+    book = LocalBook("BINANCE")
+    book.buffer = [_diff(12, 8), _diff(13, 13, 99)]
+    assert not book.binance_snapshot(10, _snapshot(10))
+    assert book.last_reason == "pu_mismatch"
+    assert [event.update_id for event in book.buffer] == [13]
+    assert book.state.state.value == "SEQUENCE_GAP"
+
+
+def test_binance_local_book_no_bridge_and_malformed_update_are_not_valid():
+    from collector.collector.book_engine import LocalBook
+    book = LocalBook("BINANCE")
+    book.buffer = [_diff(9, 9)]
+    assert not book.binance_snapshot(10, _snapshot(10))
+    assert book.state.state.value == "RECOVERING"
+    malformed = CanonicalOrderBookEvent("BINANCE", "orderbook", 1, None, 1,
+        bids=((100.0, 1.0),), asks=((101.0, 1.0),), update_id=12, first_update_id=None)
+    book.buffer = [malformed]
+    assert not book.binance_snapshot(10, _snapshot(10))

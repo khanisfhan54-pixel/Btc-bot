@@ -81,6 +81,14 @@ LIQUIDATION_SCHEMA = pa.schema([
     ("time_in_force", pa.string()),
 ], metadata={"schema_version": "1.0", "stream_name": "liquidation", "symbol": SYMBOL})
 
+BINANCE_ORDERBOOK_RAW_SCHEMA = pa.schema([
+    ("timestamp", pa.timestamp("ms", tz="UTC")), ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
+    ("local_receive_ts", pa.timestamp("ms", tz="UTC")), ("local_process_ts", pa.timestamp("ms", tz="UTC")),
+    ("bids", pa.list_(pa.list_(pa.float64()))), ("asks", pa.list_(pa.list_(pa.float64()))),
+    ("update_id", pa.int64()), ("first_update_id", pa.int64()), ("previous_update_id", pa.int64()),
+    ("book_source", pa.string()), ("quality_state", pa.string()),
+], metadata={"schema_version": "1.0", "stream_name": "binance_orderbook_raw", "symbol": SYMBOL})
+
 QUALITY_EVENTS_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
     ("exchange", pa.string()),
@@ -91,4 +99,8 @@ QUALITY_EVENTS_SCHEMA = pa.schema([
     ("rows_lost", pa.string()),
     ("quality_state", pa.string()),
     ("connection_id", pa.string()),
-], metadata={"schema_version": "1.0", "stream_name": "quality_events", "symbol": SYMBOL})
+    ("previous_state", pa.string()), ("new_state", pa.string()),
+    ("expected_previous_update_id", pa.int64()), ("actual_previous_update_id", pa.int64()),
+    ("update_id", pa.int64()), ("local_receive_ts", pa.timestamp("ms", tz="UTC")),
+    ("local_process_ts", pa.timestamp("ms", tz="UTC")),
+], metadata={"schema_version": "1.1", "stream_name": "quality_events", "symbol": SYMBOL})
