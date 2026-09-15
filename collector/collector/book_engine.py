@@ -19,20 +19,28 @@ class LocalBook:
     def __init__(self, venue: str):
         self.venue=venue; self.bids={}; self.asks={}; self.previous=None; self.buffer=[]; self.state=BookQualityStateMachine()
         self.last_reason=""; self.duplicate_count=0; self.last_transition=None; self.recovery_generation=0
+        # Only populated after a fully committed recovery transaction.  The
+        # caller persists these rows after releasing the state lock.
+        self.committed_recovery_events=[]
         self.comparator={"BINANCE":BinanceSequenceComparator(),"BYBIT":BybitSequenceComparator(),"OKX":OKXSequenceComparator()}[venue]
 
     @staticmethod
     def _valid_levels(levels):
         try:
-            return all(Decimal(str(price)) > 0 and Decimal(str(quantity)) >= 0 and Decimal(str(price)).is_finite() and Decimal(str(quantity)).is_finite() for price, quantity in levels)
+            return all(LocalBook._decimal(price) > 0 and LocalBook._decimal(quantity) >= 0 and LocalBook._decimal(price).is_finite() and LocalBook._decimal(quantity).is_finite() for price, quantity in levels)
         except (TypeError, ValueError, AttributeError): return False
+
+    @staticmethod
+    def _decimal(value):
+        """Keep Binance decimal text exact; Decimal inputs need no conversion."""
+        return value if isinstance(value, Decimal) else Decimal(str(value))
 
     def _validated_maps(self, event, bids=None, asks=None):
         if not self._valid_levels(event.bids) or not self._valid_levels(event.asks): return None
         bids=dict(self.bids if bids is None else bids); asks=dict(self.asks if asks is None else asks)
         for levels, target in ((event.bids,bids),(event.asks,asks)):
             for price, quantity in levels:
-                price, quantity = Decimal(str(price)), Decimal(str(quantity))
+                price, quantity = self._decimal(price), self._decimal(quantity)
                 if quantity == 0: target.pop(price, None)
                 else: target[price]=quantity
         # Empty sides are valid exchange states. A crossed non-empty book is not.
@@ -54,14 +62,14 @@ class LocalBook:
 
     def binance_snapshot(self,last_update_id,event):
         """Prove a snapshot plus ordered buffered chain before atomically committing it."""
-        old_bids, old_asks, old_previous = self.bids, self.asks, self.previous
         original=list(self.buffer)
-        # USD-M documentation: discard events where final update ID u is strictly less than lastUpdateId.
+        # Binance USD-M Futures: discard events whose final id u is <= the
+        # REST lastUpdateId; the *first remaining* event must bridge it.
         candidates=[]
         for diff in original:
             if not isinstance(diff.update_id, int) or not isinstance(diff.first_update_id, int):
                 self.buffer=original; self.last_reason="malformed_update_ids"; return False
-            if diff.update_id >= last_update_id: candidates.append(diff)
+            if diff.update_id > last_update_id: candidates.append(diff)
         if not candidates:
             self.buffer=original; self.last_reason="snapshot_bridge_not_found"; self.state.resync(); return False
         bridge=candidates[0]
@@ -70,20 +78,25 @@ class LocalBook:
         maps=self._validated_maps(event, {}, {})
         if maps is None:
             self.buffer=original; self.last_reason="invalid_snapshot"; self.state.gap(); return False
-        candidate_bids, candidate_asks=maps; previous=None
+        candidate_bids, candidate_asks=maps; previous=None; candidate_duplicates=0
+        generation=self.recovery_generation + 1
+        committed=[]
         # Apply bridge and chain to temporary maps only.
         for index, diff in enumerate(candidates):
             if index:
                 result=self.comparator.check(diff,previous)
-                if result.reason == "duplicate_update": self.duplicate_count += 1; continue
+                if result.reason == "duplicate_update": candidate_duplicates += 1; continue
                 if result.is_gap or result.is_resync_signal:
-                    self.buffer=candidates[index:]; self.last_reason=result.reason; self.state.gap(); return False
+                    # None of the temporary chain is authoritative until the
+                    # entire transaction commits, so retain every candidate.
+                    self.buffer=candidates; self.last_reason=result.reason; self.state.gap(); return False
             maps=self._validated_maps(diff,candidate_bids,candidate_asks)
             if maps is None:
-                self.buffer=candidates[index:]; self.last_reason="invalid_book"; self.state.gap(); return False
+                self.buffer=candidates; self.last_reason="invalid_book"; self.state.gap(); return False
             candidate_bids,candidate_asks=maps; previous=diff
+            committed.append((replace(diff, bids=tuple(sorted(candidate_bids.items(), reverse=True)), asks=tuple(sorted(candidate_asks.items())), quality_state=BookQuality.VALID.value), "RECOVERY_BRIDGE" if index == 0 else "RECOVERY_INCREMENTAL", generation))
         self.bids,self.asks,self.previous=candidate_bids,candidate_asks,previous
-        self.buffer=[]; self.state.recovered(); self.recovery_generation += 1; self.last_reason=""
+        self.buffer=[]; self.state.recovered(); self.recovery_generation = generation; self.duplicate_count += candidate_duplicates; self.committed_recovery_events=committed; self.last_reason=""
         self.last_transition=BookTransition(BookQuality.RECOVERING,BookQuality.VALID,previous)
         return True
 

@@ -55,7 +55,7 @@ BINANCE_TRADES_RAW_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")), ("local_receive_ts", pa.timestamp("ms", tz="UTC")),
     ("exchange_timestamp", pa.timestamp("ms", tz="UTC")), ("trade_id", pa.int64()),
     ("native_trade_id", pa.string()), ("price", pa.float64()), ("quantity", pa.float64()),
-], metadata={"schema_version": "1.0", "stream_name": "binance_trades_raw", "symbol": SYMBOL})
+], metadata={"schema_version": "2.0", "migration": "v2: native_trade_id is authoritative; legacy trade_id is nullable", "stream_name": "binance_trades_raw", "symbol": SYMBOL})
 
 MARKPRICE_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
@@ -91,10 +91,10 @@ BINANCE_ORDERBOOK_RAW_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),  # Canonical local processing timestamp.
     ("exchange_timestamp", pa.timestamp("ms", tz="UTC")),
     ("local_receive_ts", pa.timestamp("ms", tz="UTC")), ("local_process_ts", pa.timestamp("ms", tz="UTC")),
-    ("bids", pa.list_(pa.list_(pa.float64()))), ("asks", pa.list_(pa.list_(pa.float64()))),
+    ("bids", pa.list_(pa.list_(pa.string()))), ("asks", pa.list_(pa.list_(pa.string()))),
     ("update_id", pa.int64()), ("first_update_id", pa.int64()), ("previous_update_id", pa.int64()),
     ("book_source", pa.string()), ("event_kind", pa.string()), ("recovery_generation", pa.int64()), ("quality_state", pa.string()),
-], metadata={"schema_version": "1.0", "stream_name": "binance_orderbook_raw", "symbol": SYMBOL})
+], metadata={"schema_version": "2.0", "migration": "v2: book levels are canonical decimal strings; timestamp is canonical local event processing timestamp", "stream_name": "binance_orderbook_raw", "symbol": SYMBOL})
 
 QUALITY_EVENTS_SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("ms", tz="UTC")),
