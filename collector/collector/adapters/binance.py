@@ -1,5 +1,6 @@
 from __future__ import annotations
 import time
+from decimal import Decimal
 from typing import Optional
 from .base import ExchangeAdapter
 from ..canonical import CanonicalLiquidationEvent, CanonicalMarkPriceEvent, CanonicalOIEvent, CanonicalOrderBookEvent, CanonicalTradeEvent, OISource
@@ -19,7 +20,7 @@ class BinanceAdapter(ExchangeAdapter):
         d = raw.get("data", raw); now = int(time.time()*1000) if local_receive_ts is None else local_receive_ts; route=self.route_message(raw) or d.get("e", "")
         if route == "orderbook" or d.get("e") == "depthUpdate":
             source = "PARTIAL_DEPTH" if "@depth10" in raw.get("stream", "") else "DIFF_DEPTH_RECONSTRUCTED"
-            return [CanonicalOrderBookEvent("BINANCE","orderbook",d.get("E"),d.get("T"),now, bids=tuple((float(p),float(q)) for p,q in d.get("b",[])), asks=tuple((float(p),float(q)) for p,q in d.get("a",[])), update_id=d.get("u"),first_update_id=d.get("U"),previous_update_id=d.get("pu"), is_snapshot=False, book_source=source)]
+            return [CanonicalOrderBookEvent("BINANCE","orderbook",d.get("E"),d.get("T"),now, bids=tuple((Decimal(p),Decimal(q)) for p,q in d.get("b",[])), asks=tuple((Decimal(p),Decimal(q)) for p,q in d.get("a",[])), update_id=d.get("u"),first_update_id=d.get("U"),previous_update_id=d.get("pu"), is_snapshot=False, book_source=source)]
         if route == "trades" or d.get("e") == "aggTrade": return [CanonicalTradeEvent("BINANCE","trades",d.get("E"),d.get("T"),now,trade_id=str(d.get("a")) if d.get("a") is not None else None,price=float(d["p"]),quantity=float(d["q"]),side="SELL" if d.get("m") else "BUY",nq=float(d["nq"]) if d.get("nq") is not None else None)]
         if route == "markprice" or d.get("e") == "markPriceUpdate": return [CanonicalMarkPriceEvent("BINANCE","markprice",d.get("E"),None,now,mark_price=float(d["p"]),index_price=float(d["i"]) if d.get("i") is not None else None,funding_rate=float(d["r"]),next_funding_time=d.get("T"))]
         if route == "liquidation" or d.get("e") == "forceOrder":

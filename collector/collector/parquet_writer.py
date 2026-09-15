@@ -78,6 +78,12 @@ class ParquetWriter:
             self.quality_event_sink(event)
 
     def _recover_orphans(self) -> None:
+        # Metadata is advisory; an interrupted publication leaves only an orphan temp.
+        for meta_tmp in self.stream_dir.glob("*.meta.json.tmp"):
+            try:
+                meta_tmp.unlink()
+            except OSError as exc:
+                logger.error("metadata_orphan_discard_failed", file=str(meta_tmp), error=str(exc))
         # Never attempt pq.read_table/ParquetFile on an unclosed segment.
         for tmp in self.stream_dir.glob("*.seg.tmp"):
             count_path = Path(str(tmp).removesuffix(".tmp") + ".count.json")
