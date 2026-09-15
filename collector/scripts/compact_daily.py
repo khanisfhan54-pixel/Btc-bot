@@ -28,7 +28,7 @@ STREAM_SCHEMAS: dict[str, pa.Schema] = {
 }
 ALL_STREAMS = tuple(STREAM_SCHEMAS.keys())
 TIMESTAMP_TYPE = pa.timestamp("ms", tz="UTC")
-DATE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})-\d{2}\.parquet$")
+DATE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})-\d{2}(?:-\d{6}\.seg|\.parquet)$")
 DEFAULT_GUARD_SECONDS = 90
 class CompactionError(RuntimeError):
     """Raised when a daily compaction input fails validation.
@@ -84,7 +84,7 @@ def compact_daily(
     if force:
         _remove_stale_tmp(final_path, stream, date)
         _remove_stale_tmp(meta_path, stream, date)
-        for hourly_tmp_path in raw_dir.glob(f"{date}-*.parquet.tmp"):
+        for hourly_tmp_path in list(raw_dir.glob(f"{date}-*.parquet.tmp")) + list(raw_dir.glob(f"{date}-*.seg.tmp")):
             _remove_stale_tmp(hourly_tmp_path.with_suffix(""), stream, date)
     discovered = _discover_hourly_files(raw_dir, date, guard_seconds=guard_seconds)
     if not discovered.present_files:
@@ -228,15 +228,16 @@ def _discover_hourly_files(raw_dir: Path, date: str, *, guard_seconds: int) -> _
     current_date = now.strftime("%Y-%m-%d")
     current_hour = now.hour
     for hour in range(24):
-        path = raw_dir / f"{date}-{hour:02d}.parquet"
-        tmp_path = Path(str(path) + ".tmp")
-        if tmp_path.exists():
+        legacy = raw_dir / f"{date}-{hour:02d}.parquet"
+        paths = sorted(raw_dir.glob(f"{date}-{hour:02d}-*.seg")) or ([legacy] if legacy.exists() else [])
+        tmp_paths = list(raw_dir.glob(f"{date}-{hour:02d}-*.seg.tmp")) + [Path(str(legacy) + ".tmp")]
+        if any(path.exists() for path in tmp_paths):
             is_current_hour = date == current_date and hour == current_hour
             if is_current_hour:
                 logger.warning("compact_daily_skip_matching_tmp", stream=raw_dir.name, date=date, hour=hour)
                 skipped.append(hour)
                 continue
-            if path.exists():
+            if paths:
                 logger.warning(
                     "compact_daily_stale_tmp_ignored",
                     stream=raw_dir.name,
@@ -247,16 +248,13 @@ def _discover_hourly_files(raw_dir: Path, date: str, *, guard_seconds: int) -> _
                         "ignoring .tmp and compacting."
                     ),
                 )
-        if not path.exists():
+        if not paths:
             logger.warning("compact_daily_missing_hour", stream=raw_dir.name, date=date, hour=hour)
             missing.append(hour)
             continue
-        if path.name.endswith((".tmp", ".bak")):
-            skipped.append(hour)
-            continue
         is_current_hour = date == current_date and hour == current_hour
         if is_current_hour:
-            age_seconds = datetime.now(UTC).timestamp() - path.stat().st_mtime
+            age_seconds = min(datetime.now(UTC).timestamp() - path.stat().st_mtime for path in paths)
             if age_seconds < guard_seconds:
                 logger.warning(
                     "compact_daily_skip_current_hour",
@@ -268,7 +266,7 @@ def _discover_hourly_files(raw_dir: Path, date: str, *, guard_seconds: int) -> _
                 )
                 skipped.append(hour)
                 continue
-        present.append(path)
+        present.extend(paths)
     return _DiscoveredFiles(present, missing, skipped)
 def _discover_all_dates(data_dir: Path, streams: Sequence[str]) -> set[str]:
     dates: set[str] = set()
@@ -276,7 +274,7 @@ def _discover_all_dates(data_dir: Path, streams: Sequence[str]) -> set[str]:
         raw_dir = data_dir / "raw" / stream
         if not raw_dir.exists():
             continue
-        for path in raw_dir.glob("*.parquet"):
+        for path in list(raw_dir.glob("*.parquet")) + list(raw_dir.glob("*.seg")):
             if path.name.endswith((".tmp", ".bak")):
                 continue
             match = DATE_RE.match(path.name)
@@ -521,6 +519,9 @@ def _fsync_parent_dir(final_path: Path) -> None:
     finally:
         os.close(parent_fd)
 def _hour_from_path(path: Path) -> int:
-    return int(path.stem.rsplit("-", 1)[1])
+    match = re.match(r"^\d{4}-\d{2}-\d{2}-(\d{2})(?:-\d{6}\.seg|\.parquet)$", path.name)
+    if not match:
+        raise CompactionError(f"invalid raw segment filename: {path.name}")
+    return int(match.group(1))
 if __name__ == "__main__":
     raise SystemExit(main())

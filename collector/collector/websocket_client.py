@@ -1,14 +1,15 @@
 import asyncio
 import json
 import websockets
-from typing import Callable, Awaitable
+from typing import Callable, Awaitable, Optional
 from .utils import logger
 
 class WebSocketClient:
-    def __init__(self, url: str, on_message: Callable[[dict], Awaitable[None]], on_reconnect: Callable[[], None] = None):
+    def __init__(self, url: str, on_message: Callable[[dict], Awaitable[None]], on_reconnect: Callable[[], None] = None, on_quality_event: Optional[Callable[[str, str], None]] = None):
         self.url = url
         self.on_message = on_message
         self.on_reconnect = on_reconnect
+        self.on_quality_event = on_quality_event
         self.running = False
         self.connected = False
         self.retry_delay = 1.0
@@ -30,6 +31,9 @@ class WebSocketClient:
                     self.attempt = 0
                     logger.info("WebSocket connected")
 
+                    if self.on_quality_event:
+                        self.on_quality_event("CONNECT", "websocket_connected")
+
                     if self.on_reconnect:
                         self.on_reconnect()
 
@@ -45,9 +49,13 @@ class WebSocketClient:
             except websockets.ConnectionClosed as e:
                 self.connected = False
                 logger.warning("WebSocket connection closed", error=str(e))
+                if self.on_quality_event:
+                    self.on_quality_event("DISCONNECT", str(e))
             except Exception as e:
                 self.connected = False
                 logger.error("WebSocket error", error=str(e))
+                if self.on_quality_event:
+                    self.on_quality_event("DISCONNECT", str(e))
 
             if self.running:
                 self.attempt += 1
