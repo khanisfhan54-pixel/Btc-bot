@@ -157,10 +157,19 @@ class ParquetWriter:
             os.fsync(parent_fd)
         finally:
             os.close(parent_fd)
+        # Metadata is advisory: recovery relies only on .seg.tmp and its durable
+        # count sidecar. Publish metadata atomically so it never affects data durability.
         counter.unlink(missing_ok=True)
-        with Path(str(final) + ".meta.json").open("w", encoding="utf-8") as handle:
+        meta = Path(str(final) + ".meta.json")
+        meta_tmp = Path(str(meta) + ".tmp")
+        with meta_tmp.open("w", encoding="utf-8") as handle:
             json.dump({"record_count": self.record_count, "first_record_ts": self._first_record_ts,
                        "last_record_ts": self._last_record_ts}, handle)
+            handle.flush(); os.fsync(handle.fileno())
+        os.replace(meta_tmp, meta)
+        parent_fd = os.open(str(final.parent), os.O_RDONLY)
+        try: os.fsync(parent_fd)
+        finally: os.close(parent_fd)
         logger.info("closed_parquet_segment", stream=self.stream_name, file=str(final), rows=self.record_count)
         if open_next:
             self._seq += 1

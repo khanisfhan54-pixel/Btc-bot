@@ -64,22 +64,22 @@ class HealthMonitor:
         book_stale = (
             (now - self.last_book_ts) > ORDERBOOK_STALE_MS * HEALTH_CHECK_STALE_MULTIPLIER
             if self.last_book_ts > 0
-            else True
+            else (now - self.started_at) > ORDERBOOK_STALE_MS * HEALTH_CHECK_STALE_MULTIPLIER
         )
         trade_stale = (
             (now - self.last_trade_ts) > TRADES_STALE_MS * HEALTH_CHECK_STALE_MULTIPLIER
             if self.last_trade_ts > 0
-            else True
+            else (now - self.started_at) > TRADES_STALE_MS * HEALTH_CHECK_STALE_MULTIPLIER
         )
         mark_stale = (
             (now - self.last_mark_ts) > MARKPRICE_STALE_MS * HEALTH_CHECK_STALE_MULTIPLIER
             if self.last_mark_ts > 0
-            else True
+            else (now - self.started_at) > MARKPRICE_STALE_MS * HEALTH_CHECK_STALE_MULTIPLIER
         )
         oi_stale = (
             (now - self.last_oi_ts) > OI_STALE_MS * HEALTH_CHECK_STALE_MULTIPLIER
             if self.last_oi_ts > 0
-            else True
+            else (now - self.started_at) > OI_STALE_MS * HEALTH_CHECK_STALE_MULTIPLIER
         )
         liq_stale = (
             (now - self.last_liq_ts) > LIQUIDATION_STALE_MS

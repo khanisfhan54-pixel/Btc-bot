@@ -7,7 +7,8 @@ class GapDetector:
         self.last_seen: Dict[str, int] = {
             "orderbook": 0,
             "trades": 0,
-            "markprice": 0
+            "markprice": 0,
+            "openinterest": 0
         }
         self.thresholds = {
             "orderbook": 500,
@@ -24,6 +25,9 @@ class GapDetector:
         if threshold is None:
             raise ValueError(f"No gap threshold configured for stream: {stream_name}")
 
+        if last_ts > 0 and current_ts < last_ts:
+            logger.warning("Clock regression detected", stream=stream_name, last_ts=last_ts, current_ts=current_ts)
+            return "clock_regression"
         if last_ts > 0:
             gap_duration = current_ts - last_ts
             if gap_duration > threshold:
