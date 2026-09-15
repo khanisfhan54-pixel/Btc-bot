@@ -1,0 +1,13 @@
+from __future__ import annotations
+from abc import ABC, abstractmethod
+from typing import Any, Optional
+class ExchangeAdapter(ABC):
+    channel_event_types: dict[str, tuple[str, ...]] = {}
+    @abstractmethod
+    def connect(self): ...
+    @abstractmethod
+    def subscribe_message(self, streams): ...
+    @abstractmethod
+    def route_message(self, raw: dict) -> Optional[str]: ...
+    @abstractmethod
+    def normalize(self, raw: dict, *, local_receive_ts: Optional[int] = None) -> list[Any]: ...

@@ -67,8 +67,8 @@ def _write_stats(stats: Dict[str, Dict[str, Any]], data_dir: str, filename: str)
     print(f"Saved stats to {out_file}")
 
 
-def compute_raw_stream_stats(data_dir: str, stream_name: str, output_filename: str):
-    raw_files = glob.glob(os.path.join(data_dir, "raw", stream_name, "*.parquet"))
+def compute_raw_stream_stats(data_dir: str, stream_name: str, output_filename: str, *, max_allowed_end_ts=None):
+    raw_files = glob.glob(os.path.join(data_dir, "raw", stream_name, "*.parquet")) + glob.glob(os.path.join(data_dir, "raw", stream_name, "*.seg"))
 
     if not raw_files:
         print(f"No raw {stream_name} data found.")
@@ -76,20 +76,27 @@ def compute_raw_stream_stats(data_dir: str, stream_name: str, output_filename: s
 
     print(f"Computing stats from {len(raw_files)} raw {stream_name} files...")
     df = _load_parquet_files(raw_files)
+    _enforce_end_boundary(df, max_allowed_end_ts)
     stats = _compute_column_stats(df)
     _write_stats(stats, data_dir, output_filename)
 
 
-def compute_orderbook_stats(data_dir: str = "data"):
-    compute_raw_stream_stats(data_dir, "orderbook", "orderbook_stats.json")
+def _enforce_end_boundary(df: pd.DataFrame, max_allowed_end_ts) -> None:
+    if max_allowed_end_ts is None or "timestamp" not in df:
+        return
+    if pd.to_datetime(df["timestamp"], utc=True).max() > pd.to_datetime(max_allowed_end_ts, utc=True):
+        raise ValueError("statistics range exceeds max_allowed_end_ts")
+
+def compute_orderbook_stats(data_dir: str = "data", *, max_allowed_end_ts=None):
+    compute_raw_stream_stats(data_dir, "orderbook", "orderbook_stats.json", max_allowed_end_ts=max_allowed_end_ts)
 
 
-def compute_trades_stats(data_dir: str = "data"):
-    compute_raw_stream_stats(data_dir, "trades", "trades_stats.json")
+def compute_trades_stats(data_dir: str = "data", *, max_allowed_end_ts=None):
+    compute_raw_stream_stats(data_dir, "trades", "trades_stats.json", max_allowed_end_ts=max_allowed_end_ts)
 
 
-def compute_markprice_stats(data_dir: str = "data"):
-    compute_raw_stream_stats(data_dir, "markprice", "markprice_stats.json")
+def compute_markprice_stats(data_dir: str = "data", *, max_allowed_end_ts=None):
+    compute_raw_stream_stats(data_dir, "markprice", "markprice_stats.json", max_allowed_end_ts=max_allowed_end_ts)
 
 
 def compute_aligned_stats(data_dir: str = "data"):
