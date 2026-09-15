@@ -93,7 +93,9 @@ class ParquetWriter:
             except OSError as exc:
                 logger.error("segment_orphan_discard_failed", file=str(tmp), error=str(exc))
                 continue
-            if rows:
+            # A missing counter is itself material uncertainty; a persisted
+            # zero counter proves no rows were flushed and emits no drop.
+            if rows is None or rows > 0:
                 self._emit_drop(rows)
 
     def _open_segment(self) -> None:
@@ -150,6 +152,11 @@ class ParquetWriter:
         with tmp.open("rb") as handle:
             os.fsync(handle.fileno())
         os.replace(tmp, final)
+        parent_fd = os.open(str(final.parent), os.O_RDONLY)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
         counter.unlink(missing_ok=True)
         with Path(str(final) + ".meta.json").open("w", encoding="utf-8") as handle:
             json.dump({"record_count": self.record_count, "first_record_ts": self._first_record_ts,

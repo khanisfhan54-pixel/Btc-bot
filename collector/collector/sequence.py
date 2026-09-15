@@ -15,8 +15,10 @@ class BinanceSequenceComparator(SequenceComparator):
 class BybitSequenceComparator(SequenceComparator):
     def check(self, current, previous):
         if previous is None: return SequenceResult()
-        if current.update_id is not None and previous.update_id is not None and current.update_id <= previous.update_id:
+        if current.update_id is not None and previous.update_id is not None and current.update_id < previous.update_id:
             return SequenceResult(False, True, "update_id_decrease_or_reset")
+        if current.update_id == previous.update_id:
+            return SequenceResult(False, False, "duplicate_update")
         return SequenceResult()
 class OKXSequenceComparator(SequenceComparator):
     def check(self, current, previous):

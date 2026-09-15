@@ -18,9 +18,10 @@ class BinanceAdapter(ExchangeAdapter):
     def normalize(self, raw, *, local_receive_ts: Optional[int] = None):
         d = raw.get("data", raw); now = int(time.time()*1000) if local_receive_ts is None else local_receive_ts; route=self.route_message(raw) or d.get("e", "")
         if route == "orderbook" or d.get("e") == "depthUpdate":
-            return [CanonicalOrderBookEvent("BINANCE","orderbook",d.get("E"),d.get("T"),now, bids=tuple((float(p),float(q)) for p,q in d.get("b",[])), asks=tuple((float(p),float(q)) for p,q in d.get("a",[])), update_id=d.get("u"),first_update_id=d.get("U"),previous_update_id=d.get("pu"), is_snapshot=False)]
-        if route == "trades" or d.get("e") == "aggTrade": return [CanonicalTradeEvent("BINANCE","trades",d.get("E"),d.get("T"),now,trade_id=d.get("a"),price=float(d["p"]),quantity=float(d["q"]),side="SELL" if d.get("m") else "BUY",nq=float(d["nq"]) if d.get("nq") is not None else None)]
-        if route == "markprice" or d.get("e") == "markPriceUpdate": return [CanonicalMarkPriceEvent("BINANCE","markprice",d.get("E"),d.get("T"),now,mark_price=float(d["p"]),index_price=float(d["i"]) if d.get("i") is not None else None,funding_rate=float(d["r"]),next_funding_time=d.get("T"))]
+            source = "PARTIAL_DEPTH" if "@depth10" in raw.get("stream", "") else "DIFF_DEPTH_RECONSTRUCTED"
+            return [CanonicalOrderBookEvent("BINANCE","orderbook",d.get("E"),d.get("T"),now, bids=tuple((float(p),float(q)) for p,q in d.get("b",[])), asks=tuple((float(p),float(q)) for p,q in d.get("a",[])), update_id=d.get("u"),first_update_id=d.get("U"),previous_update_id=d.get("pu"), is_snapshot=False, book_source=source)]
+        if route == "trades" or d.get("e") == "aggTrade": return [CanonicalTradeEvent("BINANCE","trades",d.get("E"),d.get("T"),now,trade_id=str(d.get("a")) if d.get("a") is not None else None,price=float(d["p"]),quantity=float(d["q"]),side="SELL" if d.get("m") else "BUY",nq=float(d["nq"]) if d.get("nq") is not None else None)]
+        if route == "markprice" or d.get("e") == "markPriceUpdate": return [CanonicalMarkPriceEvent("BINANCE","markprice",d.get("E"),None,now,mark_price=float(d["p"]),index_price=float(d["i"]) if d.get("i") is not None else None,funding_rate=float(d["r"]),next_funding_time=d.get("T"))]
         if route == "liquidation" or d.get("e") == "forceOrder":
             o=d.get("o",{}); return [CanonicalLiquidationEvent("BINANCE","liquidation",d.get("E"),o.get("T"),now,side=o.get("S"),price=float(o["p"]),quantity=float(o["q"]))]
         return []
