@@ -6,8 +6,9 @@ from typing import Callable, Awaitable, Optional
 from .utils import logger
 
 class WebSocketClient:
-    def __init__(self, url: str, on_message: Callable[[dict], Awaitable[None]], on_reconnect: Callable[[], None] = None, on_quality_event: Optional[Callable[[str, str], None]] = None):
+    def __init__(self, url: str, on_message: Callable[[dict], Awaitable[None]], on_reconnect: Callable[[], None] = None, on_quality_event: Optional[Callable[[str, str], None]] = None, stream_group: str = "websocket"):
         self.url = url
+        self.stream_group = stream_group
         self.on_message = on_message
         self.on_reconnect = on_reconnect
         self.on_quality_event = on_quality_event
@@ -31,13 +32,13 @@ class WebSocketClient:
                 async with connection as ws:
                     self.connected = True
                     self._connection_serial += 1
-                    self.connection_id = f"{self._connection_serial}"
+                    self.connection_id = f"{self.stream_group}-{self._connection_serial}"
                     self.retry_delay = 1.0
                     self.attempt = 0
                     logger.info("WebSocket connected")
 
                     if self.on_quality_event:
-                        self.on_quality_event("CONNECT", "websocket_connected", self.connection_id)
+                        self.on_quality_event("CONNECT", "websocket_connected", self.connection_id, self.stream_group)
 
                     if self.on_reconnect:
                         self.on_reconnect()
@@ -59,12 +60,12 @@ class WebSocketClient:
                 self.connected = False
                 logger.warning("WebSocket connection closed", error=str(e))
                 if self.on_quality_event:
-                    self.on_quality_event("DISCONNECT", str(e), self.connection_id)
+                    self.on_quality_event("DISCONNECT", str(e), self.connection_id, self.stream_group)
             except Exception as e:
                 self.connected = False
                 logger.error("WebSocket error", error=str(e))
                 if self.on_quality_event:
-                    self.on_quality_event("DISCONNECT", str(e), self.connection_id)
+                    self.on_quality_event("DISCONNECT", str(e), self.connection_id, self.stream_group)
 
             if self.running:
                 self.attempt += 1

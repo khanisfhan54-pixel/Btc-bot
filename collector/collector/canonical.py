@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional
+from decimal import Decimal
 
 class OISource(str, Enum): REST_POLL = "REST_POLL"; WS_PUSH = "WS_PUSH"
 
@@ -13,7 +14,7 @@ class CanonicalEvent:
 
 @dataclass(frozen=True)
 class CanonicalOrderBookEvent(CanonicalEvent):
-    bids: tuple[tuple[float, float], ...] = (); asks: tuple[tuple[float, float], ...] = ()
+    bids: tuple[tuple[Decimal, Decimal], ...] = (); asks: tuple[tuple[Decimal, Decimal], ...] = ()
     update_id: Optional[int] = None; first_update_id: Optional[int] = None; previous_update_id: Optional[int] = None
     sequence: Optional[int] = None; is_snapshot: bool = False; book_source: str = "DIFF_DEPTH_RECONSTRUCTED"
 
