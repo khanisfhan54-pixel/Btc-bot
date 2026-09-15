@@ -74,6 +74,24 @@ def test_health_monitor_liquidation_staleness_alert(monkeypatch, monitor):
     assert "liquidation" in alerts[0]
 
 
+def test_health_monitor_does_not_alert_for_missing_initial_liquidation(monkeypatch, monitor):
+    from collector.collector.health_monitor import LIQUIDATION_STALE_MS
+
+    now = 10_000_000
+    monitor.started_at = now - LIQUIDATION_STALE_MS + 1
+    monitor.last_book_ts = now
+    monitor.last_trade_ts = now
+    monitor.last_mark_ts = now
+    monitor.last_oi_ts = now
+    alerts = []
+    monkeypatch.setattr("collector.collector.health_monitor.time.time", lambda: now / 1000)
+    monkeypatch.setattr("collector.collector.health_monitor.send_telegram_alert", alerts.append)
+
+    monitor._check_health()
+
+    assert not alerts
+
+
 @pytest.mark.parametrize(
     ("stream_attr", "constant_name"),
     [

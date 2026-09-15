@@ -23,6 +23,7 @@ class HealthMonitor:
         self.last_mark_ts = 0
         self.last_oi_ts = 0
         self.last_liq_ts = 0
+        self.started_at = int(time.time() * 1000)
         self.messages_per_minute: Dict[str, int] = {
             "orderbook": 0,
             "trades": 0,
@@ -83,7 +84,7 @@ class HealthMonitor:
         liq_stale = (
             (now - self.last_liq_ts) > LIQUIDATION_STALE_MS
             if self.last_liq_ts > 0
-            else True
+            else (now - self.started_at) > LIQUIDATION_STALE_MS
         )
 
         if book_stale or trade_stale or mark_stale or oi_stale or liq_stale:

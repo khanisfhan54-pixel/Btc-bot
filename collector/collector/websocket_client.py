@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 import websockets
 from typing import Callable, Awaitable, Optional
 from .utils import logger
@@ -41,8 +42,12 @@ class WebSocketClient:
                         if not self.running:
                             break
                         try:
+                            # Capture arrival time before decoding so downstream
+                            # research can distinguish network arrival from work
+                            # performed after JSON parsing.
+                            local_receive_ts = int(time.time() * 1000)
                             data = json.loads(msg)
-                            await self.on_message(data)
+                            await self.on_message(data, local_receive_ts)
                         except json.JSONDecodeError:
                             logger.error("Failed to parse JSON from WebSocket", msg=msg)
 

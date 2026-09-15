@@ -22,10 +22,22 @@ class LocalBook:
         self.bids.clear(); self.asks.clear(); self._apply_levels(event.bids,"b"); self._apply_levels(event.asks,"a"); self.previous=event
     def binance_snapshot(self,last_update_id,event):
         self.snapshot(event); self.state.resync()
-        buffered=[x for x in self.buffer if x.update_id >= last_update_id]
+        # Keep the bridge event when u == lastUpdateId.  USD-M uses the
+        # documented U <= lastUpdateId <= u bridge condition (no +1).
+        buffered=[x for x in self.buffer if x.update_id is not None and x.update_id >= last_update_id]
         self.buffer=[]
-        for diff in buffered:
-            if binance_snapshot_bridge(diff,last_update_id): self._apply(diff); self.state.recovered(); return True
+        for position, diff in enumerate(buffered):
+            if not binance_snapshot_bridge(diff,last_update_id):
+                continue
+            self._apply(diff)
+            for subsequent in buffered[position + 1:]:
+                result = self.comparator.check(subsequent, self.previous)
+                if result.is_gap:
+                    self.state.gap()
+                    return False
+                self._apply(subsequent)
+            self.state.recovered()
+            return True
         return False
     def apply(self,event):
         if self.venue=="BINANCE" and self.previous is None:
