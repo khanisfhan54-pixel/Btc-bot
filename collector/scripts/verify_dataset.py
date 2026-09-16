@@ -1,7 +1,6 @@
-import os
 import sys
-import glob
 import pandas as pd
+from collector.collector.storage_layout import iter_segments
 
 def verify_date(date_str: str, data_dir: str = "data"):
     print(f"Verifying {date_str}...")
@@ -11,17 +10,12 @@ def verify_date(date_str: str, data_dir: str = "data"):
     all_passed = True
 
     for stream in streams:
-        stream_dir = os.path.join(data_dir, "raw", stream)
-
-        # Check files
-        for hour in range(24):
-            file_name = f"{date_str}-{hour:02d}.parquet"
-            file_path = os.path.join(stream_dir, file_name)
-
-            if not os.path.exists(file_path):
-                print(f"  [FAIL] Missing {stream} {hour:02d}: {file_path}")
-                all_passed = False
-                continue
+        files = list(iter_segments(data_dir, stream, date=date_str))
+        if not files:
+            print(f"  [FAIL] No published source segments for {stream} {date_str}")
+            all_passed = False
+            continue
+        for file_path in files:
 
             try:
                 df = pd.read_parquet(file_path)
@@ -76,12 +70,15 @@ def verify_dataset(start_date: str, end_date: str, data_dir: str = "data"):
         print("\nAll dates passed verification.")
     else:
         print("\nSome dates failed verification.")
+    return all_passed
 
 if __name__ == "__main__":
     if len(sys.argv) == 3:
-        verify_dataset(sys.argv[1], sys.argv[2])
+        ok = verify_dataset(sys.argv[1], sys.argv[2])
     elif len(sys.argv) == 2:
-        verify_dataset(sys.argv[1], sys.argv[1])
+        ok = verify_dataset(sys.argv[1], sys.argv[1])
     else:
         print("Usage: python verify_dataset.py START_DATE [END_DATE]")
         print("Example: python verify_dataset.py 2026-06-01 2026-06-30")
+        ok = False
+    raise SystemExit(0 if ok else 1)
