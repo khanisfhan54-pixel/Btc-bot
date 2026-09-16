@@ -63,13 +63,14 @@ class LocalBook:
     def binance_snapshot(self,last_update_id,event):
         """Prove a snapshot plus ordered buffered chain before atomically committing it."""
         original=list(self.buffer)
-        # Binance USD-M Futures: discard events whose final id u is <= the
-        # REST lastUpdateId; the *first remaining* event must bridge it.
+        # Binance USD-M Futures: discard events whose final id u is strictly
+        # less than REST lastUpdateId; equality remains a bridge candidate.
+        # The first non-stale event itself must bridge the snapshot.
         candidates=[]
         for diff in original:
             if not isinstance(diff.update_id, int) or not isinstance(diff.first_update_id, int):
                 self.buffer=original; self.last_reason="malformed_update_ids"; return False
-            if diff.update_id > last_update_id: candidates.append(diff)
+            if diff.update_id >= last_update_id: candidates.append(diff)
         if not candidates:
             self.buffer=original; self.last_reason="snapshot_bridge_not_found"; self.state.resync(); return False
         bridge=candidates[0]
