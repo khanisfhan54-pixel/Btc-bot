@@ -2,61 +2,32 @@ import calendar
 import os
 import pandas as pd
 import numpy as np
-import pyarrow as pa
-import pyarrow.parquet as pa_parquet
 from datetime import datetime, timedelta
+from collector.collector.storage_layout import iter_segments
+
+
+def _read_stream(data_dir: str, stream: str, date_str: str) -> list[pd.DataFrame]:
+    """Read all published raw segments for one stream/date (legacy included)."""
+    frames = []
+    for path in iter_segments(data_dir, stream, date=date_str):
+        frame = pd.read_parquet(path)
+        if "timestamp" in frame and pd.api.types.is_datetime64_any_dtype(frame["timestamp"]):
+            # Arrow/Pandas may preserve a millisecond physical timestamp; force
+            # nanosecond resolution before converting to epoch milliseconds.
+            frame["timestamp"] = (
+                pd.to_datetime(frame["timestamp"], utc=True)
+                .astype("datetime64[ns, UTC]")
+                .astype("int64") // 1_000_000
+            )
+        frames.append(frame)
+    return frames
 
 def assemble_dataset(date_str: str, grid_ms: int = 100, data_dir: str = "data"):
     print(f"Assembling dataset for {date_str} with grid {grid_ms}ms")
 
-    # Load all files for the given date
-    ob_dir = os.path.join(data_dir, "raw", "orderbook")
-    trades_dir = os.path.join(data_dir, "raw", "trades")
-    mark_dir = os.path.join(data_dir, "raw", "markprice")
-
-    ob_dfs = []
-    trades_dfs = []
-    mark_dfs = []
-
-    # Try to load all 24 hours
-    for hour in range(24):
-        file_prefix = f"{date_str}-{hour:02d}"
-
-        ob_file = os.path.join(ob_dir, f"{file_prefix}.parquet")
-        if os.path.exists(ob_file):
-            df = pd.read_parquet(ob_file)
-            if pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
-                df["timestamp"] = (
-                    pd.to_datetime(df["timestamp"], utc=True)
-                    .astype("datetime64[ns, UTC]")
-                    .astype("int64")
-                    // 1_000_000
-                )
-            ob_dfs.append(df)
-
-        trades_file = os.path.join(trades_dir, f"{file_prefix}.parquet")
-        if os.path.exists(trades_file):
-            df = pd.read_parquet(trades_file)
-            if pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
-                df["timestamp"] = (
-                    pd.to_datetime(df["timestamp"], utc=True)
-                    .astype("datetime64[ns, UTC]")
-                    .astype("int64")
-                    // 1_000_000
-                )
-            trades_dfs.append(df)
-
-        mark_file = os.path.join(mark_dir, f"{file_prefix}.parquet")
-        if os.path.exists(mark_file):
-            df = pd.read_parquet(mark_file)
-            if pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
-                df["timestamp"] = (
-                    pd.to_datetime(df["timestamp"], utc=True)
-                    .astype("datetime64[ns, UTC]")
-                    .astype("int64")
-                    // 1_000_000
-                )
-            mark_dfs.append(df)
+    ob_dfs = _read_stream(data_dir, "orderbook", date_str)
+    trades_dfs = _read_stream(data_dir, "trades", date_str)
+    mark_dfs = _read_stream(data_dir, "markprice", date_str)
 
     if not ob_dfs or not mark_dfs:
         print(f"Insufficient data for {date_str}")
@@ -85,36 +56,30 @@ def assemble_dataset(date_str: str, grid_ms: int = 100, data_dir: str = "data"):
     grid_ts = np.arange(start_ts, end_ts, grid_ms)
     df_grid = pd.DataFrame({"timestamp": grid_ts})
 
-    # Forward fill orderbook and mark price using merge_asof
-    df_ob = df_ob.drop(columns=["exchange_timestamp", "local_timestamp", "bids_price", "bids_qty", "asks_price", "asks_qty"], errors="ignore")
-    df_mark = df_mark.drop(columns=["exchange_timestamp", "local_timestamp", "next_funding_time", "funding_rate"], errors="ignore")
+    # Causal joins have explicit freshness limits.  Never present old market
+    # state as current during an outage.
+    df_ob = df_ob.drop(columns=["bids_price", "bids_qty", "asks_price", "asks_qty"], errors="ignore")
 
     # Track staleness for gaps
     df_ob["ob_ts"] = df_ob["timestamp"]
     df_mark["mark_ts"] = df_mark["timestamp"]
 
-    df_aligned = pd.merge_asof(df_grid, df_ob, on="timestamp", direction="backward")
-    df_aligned = pd.merge_asof(df_aligned, df_mark, on="timestamp", direction="backward")
+    df_aligned = pd.merge_asof(df_grid, df_ob, on="timestamp", direction="backward", tolerance=500)
+    df_aligned = pd.merge_asof(df_aligned, df_mark, on="timestamp", direction="backward", tolerance=5000)
 
-    df_aligned["orderbook_gap"] = (df_aligned["timestamp"] - df_aligned["ob_ts"]) > 500
-    df_aligned["markprice_gap"] = (df_aligned["timestamp"] - df_aligned["mark_ts"]) > 5000
+    df_aligned["orderbook_gap"] = df_aligned["ob_ts"].isna() | ((df_aligned["timestamp"] - df_aligned["ob_ts"]) > 500)
+    df_aligned["markprice_gap"] = df_aligned["mark_ts"].isna() | ((df_aligned["timestamp"] - df_aligned["mark_ts"]) > 5000)
 
     df_aligned = df_aligned.drop(columns=["ob_ts", "mark_ts"])
 
-    # Mask orderbook spread spikes before trade aggregation so the aligned parquet
-    # carries both the raw spread and model-safe cleaned spread.
+    # Preserve stress observations.  This flag is descriptive only; no spread
+    # value is masked or forward-filled.
     SPREAD_SPIKE_THRESHOLD = 1.0
     if "spread" in df_aligned.columns:
         df_aligned["spread_spike_flag"] = df_aligned["spread"] > SPREAD_SPIKE_THRESHOLD
-        df_aligned["spread_clean"] = df_aligned["spread"].where(
-            ~df_aligned["spread_spike_flag"], other=float("nan")
-        )
-        df_aligned["spread_clean"] = df_aligned["spread_clean"].ffill(limit=10)
     else:
         df_aligned["spread_spike_flag"] = False
-        df_aligned["spread_clean"] = float("nan")
     df_aligned["spread_spike_flag"] = df_aligned["spread_spike_flag"].astype(bool)
-    df_aligned["spread_clean"] = df_aligned["spread_clean"].astype("float64")
 
     # De-saturate orderbook imbalance features for downstream linear models while
     # preserving the raw OBI columns.

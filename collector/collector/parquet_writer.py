@@ -17,6 +17,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .utils import logger
+from .storage_layout import iter_segments, segment_path
 
 
 class ParquetWriter:
@@ -53,21 +54,22 @@ class ParquetWriter:
     def _next_sequence(self, hour: str) -> int:
         prefix = f"{hour}-"
         values = []
-        for path in self.stream_dir.glob(f"{hour}-*.seg"):
+        for path in iter_segments(self.base_dir, self.stream_name):
+            if path.suffix != ".seg" or not path.name.startswith(prefix):
+                continue
             try:
-                values.append(int(path.name.removeprefix(prefix).removesuffix(".seg")))
+                values.append(int(path.stem.removeprefix(prefix)))
             except ValueError:
                 continue
         return (max(values) + 1) if values else 0
 
     def _segment_paths(self) -> tuple[Path, Path, Path]:
-        stem = f"{self.current_hour}-{self._seq:06d}.seg"
-        final = self.stream_dir / stem
+        final = segment_path(self.base_dir, self.stream_name, self.current_hour, self._seq)
         return final, Path(str(final) + ".tmp"), Path(str(final) + ".count.json")
 
     def _get_filename(self, hour_str: str) -> str:
         """Compatibility helper: return this writer's current segment pathname."""
-        return str(self.stream_dir / f"{hour_str}-{self._seq:06d}.seg")
+        return str(segment_path(self.base_dir, self.stream_name, hour_str, self._seq))
 
     def _emit_drop(self, rows_lost: Optional[int], reason: str = "crashed_segment_discarded") -> None:
         event = {"exchange": "BINANCE", "stream": self.stream_name, "event_type": "DATA_DROP",
@@ -117,7 +119,8 @@ class ParquetWriter:
         temporary = Path(str(self._counter_filepath) + ".tmp")
         with temporary.open("w", encoding="utf-8") as handle:
             json.dump({"rows": self.record_count}, handle)
-            handle.flush(); os.fsync(handle.fileno())
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(temporary, self._counter_filepath)
 
     def write(self, record: Dict[str, Any]) -> None:
@@ -154,7 +157,8 @@ class ParquetWriter:
             return
         self.flush()
         final, tmp, counter = self._segment_paths()
-        self.writer.close(); self.writer = None
+        self.writer.close()
+        self.writer = None
         with tmp.open("rb") as handle:
             os.fsync(handle.fileno())
         os.replace(tmp, final)
@@ -171,11 +175,14 @@ class ParquetWriter:
         with meta_tmp.open("w", encoding="utf-8") as handle:
             json.dump({"record_count": self.record_count, "first_record_ts": self._first_record_ts,
                        "last_record_ts": self._last_record_ts}, handle)
-            handle.flush(); os.fsync(handle.fileno())
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(meta_tmp, meta)
         parent_fd = os.open(str(final.parent), os.O_RDONLY)
-        try: os.fsync(parent_fd)
-        finally: os.close(parent_fd)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
         logger.info("closed_parquet_segment", stream=self.stream_name, file=str(final), rows=self.record_count)
         if open_next:
             self._seq += 1
@@ -186,7 +193,8 @@ class ParquetWriter:
         if self.writer is None:
             return
         if self.record_count == 0 and not self.buffer:
-            self.writer.close(); self.writer = None
+            self.writer.close()
+            self.writer = None
             if self._tmp_filepath:
                 self._tmp_filepath.unlink(missing_ok=True)
             if self._counter_filepath:

@@ -4,6 +4,7 @@ import glob
 from typing import Dict, Any, Iterable, List
 import pandas as pd
 import numpy as np
+from collector.collector.storage_layout import iter_segments
 
 
 def _load_parquet_files(files: Iterable[str]) -> pd.DataFrame:
@@ -68,7 +69,7 @@ def _write_stats(stats: Dict[str, Dict[str, Any]], data_dir: str, filename: str)
 
 
 def compute_raw_stream_stats(data_dir: str, stream_name: str, output_filename: str, *, max_allowed_end_ts=None):
-    raw_files = glob.glob(os.path.join(data_dir, "raw", stream_name, "*.parquet")) + glob.glob(os.path.join(data_dir, "raw", stream_name, "*.seg"))
+    raw_files = list(iter_segments(data_dir, stream_name))
 
     if not raw_files:
         print(f"No raw {stream_name} data found.")

@@ -47,7 +47,7 @@ def test_data(tmp_path):
         "obi_level_3": [0.2, 0.3, 0.4],
         "obi_level_5": [0.3, 0.4, 0.5]
     })
-    _write_timestamp_ms_parquet(ob_df, os.path.join(data_dir, "raw", "orderbook", f"{date_str}-00.parquet"))
+    _write_timestamp_ms_parquet(ob_df, os.path.join(data_dir, "raw", "orderbook", f"{date_str}-00-000000.seg"))
 
     # Trades data
     trades_df = pd.DataFrame({
@@ -58,7 +58,7 @@ def test_data(tmp_path):
         "is_buyer_maker": [False, True, False],
         "signed_qty": [1.0, -2.0, 3.0]
     })
-    _write_timestamp_ms_parquet(trades_df, os.path.join(data_dir, "raw", "trades", f"{date_str}-00.parquet"))
+    _write_timestamp_ms_parquet(trades_df, os.path.join(data_dir, "raw", "trades", f"{date_str}-00-000000.seg"))
 
     # Markprice data
     mark_df = pd.DataFrame({
@@ -67,7 +67,7 @@ def test_data(tmp_path):
         "funding_rate_bps": [1.0, 1.0],
         "hours_to_funding": [8.0, 7.99]
     })
-    _write_timestamp_ms_parquet(mark_df, os.path.join(data_dir, "raw", "markprice", f"{date_str}-00.parquet"))
+    _write_timestamp_ms_parquet(mark_df, os.path.join(data_dir, "raw", "markprice", f"{date_str}-00-000000.seg"))
 
     return data_dir, date_str, start_ts
 
@@ -113,16 +113,14 @@ def test_dataset_assembler(test_data):
     assert df.loc[3, "net_volume"] == 3.0
 
     # Check gaps
-    assert df.loc[0, "orderbook_gap"] == False
+    assert not df.loc[0, "orderbook_gap"]
     # at t=100, last ob was at t=0, so gap is 100 (not > 500)
-    assert df.loc[1, "orderbook_gap"] == False
+    assert not df.loc[1, "orderbook_gap"]
 
-    assert df.loc[0, "spread_spike_flag"] == False
-    assert df.loc[0, "spread_clean"] == 0.5
-    assert df.loc[2, "spread_spike_flag"] == True
-    assert df.loc[2, "spread_clean"] == 0.5
+    assert not df.loc[0, "spread_spike_flag"]
+    assert df.loc[2, "spread_spike_flag"]
     assert str(df["spread_spike_flag"].dtype) == "bool"
-    assert str(df["spread_clean"].dtype) == "float64"
+    assert "spread_clean" not in df.columns
     for col in ["obi", "obi_level_1", "obi_level_3", "obi_level_5"]:
         assert f"{col}_fisher" in df.columns
         assert str(df[f"{col}_fisher"].dtype) == "float64"
@@ -130,4 +128,5 @@ def test_dataset_assembler(test_data):
 
     # way out in the future should be a gap
     # last ob is t=400, so by t=1000 it is > 500
-    assert df.loc[10, "orderbook_gap"] == True
+    assert df.loc[10, "orderbook_gap"]
+    assert pd.isna(df.loc[10, "mid_price"])

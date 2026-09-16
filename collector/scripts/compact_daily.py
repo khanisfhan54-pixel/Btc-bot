@@ -19,6 +19,7 @@ from collector.collector.config import (
     TRADES_SCHEMA,
 )
 from collector.collector.utils import logger
+from collector.collector.storage_layout import iter_segments, parse_segment_name
 STREAM_SCHEMAS: dict[str, pa.Schema] = {
     "orderbook": ORDERBOOK_SCHEMA,
     "trades": TRADES_SCHEMA,
@@ -228,9 +229,8 @@ def _discover_hourly_files(raw_dir: Path, date: str, *, guard_seconds: int) -> _
     current_date = now.strftime("%Y-%m-%d")
     current_hour = now.hour
     for hour in range(24):
-        legacy = raw_dir / f"{date}-{hour:02d}.parquet"
-        paths = sorted(raw_dir.glob(f"{date}-{hour:02d}-*.seg")) or ([legacy] if legacy.exists() else [])
-        tmp_paths = list(raw_dir.glob(f"{date}-{hour:02d}-*.seg.tmp")) + [Path(str(legacy) + ".tmp")]
+        paths = list(iter_segments(raw_dir.parent.parent, raw_dir.name, date=date, hour=hour))
+        tmp_paths = list(raw_dir.glob(f"{date}-{hour:02d}-*.seg.tmp")) + list(raw_dir.glob(f"{date}-{hour:02d}.parquet.tmp"))
         if any(path.exists() for path in tmp_paths):
             is_current_hour = date == current_date and hour == current_hour
             if is_current_hour:
@@ -274,12 +274,10 @@ def _discover_all_dates(data_dir: Path, streams: Sequence[str]) -> set[str]:
         raw_dir = data_dir / "raw" / stream
         if not raw_dir.exists():
             continue
-        for path in list(raw_dir.glob("*.parquet")) + list(raw_dir.glob("*.seg")):
-            if path.name.endswith((".tmp", ".bak")):
-                continue
-            match = DATE_RE.match(path.name)
-            if match:
-                dates.add(match.group(1))
+        for path in iter_segments(data_dir, stream):
+            parsed = parse_segment_name(path)
+            if parsed:
+                dates.add(parsed[0])
     return dates
 def _inspect_sources(paths: Sequence[Path], stream: str, schema: pa.Schema) -> list[_HourSource]:
     sources: list[_HourSource] = []
