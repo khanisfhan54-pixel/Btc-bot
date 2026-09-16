@@ -15,13 +15,16 @@ read.
 
 ## Commands
 
-From `collector/` after installing `requirements.txt`:
+From the repository root after installing `collector/requirements.txt`:
 
 ```bash
-python pipeline/dataset_assembler.py 2026-06-03
-python scripts/verify_dataset.py 2026-06-03
-python scripts/gap_report.py 2026-06-03
-python pipeline/stats_computer.py
+python -m collector.pipeline.dataset_assembler 2026-06-03
+python -m collector.scripts.verify_dataset 2026-06-03
+python -m collector.scripts.gap_report 2026-06-03
+python -m collector.pipeline.stats_computer
+python -m collector.pipeline.label_generator 2026-06-03
+python -m collector.pipeline.split_generator
+python -m collector.run_collector
 ```
 
 `verify_dataset.py` and `gap_report.py` fail when a requested stream has no

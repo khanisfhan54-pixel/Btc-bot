@@ -5,10 +5,10 @@ After=network.target
 [Service]
 Type=simple
 User=ubuntu
-WorkingDirectory=/path/to/collector
+WorkingDirectory=/path/to/Btc-bot
 Environment="TELEGRAM_BOT_TOKEN=YOUR_BOT_TOKEN"
 EnvironmentFile=/etc/btc-collector.env
-ExecStart=/usr/bin/python3 run_collector.py
+ExecStart=/usr/bin/python3 -m collector.run_collector
 Restart=always
 RestartSec=5
 # Give the system time to cleanly flush parquets on stop
