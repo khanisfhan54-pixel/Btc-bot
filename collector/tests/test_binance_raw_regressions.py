@@ -22,14 +22,23 @@ def _snapshot():
         update_id=10, is_snapshot=True)
 
 
-def test_usdm_equality_is_stale_and_first_remaining_event_must_bridge():
+def test_usdm_equality_is_a_valid_first_snapshot_bridge():
     book = LocalBook("BINANCE")
-    # u == L is discarded.  U > L on the first remaining event is fatal even
-    # when a later buffered event appears bridgeable.
-    book.buffer = [_event(10, 9), _event(12, 12), _event(13, 10, 12)]
+    # u < L is stale; an equality event that overlaps L is the first bridge.
+    book.buffer = [_event(9, 9), _event(10, 9)]
+    assert book.binance_snapshot(10, _snapshot())
+    assert book.previous.update_id == 10
+    assert book.state.state.value == "VALID"
+
+
+def test_usdm_does_not_skip_invalid_first_non_stale_bridge_candidate():
+    book = LocalBook("BINANCE")
+    # The first non-stale candidate starts after L, even though a later event
+    # would overlap it; recovery must not forward-search for that later bridge.
+    book.buffer = [_event(9, 9), _event(12, 12), _event(13, 10, 12)]
     assert not book.binance_snapshot(10, _snapshot())
     assert book.last_reason == "snapshot_bridge_not_found"
-    assert [e.update_id for e in book.buffer] == [10, 12, 13]
+    assert [e.update_id for e in book.buffer] == [9, 12, 13]
 
 
 def test_recovery_provenance_and_decimal_raw_persistence_are_exact():

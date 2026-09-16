@@ -44,9 +44,8 @@ def _snapshot(update):
 def test_binance_local_book_snapshot_bridges_and_discards_stale_diffs():
     from collector.collector.book_engine import LocalBook
     book = LocalBook("BINANCE")
-    # u == lastUpdateId is stale under the USD-M algorithm.  The next first
-    # eligible update itself must bridge the REST snapshot.
-    book.buffer = [_diff(9, 9), _diff(10, 9), _diff(11, 10, 10)]
+    # u < lastUpdateId is stale, while equality remains a valid bridge.
+    book.buffer = [_diff(9, 9), _diff(10, 9), _diff(11, 11, 10)]
     assert book.binance_snapshot(10, _snapshot(10))
     assert book.previous.update_id == 11
     assert book.state.state.value == "VALID"
